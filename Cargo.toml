@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/trit-core",
+    "crates/trit-schedule",
+    "crates/trit-orch",
+    "crates/trit-reasonix",
+    "crates/trit-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bfxh/trit-agent-kernel"
+
+[workspace.dependencies]
+trit-core = { path = "crates/trit-core", version = "0.1.0" }
+trit-schedule = { path = "crates/trit-schedule", version = "0.1.0" }
+trit-orch = { path = "crates/trit-orch", version = "0.1.0" }
+trit-reasonix = { path = "crates/trit-reasonix", version = "0.1.0" }
+trit-agent = { path = "crates/trit-agent", version = "0.1.0" }
