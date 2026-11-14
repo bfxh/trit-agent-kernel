@@ -312,7 +312,7 @@ fn shell_command(command: &str) -> Command {
 
 #[cfg(unix)]
 fn link_count(file: &cap_std::fs::File) -> Result<u64, AgentError> {
-    use std::os::unix::fs::MetadataExt;
+    use cap_fs_ext::MetadataExt;
     let metadata = file
         .metadata()
         .map_err(|error| AgentError::Io(format!("stat handle: {error}")))?;
