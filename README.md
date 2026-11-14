@@ -1,5 +1,7 @@
 # trit-agent-kernel
 
+[![CI](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml)
+
 Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定 API。**
 
 本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出智能体相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与无头宿主能力。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
