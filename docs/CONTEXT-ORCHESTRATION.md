@@ -119,12 +119,16 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
 - Agent 自主：`AgentContext` + `AgentContextTools` 提供 `context_search` / `context_add` /
   `context_read`。agent 自己搜索并加入动态上下文；新增内容一律进 `DynamicTail`，
   不会改稳定前缀；`AgentContextPlanner` 把共享状态每轮快照给 provider。
+  `context_read` 支持 `offset/length` span 与单轮字符预算；CLI 用
+  `--context-catalog` 启用，`--context-read-budget` / `--context-read-max` 限流。
 - Provider 对接：`ContextPlan` 已进入 `ProviderRequest` 与 OpenAI-compatible 消息；
   `ContextPlanner` 每轮提供计划；`ProviderResponse.context` 与 session 的
   `Proposal.context` 记录 inclusion receipt 和“前缀指纹 → 实际 cache hit/miss”的对照。
   但 CLI 尚未配置 catalog/planner，`hit_potential` 仍需要和实际观测对照验证。
   上下文工具只在有 `ContextPlan` 时向模型暴露，避免 CLI 默认广告不可执行工具；
   自主路径用 `AgentContextTools` 包装执行器（只读路径可用 `ContextReadTools`）。
+  `AgentHost` 用 `CacheLedger` 按 prefix fingerprint 聚合实际 hit/miss，并提供
+  `hit_potential(prefix, threshold)` 把观测折叠成三值；CLI 结束向 stderr 打印 ledger。
 - 边界：token 仍是粗估；校准用最大值而非分位数；“印象”只比较 revision/hash，不做语义 diff。
 
 ### 3.6 非目标

@@ -103,6 +103,12 @@ pub struct ResolvedContext {
     pub document: ContextDocument,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSpan {
+    pub offset: usize,
+    pub length: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriorImpression {
     #[serde(default)]
@@ -485,6 +491,104 @@ impl CacheObservation {
             0
         } else {
             ((u128::from(self.cache_hit_tokens) * 10_000) / u128::from(input)) as u32
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheStat {
+    pub samples: u64,
+    pub exact_samples: u64,
+    pub estimated_samples: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+}
+
+impl CacheStat {
+    pub fn observe(&mut self, observation: &CacheObservation) {
+        self.samples = self.samples.saturating_add(1);
+        if observation.estimated {
+            self.estimated_samples = self.estimated_samples.saturating_add(1);
+        } else {
+            self.exact_samples = self.exact_samples.saturating_add(1);
+        }
+        self.cache_hit_tokens = self
+            .cache_hit_tokens
+            .saturating_add(observation.cache_hit_tokens);
+        self.cache_miss_tokens = self
+            .cache_miss_tokens
+            .saturating_add(observation.cache_miss_tokens);
+    }
+
+    pub fn hit_rate_bp(&self) -> u32 {
+        let input = self.cache_hit_tokens.saturating_add(self.cache_miss_tokens);
+        if input == 0 {
+            0
+        } else {
+            ((u128::from(self.cache_hit_tokens) * 10_000) / u128::from(input)) as u32
+        }
+    }
+
+    pub fn confidence(&self) -> Ternary {
+        if self.exact_samples >= 3 {
+            Ternary::True
+        } else if self.exact_samples > 0 {
+            Ternary::Unknown
+        } else {
+            Ternary::False
+        }
+    }
+}
+
+/// 按 prefix fingerprint 聚合实际 cache 观测；用于把计划层 hit_potential
+/// 校准成可验证的命中率。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheLedger {
+    entries: BTreeMap<String, CacheStat>,
+}
+
+impl CacheLedger {
+    pub fn observe(&mut self, observation: &CacheObservation) {
+        self.entries
+            .entry(observation.prefix_fingerprint.clone())
+            .or_default()
+            .observe(observation);
+    }
+
+    pub fn stat(&self, prefix_fingerprint: &str) -> Option<&CacheStat> {
+        self.entries.get(prefix_fingerprint)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &CacheStat)> {
+        self.entries.iter()
+    }
+
+    pub fn total_hit_rate_bp(&self) -> u32 {
+        let hits: u64 = self
+            .entries
+            .values()
+            .map(|stat| stat.cache_hit_tokens)
+            .sum();
+        let misses: u64 = self
+            .entries
+            .values()
+            .map(|stat| stat.cache_miss_tokens)
+            .sum();
+        let input = hits.saturating_add(misses);
+        if input == 0 {
+            0
+        } else {
+            ((u128::from(hits) * 10_000) / u128::from(input)) as u32
+        }
+    }
+
+    /// 用实际观测把某个 prefix 的命中把握折叠成三值；样本不足返回 Unknown。
+    pub fn hit_potential(&self, prefix_fingerprint: &str, threshold_bp: u32) -> Ternary {
+        match self.stat(prefix_fingerprint) {
+            Some(stat) if stat.confidence() == Ternary::True => {
+                Ternary::from_bool(stat.hit_rate_bp() >= threshold_bp)
+            }
+            _ => Ternary::Unknown,
         }
     }
 }

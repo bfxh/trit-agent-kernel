@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use crate::context_layers::{AgentContext, ContextCatalog, ContextDetail, ContextPlan};
+use crate::context_layers::{
+    AgentContext, ContextCatalog, ContextDetail, ContextPlan, ContextSpan,
+};
 use crate::provider::ContextPlanner;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest, TurnContext};
 
@@ -16,6 +18,8 @@ pub struct ContextReadRecord {
     pub handle: String,
     pub id: String,
     pub chars: usize,
+    #[serde(default)]
+    pub span: Option<ContextSpan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +35,8 @@ pub struct ContextReadTools<T, R> {
     plan: ContextPlan,
     resolver: R,
     max_chars: usize,
+    read_budget_chars: usize,
+    read_used: usize,
     reads: Vec<ContextReadRecord>,
 }
 
@@ -41,12 +47,19 @@ impl<T, R> ContextReadTools<T, R> {
             plan,
             resolver,
             max_chars: 8 * 1024,
+            read_budget_chars: 16 * 1024,
+            read_used: 0,
             reads: Vec::new(),
         }
     }
 
     pub fn with_max_chars(mut self, max_chars: usize) -> Self {
         self.max_chars = max_chars.max(1);
+        self
+    }
+
+    pub fn with_read_budget(mut self, read_budget_chars: usize) -> Self {
+        self.read_budget_chars = read_budget_chars.max(1);
         self
     }
 
@@ -83,12 +96,19 @@ impl<T: ToolExecutor, R: crate::context_layers::ContextResolver> ToolExecutor
                 resolved.document.id, item.id
             )));
         }
-        let text = truncate(resolved.document.full, self.max_chars);
-        let chars = text.chars().count();
+        let remaining = self.read_budget_chars.saturating_sub(self.read_used);
+        let (text, chars) = read_slice(
+            resolved.document.full,
+            request.span,
+            self.max_chars,
+            remaining,
+        )?;
+        self.read_used = self.read_used.saturating_add(chars);
         self.reads.push(ContextReadRecord {
             handle: handle.clone(),
             id: item.id.clone(),
             chars,
+            span: request.span,
         });
         Ok(ToolOutcome {
             call_id: request.call_id.clone(),
@@ -104,6 +124,7 @@ impl<T: ToolExecutor, R: crate::context_layers::ContextResolver> ToolExecutor
 
     fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
         self.reads.clear();
+        self.read_used = 0;
         self.inner.begin_turn(turn, objective)
     }
 
@@ -117,6 +138,8 @@ pub struct AgentContextTools<T, R> {
     inner: T,
     context: Arc<Mutex<AgentContext<R>>>,
     max_chars: usize,
+    read_budget_chars: usize,
+    read_used: usize,
     reads: Vec<ContextReadRecord>,
     adds: Vec<ContextAddRecord>,
 }
@@ -127,6 +150,8 @@ impl<T, R> AgentContextTools<T, R> {
             inner,
             context,
             max_chars: 8 * 1024,
+            read_budget_chars: 16 * 1024,
+            read_used: 0,
             reads: Vec::new(),
             adds: Vec::new(),
         }
@@ -134,6 +159,11 @@ impl<T, R> AgentContextTools<T, R> {
 
     pub fn with_max_chars(mut self, max_chars: usize) -> Self {
         self.max_chars = max_chars.max(1);
+        self
+    }
+
+    pub fn with_read_budget(mut self, read_budget_chars: usize) -> Self {
+        self.read_budget_chars = read_budget_chars.max(1);
         self
     }
 
@@ -207,12 +237,14 @@ impl<T: ToolExecutor, R: ContextCatalog> ToolExecutor for AgentContextTools<T, R
                     .lock()?
                     .read(handle)
                     .map_err(|error| AgentError::Tool(error.to_string()))?;
-                let text = truncate(full, self.max_chars);
-                let chars = text.chars().count();
+                let remaining = self.read_budget_chars.saturating_sub(self.read_used);
+                let (text, chars) = read_slice(full, request.span, self.max_chars, remaining)?;
+                self.read_used = self.read_used.saturating_add(chars);
                 self.reads.push(ContextReadRecord {
                     handle: handle.clone(),
                     id: item.id,
                     chars,
+                    span: request.span,
                 });
                 Ok(outcome(request, text))
             }
@@ -223,6 +255,7 @@ impl<T: ToolExecutor, R: ContextCatalog> ToolExecutor for AgentContextTools<T, R
     fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
         self.reads.clear();
         self.adds.clear();
+        self.read_used = 0;
         self.inner.begin_turn(turn, objective)
     }
 
@@ -269,16 +302,34 @@ fn outcome(request: &ToolRequest, output: String) -> ToolOutcome {
     }
 }
 
-fn truncate(mut text: String, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text;
+fn read_slice(
+    text: String,
+    span: Option<ContextSpan>,
+    max_chars: usize,
+    remaining_budget: usize,
+) -> Result<(String, usize), AgentError> {
+    if remaining_budget == 0 {
+        return Err(AgentError::Tool("context read budget exhausted".into()));
     }
-    let end = text
-        .char_indices()
-        .nth(max)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len());
-    text.truncate(end);
-    text.push_str("...(truncated)");
-    text
+    let chars: Vec<char> = text.chars().collect();
+    let offset = span.map_or(0, |span| span.offset);
+    if offset > chars.len() {
+        return Err(AgentError::Tool(format!(
+            "context span offset {offset} exceeds {len} chars",
+            len = chars.len()
+        )));
+    }
+    let end = span
+        .map(|span| offset.saturating_add(span.length))
+        .unwrap_or(chars.len())
+        .min(chars.len());
+    let mut text: String = chars[offset..end].iter().collect();
+    let cap = max_chars.min(remaining_budget);
+    let mut used = text.chars().count();
+    if used > cap {
+        text = text.chars().take(cap).collect();
+        text.push_str("...(truncated)");
+        used = cap;
+    }
+    Ok((text, used))
 }

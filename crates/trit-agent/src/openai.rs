@@ -187,7 +187,11 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
                 }),
                 "context_read" => json!({
                     "type": "object",
-                    "properties": {"handle": {"type": "string"}},
+                    "properties": {
+                        "handle": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "length": {"type": "integer"}
+                    },
                     "required": ["handle"]
                 }),
                 "complete_subtask" => json!({
@@ -300,7 +304,24 @@ fn parse_response(body: &str) -> Result<ProviderResponse, AgentError> {
                 }
                 "context_read" => {
                     let handle = string_arg(&arguments, "handle")?;
-                    tool_calls.push(ToolRequest::context_read(call_id, handle));
+                    let span = match (
+                        arguments.get("offset").and_then(Value::as_u64),
+                        arguments.get("length").and_then(Value::as_u64),
+                    ) {
+                        (Some(offset), Some(length)) => Some(crate::ContextSpan {
+                            offset: offset as usize,
+                            length: length as usize,
+                        }),
+                        (None, None) => None,
+                        _ => {
+                            return Err(AgentError::Provider(
+                                "context_read span needs both offset and length".into(),
+                            ));
+                        }
+                    };
+                    let mut request = ToolRequest::context_read(call_id, handle);
+                    request.span = span;
+                    tool_calls.push(request);
                 }
                 "complete_subtask" => {
                     completion = Some(parse_claim(&arguments, &call_id)?);
@@ -656,13 +677,20 @@ mod tests {
     fn parses_context_read_tool_call() {
         let body = r#"{
             "choices": [{"message": {"tool_calls": [
-                {"id": "call-1", "function": {"name": "context_read", "arguments": "{\"handle\":\"C1\"}"}}
+                {"id": "call-1", "function": {"name": "context_read", "arguments": "{\"handle\":\"C1\",\"offset\":2,\"length\":3}"}}
             ]}}]
         }"#;
         let response = parse_response(body).unwrap();
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].tool, "context_read");
         assert_eq!(response.tool_calls[0].paths, ["C1"]);
+        assert_eq!(
+            response.tool_calls[0].span,
+            Some(crate::ContextSpan {
+                offset: 2,
+                length: 3
+            })
+        );
         assert!(response.tool_calls[0].read_only);
     }
 

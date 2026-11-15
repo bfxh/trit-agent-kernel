@@ -345,6 +345,10 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
         &self.log
     }
 
+    pub fn cache_ledger(&self) -> &crate::context_layers::CacheLedger {
+        self.host.cache_ledger()
+    }
+
     pub fn run_turn(&mut self, turn: &TurnSpec) -> Result<TurnOutcome, AgentError> {
         let index = self.state.next_turn();
         self.host.begin_turn(index, &turn.objective)?;

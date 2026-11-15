@@ -78,6 +78,8 @@ pub struct ToolRequest {
     pub operation: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<crate::context_layers::ContextSpan>,
 }
 
 impl ToolRequest {
@@ -119,6 +121,16 @@ impl ToolRequest {
             paths: vec![handle.into()],
             ..Self::default()
         }
+    }
+
+    pub fn context_read_span(
+        call_id: impl Into<String>,
+        handle: impl Into<String>,
+        span: crate::context_layers::ContextSpan,
+    ) -> Self {
+        let mut request = Self::context_read(call_id, handle);
+        request.span = Some(span);
+        request
     }
 
     pub fn context_search(
@@ -333,6 +345,7 @@ pub struct AgentHost<M, T> {
     tools: T,
     max_steps: usize,
     context: ContextPolicy,
+    cache_ledger: crate::context_layers::CacheLedger,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -342,6 +355,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             tools,
             max_steps: 8,
             context: ContextPolicy::default(),
+            cache_ledger: crate::context_layers::CacheLedger::default(),
         }
     }
 
@@ -357,6 +371,10 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
 
     pub fn model(&self) -> &M {
         &self.model
+    }
+
+    pub fn cache_ledger(&self) -> &crate::context_layers::CacheLedger {
+        &self.cache_ledger
     }
 
     pub fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
@@ -470,6 +488,13 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     context: proposal.context_receipt.clone(),
                 },
             )?;
+            if let Some(cache) = proposal
+                .context_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.cache.as_ref())
+            {
+                self.cache_ledger.observe(cache);
+            }
             if let Some(prefix) = &proposal.prefix
                 && prefix.changed
             {
@@ -757,13 +782,13 @@ pub use checkpoint::{
 };
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
 pub use context_layers::{
-    AgentContext, AutonomyPolicy, CacheClass, CacheObservation, CacheReport, CalibrationReport,
-    ContextCatalog, ContextDegradation, ContextDetail, ContextDocument, ContextDropReason,
-    ContextError, ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef,
-    ContextRequest, ContextResolver, ContextScope, ContextSelection, DroppedContext,
-    ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression,
-    ReasoningEffort, ResolvedContext, Sensitivity, UsageCalibration, assemble_context,
-    estimate_tokens,
+    AgentContext, AutonomyPolicy, CacheClass, CacheLedger, CacheObservation, CacheReport,
+    CacheStat, CalibrationReport, ContextCatalog, ContextDegradation, ContextDetail,
+    ContextDocument, ContextDropReason, ContextError, ContextItem, ContextKind, ContextPlan,
+    ContextReceipt, ContextRef, ContextRequest, ContextResolver, ContextScope, ContextSelection,
+    ContextSpan, DroppedContext, ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile,
+    PriorImpression, ReasoningEffort, ResolvedContext, Sensitivity, UsageCalibration,
+    assemble_context, estimate_tokens,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, ContextAddRecord, ContextReadRecord, ContextReadTools,

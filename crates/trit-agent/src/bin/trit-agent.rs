@@ -1,13 +1,15 @@
 use std::error::Error;
 use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_agent::{
-    CheckpointStore, CheckpointingTools, ContextPolicy, GitCheckpointStore, GitCheckpointingTools,
-    HeadlessConfig, Model, OpenAiConfig, OpenAiProvider, Proposal, ProviderModel, RewindScope,
-    ScriptedModel, Session, ToolExecutor, rewind_session_git_with_policy,
-    rewind_session_with_policy, run_headless,
+    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CheckpointStore,
+    CheckpointingTools, ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools,
+    HeadlessConfig, InMemoryContext, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal,
+    ProviderModel, ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, Session,
+    ToolExecutor, rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -50,6 +52,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut checkpoint_dir: Option<PathBuf> = None;
     let mut checkpoint_backend = "files".to_owned();
     let mut checkpoint_retain: Option<usize> = None;
+    let mut context_catalog: Option<PathBuf> = None;
+    let mut context_project: Option<String> = None;
+    let mut context_session_id: Option<String> = None;
+    let mut context_budget: u64 = 0;
+    let mut context_window: u64 = 128_000;
+    let mut model_max_output: u64 = 8_192;
+    let mut supports_reasoning = false;
+    let mut reasoning = ReasoningEffort::Off;
+    let mut context_read_budget: usize = 16 * 1024;
+    let mut context_read_max: usize = 8 * 1024;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -96,6 +108,42 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .parse()
                     .map_err(|error| fail(format!("bad --context-output: {error}")))?;
             }
+            "--context-catalog" => {
+                context_catalog = Some(PathBuf::from(next(&mut args, "--context-catalog")?));
+            }
+            "--context-project" => context_project = Some(next(&mut args, "--context-project")?),
+            "--context-session-id" => {
+                context_session_id = Some(next(&mut args, "--context-session-id")?);
+            }
+            "--context-budget" => {
+                context_budget = next(&mut args, "--context-budget")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --context-budget: {error}")))?;
+            }
+            "--context-window" => {
+                context_window = next(&mut args, "--context-window")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --context-window: {error}")))?;
+            }
+            "--model-max-output" => {
+                model_max_output = next(&mut args, "--model-max-output")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --model-max-output: {error}")))?;
+            }
+            "--supports-reasoning" => supports_reasoning = true,
+            "--reasoning" => {
+                reasoning = parse_reasoning(&next(&mut args, "--reasoning")?)?;
+            }
+            "--context-read-budget" => {
+                context_read_budget = next(&mut args, "--context-read-budget")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --context-read-budget: {error}")))?;
+            }
+            "--context-read-max" => {
+                context_read_max = next(&mut args, "--context-read-max")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --context-read-max: {error}")))?;
+            }
             "--help" | "-h" => {
                 usage();
                 return Ok(());
@@ -126,6 +174,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if checkpoint_backend == "git" && checkpoint_dir.is_none() {
         return Err(fail("--checkpoint-backend git requires --checkpoint-dir"));
+    }
+    if context_catalog.is_some() && provider != "openai" {
+        return Err(fail("--context-catalog requires --provider openai"));
     }
     let workspace_root = workspace.clone();
     let mut workspace = WorkspaceConfig::new(workspace);
@@ -165,15 +216,56 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         other => return Err(fail(format!("unknown provider: {other}"))),
     };
-    let outcome = if resume || checkpoint_dir.is_some() {
+    let openai_config = if provider == "openai" {
+        Some(OpenAiConfig::from_env()?)
+    } else {
+        None
+    };
+    let context_agent = match context_catalog.as_ref() {
+        Some(path) => {
+            let config = openai_config
+                .as_ref()
+                .ok_or_else(|| fail("--context-catalog requires --provider openai"))?;
+            let catalog = load_context_catalog(path)?;
+            let project = context_project
+                .clone()
+                .unwrap_or_else(|| workspace_root.display().to_string());
+            let session_id = context_session_id.clone().unwrap_or_else(|| {
+                session_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "cli".into())
+            });
+            let request = ContextRequest {
+                project,
+                session: session_id,
+                query: turn.objective.clone(),
+                selections: Vec::new(),
+                budget_tokens: context_budget,
+                model: ModelProfile {
+                    name: config.model.clone(),
+                    context_window,
+                    max_output_tokens: model_max_output,
+                    supports_tools: true,
+                    supports_context_read: true,
+                    supports_reasoning,
+                },
+                reasoning,
+                allow_secret: false,
+                autonomy: Default::default(),
+                priors: Default::default(),
+                calibration: None,
+            };
+            Some(Arc::new(Mutex::new(AgentContext::assemble(
+                request, catalog,
+            )?)))
+        }
+        None => None,
+    };
+    let (outcome, cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
-        let model: Box<dyn Model> = match scripted {
-            Some(proposals) => Box::new(ScriptedModel::new(proposals)),
-            None => Box::new(ProviderModel::new(OpenAiProvider::new(
-                OpenAiConfig::from_env()?,
-            ))),
-        };
-        let local = LocalTools::new(config.workspace)?;
+        let model = build_model(scripted, openai_config.as_ref(), context_agent.as_ref())?;
+        let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
             Some(dir) => match checkpoint_backend.as_str() {
                 "git" => {
@@ -195,20 +287,54 @@ fn run() -> Result<(), Box<dyn Error>> {
             },
             None => Box::new(local),
         };
+        let tools: Box<dyn ToolExecutor> = match context_agent.as_ref() {
+            Some(shared) => Box::new(
+                AgentContextTools::new(tools, Arc::clone(shared))
+                    .with_max_chars(context_read_max)
+                    .with_read_budget(context_read_budget),
+            ),
+            None => tools,
+        };
         let mut session = Session::open(model, tools, &path)?
             .with_max_steps(max_steps)
             .with_context(context);
-        session.run_turn(&turn)?
-    } else {
-        match scripted {
-            Some(proposals) => run_headless(turn, ScriptedModel::new(proposals), config)?,
-            None => {
-                let provider = OpenAiProvider::new(OpenAiConfig::from_env()?);
-                run_headless(turn, ProviderModel::new(provider), config)?
-            }
+        let outcome = session.run_turn(&turn)?;
+        let ledger = session.cache_ledger().clone();
+        (outcome, Some(ledger))
+    } else if let Some(shared) = context_agent.as_ref() {
+        let model = build_model(scripted, openai_config.as_ref(), Some(shared))?;
+        let local = LocalTools::new(config.workspace.clone())?;
+        let tools = AgentContextTools::new(local, Arc::clone(shared))
+            .with_max_chars(context_read_max)
+            .with_read_budget(context_read_budget);
+        if let Some(path) = config.session.as_ref() {
+            let mut session = Session::open(model, tools, path)?
+                .with_max_steps(max_steps)
+                .with_context(context);
+            let outcome = session.run_turn(&turn)?;
+            let ledger = session.cache_ledger().clone();
+            (outcome, Some(ledger))
+        } else {
+            let mut host = AgentHost::new(model, tools)
+                .with_max_steps(max_steps)
+                .with_context(context);
+            let outcome = host.run_turn(&turn)?;
+            let ledger = host.cache_ledger().clone();
+            (outcome, Some(ledger))
         }
+    } else {
+        let model = build_model(scripted, openai_config.as_ref(), None)?;
+        (run_headless(turn, model, config)?, None)
     };
 
+    if context_agent.is_some()
+        && let Some(ledger) = cache_ledger
+    {
+        eprintln!(
+            "cache ledger: {}",
+            serde_json::to_string_pretty(&ledger).map_err(|error| fail(error.to_string()))?
+        );
+    }
     let mut stdout = std::io::stdout().lock();
     writeln!(
         stdout,
@@ -219,6 +345,44 @@ fn run() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn build_model(
+    scripted: Option<Vec<Proposal>>,
+    config: Option<&OpenAiConfig>,
+    context: Option<&Arc<Mutex<AgentContext<InMemoryContext>>>>,
+) -> Result<Box<dyn Model>, Box<dyn Error>> {
+    if let Some(proposals) = scripted {
+        return Ok(Box::new(ScriptedModel::new(proposals)));
+    }
+    let config = config.ok_or_else(|| fail("--provider openai requires OPENAI_* env"))?;
+    let mut model = ProviderModel::new(OpenAiProvider::new(config.clone()));
+    if let Some(shared) = context {
+        model = model.with_context_planner(Box::new(AgentContextPlanner::new(Arc::clone(shared))));
+    }
+    Ok(Box::new(model))
+}
+
+fn load_context_catalog(path: &Path) -> Result<InMemoryContext, Box<dyn Error>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| fail(format!("read context catalog {}: {error}", path.display())))?;
+    let entries: Vec<ResolvedContext> = serde_json::from_str(&text)
+        .map_err(|error| fail(format!("parse context catalog: {error}")))?;
+    let mut catalog = InMemoryContext::default();
+    for entry in entries {
+        catalog.insert(entry.reference, entry.document)?;
+    }
+    Ok(catalog)
+}
+
+fn parse_reasoning(value: &str) -> Result<ReasoningEffort, Box<dyn Error>> {
+    match value {
+        "off" => Ok(ReasoningEffort::Off),
+        "low" => Ok(ReasoningEffort::Low),
+        "medium" => Ok(ReasoningEffort::Medium),
+        "high" => Ok(ReasoningEffort::High),
+        other => Err(fail(format!("bad --reasoning: {other}"))),
+    }
 }
 
 fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
@@ -239,14 +403,20 @@ fn usage() {
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
-         [--allow-hardlinks] [--context-receipts N] [--context-chars N] [--context-output N]\n\n\
+         [--allow-hardlinks] [--context-receipts N] [--context-chars N] [--context-output N] \\\n    \
+         [--context-catalog <json> [--context-project <id>] [--context-session-id <id>] \\\n    \
+         [--context-budget N] [--context-window N] [--model-max-output N] \\\n    \
+         [--supports-reasoning] [--reasoning off|low|medium|high] \\\n    \
+         [--context-read-budget N] [--context-read-max N]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
-         checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\n\
+         checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
+         context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\
+         context_search / context_add / context_read with dynamic-tail-only additions.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
@@ -318,4 +488,45 @@ fn run_rewind(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Erro
         serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trit_agent::{
+        CacheClass, ContextDocument, ContextKind, ContextRef, ContextScope, Sensitivity,
+    };
+
+    #[test]
+    fn loads_context_catalog_json() {
+        let entry = ResolvedContext {
+            reference: ContextRef {
+                id: "doc".into(),
+                label: "doc".into(),
+                kind: ContextKind::Doc,
+                scope: ContextScope::Project,
+                project: Some("p1".into()),
+                session: None,
+                revision: "rev1".into(),
+                content_hash: None,
+                sensitivity: Sensitivity::Internal,
+                cache: CacheClass::DynamicTail,
+            },
+            document: ContextDocument {
+                id: "doc".into(),
+                full: "body".into(),
+                summary: None,
+                tokens: Some(1),
+            },
+        };
+        let path = std::env::temp_dir().join(format!(
+            "trit-cli-catalog-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, serde_json::to_string(&vec![entry]).unwrap()).unwrap();
+        let catalog = load_context_catalog(&path).unwrap();
+        assert_eq!(catalog.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
 }

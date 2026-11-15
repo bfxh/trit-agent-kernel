@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use trit_agent::{
     AgentContext, AgentContextTools, AgentError, CacheClass, ContextDocument, ContextKind,
     ContextPlan, ContextReadTools, ContextRef, ContextRequest, ContextScope, ContextSelection,
-    InMemoryContext, ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity, ToolExecutor,
-    ToolRequest, assemble_context,
+    ContextSpan, InMemoryContext, ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity,
+    ToolExecutor, ToolRequest, assemble_context,
 };
 
 fn plan_and_context() -> (ContextPlan, InMemoryContext, ContextRequest) {
@@ -179,4 +179,25 @@ fn agent_context_denies_add_when_autonomy_is_not_allowed() {
     ));
     let error = context.add("missing").unwrap_err();
     assert!(matches!(error, trit_agent::ContextError::AutonomyDenied(_)));
+}
+
+#[test]
+fn context_read_supports_spans_and_per_turn_budget() {
+    let (plan, context, _) = plan_and_context();
+    let mut tools =
+        ContextReadTools::new(ScriptedTools::new(Vec::new()), plan, context).with_read_budget(7);
+    let span = ContextSpan {
+        offset: 5,
+        length: 7,
+    };
+    let outcome = tools
+        .execute(&ToolRequest::context_read_span("r1", "C1", span))
+        .unwrap();
+    assert_eq!(outcome.output, "context");
+    assert_eq!(tools.reads()[0].span, Some(span));
+
+    let error = tools
+        .execute(&ToolRequest::context_read("r2", "C1"))
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Tool(message) if message.contains("budget exhausted")));
 }

@@ -698,3 +698,23 @@ fn prior(reference: &ContextRef) -> PriorImpression {
         summary: None,
     }
 }
+
+#[test]
+fn cache_ledger_calibrates_prefix_hit_potential_from_real_observations() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    for _ in 0..3 {
+        ledger.observe(&trit_agent::CacheObservation {
+            prefix_fingerprint: "fnv1a64:ok".into(),
+            prompt_tokens: 100,
+            cache_hit_tokens: 80,
+            cache_miss_tokens: 20,
+            estimated: false,
+        });
+    }
+    assert_eq!(ledger.hit_potential("fnv1a64:ok", 5_000), Ternary::True);
+    assert_eq!(ledger.hit_potential("fnv1a64:ok", 9_000), Ternary::False);
+    assert_eq!(
+        ledger.hit_potential("fnv1a64:missing", 5_000),
+        Ternary::Unknown
+    );
+}
