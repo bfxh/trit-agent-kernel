@@ -323,7 +323,7 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
                 .lock()
                 .map_err(|_| AgentError::Tool("cache ledger poisoned".into()))?;
             if let Some(stat) = cache_ledger.stat_for(&plan.model, &plan.cache.prefix_fingerprint) {
-                plan.cache.observed_hit_rate_bp = Some(stat.hit_rate_bp());
+                plan.cache.observed_hit_rate_bp = Some(stat.calibrated_hit_rate_bp());
                 plan.cache.calibration = stat.confidence();
                 if stat.confidence() == trit_orch::Ternary::True {
                     plan.cache.hit_potential = cache_ledger.hit_potential_for(
