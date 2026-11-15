@@ -442,6 +442,12 @@ pub struct CacheReport {
     pub dynamic_items: usize,
     pub prefix_tokens: u64,
     pub dynamic_tokens: u64,
+    /// 实际观测到的 prefix 命中率（基点）；没有观测时为 None。
+    #[serde(default)]
+    pub observed_hit_rate_bp: Option<u32>,
+    /// 实际观测的置信度；没有观测时为 Unknown。
+    #[serde(default)]
+    pub calibration: Ternary,
     /// 稳定前缀的确定性指纹；前缀没变时它应保持不变。
     #[serde(default)]
     pub prefix_fingerprint: String,
@@ -457,6 +463,8 @@ impl Default for CacheReport {
             dynamic_items: 0,
             prefix_tokens: 0,
             dynamic_tokens: 0,
+            observed_hit_rate_bp: None,
+            calibration: Ternary::Unknown,
             prefix_fingerprint: String::new(),
             hit_potential: Ternary::Unknown,
             invalidated: Vec::new(),

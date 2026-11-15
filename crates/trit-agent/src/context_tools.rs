@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::context_layers::{
-    AgentContext, ContextCatalog, ContextDetail, ContextPlan, ContextSpan,
+    AgentContext, CacheLedger, ContextCatalog, ContextDetail, ContextPlan, ContextSpan,
 };
 use crate::provider::ContextPlanner;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest, TurnContext};
@@ -267,11 +267,27 @@ impl<T: ToolExecutor, R: ContextCatalog> ToolExecutor for AgentContextTools<T, R
 /// 把共享的 `AgentContext` 每轮快照成 `ContextPlan`，供 ProviderModel 使用。
 pub struct AgentContextPlanner<R> {
     context: Arc<Mutex<AgentContext<R>>>,
+    cache_ledger: Option<Arc<Mutex<CacheLedger>>>,
+    hit_threshold_bp: u32,
 }
 
 impl<R> AgentContextPlanner<R> {
     pub fn new(context: Arc<Mutex<AgentContext<R>>>) -> Self {
-        Self { context }
+        Self {
+            context,
+            cache_ledger: None,
+            hit_threshold_bp: 5_000,
+        }
+    }
+
+    pub fn with_cache_ledger(mut self, cache_ledger: Arc<Mutex<CacheLedger>>) -> Self {
+        self.cache_ledger = Some(cache_ledger);
+        self
+    }
+
+    pub fn with_hit_threshold_bp(mut self, hit_threshold_bp: u32) -> Self {
+        self.hit_threshold_bp = hit_threshold_bp;
+        self
     }
 }
 
@@ -285,7 +301,22 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
             .context
             .lock()
             .map_err(|_| AgentError::Tool("context state poisoned".into()))?;
-        Ok(Some(context.plan().clone()))
+        let mut plan = context.plan().clone();
+        drop(context);
+        if let Some(cache_ledger) = &self.cache_ledger {
+            let cache_ledger = cache_ledger
+                .lock()
+                .map_err(|_| AgentError::Tool("cache ledger poisoned".into()))?;
+            if let Some(stat) = cache_ledger.stat(&plan.cache.prefix_fingerprint) {
+                plan.cache.observed_hit_rate_bp = Some(stat.hit_rate_bp());
+                plan.cache.calibration = stat.confidence();
+                if stat.confidence() == trit_orch::Ternary::True {
+                    plan.cache.hit_potential = cache_ledger
+                        .hit_potential(&plan.cache.prefix_fingerprint, self.hit_threshold_bp);
+                }
+            }
+        }
+        Ok(Some(plan))
     }
 }
 

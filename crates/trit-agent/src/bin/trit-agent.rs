@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_agent::{
-    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CheckpointStore,
+    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger, CheckpointStore,
     CheckpointingTools, ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools,
     HeadlessConfig, InMemoryContext, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal,
     ProviderModel, ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, Session,
@@ -262,9 +262,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    let shared_cache_ledger = Arc::new(Mutex::new(CacheLedger::default()));
     let (outcome, cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
-        let model = build_model(scripted, openai_config.as_ref(), context_agent.as_ref())?;
+        let model = build_model(
+            scripted,
+            openai_config.as_ref(),
+            context_agent.as_ref(),
+            &shared_cache_ledger,
+        )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
             Some(dir) => match checkpoint_backend.as_str() {
@@ -297,12 +303,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         };
         let mut session = Session::open(model, tools, &path)?
             .with_max_steps(max_steps)
-            .with_context(context);
+            .with_context(context)
+            .with_cache_ledger(Arc::clone(&shared_cache_ledger));
         let outcome = session.run_turn(&turn)?;
-        let ledger = session.cache_ledger().clone();
+        let ledger = session.cache_ledger();
         (outcome, Some(ledger))
     } else if let Some(shared) = context_agent.as_ref() {
-        let model = build_model(scripted, openai_config.as_ref(), Some(shared))?;
+        let model = build_model(
+            scripted,
+            openai_config.as_ref(),
+            Some(shared),
+            &shared_cache_ledger,
+        )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools = AgentContextTools::new(local, Arc::clone(shared))
             .with_max_chars(context_read_max)
@@ -310,29 +322,34 @@ fn run() -> Result<(), Box<dyn Error>> {
         if let Some(path) = config.session.as_ref() {
             let mut session = Session::open(model, tools, path)?
                 .with_max_steps(max_steps)
-                .with_context(context);
+                .with_context(context)
+                .with_cache_ledger(Arc::clone(&shared_cache_ledger));
             let outcome = session.run_turn(&turn)?;
-            let ledger = session.cache_ledger().clone();
+            let ledger = session.cache_ledger();
             (outcome, Some(ledger))
         } else {
             let mut host = AgentHost::new(model, tools)
                 .with_max_steps(max_steps)
-                .with_context(context);
+                .with_context(context)
+                .with_cache_ledger(Arc::clone(&shared_cache_ledger));
             let outcome = host.run_turn(&turn)?;
             let ledger = host.cache_ledger().clone();
             (outcome, Some(ledger))
         }
     } else {
-        let model = build_model(scripted, openai_config.as_ref(), None)?;
+        let model = build_model(scripted, openai_config.as_ref(), None, &shared_cache_ledger)?;
         (run_headless(turn, model, config)?, None)
     };
 
     if context_agent.is_some()
         && let Some(ledger) = cache_ledger
     {
+        let ledger = ledger
+            .lock()
+            .map_err(|_| fail("cache ledger is poisoned"))?;
         eprintln!(
             "cache ledger: {}",
-            serde_json::to_string_pretty(&ledger).map_err(|error| fail(error.to_string()))?
+            serde_json::to_string_pretty(&*ledger).map_err(|error| fail(error.to_string()))?
         );
     }
     let mut stdout = std::io::stdout().lock();
@@ -351,6 +368,7 @@ fn build_model(
     scripted: Option<Vec<Proposal>>,
     config: Option<&OpenAiConfig>,
     context: Option<&Arc<Mutex<AgentContext<InMemoryContext>>>>,
+    cache_ledger: &Arc<Mutex<CacheLedger>>,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
@@ -358,7 +376,10 @@ fn build_model(
     let config = config.ok_or_else(|| fail("--provider openai requires OPENAI_* env"))?;
     let mut model = ProviderModel::new(OpenAiProvider::new(config.clone()));
     if let Some(shared) = context {
-        model = model.with_context_planner(Box::new(AgentContextPlanner::new(Arc::clone(shared))));
+        model = model.with_context_planner(Box::new(
+            AgentContextPlanner::new(Arc::clone(shared))
+                .with_cache_ledger(Arc::clone(cache_ledger)),
+        ));
     }
     Ok(Box::new(model))
 }

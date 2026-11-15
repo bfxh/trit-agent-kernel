@@ -345,8 +345,18 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
         &self.log
     }
 
-    pub fn cache_ledger(&self) -> &crate::context_layers::CacheLedger {
+    pub fn cache_ledger(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<crate::context_layers::CacheLedger>> {
         self.host.cache_ledger()
+    }
+
+    pub fn with_cache_ledger(
+        mut self,
+        cache_ledger: std::sync::Arc<std::sync::Mutex<crate::context_layers::CacheLedger>>,
+    ) -> Self {
+        self.host = self.host.with_cache_ledger(cache_ledger);
+        self
     }
 
     pub fn run_turn(&mut self, turn: &TurnSpec) -> Result<TurnOutcome, AgentError> {

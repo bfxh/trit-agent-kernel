@@ -4,6 +4,7 @@
 //! 宿主实现 [`Model`] 与 [`ToolExecutor`] 即可。内核仍是纯库，I/O 只发生在工具实现里。
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use trit_orch::{
@@ -345,7 +346,7 @@ pub struct AgentHost<M, T> {
     tools: T,
     max_steps: usize,
     context: ContextPolicy,
-    cache_ledger: crate::context_layers::CacheLedger,
+    cache_ledger: Arc<Mutex<crate::context_layers::CacheLedger>>,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -355,7 +356,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             tools,
             max_steps: 8,
             context: ContextPolicy::default(),
-            cache_ledger: crate::context_layers::CacheLedger::default(),
+            cache_ledger: Arc::new(Mutex::new(crate::context_layers::CacheLedger::default())),
         }
     }
 
@@ -373,8 +374,16 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         &self.model
     }
 
-    pub fn cache_ledger(&self) -> &crate::context_layers::CacheLedger {
-        &self.cache_ledger
+    pub fn cache_ledger(&self) -> Arc<Mutex<crate::context_layers::CacheLedger>> {
+        Arc::clone(&self.cache_ledger)
+    }
+
+    pub fn with_cache_ledger(
+        mut self,
+        cache_ledger: Arc<Mutex<crate::context_layers::CacheLedger>>,
+    ) -> Self {
+        self.cache_ledger = cache_ledger;
+        self
     }
 
     pub fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
@@ -493,7 +502,11 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 .as_ref()
                 .and_then(|receipt| receipt.cache.as_ref())
             {
-                self.cache_ledger.observe(cache);
+                let mut ledger = self
+                    .cache_ledger
+                    .lock()
+                    .map_err(|_| AgentError::SessionState("cache ledger is poisoned".into()))?;
+                ledger.observe(cache);
             }
             if let Some(prefix) = &proposal.prefix
                 && prefix.changed

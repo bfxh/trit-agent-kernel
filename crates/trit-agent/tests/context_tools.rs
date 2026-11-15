@@ -1,11 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use trit_agent::{
-    AgentContext, AgentContextTools, AgentError, CacheClass, ContextDocument, ContextKind,
-    ContextPlan, ContextReadTools, ContextRef, ContextRequest, ContextScope, ContextSelection,
-    ContextSpan, InMemoryContext, ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity,
-    ToolExecutor, ToolRequest, assemble_context,
+    AgentContext, AgentContextPlanner, AgentContextTools, AgentError, CacheClass, CacheLedger,
+    CacheObservation, ContextDocument, ContextKind, ContextPlan, ContextPlanner, ContextReadTools,
+    ContextRef, ContextRequest, ContextScope, ContextSelection, ContextSpan, InMemoryContext,
+    ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity, ToolExecutor, ToolRequest,
+    TurnContext, assemble_context,
 };
+use trit_orch::{TaskBrief, Ternary, TokenUsage};
 
 fn plan_and_context() -> (ContextPlan, InMemoryContext, ContextRequest) {
     let mut context = InMemoryContext::default();
@@ -200,4 +202,81 @@ fn context_read_supports_spans_and_per_turn_budget() {
         .execute(&ToolRequest::context_read("r2", "C1"))
         .unwrap_err();
     assert!(matches!(error, AgentError::Tool(message) if message.contains("budget exhausted")));
+}
+
+fn brief() -> TaskBrief {
+    TaskBrief {
+        task: "t".into(),
+        epoch: 0,
+        guidance: Default::default(),
+        resolves: Vec::new(),
+        produces: Default::default(),
+        effects: Vec::new(),
+        requirements: Default::default(),
+        max_tokens: 0,
+        admission: Ternary::True,
+        granted_tokens: 0,
+        blockers: Vec::new(),
+        obligations: Vec::new(),
+    }
+}
+
+fn turn_context() -> TurnContext {
+    TurnContext {
+        task: "t".into(),
+        step: 0,
+        usage: TokenUsage::default(),
+        receipts: Vec::new(),
+        digest: None,
+    }
+}
+
+#[test]
+fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
+    let (plan, context, request) = plan_and_context();
+    let fingerprint = plan.cache.prefix_fingerprint.clone();
+    assert!(!fingerprint.is_empty());
+    let shared = Arc::new(Mutex::new(AgentContext::new(request, context, plan)));
+
+    let ledger = Arc::new(Mutex::new(CacheLedger::default()));
+    {
+        let mut ledger = ledger.lock().unwrap();
+        for _ in 0..3 {
+            ledger.observe(&CacheObservation {
+                prefix_fingerprint: fingerprint.clone(),
+                prompt_tokens: 100,
+                cache_hit_tokens: 80,
+                cache_miss_tokens: 20,
+                estimated: false,
+            });
+        }
+    }
+    let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
+        .with_cache_ledger(Arc::clone(&ledger))
+        .with_hit_threshold_bp(5_000);
+    let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    assert_eq!(plan.cache.hit_potential, Ternary::True);
+    assert_eq!(plan.cache.observed_hit_rate_bp, Some(8_000));
+    assert_eq!(plan.cache.calibration, Ternary::True);
+
+    let low = Arc::new(Mutex::new(CacheLedger::default()));
+    {
+        let mut low = low.lock().unwrap();
+        for _ in 0..3 {
+            low.observe(&CacheObservation {
+                prefix_fingerprint: fingerprint.clone(),
+                prompt_tokens: 100,
+                cache_hit_tokens: 20,
+                cache_miss_tokens: 80,
+                estimated: false,
+            });
+        }
+    }
+    let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
+        .with_cache_ledger(low)
+        .with_hit_threshold_bp(5_000);
+    let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    assert_eq!(plan.cache.hit_potential, Ternary::False);
+    assert_eq!(plan.cache.observed_hit_rate_bp, Some(2_000));
+    assert_eq!(plan.cache.calibration, Ternary::True);
 }

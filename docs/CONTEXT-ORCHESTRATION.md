@@ -127,7 +127,9 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
   但 CLI 尚未配置 catalog/planner，`hit_potential` 仍需要和实际观测对照验证。
   上下文工具只在有 `ContextPlan` 时向模型暴露，避免 CLI 默认广告不可执行工具；
   自主路径用 `AgentContextTools` 包装执行器（只读路径可用 `ContextReadTools`）。
-  `AgentHost` 用 `CacheLedger` 按 prefix fingerprint 聚合实际 hit/miss，并提供
+  `AgentHost` 与 `AgentContextPlanner` 共享 `CacheLedger`，按 prefix fingerprint 聚合实际
+  hit/miss；同一 prefix 至少 3 次精确观测后，planner 用实际命中率覆盖下一轮
+  `hit_potential`，并写入 `observed_hit_rate_bp` 与 `calibration`。
   `hit_potential(prefix, threshold)` 把观测折叠成三值；CLI 结束向 stderr 打印 ledger。
 - 边界：token 仍是粗估；校准用最大值而非分位数；“印象”只比较 revision/hash，不做语义 diff。
 

@@ -573,6 +573,8 @@ mod tests {
                 dynamic_items: 1,
                 prefix_tokens: 10,
                 dynamic_tokens: 10,
+                observed_hit_rate_bp: None,
+                calibration: Ternary::Unknown,
                 prefix_fingerprint: "fnv1a64:abc".into(),
                 hit_potential: Ternary::True,
                 invalidated: Vec::new(),
