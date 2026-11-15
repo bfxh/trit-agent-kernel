@@ -6,7 +6,10 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentError, Model, PrefixSignal, Proposal, ToolOutcome, ToolRequest, TurnContext};
+use crate::{
+    AgentError, ContextPlan, ContextReceipt, Model, PrefixSignal, Proposal, ToolOutcome,
+    ToolRequest, TurnContext,
+};
 use trit_orch::{TaskBrief, TokenUsage};
 use trit_reasonix::{ClaimRequest, HostUsage};
 
@@ -17,6 +20,17 @@ pub struct ToolSpec {
     pub read_only: bool,
 }
 
+/// 每轮由宿主提供的上下文计划；ProviderModel 不知道 catalog/ACL。
+/// 启用后宿主还必须用 `ContextReadTools` 包装 ToolExecutor，否则模型调用
+/// `context_read` 时执行器会报 unknown tool。
+pub trait ContextPlanner {
+    fn plan(
+        &mut self,
+        brief: &TaskBrief,
+        context: &TurnContext,
+    ) -> Result<Option<ContextPlan>, AgentError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderRequest {
     pub brief: TaskBrief,
@@ -25,6 +39,7 @@ pub struct ProviderRequest {
     pub step: usize,
     pub usage: TokenUsage,
     pub context_digest: Option<String>,
+    pub context: Option<ContextPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +49,8 @@ pub struct ProviderResponse {
     pub usage: HostUsage,
     /// 可选：上下文 prefix 变化（Reasonix/宿主诊断）。
     pub prefix: Option<PrefixSignal>,
+    /// 可选：本轮 inclusion receipt 与实际 cache hit/miss 对照。
+    pub context: Option<ContextReceipt>,
 }
 
 pub trait Provider {
@@ -43,6 +60,7 @@ pub trait Provider {
 pub struct ProviderModel<P> {
     provider: P,
     tools: Vec<ToolSpec>,
+    context_planner: Option<Box<dyn ContextPlanner>>,
 }
 
 impl<P: Provider> ProviderModel<P> {
@@ -50,11 +68,21 @@ impl<P: Provider> ProviderModel<P> {
         Self {
             provider,
             tools: default_tools(),
+            context_planner: None,
         }
     }
 
     pub fn with_tools(provider: P, tools: Vec<ToolSpec>) -> Self {
-        Self { provider, tools }
+        Self {
+            provider,
+            tools,
+            context_planner: None,
+        }
+    }
+
+    pub fn with_context_planner(mut self, planner: Box<dyn ContextPlanner>) -> Self {
+        self.context_planner = Some(planner);
+        self
     }
 
     pub fn provider(&self) -> &P {
@@ -68,19 +96,35 @@ impl<P: Provider> Model for ProviderModel<P> {
         brief: &TaskBrief,
         context: &TurnContext,
     ) -> Result<Proposal, AgentError> {
+        let plan = match self.context_planner.as_mut() {
+            Some(planner) => planner.plan(brief, context)?,
+            None => None,
+        };
+        // 没有上下文计划时不要向模型暴露 context_read：CLI 默认没有 catalog。
+        let tools = if plan.is_some() {
+            self.tools.clone()
+        } else {
+            self.tools
+                .iter()
+                .filter(|tool| tool.name != "context_read")
+                .cloned()
+                .collect()
+        };
         let response = self.provider.complete(&ProviderRequest {
             brief: brief.clone(),
-            tools: self.tools.clone(),
+            tools,
             receipts: context.receipts.clone(),
             step: context.step,
             usage: context.usage,
             context_digest: context.digest.clone(),
+            context: plan,
         })?;
         Ok(Proposal {
             tool_calls: response.tool_calls,
             completion: response.completion,
             usage: response.usage,
             prefix: response.prefix,
+            context_receipt: response.context,
         })
     }
 }
@@ -101,6 +145,11 @@ pub fn default_tools() -> Vec<ToolSpec> {
             name: "bash".into(),
             description: "Run a shell command in the workspace; requires allow-shell.".into(),
             read_only: false,
+        },
+        ToolSpec {
+            name: "context_read".into(),
+            description: "Expand a context handle (C1, C2, ...) into its full text.".into(),
+            read_only: true,
         },
         ToolSpec {
             name: "complete_subtask".into(),

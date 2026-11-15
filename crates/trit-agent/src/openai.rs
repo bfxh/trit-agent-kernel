@@ -9,7 +9,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::{
-    AgentError, PrefixSignal, Provider, ProviderRequest, ProviderResponse, ToolRequest, ToolSpec,
+    AgentError, CacheObservation, ContextReceipt, PrefixSignal, Provider, ProviderRequest,
+    ProviderResponse, ToolRequest, ToolSpec,
 };
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage};
 
@@ -90,7 +91,9 @@ impl Provider for OpenAiProvider {
                 let text = response
                     .into_string()
                     .map_err(|error| AgentError::Provider(format!("read response: {error}")))?;
-                parse_response(&text)
+                let mut response = parse_response(&text)?;
+                attach_context_receipt(&mut response, request);
+                Ok(response)
             }
             Err(ureq::Error::Status(code, response)) => {
                 let text = response.into_string().unwrap_or_default();
@@ -102,18 +105,30 @@ impl Provider for OpenAiProvider {
 }
 
 fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value {
-    let system = format!(
+    let mut system = format!(
         "{}\n\nYou are a headless coding agent. Use the provided tools. \
          Only claim completion with complete_subtask. Every criterion must be backed \
          by a tool result (a command that ran or paths that were written). \
          Manual notes are never evidence.",
         request.brief.render()
     );
+    let mut context_tail = String::new();
+    let mut context_fingerprint = String::new();
+    if let Some(plan) = &request.context {
+        if plan.cache.prefix_items > 0 {
+            system.push_str("\n\n");
+            system.push_str(&plan.render_prefix());
+        }
+        context_tail = plan.render_tail();
+        context_fingerprint = plan.cache.prefix_fingerprint.clone();
+    }
     let user = json!({
         "step": request.step,
         "usage": request.usage,
         "receipts": request.receipts,
         "context_digest": request.context_digest,
+        "context_tail": context_tail,
+        "context_fingerprint": context_fingerprint,
         "instruction": "Continue the task. Call tools as needed. When finished, call complete_subtask."
     });
     let mut body = json!({
@@ -156,6 +171,11 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
                         "read_only": {"type": "boolean"}
                     },
                     "required": ["command"]
+                }),
+                "context_read" => json!({
+                    "type": "object",
+                    "properties": {"handle": {"type": "string"}},
+                    "required": ["handle"]
                 }),
                 "complete_subtask" => json!({
                     "type": "object",
@@ -253,6 +273,10 @@ fn parse_response(body: &str) -> Result<ProviderResponse, AgentError> {
                     request.read_only = read_only;
                     tool_calls.push(request);
                 }
+                "context_read" => {
+                    let handle = string_arg(&arguments, "handle")?;
+                    tool_calls.push(ToolRequest::context_read(call_id, handle));
+                }
                 "complete_subtask" => {
                     completion = Some(parse_claim(&arguments, &call_id)?);
                 }
@@ -267,7 +291,25 @@ fn parse_response(body: &str) -> Result<ProviderResponse, AgentError> {
         completion,
         usage,
         prefix: parse_prefix(&value),
+        context: None,
     })
+}
+
+fn attach_context_receipt(response: &mut ProviderResponse, request: &ProviderRequest) {
+    let Some(plan) = &request.context else {
+        return;
+    };
+    let cache = CacheObservation {
+        prefix_fingerprint: plan.cache.prefix_fingerprint.clone(),
+        prompt_tokens: response.usage.prompt_tokens,
+        cache_hit_tokens: response.usage.cache_hit_tokens,
+        cache_miss_tokens: response.usage.cache_miss_tokens,
+        estimated: response.usage.estimated,
+    };
+    response.context = Some(ContextReceipt {
+        inclusion: Some(plan.inclusion_receipt()),
+        cache: Some(cache),
+    });
 }
 
 fn parse_prefix(value: &Value) -> Option<PrefixSignal> {
@@ -397,6 +439,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    use crate::{
+        CacheClass, CacheReport, ContextDetail, ContextItem, ContextKind, ContextPlan,
+        ContextScope, ReasoningEffort,
+    };
     use trit_orch::{
         Limits, Observation, Plan, Resources, Snapshot, TaskBrief, Ternary, TokenUsage, task_brief,
     };
@@ -434,6 +480,62 @@ mod tests {
         task_brief(&plan, &selection, "turn-1").unwrap()
     }
 
+    fn context_plan() -> ContextPlan {
+        ContextPlan {
+            project: "p1".into(),
+            session: "s1".into(),
+            model: "model-x".into(),
+            reasoning: ReasoningEffort::Off,
+            items: vec![
+                ContextItem {
+                    handle: "C1".into(),
+                    id: "stable".into(),
+                    label: "stable doc".into(),
+                    kind: ContextKind::Doc,
+                    scope: ContextScope::Project,
+                    revision: "rev1".into(),
+                    required: false,
+                    cache: CacheClass::StablePrefix,
+                    score: None,
+                    content_hash: Some("stable-hash".into()),
+                    detail: ContextDetail::Full,
+                    text: Some("stable text".into()),
+                    tokens: 10,
+                },
+                ContextItem {
+                    handle: "C2".into(),
+                    id: "dynamic".into(),
+                    label: "dynamic doc".into(),
+                    kind: ContextKind::Doc,
+                    scope: ContextScope::Project,
+                    revision: "rev2".into(),
+                    required: false,
+                    cache: CacheClass::DynamicTail,
+                    score: None,
+                    content_hash: None,
+                    detail: ContextDetail::Full,
+                    text: Some("dynamic text".into()),
+                    tokens: 10,
+                },
+            ],
+            dropped: Vec::new(),
+            degradations: Vec::new(),
+            budget_tokens: 100,
+            estimated_tokens: 20,
+            cache: CacheReport {
+                prefix_items: 1,
+                dynamic_items: 1,
+                prefix_tokens: 10,
+                dynamic_tokens: 10,
+                prefix_fingerprint: "fnv1a64:abc".into(),
+                hit_potential: Ternary::True,
+                invalidated: Vec::new(),
+            },
+            autonomy: Default::default(),
+            calibration: None,
+        }
+    }
+
     fn provider_request() -> ProviderRequest {
         ProviderRequest {
             brief: brief(),
@@ -456,14 +558,17 @@ mod tests {
                 estimated: false,
             },
             context_digest: None,
+            context: None,
         }
     }
 
     #[test]
     fn builds_openai_request_with_brief_tools_and_receipts() {
+        let mut request = provider_request();
+        request.context = Some(context_plan());
         let body = build_request_body(
             &OpenAiConfig::new("https://example.test/v1", "sk-test", "model-x"),
-            &provider_request(),
+            &request,
         );
         assert_eq!(body["model"], "model-x");
         let system = body["messages"][0]["content"].as_str().unwrap();
@@ -471,6 +576,9 @@ mod tests {
         assert!(system.contains("do not touch schema"));
         let user = body["messages"][1]["content"].as_str().unwrap();
         assert!(user.contains("wrote 5 bytes"));
+        assert!(system.contains("stable text"));
+        assert!(user.contains("dynamic text"));
+        assert!(user.contains("fnv1a64:abc"));
         let tools: Vec<&str> = body["tools"]
             .as_array()
             .unwrap()
@@ -479,8 +587,56 @@ mod tests {
             .collect();
         assert_eq!(
             tools,
-            ["read_file", "write_file", "bash", "complete_subtask"]
+            [
+                "read_file",
+                "write_file",
+                "bash",
+                "context_read",
+                "complete_subtask"
+            ]
         );
+    }
+
+    #[test]
+    fn attaches_context_inclusion_and_cache_observation() {
+        let mut request = provider_request();
+        request.context = Some(context_plan());
+        let mut response = ProviderResponse {
+            tool_calls: Vec::new(),
+            completion: None,
+            usage: HostUsage {
+                prompt_tokens: 100,
+                completion_tokens: 5,
+                cache_hit_tokens: 80,
+                cache_miss_tokens: 20,
+                estimated: false,
+            },
+            prefix: None,
+            context: None,
+        };
+        attach_context_receipt(&mut response, &request);
+        let receipt = response.context.unwrap();
+        let inclusion = receipt.inclusion.unwrap();
+        assert_eq!(inclusion.prefix_fingerprint, "fnv1a64:abc");
+        assert_eq!(inclusion.handles, ["C1", "C2"]);
+        let cache = receipt.cache.unwrap();
+        assert_eq!(cache.cache_hit_tokens, 80);
+        assert_eq!(cache.cache_miss_tokens, 20);
+        assert_eq!(cache.cache_hit_rate_bp(), 8_000);
+    }
+
+    #[test]
+    fn parses_context_read_tool_call() {
+        let body = r#"{
+            "choices": [{"message": {"tool_calls": [
+                {"id": "call-1", "function": {"name": "context_read", "arguments": "{\"handle\":\"C1\"}"}}
+            ]}}]
+        }"#;
+        let response = parse_response(body).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].tool, "context_read");
+        assert_eq!(response.tool_calls[0].paths, ["C1"]);
+        assert!(response.tool_calls[0].read_only);
     }
 
     #[test]

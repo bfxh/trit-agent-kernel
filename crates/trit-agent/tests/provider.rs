@@ -1,9 +1,10 @@
 use trit_agent::PrefixSignal;
 use trit_agent::{
-    AgentHost, ContextPolicy, ProviderModel, ProviderResponse, ScriptedProvider, ScriptedTools,
-    ToolOutcome, ToolRequest, default_tools,
+    AgentError, AgentHost, CacheObservation, ContextPlan, ContextPlanner, ContextPolicy,
+    ContextReceipt, InclusionReceipt, ProviderModel, ProviderResponse, ScriptedProvider,
+    ScriptedTools, SessionEvent, SessionLog, ToolOutcome, ToolRequest, TurnContext,
 };
-use trit_orch::{EvidenceVerdict, ObligationKind};
+use trit_orch::{EvidenceVerdict, ObligationKind, TaskBrief};
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, TurnSpec};
 
 fn turn() -> TurnSpec {
@@ -31,6 +32,7 @@ fn provider_model_receives_brief_tools_and_receipts() {
                 estimated: false,
             },
             prefix: None,
+            context: None,
         },
         ProviderResponse {
             tool_calls: vec![],
@@ -50,6 +52,7 @@ fn provider_model_receives_brief_tools_and_receipts() {
                 estimated: true,
             },
             prefix: None,
+            context: None,
         },
     ]);
     let tools = ScriptedTools::new(vec![ToolOutcome {
@@ -75,7 +78,18 @@ fn provider_model_receives_brief_tools_and_receipts() {
         requests[0].brief.guidance.constraints,
         ["do not touch schema"]
     );
-    assert_eq!(requests[0].tools, default_tools());
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "read_file")
+    );
+    assert!(
+        !requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "context_read")
+    );
     assert!(requests[0].receipts.is_empty());
     assert_eq!(requests[0].step, 0);
 
@@ -101,6 +115,7 @@ fn prefix_change_emits_rebasis_obligation() {
             changed: true,
             reasons: vec!["compaction".into()],
         }),
+        context: None,
     }]);
     let mut host = AgentHost::new(ProviderModel::new(provider), ScriptedTools::new(vec![]));
     let outcome = host.run_turn(&turn()).unwrap();
@@ -133,6 +148,7 @@ fn compacts_old_receipts_before_the_next_provider_call() {
             completion: None,
             usage: HostUsage::default(),
             prefix: None,
+            context: None,
         },
         ProviderResponse {
             tool_calls: vec![ToolRequest::verification("call-3", "test3")],
@@ -146,6 +162,7 @@ fn compacts_old_receipts_before_the_next_provider_call() {
             }),
             usage: HostUsage::default(),
             prefix: None,
+            context: None,
         },
     ]);
     let tools = ScriptedTools::new(vec![
@@ -173,4 +190,104 @@ fn compacts_old_receipts_before_the_next_provider_call() {
             .unwrap()
             .contains("compacted 1")
     );
+}
+
+struct FixedPlanner(ContextPlan);
+
+impl ContextPlanner for FixedPlanner {
+    fn plan(
+        &mut self,
+        _brief: &TaskBrief,
+        _context: &TurnContext,
+    ) -> Result<Option<ContextPlan>, AgentError> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+#[test]
+fn provider_model_passes_context_plan_to_provider() {
+    let provider = ScriptedProvider::new(vec![ProviderResponse {
+        tool_calls: vec![],
+        completion: Some(ClaimRequest {
+            criteria: vec![CriterionRequest {
+                id: "m1".into(),
+                kind: CriterionKind::Manual,
+            }],
+        }),
+        usage: HostUsage::default(),
+        prefix: None,
+        context: None,
+    }]);
+    let plan = ContextPlan {
+        project: "p1".into(),
+        ..ContextPlan::default()
+    };
+    let model = ProviderModel::new(provider).with_context_planner(Box::new(FixedPlanner(plan)));
+    let mut host = AgentHost::new(model, ScriptedTools::new(Vec::new()));
+    host.run_turn(&turn()).unwrap();
+    let requests = host.model().provider().requests();
+    assert_eq!(
+        requests[0]
+            .context
+            .as_ref()
+            .map(|plan| plan.project.as_str()),
+        Some("p1")
+    );
+}
+
+#[test]
+fn context_receipt_is_logged_to_session() {
+    let receipt = ContextReceipt {
+        inclusion: Some(InclusionReceipt {
+            project: "p1".into(),
+            session: "s1".into(),
+            prefix_fingerprint: "fnv1a64:abc".into(),
+            handles: vec!["C1".into()],
+            refs: vec!["doc".into()],
+            estimated_tokens: 10,
+            hit_potential: trit_orch::Ternary::True,
+        }),
+        cache: Some(CacheObservation {
+            prefix_fingerprint: "fnv1a64:abc".into(),
+            prompt_tokens: 100,
+            cache_hit_tokens: 80,
+            cache_miss_tokens: 20,
+            estimated: false,
+        }),
+    };
+    let provider = ScriptedProvider::new(vec![ProviderResponse {
+        tool_calls: vec![],
+        completion: Some(ClaimRequest {
+            criteria: vec![CriterionRequest {
+                id: "m1".into(),
+                kind: CriterionKind::Manual,
+            }],
+        }),
+        usage: HostUsage::default(),
+        prefix: None,
+        context: Some(receipt),
+    }]);
+    let path = std::env::temp_dir().join(format!(
+        "trit-context-receipt-{}-{:?}.jsonl",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut log = SessionLog::open(&path).unwrap();
+    let mut host = AgentHost::new(ProviderModel::new(provider), ScriptedTools::new(Vec::new()));
+    host.run_turn_with_session(&turn(), &mut log).unwrap();
+    let events = log.load().unwrap();
+    let observed = events.iter().find_map(|record| match &record.event {
+        SessionEvent::Proposal {
+            context: Some(receipt),
+            ..
+        } => Some(receipt),
+        _ => None,
+    });
+    let observed = observed.expect("context receipt should be logged");
+    assert_eq!(
+        observed.cache.as_ref().map(|cache| cache.cache_hit_tokens),
+        Some(80)
+    );
+    let _ = std::fs::remove_file(&path);
 }

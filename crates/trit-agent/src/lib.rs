@@ -111,6 +111,16 @@ impl ToolRequest {
         }
     }
 
+    pub fn context_read(call_id: impl Into<String>, handle: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: "context_read".into(),
+            read_only: true,
+            paths: vec![handle.into()],
+            ..Self::default()
+        }
+    }
+
     pub fn write(
         call_id: impl Into<String>,
         tool: impl Into<String>,
@@ -168,6 +178,9 @@ pub struct Proposal {
     pub usage: HostUsage,
     #[serde(default)]
     pub prefix: Option<PrefixSignal>,
+    /// 本轮上下文 inclusion receipt + 实际 cache 观察。
+    #[serde(default)]
+    pub context_receipt: Option<crate::context_layers::ContextReceipt>,
 }
 
 /// Provider 报告的 prompt prefix 变化；用于产生 Rebasis 义务。
@@ -429,6 +442,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     tool_calls: proposal.tool_calls.len(),
                     completion: proposal.completion.is_some(),
                     usage: proposal.usage,
+                    context: proposal.context_receipt.clone(),
                 },
             )?;
             if let Some(prefix) = &proposal.prefix
@@ -706,6 +720,7 @@ pub fn run_headless<M: Model>(
 pub mod checkpoint;
 pub mod context;
 pub mod context_layers;
+pub mod context_tools;
 pub mod git_checkpoint;
 pub mod openai;
 pub mod provider;
@@ -717,19 +732,21 @@ pub use checkpoint::{
 };
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
 pub use context_layers::{
-    AutonomyPolicy, CacheClass, CacheReport, CalibrationReport, ContextDegradation, ContextDetail,
-    ContextDocument, ContextDropReason, ContextError, ContextItem, ContextKind, ContextPlan,
-    ContextRef, ContextRequest, ContextResolver, ContextScope, ContextSelection, DroppedContext,
-    ImpressionDelta, InMemoryContext, ModelProfile, PriorImpression, ReasoningEffort,
+    AutonomyPolicy, CacheClass, CacheObservation, CacheReport, CalibrationReport,
+    ContextDegradation, ContextDetail, ContextDocument, ContextDropReason, ContextError,
+    ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef, ContextRequest,
+    ContextResolver, ContextScope, ContextSelection, DroppedContext, ImpressionDelta,
+    InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression, ReasoningEffort,
     ResolvedContext, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
 };
+pub use context_tools::{ContextReadRecord, ContextReadTools};
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use provider::{
-    Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider, ToolSpec,
-    default_tools,
+    ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
+    ToolSpec, default_tools,
 };
 pub use session::{
     SESSION_SCHEMA, Session, SessionEvent, SessionLog, SessionRecord, SessionState, TurnRecord,

@@ -34,6 +34,8 @@ pub enum SessionEvent {
         tool_calls: usize,
         completion: bool,
         usage: HostUsage,
+        #[serde(default)]
+        context: Option<crate::context_layers::ContextReceipt>,
     },
     ToolRequested {
         step: usize,

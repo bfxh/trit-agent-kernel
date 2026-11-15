@@ -435,6 +435,45 @@ impl Default for CacheReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InclusionReceipt {
+    pub project: String,
+    pub session: String,
+    pub prefix_fingerprint: String,
+    pub handles: Vec<String>,
+    pub refs: Vec<String>,
+    pub estimated_tokens: u64,
+    pub hit_potential: Ternary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheObservation {
+    pub prefix_fingerprint: String,
+    pub prompt_tokens: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub estimated: bool,
+}
+
+impl CacheObservation {
+    pub fn cache_hit_rate_bp(&self) -> u32 {
+        let input = self.cache_hit_tokens.saturating_add(self.cache_miss_tokens);
+        if input == 0 {
+            0
+        } else {
+            ((u128::from(self.cache_hit_tokens) * 10_000) / u128::from(input)) as u32
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextReceipt {
+    #[serde(default)]
+    pub inclusion: Option<InclusionReceipt>,
+    #[serde(default)]
+    pub cache: Option<CacheObservation>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPlan {
     pub project: String,
     pub session: String,
@@ -466,12 +505,45 @@ impl ContextPlan {
 
     /// 给模型看的句柄清单；不含正文。
     pub fn render_manifest(&self) -> String {
-        let mut out = String::from("# Context\n");
-        if self.items.is_empty() {
-            out.push_str("- (none)\n");
-            return out;
+        self.render_subset(|_| true, false)
+    }
+
+    /// 句柄清单 + 被选择内联的摘要/全文；宿主可直接嵌入 prompt。
+    pub fn render_for_model(&self) -> String {
+        self.render_subset(|_| true, true)
+    }
+
+    /// 只渲染稳定前缀（应放在 cache-stable system prefix）。
+    pub fn render_prefix(&self) -> String {
+        self.render_subset(|item| item.cache == CacheClass::StablePrefix, true)
+    }
+
+    /// 只渲染动态尾段（应放在每轮变化的 user tail）。
+    pub fn render_tail(&self) -> String {
+        self.render_subset(|item| item.cache != CacheClass::StablePrefix, true)
+    }
+
+    pub fn inclusion_receipt(&self) -> InclusionReceipt {
+        InclusionReceipt {
+            project: self.project.clone(),
+            session: self.session.clone(),
+            prefix_fingerprint: self.cache.prefix_fingerprint.clone(),
+            handles: self.items.iter().map(|item| item.handle.clone()).collect(),
+            refs: self.items.iter().map(|item| item.id.clone()).collect(),
+            estimated_tokens: self.estimated_tokens,
+            hit_potential: self.cache.hit_potential,
         }
-        for item in &self.items {
+    }
+
+    fn render_subset<F: Fn(&ContextItem) -> bool>(
+        &self,
+        filter: F,
+        include_inline: bool,
+    ) -> String {
+        let mut out = String::from("# Context\n");
+        let mut any = false;
+        for item in self.items.iter().filter(|item| filter(item)) {
+            any = true;
             let _ = writeln!(
                 out,
                 "- {} [{}] {} (rev {})",
@@ -485,24 +557,28 @@ impl ContextPlan {
                 }
             );
         }
-        out
-    }
-
-    /// 句柄清单 + 被选择内联的摘要/全文；宿主可直接嵌入 prompt。
-    pub fn render_for_model(&self) -> String {
-        let mut out = self.render_manifest();
-        for item in self.inline() {
-            let _ = writeln!(
-                out,
-                "\n## {} [{}] {}",
-                item.handle,
-                scope_name(item.scope),
-                item.label
-            );
-            if let Some(text) = &item.text {
-                out.push_str(text);
-                if !text.ends_with('\n') {
-                    out.push('\n');
+        if !any {
+            out.push_str("- (none)\n");
+            return out;
+        }
+        if include_inline {
+            for item in self
+                .items
+                .iter()
+                .filter(|item| filter(item) && item.detail != ContextDetail::Handle)
+            {
+                let _ = writeln!(
+                    out,
+                    "\n## {} [{}] {}",
+                    item.handle,
+                    scope_name(item.scope),
+                    item.label
+                );
+                if let Some(text) = &item.text {
+                    out.push_str(text);
+                    if !text.ends_with('\n') {
+                        out.push('\n');
+                    }
                 }
             }
         }
