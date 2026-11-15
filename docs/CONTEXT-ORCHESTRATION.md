@@ -106,7 +106,20 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
 
 参考：Prompt Cache / SGLang RadixAttention / CAG / 上下文工程综述（见 §15）。
 
-### 3.5 非目标
+### 3.5 缓存优先、印象对比与用量校准（第一版实现）
+
+- `CacheClass`：`StablePrefix` / `DynamicTail` / `Uncacheable`。稳定前缀按稳定 ID 排序，
+  不随语义分数变化；`CacheReport` 记录 prefix/dynamic tokens、FNV 指纹、失效列表。
+- `PriorImpression`：记录上一轮的 revision/content hash；对比结果为
+  `Same / Changed / Unknown`。`Changed` 会使稳定前缀失效；`Unknown` 不假装命中。
+- `AutonomyPolicy`（三值）：`may_add_optional`、`may_expand_handles`、`may_break_prefix`。
+  `Unknown` 默认不当作允许；前缀变化在未获准时降级为动态尾段。
+- `UsageCalibration`：从真实 `TokenUsage` 累计 cache hit/miss 与 output 峰值；
+  至少 3 次精确观测才把 output 预留降到实测值；估算样本/模型不匹配时不信任。
+- 边界：尚未接 provider prompt cache；token 仍是粗估；校准用最大值而非分位数；
+  “印象”目前只比较 revision/hash，不做语义 diff。
+
+### 3.6 非目标
 
 - 不做通用向量数据库；检索只是 ref 解析的一种来源。
 - 不自动把整个项目内联进 prompt。
@@ -342,7 +355,8 @@ TokUI（JBoltAI，MIT）提供了“后端 DSL → SSE/WebSocket → 前端增�
 
 > **实现状态（2026-11-15）**：第一刀已落在 `crates/trit-agent/src/context_layers.rs`：
 > `ContextRef` / `ContextDocument` / `InMemoryContext` / `ModelProfile` / `ReasoningEffort` /
-> `assemble_context`，覆盖 scope 校验、句柄/摘要/全文预算、工具/`context_read` 能力降级与推理预留。
+> `assemble_context`，覆盖 scope 校验、句柄/摘要/全文预算、工具/`context_read` 能力降级、
+> 稳定前缀/动态尾段、`PriorImpression` 对比、三值 autonomy 闸门与真实 usage 校准。
 > 语义分数仍由宿主传入（`ContextSelection.score`），尚未接入 `ProviderRequest`；
 > 这不是“语义判断已自动化”，只是给它留了输入口。
 

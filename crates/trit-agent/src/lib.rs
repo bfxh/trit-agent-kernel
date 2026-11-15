@@ -717,10 +717,11 @@ pub use checkpoint::{
 };
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
 pub use context_layers::{
-    ContextDegradation, ContextDetail, ContextDocument, ContextDropReason, ContextError,
-    ContextItem, ContextKind, ContextPlan, ContextRef, ContextRequest, ContextResolver,
-    ContextScope, ContextSelection, DroppedContext, InMemoryContext, ModelProfile, ReasoningEffort,
-    ResolvedContext, Sensitivity, assemble_context, estimate_tokens,
+    AutonomyPolicy, CacheClass, CacheReport, CalibrationReport, ContextDegradation, ContextDetail,
+    ContextDocument, ContextDropReason, ContextError, ContextItem, ContextKind, ContextPlan,
+    ContextRef, ContextRequest, ContextResolver, ContextScope, ContextSelection, DroppedContext,
+    ImpressionDelta, InMemoryContext, ModelProfile, PriorImpression, ReasoningEffort,
+    ResolvedContext, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
 };
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,

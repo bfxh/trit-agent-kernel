@@ -1,8 +1,12 @@
+use std::collections::BTreeMap;
+
 use trit_agent::{
-    ContextDegradation, ContextDetail, ContextDocument, ContextDropReason, ContextError,
-    ContextKind, ContextRef, ContextRequest, ContextScope, ContextSelection, InMemoryContext,
-    ModelProfile, ReasoningEffort, Sensitivity, assemble_context,
+    AutonomyPolicy, CacheClass, ContextDegradation, ContextDetail, ContextDocument,
+    ContextDropReason, ContextError, ContextKind, ContextRef, ContextRequest, ContextScope,
+    ContextSelection, InMemoryContext, ModelProfile, PriorImpression, ReasoningEffort, Sensitivity,
+    UsageCalibration, assemble_context,
 };
+use trit_orch::{Ternary, TokenUsage};
 
 fn reference(
     id: &str,
@@ -20,6 +24,7 @@ fn reference(
         revision: "rev1".into(),
         content_hash: Some(format!("hash-{id}")),
         sensitivity: Sensitivity::Internal,
+        cache: CacheClass::DynamicTail,
     }
 }
 
@@ -57,6 +62,9 @@ fn request(
         model,
         reasoning,
         allow_secret: false,
+        autonomy: AutonomyPolicy::default(),
+        priors: BTreeMap::new(),
+        calibration: None,
     }
 }
 
@@ -459,4 +467,227 @@ fn rejects_document_id_mismatch_on_insert() {
         )
         .unwrap_err();
     assert_eq!(error, ContextError::DocumentMismatch("other".into()));
+}
+
+#[test]
+fn stable_prefix_order_and_fingerprint_ignore_semantic_scores() {
+    let mut context = InMemoryContext::default();
+    for (id, cache) in [
+        ("b", CacheClass::StablePrefix),
+        ("a", CacheClass::StablePrefix),
+        ("c", CacheClass::DynamicTail),
+    ] {
+        let mut reference = reference(id, ContextScope::Project, Some("p1"), None);
+        reference.cache = cache;
+        context
+            .insert(reference, document(id, id, None, Some(10)))
+            .unwrap();
+    }
+    let mut request = request(
+        model(true, false),
+        ReasoningEffort::Low,
+        vec![
+            selection("c", false, Some(100)),
+            selection("a", false, Some(10)),
+            selection("b", false, Some(5)),
+        ],
+    );
+    let plan = assemble_context(&request, &context).unwrap();
+    assert_eq!(
+        plan.items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+    assert_eq!(plan.cache.prefix_items, 2);
+    assert_eq!(plan.cache.dynamic_items, 1);
+    assert!(plan.cache.prefix_fingerprint.starts_with("fnv1a64:"));
+    assert_eq!(plan.cache.hit_potential, Ternary::Unknown);
+    let fingerprint = plan.cache.prefix_fingerprint.clone();
+
+    request.priors.insert(
+        "a".into(),
+        prior(&reference("a", ContextScope::Project, Some("p1"), None)),
+    );
+    request.priors.insert(
+        "b".into(),
+        prior(&reference("b", ContextScope::Project, Some("p1"), None)),
+    );
+    let plan = assemble_context(&request, &context).unwrap();
+    assert_eq!(plan.cache.prefix_fingerprint, fingerprint);
+    assert_eq!(plan.cache.hit_potential, Ternary::True);
+    assert!(plan.cache.invalidated.is_empty());
+}
+
+#[test]
+fn changed_impressions_invalidate_or_demote_the_prefix() {
+    let mut context = InMemoryContext::default();
+    for id in ["a", "b"] {
+        let mut reference = reference(id, ContextScope::Project, Some("p1"), None);
+        reference.cache = CacheClass::StablePrefix;
+        context
+            .insert(reference, document(id, id, None, Some(10)))
+            .unwrap();
+    }
+    let mut request = request(
+        model(true, false),
+        ReasoningEffort::Low,
+        vec![
+            selection("a", false, Some(10)),
+            selection("b", false, Some(5)),
+        ],
+    );
+    request.priors.insert(
+        "a".into(),
+        prior(&reference("a", ContextScope::Project, Some("p1"), None)),
+    );
+    request.priors.insert(
+        "b".into(),
+        PriorImpression {
+            revision: "old".into(),
+            content_hash: Some("old-hash".into()),
+            summary: None,
+        },
+    );
+
+    let plan = assemble_context(&request, &context).unwrap();
+    assert_eq!(plan.cache.hit_potential, Ternary::False);
+    assert_eq!(plan.cache.invalidated, ["b"]);
+    assert_eq!(
+        plan.items.iter().find(|item| item.id == "b").unwrap().cache,
+        CacheClass::DynamicTail
+    );
+    assert_eq!(plan.cache.prefix_items, 1);
+
+    request.autonomy.may_break_prefix = Ternary::True;
+    let plan = assemble_context(&request, &context).unwrap();
+    assert_eq!(plan.cache.hit_potential, Ternary::False);
+    assert_eq!(plan.cache.invalidated, ["b"]);
+    assert_eq!(plan.cache.prefix_items, 2);
+
+    request.autonomy.may_break_prefix = Ternary::Unknown;
+    let plan = assemble_context(&request, &context).unwrap();
+    assert_eq!(plan.cache.invalidated, ["b"]);
+    assert!(
+        plan.degradations
+            .contains(&ContextDegradation::PrefixChangeRequiresApproval)
+    );
+}
+
+#[test]
+fn autonomy_can_deny_optional_context_and_handle_expansion() {
+    let mut context = InMemoryContext::default();
+    context
+        .insert(
+            reference("doc", ContextScope::Project, Some("p1"), None),
+            document("doc", "full", Some("summary"), Some(100)),
+        )
+        .unwrap();
+    let mut request = request(
+        model(true, false),
+        ReasoningEffort::Low,
+        vec![selection("doc", false, None)],
+    );
+    request.autonomy.may_add_optional = Ternary::False;
+    let plan = assemble_context(&request, &context).unwrap();
+    assert!(plan.items.is_empty());
+    assert!(
+        plan.dropped
+            .iter()
+            .any(|drop| drop.reason == ContextDropReason::AutonomyDenied)
+    );
+
+    request.autonomy.may_add_optional = Ternary::Unknown;
+    let plan = assemble_context(&request, &context).unwrap();
+    assert!(plan.items.is_empty());
+    assert!(
+        plan.dropped
+            .iter()
+            .any(|drop| drop.reason == ContextDropReason::AutonomyUnknown)
+    );
+    assert!(
+        plan.degradations
+            .contains(&ContextDegradation::AutonomyUnknown)
+    );
+
+    request.autonomy.may_add_optional = Ternary::True;
+    request.autonomy.may_expand_handles = Ternary::False;
+    let plan = assemble_context(&request, &context).unwrap();
+    assert_eq!(plan.items[0].detail, ContextDetail::Summary);
+}
+
+#[test]
+fn real_usage_calibration_overrides_declared_output_reserve() {
+    let mut calibration = UsageCalibration::new("test-model");
+    for (output, cached, fresh) in [(1_000, 100, 900), (2_000, 800, 200), (1_500, 0, 1_000)] {
+        calibration.observe(&TokenUsage {
+            fresh,
+            cached,
+            output,
+            estimated: false,
+        });
+    }
+    let mut request = request(model(true, false), ReasoningEffort::Off, Vec::new());
+    request.calibration = Some(calibration);
+    let plan = assemble_context(&request, &NoSuchResolver).unwrap();
+    let report = plan.calibration.unwrap();
+    assert_eq!(report.confidence, Ternary::True);
+    assert_eq!(report.output_reserve, 2_000);
+    assert_eq!(report.cache_hit_rate_bp, 3_000);
+    assert_eq!(plan.budget_tokens, 10_000);
+}
+
+#[test]
+fn estimated_or_mismatched_calibration_is_not_trusted() {
+    let mut estimated = UsageCalibration::new("test-model");
+    for _ in 0..3 {
+        estimated.observe(&TokenUsage {
+            fresh: 10,
+            cached: 0,
+            output: 1_000,
+            estimated: true,
+        });
+    }
+    let mut request = request(model(true, false), ReasoningEffort::Off, Vec::new());
+    request.calibration = Some(estimated);
+    let plan = assemble_context(&request, &NoSuchResolver).unwrap();
+    let report = plan.calibration.unwrap();
+    assert_eq!(report.confidence, Ternary::False);
+    assert_eq!(report.output_reserve, 1_000);
+    assert!(
+        plan.degradations
+            .contains(&ContextDegradation::CalibrationUncertain)
+    );
+
+    let mut mismatch = UsageCalibration::new("other-model");
+    mismatch.observe(&TokenUsage {
+        fresh: 10,
+        cached: 0,
+        output: 2_000,
+        estimated: false,
+    });
+    request.calibration = Some(mismatch);
+    let plan = assemble_context(&request, &NoSuchResolver).unwrap();
+    assert!(plan.calibration.is_none());
+    assert!(
+        plan.degradations
+            .contains(&ContextDegradation::CalibrationModelMismatch)
+    );
+}
+
+struct NoSuchResolver;
+
+impl trit_agent::ContextResolver for NoSuchResolver {
+    fn resolve(&self, _id: &str) -> Result<Option<trit_agent::ResolvedContext>, ContextError> {
+        Ok(None)
+    }
+}
+
+fn prior(reference: &ContextRef) -> PriorImpression {
+    PriorImpression {
+        revision: reference.revision.clone(),
+        content_hash: reference.content_hash.clone(),
+        summary: None,
+    }
 }
