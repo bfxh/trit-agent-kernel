@@ -705,6 +705,7 @@ pub fn run_headless<M: Model>(
 
 pub mod checkpoint;
 pub mod context;
+pub mod context_layers;
 pub mod git_checkpoint;
 pub mod openai;
 pub mod provider;
@@ -715,6 +716,12 @@ pub use checkpoint::{
     RewindReport, RewindScope, rewind_session, rewind_session_with_policy,
 };
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
+pub use context_layers::{
+    ContextDegradation, ContextDetail, ContextDocument, ContextDropReason, ContextError,
+    ContextItem, ContextKind, ContextPlan, ContextRef, ContextRequest, ContextResolver,
+    ContextScope, ContextSelection, DroppedContext, InMemoryContext, ModelProfile, ReasoningEffort,
+    ResolvedContext, Sensitivity, assemble_context, estimate_tokens,
+};
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };

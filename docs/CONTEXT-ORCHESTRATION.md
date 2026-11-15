@@ -53,7 +53,8 @@ UI 展示都变成可审计的结构化事件。
 | 句柄 | `C1` + 一行标签 | 可选、按需展开 |
 
 推荐默认：**句柄 + 一行标签**。模型需要细节时调用 `context_read(C1, span)`；
-宿主按预算返回切片，而不是一次性灌入全部内容。
+宿主按预算返回切片，而不是一次性灌入全部内容。注意：**只有 tool calling 还不够**，
+模型还必须具备 `context_read` 这类句柄展开能力，否则句柄不可用，必须降级为摘要/全文。
 
 ### 3.2 `ContextRef`
 
@@ -338,6 +339,12 @@ TokUI（JBoltAI，MIT）提供了“后端 DSL → SSE/WebSocket → 前端增�
 ---
 
 ## 10. 与现有代码的映射
+
+> **实现状态（2026-11-15）**：第一刀已落在 `crates/trit-agent/src/context_layers.rs`：
+> `ContextRef` / `ContextDocument` / `InMemoryContext` / `ModelProfile` / `ReasoningEffort` /
+> `assemble_context`，覆盖 scope 校验、句柄/摘要/全文预算、工具/`context_read` 能力降级与推理预留。
+> 语义分数仍由宿主传入（`ContextSelection.score`），尚未接入 `ProviderRequest`；
+> 这不是“语义判断已自动化”，只是给它留了输入口。
 
 | 现有能力 | 可复用的部分 | 需要新增/扩展 |
 | --- | --- | --- |
