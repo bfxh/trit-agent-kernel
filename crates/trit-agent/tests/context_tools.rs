@@ -4,8 +4,8 @@ use trit_agent::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentError, CacheClass, CacheLedger,
     CacheObservation, ContextDocument, ContextKind, ContextPlan, ContextPlanner, ContextReadTools,
     ContextRef, ContextRequest, ContextScope, ContextSelection, ContextSpan, InMemoryContext,
-    ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity, ToolExecutor, ToolRequest,
-    TurnContext, assemble_context,
+    LowHitPolicy, ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity, ToolExecutor,
+    ToolRequest, TurnContext, assemble_context,
 };
 use trit_orch::{TaskBrief, Ternary, TokenUsage};
 
@@ -243,6 +243,7 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         let mut ledger = ledger.lock().unwrap();
         for _ in 0..3 {
             ledger.observe(&CacheObservation {
+                model: "model".into(),
                 prefix_fingerprint: fingerprint.clone(),
                 prompt_tokens: 100,
                 cache_hit_tokens: 80,
@@ -264,6 +265,7 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         let mut low = low.lock().unwrap();
         for _ in 0..3 {
             low.observe(&CacheObservation {
+                model: "model".into(),
                 prefix_fingerprint: fingerprint.clone(),
                 prompt_tokens: 100,
                 cache_hit_tokens: 20,
@@ -273,10 +275,20 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         }
     }
     let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
-        .with_cache_ledger(low)
+        .with_cache_ledger(Arc::clone(&low))
         .with_hit_threshold_bp(5_000);
     let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
     assert_eq!(plan.cache.hit_potential, Ternary::False);
     assert_eq!(plan.cache.observed_hit_rate_bp, Some(2_000));
     assert_eq!(plan.cache.calibration, Ternary::True);
+    assert_eq!(plan.cache.prefix_items, 1, "keep policy preserves prefix");
+
+    let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
+        .with_cache_ledger(low)
+        .with_hit_threshold_bp(5_000)
+        .with_low_hit_policy(LowHitPolicy::DemotePrefix);
+    let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    assert_eq!(plan.cache.hit_potential, Ternary::False);
+    assert_eq!(plan.cache.prefix_items, 0);
+    assert!(plan.cache.prefix_fingerprint.is_empty());
 }

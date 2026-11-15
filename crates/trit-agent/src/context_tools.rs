@@ -265,10 +265,19 @@ impl<T: ToolExecutor, R: ContextCatalog> ToolExecutor for AgentContextTools<T, R
 }
 
 /// 把共享的 `AgentContext` 每轮快照成 `ContextPlan`，供 ProviderModel 使用。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LowHitPolicy {
+    #[default]
+    Keep,
+    DemotePrefix,
+}
+
 pub struct AgentContextPlanner<R> {
     context: Arc<Mutex<AgentContext<R>>>,
     cache_ledger: Option<Arc<Mutex<CacheLedger>>>,
     hit_threshold_bp: u32,
+    low_hit_policy: LowHitPolicy,
 }
 
 impl<R> AgentContextPlanner<R> {
@@ -277,6 +286,7 @@ impl<R> AgentContextPlanner<R> {
             context,
             cache_ledger: None,
             hit_threshold_bp: 5_000,
+            low_hit_policy: LowHitPolicy::Keep,
         }
     }
 
@@ -287,6 +297,11 @@ impl<R> AgentContextPlanner<R> {
 
     pub fn with_hit_threshold_bp(mut self, hit_threshold_bp: u32) -> Self {
         self.hit_threshold_bp = hit_threshold_bp;
+        self
+    }
+
+    pub fn with_low_hit_policy(mut self, low_hit_policy: LowHitPolicy) -> Self {
+        self.low_hit_policy = low_hit_policy;
         self
     }
 }
@@ -307,12 +322,20 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
             let cache_ledger = cache_ledger
                 .lock()
                 .map_err(|_| AgentError::Tool("cache ledger poisoned".into()))?;
-            if let Some(stat) = cache_ledger.stat(&plan.cache.prefix_fingerprint) {
+            if let Some(stat) = cache_ledger.stat_for(&plan.model, &plan.cache.prefix_fingerprint) {
                 plan.cache.observed_hit_rate_bp = Some(stat.hit_rate_bp());
                 plan.cache.calibration = stat.confidence();
                 if stat.confidence() == trit_orch::Ternary::True {
-                    plan.cache.hit_potential = cache_ledger
-                        .hit_potential(&plan.cache.prefix_fingerprint, self.hit_threshold_bp);
+                    plan.cache.hit_potential = cache_ledger.hit_potential_for(
+                        &plan.model,
+                        &plan.cache.prefix_fingerprint,
+                        self.hit_threshold_bp,
+                    );
+                    if plan.cache.hit_potential == trit_orch::Ternary::False
+                        && self.low_hit_policy == LowHitPolicy::DemotePrefix
+                    {
+                        plan.demote_stable_prefix();
+                    }
                 }
             }
         }

@@ -248,6 +248,7 @@ fn context_receipt_is_logged_to_session() {
             hit_potential: trit_orch::Ternary::True,
         }),
         cache: Some(CacheObservation {
+            model: "model-x".into(),
             prefix_fingerprint: "fnv1a64:abc".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 80,

@@ -704,6 +704,7 @@ fn cache_ledger_calibrates_prefix_hit_potential_from_real_observations() {
     let mut ledger = trit_agent::CacheLedger::default();
     for _ in 0..3 {
         ledger.observe(&trit_agent::CacheObservation {
+            model: "m".into(),
             prefix_fingerprint: "fnv1a64:ok".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 80,
@@ -711,10 +712,48 @@ fn cache_ledger_calibrates_prefix_hit_potential_from_real_observations() {
             estimated: false,
         });
     }
-    assert_eq!(ledger.hit_potential("fnv1a64:ok", 5_000), Ternary::True);
-    assert_eq!(ledger.hit_potential("fnv1a64:ok", 9_000), Ternary::False);
     assert_eq!(
-        ledger.hit_potential("fnv1a64:missing", 5_000),
+        ledger.hit_potential_for("m", "fnv1a64:ok", 5_000),
+        Ternary::True
+    );
+    assert_eq!(
+        ledger.hit_potential_for("m", "fnv1a64:ok", 9_000),
+        Ternary::False
+    );
+    assert_eq!(
+        ledger.hit_potential_for("m", "fnv1a64:missing", 5_000),
         Ternary::Unknown
+    );
+}
+
+#[test]
+fn estimated_cache_samples_do_not_move_calibrated_rate() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    for _ in 0..3 {
+        ledger.observe(&trit_agent::CacheObservation {
+            model: "m".into(),
+            prefix_fingerprint: "fnv1a64:mixed".into(),
+            prompt_tokens: 100,
+            cache_hit_tokens: 20,
+            cache_miss_tokens: 80,
+            estimated: false,
+        });
+    }
+    for _ in 0..10 {
+        ledger.observe(&trit_agent::CacheObservation {
+            model: "m".into(),
+            prefix_fingerprint: "fnv1a64:mixed".into(),
+            prompt_tokens: 100,
+            cache_hit_tokens: 100,
+            cache_miss_tokens: 0,
+            estimated: true,
+        });
+    }
+    let stat = ledger.stat_for("m", "fnv1a64:mixed").unwrap();
+    assert_eq!(stat.hit_rate_bp(), 8_153);
+    assert_eq!(stat.calibrated_hit_rate_bp(), 2000);
+    assert_eq!(
+        ledger.hit_potential_for("m", "fnv1a64:mixed", 5000),
+        Ternary::False
     );
 }

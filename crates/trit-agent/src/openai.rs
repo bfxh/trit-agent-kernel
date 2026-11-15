@@ -346,6 +346,7 @@ fn attach_context_receipt(response: &mut ProviderResponse, request: &ProviderReq
         return;
     };
     let cache = CacheObservation {
+        model: plan.model.clone(),
         prefix_fingerprint: plan.cache.prefix_fingerprint.clone(),
         prompt_tokens: response.usage.prompt_tokens,
         cache_hit_tokens: response.usage.cache_hit_tokens,

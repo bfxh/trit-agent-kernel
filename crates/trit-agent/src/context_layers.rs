@@ -483,8 +483,10 @@ pub struct InclusionReceipt {
     pub hit_potential: Ternary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheObservation {
+    #[serde(default)]
+    pub model: String,
     pub prefix_fingerprint: String,
     pub prompt_tokens: u64,
     pub cache_hit_tokens: u64,
@@ -510,22 +512,47 @@ pub struct CacheStat {
     pub estimated_samples: u64,
     pub cache_hit_tokens: u64,
     pub cache_miss_tokens: u64,
+    /// 仅精确样本的 hit/miss，用于校准。
+    pub exact_hit_tokens: u64,
+    pub exact_miss_tokens: u64,
 }
 
 impl CacheStat {
+    pub fn merge(&mut self, other: &CacheStat) {
+        self.samples = self.samples.saturating_add(other.samples);
+        self.exact_samples = self.exact_samples.saturating_add(other.exact_samples);
+        self.estimated_samples = self
+            .estimated_samples
+            .saturating_add(other.estimated_samples);
+        self.cache_hit_tokens = self.cache_hit_tokens.saturating_add(other.cache_hit_tokens);
+        self.cache_miss_tokens = self
+            .cache_miss_tokens
+            .saturating_add(other.cache_miss_tokens);
+        self.exact_hit_tokens = self.exact_hit_tokens.saturating_add(other.exact_hit_tokens);
+        self.exact_miss_tokens = self
+            .exact_miss_tokens
+            .saturating_add(other.exact_miss_tokens);
+    }
+
     pub fn observe(&mut self, observation: &CacheObservation) {
         self.samples = self.samples.saturating_add(1);
-        if observation.estimated {
-            self.estimated_samples = self.estimated_samples.saturating_add(1);
-        } else {
-            self.exact_samples = self.exact_samples.saturating_add(1);
-        }
         self.cache_hit_tokens = self
             .cache_hit_tokens
             .saturating_add(observation.cache_hit_tokens);
         self.cache_miss_tokens = self
             .cache_miss_tokens
             .saturating_add(observation.cache_miss_tokens);
+        if observation.estimated {
+            self.estimated_samples = self.estimated_samples.saturating_add(1);
+        } else {
+            self.exact_samples = self.exact_samples.saturating_add(1);
+            self.exact_hit_tokens = self
+                .exact_hit_tokens
+                .saturating_add(observation.cache_hit_tokens);
+            self.exact_miss_tokens = self
+                .exact_miss_tokens
+                .saturating_add(observation.cache_miss_tokens);
+        }
     }
 
     pub fn hit_rate_bp(&self) -> u32 {
@@ -534,6 +561,15 @@ impl CacheStat {
             0
         } else {
             ((u128::from(self.cache_hit_tokens) * 10_000) / u128::from(input)) as u32
+        }
+    }
+
+    pub fn calibrated_hit_rate_bp(&self) -> u32 {
+        let input = self.exact_hit_tokens.saturating_add(self.exact_miss_tokens);
+        if input == 0 {
+            0
+        } else {
+            ((u128::from(self.exact_hit_tokens) * 10_000) / u128::from(input)) as u32
         }
     }
 
@@ -558,13 +594,22 @@ pub struct CacheLedger {
 impl CacheLedger {
     pub fn observe(&mut self, observation: &CacheObservation) {
         self.entries
-            .entry(observation.prefix_fingerprint.clone())
+            .entry(cache_key(
+                &observation.model,
+                &observation.prefix_fingerprint,
+            ))
             .or_default()
             .observe(observation);
     }
 
-    pub fn stat(&self, prefix_fingerprint: &str) -> Option<&CacheStat> {
-        self.entries.get(prefix_fingerprint)
+    pub fn merge(&mut self, other: &CacheLedger) {
+        for (key, stat) in &other.entries {
+            self.entries.entry(key.clone()).or_default().merge(stat);
+        }
+    }
+
+    pub fn stat_for(&self, model: &str, prefix_fingerprint: &str) -> Option<&CacheStat> {
+        self.entries.get(&cache_key(model, prefix_fingerprint))
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&String, &CacheStat)> {
@@ -591,14 +636,23 @@ impl CacheLedger {
     }
 
     /// 用实际观测把某个 prefix 的命中把握折叠成三值；样本不足返回 Unknown。
-    pub fn hit_potential(&self, prefix_fingerprint: &str, threshold_bp: u32) -> Ternary {
-        match self.stat(prefix_fingerprint) {
+    pub fn hit_potential_for(
+        &self,
+        model: &str,
+        prefix_fingerprint: &str,
+        threshold_bp: u32,
+    ) -> Ternary {
+        match self.stat_for(model, prefix_fingerprint) {
             Some(stat) if stat.confidence() == Ternary::True => {
-                Ternary::from_bool(stat.hit_rate_bp() >= threshold_bp)
+                Ternary::from_bool(stat.calibrated_hit_rate_bp() >= threshold_bp)
             }
             _ => Ternary::Unknown,
         }
     }
+}
+
+fn cache_key(model: &str, prefix_fingerprint: &str) -> String {
+    format!("{model}|{prefix_fingerprint}")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,6 +711,21 @@ impl ContextPlan {
     /// 只渲染动态尾段（应放在每轮变化的 user tail）。
     pub fn render_tail(&self) -> String {
         self.render_subset(|item| item.cache != CacheClass::StablePrefix, true)
+    }
+
+    /// 把稳定前缀整体降级为动态尾段；用于“实际命中率长期过低”的显式策略。
+    pub fn demote_stable_prefix(&mut self) {
+        for item in &mut self.items {
+            if item.cache == CacheClass::StablePrefix {
+                item.cache = CacheClass::DynamicTail;
+            }
+        }
+        self.cache.prefix_items = 0;
+        self.cache.prefix_tokens = 0;
+        self.cache.dynamic_items = self.items.len();
+        self.cache.dynamic_tokens = self.items.iter().map(|item| item.tokens).sum();
+        self.cache.prefix_fingerprint.clear();
+        self.cache.hit_potential = Ternary::False;
     }
 
     pub fn inclusion_receipt(&self) -> InclusionReceipt {

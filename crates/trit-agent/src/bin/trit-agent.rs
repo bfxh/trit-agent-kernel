@@ -7,9 +7,10 @@ use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_agent::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger, CheckpointStore,
     CheckpointingTools, ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools,
-    HeadlessConfig, InMemoryContext, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal,
-    ProviderModel, ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, Session,
-    ToolExecutor, rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
+    HeadlessConfig, InMemoryContext, LowHitPolicy, Model, ModelProfile, OpenAiConfig,
+    OpenAiProvider, Proposal, ProviderModel, ReasoningEffort, ResolvedContext, RewindScope,
+    ScriptedModel, Session, ToolExecutor, rewind_session_git_with_policy,
+    rewind_session_with_policy, run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -62,6 +63,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut reasoning = ReasoningEffort::Off;
     let mut context_read_budget: usize = 16 * 1024;
     let mut context_read_max: usize = 8 * 1024;
+    let mut cache_hit_threshold: u32 = 5_000;
+    let mut low_hit_policy = LowHitPolicy::Keep;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -143,6 +146,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 context_read_max = next(&mut args, "--context-read-max")?
                     .parse()
                     .map_err(|error| fail(format!("bad --context-read-max: {error}")))?;
+            }
+            "--cache-hit-threshold" => {
+                cache_hit_threshold = next(&mut args, "--cache-hit-threshold")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --cache-hit-threshold: {error}")))?;
+            }
+            "--cache-low-hit-policy" => {
+                low_hit_policy = parse_low_hit_policy(&next(&mut args, "--cache-low-hit-policy")?)?;
             }
             "--help" | "-h" => {
                 usage();
@@ -270,6 +281,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             openai_config.as_ref(),
             context_agent.as_ref(),
             &shared_cache_ledger,
+            cache_hit_threshold,
+            low_hit_policy,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
@@ -314,6 +327,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             openai_config.as_ref(),
             Some(shared),
             &shared_cache_ledger,
+            cache_hit_threshold,
+            low_hit_policy,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools = AgentContextTools::new(local, Arc::clone(shared))
@@ -337,7 +352,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             (outcome, Some(ledger))
         }
     } else {
-        let model = build_model(scripted, openai_config.as_ref(), None, &shared_cache_ledger)?;
+        let model = build_model(
+            scripted,
+            openai_config.as_ref(),
+            None,
+            &shared_cache_ledger,
+            cache_hit_threshold,
+            low_hit_policy,
+        )?;
         (run_headless(turn, model, config)?, None)
     };
 
@@ -369,6 +391,8 @@ fn build_model(
     config: Option<&OpenAiConfig>,
     context: Option<&Arc<Mutex<AgentContext<InMemoryContext>>>>,
     cache_ledger: &Arc<Mutex<CacheLedger>>,
+    cache_hit_threshold: u32,
+    low_hit_policy: LowHitPolicy,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
@@ -378,7 +402,9 @@ fn build_model(
     if let Some(shared) = context {
         model = model.with_context_planner(Box::new(
             AgentContextPlanner::new(Arc::clone(shared))
-                .with_cache_ledger(Arc::clone(cache_ledger)),
+                .with_cache_ledger(Arc::clone(cache_ledger))
+                .with_hit_threshold_bp(cache_hit_threshold)
+                .with_low_hit_policy(low_hit_policy),
         ));
     }
     Ok(Box::new(model))
@@ -394,6 +420,14 @@ fn load_context_catalog(path: &Path) -> Result<InMemoryContext, Box<dyn Error>> 
         catalog.insert(entry.reference, entry.document)?;
     }
     Ok(catalog)
+}
+
+fn parse_low_hit_policy(value: &str) -> Result<LowHitPolicy, Box<dyn Error>> {
+    match value {
+        "keep" => Ok(LowHitPolicy::Keep),
+        "demote" => Ok(LowHitPolicy::DemotePrefix),
+        other => Err(fail(format!("bad --cache-low-hit-policy: {other}"))),
+    }
 }
 
 fn parse_reasoning(value: &str) -> Result<ReasoningEffort, Box<dyn Error>> {
@@ -428,7 +462,8 @@ fn usage() {
          [--context-catalog <json> [--context-project <id>] [--context-session-id <id>] \\\n    \
          [--context-budget N] [--context-window N] [--model-max-output N] \\\n    \
          [--supports-reasoning] [--reasoning off|low|medium|high] \\\n    \
-         [--context-read-budget N] [--context-read-max N]]\n\n\
+         [--context-read-budget N] [--context-read-max N] \\\n    \
+         [--cache-hit-threshold BP] [--cache-low-hit-policy keep|demote]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
@@ -437,7 +472,8 @@ fn usage() {
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
          context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\
-         context_search / context_add / context_read with dynamic-tail-only additions.\n\n\
+         context_search / context_add / context_read with dynamic-tail-only additions.\n\
+         cache-hit-threshold: basis points (default 5000); low-hit-policy keep|demote (default keep).\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"

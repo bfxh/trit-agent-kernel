@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use trit_agent::tools::WorkspaceConfig;
 use trit_agent::{
-    AgentError, HeadlessConfig, Proposal, SESSION_SCHEMA, ScriptedModel, ScriptedTools, Session,
-    SessionEvent, SessionLog, ToolOutcome, ToolRequest, run_headless,
+    AgentError, CacheObservation, ContextReceipt, HeadlessConfig, Proposal, SESSION_SCHEMA,
+    ScriptedModel, ScriptedTools, Session, SessionEvent, SessionLog, ToolOutcome, ToolRequest,
+    run_headless,
 };
 use trit_orch::{EvidenceVerdict, TokenUsage};
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, TurnSpec};
@@ -258,4 +259,46 @@ fn unfinished_turn_is_recovered_as_incomplete() {
     assert!(!session.state().turns[0].complete);
     assert_eq!(session.state().next_turn(), 1);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn reopening_a_session_rebuilds_the_cache_ledger() {
+    let root = temp_workspace("ledger");
+    let path = temp_file("ledger");
+    let mut proposal = proposal();
+    proposal.context_receipt = Some(ContextReceipt {
+        inclusion: None,
+        cache: Some(CacheObservation {
+            model: "model-x".into(),
+            prefix_fingerprint: "fnv1a64:replay".into(),
+            prompt_tokens: 100,
+            cache_hit_tokens: 80,
+            cache_miss_tokens: 20,
+            estimated: false,
+        }),
+    });
+    let mut session = Session::open(
+        ScriptedModel::new(vec![proposal]),
+        ScriptedTools::new(vec![write_outcome()]),
+        &path,
+    )
+    .unwrap();
+    session.run_turn(&turn()).unwrap();
+    drop(session);
+
+    let reopened = Session::open(
+        ScriptedModel::new(Vec::new()),
+        ScriptedTools::new(Vec::new()),
+        &path,
+    )
+    .unwrap();
+    let ledger = reopened.cache_ledger();
+    let ledger = ledger.lock().unwrap();
+    let stat = ledger
+        .stat_for("model-x", "fnv1a64:replay")
+        .expect("replayed ledger should contain the prefix");
+    assert_eq!(stat.cache_hit_tokens, 80);
+    assert_eq!(stat.cache_miss_tokens, 20);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&root);
 }

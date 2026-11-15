@@ -319,9 +319,12 @@ pub struct Session<M, T> {
 impl<M: Model, T: ToolExecutor> Session<M, T> {
     pub fn open(model: M, tools: T, path: impl Into<PathBuf>) -> Result<Self, AgentError> {
         let log = SessionLog::open(path)?;
-        let state = recover(&log.load()?)?;
+        let records = log.load()?;
+        let state = recover(&records)?;
+        let cache_ledger =
+            std::sync::Arc::new(std::sync::Mutex::new(cache_ledger_from_records(&records)));
         Ok(Self {
-            host: AgentHost::new(model, tools),
+            host: AgentHost::new(model, tools).with_cache_ledger(cache_ledger),
             log,
             state,
         })
@@ -355,6 +358,10 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
         mut self,
         cache_ledger: std::sync::Arc<std::sync::Mutex<crate::context_layers::CacheLedger>>,
     ) -> Self {
+        let replay = self.host.cache_ledger();
+        if let (Ok(replay), Ok(mut target)) = (replay.lock(), cache_ledger.lock()) {
+            target.merge(&replay);
+        }
         self.host = self.host.with_cache_ledger(cache_ledger);
         self
     }
@@ -377,9 +384,29 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
     /// 删除 `turn` 及之后的会话事件；`turn` 是 0-based 的已存在 turn。
     pub fn truncate_before_turn(&mut self, turn: usize) -> Result<usize, AgentError> {
         self.log.truncate_before_turn(turn)?;
-        self.state = recover(&self.log.load()?)?;
+        let records = self.log.load()?;
+        self.state = recover(&records)?;
+        let rebuilt = cache_ledger_from_records(&records);
+        if let Ok(mut ledger) = self.host.cache_ledger().lock() {
+            *ledger = rebuilt;
+        }
         Ok(self.state.turns.len())
     }
+}
+
+fn cache_ledger_from_records(records: &[SessionRecord]) -> crate::context_layers::CacheLedger {
+    let mut ledger = crate::context_layers::CacheLedger::default();
+    for record in records {
+        if let SessionEvent::Proposal {
+            context: Some(receipt),
+            ..
+        } = &record.event
+            && let Some(cache) = &receipt.cache
+        {
+            ledger.observe(cache);
+        }
+    }
+    ledger
 }
 
 fn add_usage(into: &mut TokenUsage, usage: TokenUsage) {
