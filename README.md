@@ -73,6 +73,7 @@ cargo run -p trit-agent -- rewind \
 
 ## 文档
 
+- [CONTEXT-ORCHESTRATION.md](docs/CONTEXT-ORCHESTRATION.md)：上下文引用/复用、会话地址、推理记录、语义判断、调用缝合与交互式 UI 提案。
 - [KERNEL-REASONIX-FUSION.md](docs/KERNEL-REASONIX-FUSION.md)：与 Reasonix 的组合边界、认证平面与 Rust 迁移策略。
 - [TERNARY-ORCHESTRATION.md](docs/TERNARY-ORCHESTRATION.md)：三值编排模型。
 - [TRACE-AND-TIME.md](docs/TRACE-AND-TIME.md)：轨迹、重放与时间语义。
