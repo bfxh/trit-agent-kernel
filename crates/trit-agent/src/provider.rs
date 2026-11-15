@@ -106,7 +106,7 @@ impl<P: Provider> Model for ProviderModel<P> {
         } else {
             self.tools
                 .iter()
-                .filter(|tool| tool.name != "context_read")
+                .filter(|tool| !tool.name.starts_with("context_"))
                 .cloned()
                 .collect()
         };
@@ -144,6 +144,17 @@ pub fn default_tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: "bash".into(),
             description: "Run a shell command in the workspace; requires allow-shell.".into(),
+            read_only: false,
+        },
+        ToolSpec {
+            name: "context_search".into(),
+            description: "Search the context catalog and return candidate ids/labels.".into(),
+            read_only: true,
+        },
+        ToolSpec {
+            name: "context_add".into(),
+            description: "Add a searched context ref to the dynamic tail and return its handle."
+                .into(),
             read_only: false,
         },
         ToolSpec {

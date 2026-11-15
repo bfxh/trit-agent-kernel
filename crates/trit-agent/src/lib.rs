@@ -121,6 +121,31 @@ impl ToolRequest {
         }
     }
 
+    pub fn context_search(
+        call_id: impl Into<String>,
+        query: impl Into<String>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: "context_search".into(),
+            read_only: true,
+            command: Some(query.into()),
+            content: limit.map(|limit| limit.to_string()),
+            ..Self::default()
+        }
+    }
+
+    pub fn context_add(call_id: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: "context_add".into(),
+            read_only: false,
+            paths: vec![id.into()],
+            ..Self::default()
+        }
+    }
+
     pub fn write(
         call_id: impl Into<String>,
         tool: impl Into<String>,
@@ -732,14 +757,17 @@ pub use checkpoint::{
 };
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
 pub use context_layers::{
-    AutonomyPolicy, CacheClass, CacheObservation, CacheReport, CalibrationReport,
-    ContextDegradation, ContextDetail, ContextDocument, ContextDropReason, ContextError,
-    ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef, ContextRequest,
-    ContextResolver, ContextScope, ContextSelection, DroppedContext, ImpressionDelta,
-    InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression, ReasoningEffort,
-    ResolvedContext, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
+    AgentContext, AutonomyPolicy, CacheClass, CacheObservation, CacheReport, CalibrationReport,
+    ContextCatalog, ContextDegradation, ContextDetail, ContextDocument, ContextDropReason,
+    ContextError, ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef,
+    ContextRequest, ContextResolver, ContextScope, ContextSelection, DroppedContext,
+    ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression,
+    ReasoningEffort, ResolvedContext, Sensitivity, UsageCalibration, assemble_context,
+    estimate_tokens,
 };
-pub use context_tools::{ContextReadRecord, ContextReadTools};
+pub use context_tools::{
+    AgentContextPlanner, AgentContextTools, ContextAddRecord, ContextReadRecord, ContextReadTools,
+};
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };

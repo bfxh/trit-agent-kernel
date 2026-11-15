@@ -136,6 +136,11 @@ pub trait ContextResolver {
     fn resolve(&self, id: &str) -> Result<Option<ResolvedContext>, ContextError>;
 }
 
+/// 智能体可搜索的上下文目录；搜索只返回候选 ref，不直接展开正文。
+pub trait ContextCatalog: ContextResolver {
+    fn search(&self, query: &str, limit: usize) -> Vec<ContextRef>;
+}
+
 /// 进程内实现；宿主可换成数据库、对象存储或 Git 内容寻址存储。
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryContext {
@@ -177,6 +182,24 @@ impl InMemoryContext {
 impl ContextResolver for InMemoryContext {
     fn resolve(&self, id: &str) -> Result<Option<ResolvedContext>, ContextError> {
         Ok(self.entries.get(id).cloned())
+    }
+}
+
+impl ContextCatalog for InMemoryContext {
+    fn search(&self, query: &str, limit: usize) -> Vec<ContextRef> {
+        let query = query.to_lowercase();
+        let mut hits: Vec<ContextRef> = self
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.reference.id.to_lowercase().contains(&query)
+                    || entry.reference.label.to_lowercase().contains(&query)
+            })
+            .map(|entry| entry.reference.clone())
+            .collect();
+        hits.sort_by(|left, right| left.id.cmp(&right.id));
+        hits.truncate(limit.max(1));
+        hits
     }
 }
 
@@ -403,6 +426,7 @@ pub enum ContextDegradation {
     CalibrationUncertain,
     CalibrationModelMismatch,
     PrefixChangeRequiresApproval,
+    DynamicPrefixOverride,
     BudgetReduced { requested: u64, available: u64 },
 }
 
@@ -604,6 +628,22 @@ pub enum ContextError {
     },
     #[error("context document {0} does not match its ref")]
     DocumentMismatch(String),
+    #[error("context ref {0} is unknown")]
+    UnknownRef(String),
+    #[error("context ref {0} is already included")]
+    AlreadyIncluded(String),
+    #[error("context ref {0} was denied by autonomy policy")]
+    AutonomyDenied(String),
+    #[error("context ref {0} has unknown autonomy status")]
+    AutonomyUnknown(String),
+    #[error("context add {id} exceeds budget: needs {needed}, available {available}")]
+    DynamicBudgetExceeded {
+        id: String,
+        needed: u64,
+        available: u64,
+    },
+    #[error("context handle {0} is not in the current plan")]
+    UnknownHandle(String),
     #[error("context resolver: {0}")]
     Resolver(String),
 }
@@ -936,6 +976,152 @@ pub fn assemble_context(
         autonomy,
         calibration: calibration_report,
     })
+}
+
+/// 智能体自主上下文：在初始计划之上允许 agent 搜索、添加动态 ref、按句柄读取。
+///
+/// 动态添加永远落到 `DynamicTail`，不会改稳定前缀；ACL/预算/secret/autonomy
+/// 仍由宿主侧这里统一执行。初始计划之外的新 ref 不会自动进入前缀缓存。
+pub struct AgentContext<R> {
+    request: ContextRequest,
+    resolver: R,
+    plan: ContextPlan,
+}
+
+impl<R: ContextCatalog> AgentContext<R> {
+    pub fn new(request: ContextRequest, resolver: R, plan: ContextPlan) -> Self {
+        Self {
+            request,
+            resolver,
+            plan,
+        }
+    }
+
+    pub fn assemble(request: ContextRequest, resolver: R) -> Result<Self, ContextError> {
+        let plan = assemble_context(&request, &resolver)?;
+        Ok(Self::new(request, resolver, plan))
+    }
+
+    pub fn plan(&self) -> &ContextPlan {
+        &self.plan
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> Vec<ContextRef> {
+        self.resolver.search(query, limit)
+    }
+
+    /// 智能体主动添加一个动态 ref；成功返回新句柄项。
+    pub fn add(&mut self, id: &str) -> Result<ContextItem, ContextError> {
+        if self.plan.items.iter().any(|item| item.id == id) {
+            return Err(ContextError::AlreadyIncluded(id.to_owned()));
+        }
+        match self.request.autonomy.may_add_optional {
+            Ternary::True => {}
+            Ternary::False => return Err(ContextError::AutonomyDenied(id.to_owned())),
+            Ternary::Unknown => return Err(ContextError::AutonomyUnknown(id.to_owned())),
+        }
+        let resolved = self
+            .resolver
+            .resolve(id)?
+            .ok_or_else(|| ContextError::UnknownRef(id.to_owned()))?;
+        if resolved.reference.id != id || resolved.document.id != id {
+            return Err(ContextError::DocumentMismatch(id.to_owned()));
+        }
+        let selection = ContextSelection {
+            id: id.to_owned(),
+            required: false,
+            score: None,
+            shared_opt_in: false,
+        };
+        if !scope_allowed(&resolved.reference, &self.request, &selection) {
+            return Err(ContextError::RequiredOutOfScope(id.to_owned()));
+        }
+        if resolved.reference.sensitivity == Sensitivity::Secret && !self.request.allow_secret {
+            return Err(ContextError::RequiredSecret(id.to_owned()));
+        }
+
+        let mut can_read_handles = self.request.model.supports_tools
+            && self.request.model.supports_context_read
+            && self.request.autonomy.may_expand_handles == Ternary::True;
+        if self.request.autonomy.may_expand_handles == Ternary::Unknown {
+            self.plan
+                .degradations
+                .push(ContextDegradation::AutonomyUnknown);
+            can_read_handles = false;
+        }
+        let preferred = preferred_detail(can_read_handles, self.plan.reasoning, &resolved.document);
+        let remaining = self
+            .plan
+            .budget_tokens
+            .saturating_sub(self.plan.estimated_tokens);
+        let mut chosen = None;
+        for detail in detail_chain(
+            preferred,
+            resolved.document.summary.is_some(),
+            can_read_handles,
+        ) {
+            let tokens = item_tokens(&resolved, detail);
+            if tokens <= remaining {
+                chosen = Some((detail, tokens));
+                break;
+            }
+        }
+        let Some((detail, tokens)) = chosen else {
+            return Err(ContextError::DynamicBudgetExceeded {
+                id: id.to_owned(),
+                needed: item_tokens(&resolved, ContextDetail::Full),
+                available: remaining,
+            });
+        };
+
+        let mut cache = resolved.reference.cache;
+        if cache == CacheClass::StablePrefix {
+            // Agent 运行时新增内容不能改已经缓存的前缀。
+            cache = CacheClass::DynamicTail;
+            self.plan
+                .degradations
+                .push(ContextDegradation::DynamicPrefixOverride);
+        }
+        let item = ContextItem {
+            handle: format!("C{}", self.plan.items.len() + 1),
+            id: resolved.reference.id.clone(),
+            label: resolved.reference.label.clone(),
+            kind: resolved.reference.kind,
+            scope: resolved.reference.scope,
+            revision: resolved.reference.revision.clone(),
+            required: false,
+            cache,
+            score: None,
+            content_hash: resolved.reference.content_hash.clone(),
+            detail,
+            text: match detail {
+                ContextDetail::Handle => None,
+                ContextDetail::Summary => resolved.document.summary.clone(),
+                ContextDetail::Full => Some(resolved.document.full.clone()),
+            },
+            tokens,
+        };
+        self.plan.estimated_tokens = self.plan.estimated_tokens.saturating_add(tokens);
+        self.plan.cache.dynamic_items += 1;
+        self.plan.cache.dynamic_tokens = self.plan.cache.dynamic_tokens.saturating_add(tokens);
+        self.plan.items.push(item.clone());
+        Ok(item)
+    }
+
+    /// 按句柄读取完整正文；读取本身不改变 prefix，也不自动加入计划。
+    pub fn read(&self, handle: &str) -> Result<(ContextItem, String), ContextError> {
+        let item = self
+            .plan
+            .items
+            .iter()
+            .find(|item| item.handle == handle)
+            .ok_or_else(|| ContextError::UnknownHandle(handle.to_owned()))?;
+        let resolved = self
+            .resolver
+            .resolve(&item.id)?
+            .ok_or_else(|| ContextError::UnknownRef(item.id.clone()))?;
+        Ok((item.clone(), resolved.document.full))
+    }
 }
 
 fn impression_delta(reference: &ContextRef, prior: Option<&PriorImpression>) -> ImpressionDelta {

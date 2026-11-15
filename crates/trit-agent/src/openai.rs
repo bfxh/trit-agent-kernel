@@ -172,6 +172,19 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
                     },
                     "required": ["command"]
                 }),
+                "context_search" => json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"}
+                    },
+                    "required": ["query"]
+                }),
+                "context_add" => json!({
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"]
+                }),
                 "context_read" => json!({
                     "type": "object",
                     "properties": {"handle": {"type": "string"}},
@@ -272,6 +285,18 @@ fn parse_response(body: &str) -> Result<ProviderResponse, AgentError> {
                     let mut request = ToolRequest::shell(call_id, command);
                     request.read_only = read_only;
                     tool_calls.push(request);
+                }
+                "context_search" => {
+                    let query = string_arg(&arguments, "query")?;
+                    let limit = arguments
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .map(|limit| limit as usize);
+                    tool_calls.push(ToolRequest::context_search(call_id, query, limit));
+                }
+                "context_add" => {
+                    let id = string_arg(&arguments, "id")?;
+                    tool_calls.push(ToolRequest::context_add(call_id, id));
                 }
                 "context_read" => {
                     let handle = string_arg(&arguments, "handle")?;
@@ -591,6 +616,8 @@ mod tests {
                 "read_file",
                 "write_file",
                 "bash",
+                "context_search",
+                "context_add",
                 "context_read",
                 "complete_subtask"
             ]

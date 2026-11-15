@@ -116,12 +116,15 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
   `Unknown` 默认不当作允许；前缀变化在未获准时降级为动态尾段。
 - `UsageCalibration`：从真实 `TokenUsage` 累计 cache hit/miss 与 output 峰值；
   至少 3 次精确观测才把 output 预留降到实测值；估算样本/模型不匹配时不信任。
+- Agent 自主：`AgentContext` + `AgentContextTools` 提供 `context_search` / `context_add` /
+  `context_read`。agent 自己搜索并加入动态上下文；新增内容一律进 `DynamicTail`，
+  不会改稳定前缀；`AgentContextPlanner` 把共享状态每轮快照给 provider。
 - Provider 对接：`ContextPlan` 已进入 `ProviderRequest` 与 OpenAI-compatible 消息；
   `ContextPlanner` 每轮提供计划；`ProviderResponse.context` 与 session 的
   `Proposal.context` 记录 inclusion receipt 和“前缀指纹 → 实际 cache hit/miss”的对照。
   但 CLI 尚未配置 catalog/planner，`hit_potential` 仍需要和实际观测对照验证。
-  `context_read` 也只在有 `ContextPlan` 时向模型暴露，避免 CLI 默认广告一个不可执行的工具；
-  宿主启用 planner 时还必须用 `ContextReadTools` 包装工具执行器。
+  上下文工具只在有 `ContextPlan` 时向模型暴露，避免 CLI 默认广告不可执行工具；
+  自主路径用 `AgentContextTools` 包装执行器（只读路径可用 `ContextReadTools`）。
 - 边界：token 仍是粗估；校准用最大值而非分位数；“印象”只比较 revision/hash，不做语义 diff。
 
 ### 3.6 非目标
@@ -374,7 +377,7 @@ TokUI（JBoltAI，MIT）提供了“后端 DSL → SSE/WebSocket → 前端增�
 | `TaskBrief` | 任务 brief 的 guidance/obligations | brief 中携带 refs 与 selection receipt |
 | `TraceLog` / `replay` | 轨迹、不变量、回放 | reasoning summary、调用图、多轨时间线索引 |
 | `OrchestrationMetrics` | token/cache/concurrency 指标 | model/role/tool 调用数、handoffs、stitch 向量 |
-| `ToolOutcome` / `ToolRequest` | 工具回执与写入路径 | `context_read` 工具、`Resource` 状态机、进度/等待事件 |
+| `ToolOutcome` / `ToolRequest` | 工具回执与写入路径 | `context_search` / `context_add` / `context_read`、`Resource` 状态机、进度/等待事件 |
 | `ProviderRequest` / OpenAI provider | brief、tools、receipts | `ContextPlan`、prefix/tail 消息、cache receipt |
 | `InterventionPolicy` / 义务 | 隔离、升级、补证 | loop signal → intervention 的统一映射 |
 | `checkpoint/rewind` | 工作区快照与回退 | 与 session/address 的关联（回退后 epoch/freshness） |

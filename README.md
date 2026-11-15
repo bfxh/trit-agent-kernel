@@ -26,7 +26,7 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 影子策略学习：安全选择、增量/加权/窗口/跨宿主合并、Beta 先验与漂移窗口。
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
 - 分层上下文组装初版：`Session/Project/Shared` scope、引用句柄、稳定前缀/动态尾段、印象对比、三值 autonomy、模型/推理 profile 与真实 usage 校准。
-- Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息，`context_read` 工具展开句柄，inclusion receipt 与实际 cache hit/miss 写入会话。
+- Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息；`context_search` / `context_add` / `context_read` 让 agent 自主搜索、加入动态上下文并读取句柄；inclusion receipt 与实际 cache hit/miss 写入会话。
 - 无头 agent：OpenAI-compatible provider、scripted replay、session JSONL、`--resume`。
 - 文件级 checkpoint/rewind：预检、symlink/类型拒绝、应用失败逆序回滚。
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。
