@@ -121,6 +121,17 @@ pub enum ImpressionDelta {
     Unknown,
 }
 
+impl ImpressionDelta {
+    /// 领域三态到三值逻辑的桥：Same=True、Changed=False、Unknown=Unknown。
+    pub fn as_ternary(self) -> Ternary {
+        match self {
+            Self::Same => Ternary::True,
+            Self::Changed => Ternary::False,
+            Self::Unknown => Ternary::Unknown,
+        }
+    }
+}
+
 pub trait ContextResolver {
     fn resolve(&self, id: &str) -> Result<Option<ResolvedContext>, ContextError>;
 }

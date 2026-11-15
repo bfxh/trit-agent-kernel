@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use trit_agent::{
     AutonomyPolicy, CacheClass, ContextDegradation, ContextDetail, ContextDocument,
     ContextDropReason, ContextError, ContextKind, ContextRef, ContextRequest, ContextScope,
-    ContextSelection, InMemoryContext, ModelProfile, PriorImpression, ReasoningEffort, Sensitivity,
-    UsageCalibration, assemble_context,
+    ContextSelection, ImpressionDelta, InMemoryContext, ModelProfile, PriorImpression,
+    ReasoningEffort, Sensitivity, UsageCalibration, assemble_context,
 };
 use trit_orch::{Ternary, TokenUsage};
 
@@ -455,6 +455,13 @@ fn rejects_model_profile_without_room() {
         assemble_context(&request, &context),
         Err(ContextError::InvalidModelProfile)
     );
+}
+
+#[test]
+fn impression_delta_maps_to_ternary() {
+    assert_eq!(ImpressionDelta::Same.as_ternary(), Ternary::True);
+    assert_eq!(ImpressionDelta::Changed.as_ternary(), Ternary::False);
+    assert_eq!(ImpressionDelta::Unknown.as_ternary(), Ternary::Unknown);
 }
 
 #[test]
