@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 
 use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_agent::{
-    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger, CheckpointStore,
-    CheckpointingTools, ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools,
-    HeadlessConfig, InMemoryContext, LowHitPolicy, Model, ModelProfile, OpenAiConfig,
-    OpenAiProvider, Proposal, ProviderModel, ReasoningEffort, ResolvedContext, RewindScope,
-    ScriptedModel, Session, ToolExecutor, rewind_session_git_with_policy,
+    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger, CacheWindow,
+    CheckpointStore, CheckpointingTools, ContextPolicy, ContextRequest, GitCheckpointStore,
+    GitCheckpointingTools, HeadlessConfig, InMemoryContext, LowHitPolicy, Model, ModelProfile,
+    OpenAiConfig, OpenAiProvider, Proposal, ProviderModel, ReasoningEffort, ResolvedContext,
+    RewindScope, ScriptedModel, Session, ToolExecutor, rewind_session_git_with_policy,
     rewind_session_with_policy, run_headless,
 };
 use trit_reasonix::TurnSpec;
@@ -65,6 +65,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut context_read_max: usize = 8 * 1024;
     let mut cache_hit_threshold: u32 = 5_000;
     let mut low_hit_policy = LowHitPolicy::Keep;
+    let mut cache_window_samples: usize = 64;
+    let mut cache_window_ms: Option<u64> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -154,6 +156,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "--cache-low-hit-policy" => {
                 low_hit_policy = parse_low_hit_policy(&next(&mut args, "--cache-low-hit-policy")?)?;
+            }
+            "--cache-window-samples" => {
+                cache_window_samples = next(&mut args, "--cache-window-samples")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --cache-window-samples: {error}")))?;
+            }
+            "--cache-window-ms" => {
+                cache_window_ms = Some(
+                    next(&mut args, "--cache-window-ms")?
+                        .parse()
+                        .map_err(|error| fail(format!("bad --cache-window-ms: {error}")))?,
+                );
             }
             "--help" | "-h" => {
                 usage();
@@ -255,6 +269,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 budget_tokens: context_budget,
                 model: ModelProfile {
                     name: config.model.clone(),
+                    provider: config.base_url.clone(),
                     context_window,
                     max_output_tokens: model_max_output,
                     supports_tools: true,
@@ -274,6 +289,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         None => None,
     };
     let shared_cache_ledger = Arc::new(Mutex::new(CacheLedger::default()));
+    let cache_window = CacheWindow {
+        max_samples: cache_window_samples,
+        max_age_ms: cache_window_ms,
+    };
     let (outcome, cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
         let model = build_model(
@@ -283,6 +302,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             &shared_cache_ledger,
             cache_hit_threshold,
             low_hit_policy,
+            cache_window,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
@@ -329,6 +349,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             &shared_cache_ledger,
             cache_hit_threshold,
             low_hit_policy,
+            cache_window,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools = AgentContextTools::new(local, Arc::clone(shared))
@@ -359,6 +380,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             &shared_cache_ledger,
             cache_hit_threshold,
             low_hit_policy,
+            cache_window,
         )?;
         (run_headless(turn, model, config)?, None)
     };
@@ -393,6 +415,7 @@ fn build_model(
     cache_ledger: &Arc<Mutex<CacheLedger>>,
     cache_hit_threshold: u32,
     low_hit_policy: LowHitPolicy,
+    cache_window: CacheWindow,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
@@ -404,7 +427,8 @@ fn build_model(
             AgentContextPlanner::new(Arc::clone(shared))
                 .with_cache_ledger(Arc::clone(cache_ledger))
                 .with_hit_threshold_bp(cache_hit_threshold)
-                .with_low_hit_policy(low_hit_policy),
+                .with_low_hit_policy(low_hit_policy)
+                .with_cache_window(cache_window),
         ));
     }
     Ok(Box::new(model))
@@ -463,7 +487,8 @@ fn usage() {
          [--context-budget N] [--context-window N] [--model-max-output N] \\\n    \
          [--supports-reasoning] [--reasoning off|low|medium|high] \\\n    \
          [--context-read-budget N] [--context-read-max N] \\\n    \
-         [--cache-hit-threshold BP] [--cache-low-hit-policy keep|demote]]\n\n\
+         [--cache-hit-threshold BP] [--cache-low-hit-policy keep|demote] \\\n    \
+         [--cache-window-samples N] [--cache-window-ms N]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\

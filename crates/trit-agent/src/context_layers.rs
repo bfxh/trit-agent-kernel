@@ -4,7 +4,7 @@
 //! 权限/scope 校验、模型能力降级、预算选择，以及句柄/摘要/全文的取舍。
 //! 它不调用模型，也不把语义判断硬编码成词表。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -223,6 +223,8 @@ pub enum ReasoningEffort {
 pub struct ModelProfile {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub provider: String,
     pub context_window: u64,
     #[serde(default)]
     pub max_output_tokens: u64,
@@ -486,12 +488,80 @@ pub struct InclusionReceipt {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheObservation {
     #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
     pub model: String,
     pub prefix_fingerprint: String,
     pub prompt_tokens: u64,
     pub cache_hit_tokens: u64,
     pub cache_miss_tokens: u64,
     pub estimated: bool,
+    #[serde(default)]
+    pub observed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSample {
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub estimated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheWindow {
+    pub max_samples: usize,
+    pub max_age_ms: Option<u64>,
+}
+
+impl Default for CacheWindow {
+    fn default() -> Self {
+        Self {
+            max_samples: 64,
+            max_age_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheWindowStats {
+    pub samples: u64,
+    pub exact_samples: u64,
+    pub cache_hit_tokens: u64,
+    pub cache_miss_tokens: u64,
+    pub exact_hit_tokens: u64,
+    pub exact_miss_tokens: u64,
+}
+
+impl CacheWindowStats {
+    pub fn hit_rate_bp(&self) -> u32 {
+        let input = self.cache_hit_tokens.saturating_add(self.cache_miss_tokens);
+        if input == 0 {
+            0
+        } else {
+            ((u128::from(self.cache_hit_tokens) * 10_000) / u128::from(input)) as u32
+        }
+    }
+
+    pub fn calibrated_hit_rate_bp(&self) -> u32 {
+        let input = self.exact_hit_tokens.saturating_add(self.exact_miss_tokens);
+        if input == 0 {
+            0
+        } else {
+            ((u128::from(self.exact_hit_tokens) * 10_000) / u128::from(input)) as u32
+        }
+    }
+
+    pub fn confidence(&self) -> Ternary {
+        if self.exact_samples >= 3 {
+            Ternary::True
+        } else if self.exact_samples > 0 {
+            Ternary::Unknown
+        } else {
+            Ternary::False
+        }
+    }
 }
 
 impl CacheObservation {
@@ -515,6 +585,9 @@ pub struct CacheStat {
     /// 仅精确样本的 hit/miss，用于校准。
     pub exact_hit_tokens: u64,
     pub exact_miss_tokens: u64,
+    /// 最近样本（用于时间/样本窗口校准）；旧日志无时间戳也会保留。
+    #[serde(default)]
+    pub recent: VecDeque<CacheSample>,
 }
 
 impl CacheStat {
@@ -536,6 +609,15 @@ impl CacheStat {
 
     pub fn observe(&mut self, observation: &CacheObservation) {
         self.samples = self.samples.saturating_add(1);
+        self.recent.push_back(CacheSample {
+            at_ms: observation.observed_at_ms,
+            cache_hit_tokens: observation.cache_hit_tokens,
+            cache_miss_tokens: observation.cache_miss_tokens,
+            estimated: observation.estimated,
+        });
+        while self.recent.len() > MAX_RECENT_CACHE_SAMPLES {
+            self.recent.pop_front();
+        }
         self.cache_hit_tokens = self
             .cache_hit_tokens
             .saturating_add(observation.cache_hit_tokens);
@@ -582,7 +664,37 @@ impl CacheStat {
             Ternary::False
         }
     }
+
+    pub fn windowed(&self, now_ms: Option<u64>, window: CacheWindow) -> CacheWindowStats {
+        let mut stats = CacheWindowStats::default();
+        for sample in self.recent.iter().rev().take(window.max_samples.max(1)) {
+            if let (Some(max_age), Some(now), Some(at)) = (window.max_age_ms, now_ms, sample.at_ms)
+                && now.saturating_sub(at) > max_age
+            {
+                continue;
+            }
+            stats.samples = stats.samples.saturating_add(1);
+            stats.cache_hit_tokens = stats
+                .cache_hit_tokens
+                .saturating_add(sample.cache_hit_tokens);
+            stats.cache_miss_tokens = stats
+                .cache_miss_tokens
+                .saturating_add(sample.cache_miss_tokens);
+            if !sample.estimated {
+                stats.exact_samples = stats.exact_samples.saturating_add(1);
+                stats.exact_hit_tokens = stats
+                    .exact_hit_tokens
+                    .saturating_add(sample.cache_hit_tokens);
+                stats.exact_miss_tokens = stats
+                    .exact_miss_tokens
+                    .saturating_add(sample.cache_miss_tokens);
+            }
+        }
+        stats
+    }
 }
+
+const MAX_RECENT_CACHE_SAMPLES: usize = 256;
 
 /// 按 prefix fingerprint 聚合实际 cache 观测；用于把计划层 hit_potential
 /// 校准成可验证的命中率。
@@ -595,6 +707,7 @@ impl CacheLedger {
     pub fn observe(&mut self, observation: &CacheObservation) {
         self.entries
             .entry(cache_key(
+                &observation.provider,
                 &observation.model,
                 &observation.prefix_fingerprint,
             ))
@@ -608,8 +721,14 @@ impl CacheLedger {
         }
     }
 
-    pub fn stat_for(&self, model: &str, prefix_fingerprint: &str) -> Option<&CacheStat> {
-        self.entries.get(&cache_key(model, prefix_fingerprint))
+    pub fn stat_for(
+        &self,
+        provider: &str,
+        model: &str,
+        prefix_fingerprint: &str,
+    ) -> Option<&CacheStat> {
+        self.entries
+            .get(&cache_key(provider, model, prefix_fingerprint))
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (&String, &CacheStat)> {
@@ -638,11 +757,12 @@ impl CacheLedger {
     /// 用实际观测把某个 prefix 的命中把握折叠成三值；样本不足返回 Unknown。
     pub fn hit_potential_for(
         &self,
+        provider: &str,
         model: &str,
         prefix_fingerprint: &str,
         threshold_bp: u32,
     ) -> Ternary {
-        match self.stat_for(model, prefix_fingerprint) {
+        match self.stat_for(provider, model, prefix_fingerprint) {
             Some(stat) if stat.confidence() == Ternary::True => {
                 Ternary::from_bool(stat.calibrated_hit_rate_bp() >= threshold_bp)
             }
@@ -651,8 +771,8 @@ impl CacheLedger {
     }
 }
 
-fn cache_key(model: &str, prefix_fingerprint: &str) -> String {
-    format!("{model}|{prefix_fingerprint}")
+fn cache_key(provider: &str, model: &str, prefix_fingerprint: &str) -> String {
+    format!("{provider}|{model}|{prefix_fingerprint}")
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,6 +788,8 @@ pub struct ContextPlan {
     pub project: String,
     pub session: String,
     pub model: String,
+    #[serde(default)]
+    pub provider: String,
     pub reasoning: ReasoningEffort,
     pub items: Vec<ContextItem>,
     pub dropped: Vec<DroppedContext>,
@@ -1147,6 +1269,7 @@ pub fn assemble_context(
         project: request.project.clone(),
         session: request.session.clone(),
         model: request.model.name.clone(),
+        provider: request.model.provider.clone(),
         reasoning,
         items,
         dropped,

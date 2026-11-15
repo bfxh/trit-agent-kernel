@@ -269,12 +269,14 @@ fn reopening_a_session_rebuilds_the_cache_ledger() {
     proposal.context_receipt = Some(ContextReceipt {
         inclusion: None,
         cache: Some(CacheObservation {
+            provider: "provider".into(),
             model: "model-x".into(),
             prefix_fingerprint: "fnv1a64:replay".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 80,
             cache_miss_tokens: 20,
             estimated: false,
+            observed_at_ms: None,
         }),
     });
     let mut session = Session::open(
@@ -295,7 +297,7 @@ fn reopening_a_session_rebuilds_the_cache_ledger() {
     let ledger = reopened.cache_ledger();
     let ledger = ledger.lock().unwrap();
     let stat = ledger
-        .stat_for("model-x", "fnv1a64:replay")
+        .stat_for("provider", "model-x", "fnv1a64:replay")
         .expect("replayed ledger should contain the prefix");
     assert_eq!(stat.cache_hit_tokens, 80);
     assert_eq!(stat.cache_miss_tokens, 20);

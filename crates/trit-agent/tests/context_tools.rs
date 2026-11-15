@@ -46,6 +46,7 @@ fn plan_and_context() -> (ContextPlan, InMemoryContext, ContextRequest) {
         budget_tokens: 1_000,
         model: ModelProfile {
             name: "model".into(),
+            provider: "provider".into(),
             context_window: 4_000,
             max_output_tokens: 100,
             supports_tools: true,
@@ -243,12 +244,14 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         let mut ledger = ledger.lock().unwrap();
         for _ in 0..3 {
             ledger.observe(&CacheObservation {
+                provider: "provider".into(),
                 model: "model".into(),
                 prefix_fingerprint: fingerprint.clone(),
                 prompt_tokens: 100,
                 cache_hit_tokens: 80,
                 cache_miss_tokens: 20,
                 estimated: false,
+                observed_at_ms: None,
             });
         }
     }
@@ -265,12 +268,14 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         let mut low = low.lock().unwrap();
         for _ in 0..3 {
             low.observe(&CacheObservation {
+                provider: "provider".into(),
                 model: "model".into(),
                 prefix_fingerprint: fingerprint.clone(),
                 prompt_tokens: 100,
                 cache_hit_tokens: 20,
                 cache_miss_tokens: 80,
                 estimated: false,
+                observed_at_ms: None,
             });
         }
     }

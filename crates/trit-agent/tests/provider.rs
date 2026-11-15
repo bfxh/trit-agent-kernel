@@ -248,12 +248,14 @@ fn context_receipt_is_logged_to_session() {
             hit_potential: trit_orch::Ternary::True,
         }),
         cache: Some(CacheObservation {
+            provider: "https://example.test/v1".into(),
             model: "model-x".into(),
             prefix_fingerprint: "fnv1a64:abc".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 80,
             cache_miss_tokens: 20,
             estimated: false,
+            observed_at_ms: None,
         }),
     };
     let provider = ScriptedProvider::new(vec![ProviderResponse {

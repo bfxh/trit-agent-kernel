@@ -127,15 +127,21 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
   CLI 用 `--context-catalog` 显式启用 planner/catalog；上下文工具只在有 `ContextPlan`
   时向模型暴露，避免默认广告不可执行工具；自主路径用 `AgentContextTools` 包装执行器
   （只读路径可用 `ContextReadTools`）。
-  `AgentHost` 与 `AgentContextPlanner` 共享 `CacheLedger`，按 `model + prefix fingerprint`
-  聚合实际 hit/miss；`--resume` 或重新打开 session 时会从历史 `Proposal.context` 重建
-  ledger，回退/截断后也会重建。同一 model/prefix 至少 3 次**精确**观测后，planner 用
-  精确样本命中率覆盖下一轮 `hit_potential`，并写入 `observed_hit_rate_bp` / `calibration`；
-  `estimated` 样本只进 ledger 总量，不提高校准置信度，也不参与精确命中率。
-  `hit_potential_for(model, prefix, threshold)` 把观测折叠成三值；`--cache-hit-threshold`
-  可调阈值。默认 `--cache-low-hit-policy keep`，只有显式 `demote` 才会在确认低命中时
-  把稳定前缀降级为动态尾段。CLI 结束向 stderr 打印 ledger。
+  `AgentHost` 与 `AgentContextPlanner` 共享 `CacheLedger`，按
+  `provider + model + prefix fingerprint` 聚合实际 hit/miss；`--resume` 或重新打开 session
+  时会从历史 `Proposal.context` 重建 ledger，回退/截断后也会重建。planner 使用
+  `CacheWindow`（最近样本数 + 可选时间窗）内的精确样本，至少 3 次后覆盖下一轮
+  `hit_potential`，并写入 `observed_hit_rate_bp` / `calibration`；`estimated` 样本只进
+  ledger 总量，不提高校准置信度，也不参与精确命中率。
+  `hit_potential_for(provider, model, prefix, threshold)` 把观测折叠成三值；
+  `--cache-hit-threshold`、`--cache-window-samples`、`--cache-window-ms` 可调窗口/阈值。
+  默认 `--cache-low-hit-policy keep`，只有显式 `demote` 才会在确认低命中时把稳定前缀
+  降级为动态尾段。CLI 结束向 stderr 打印 ledger。
 - 边界：token 仍是粗估；校准用最大值而非分位数；“印象”只比较 revision/hash，不做语义 diff。
+
+- 旧 session 若没有 `Proposal.context`（早期日志/第三方日志），无法还原当时的 cache 观测；
+  ledger 只能从已有 receipt 重建，缺失部分按无观测处理。
+- ledger 是 session 派生的内存视图，不是独立持久化数据库；进程内按 session 重建。
 
 ### 3.6 非目标
 

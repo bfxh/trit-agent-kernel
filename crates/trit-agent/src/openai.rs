@@ -346,17 +346,26 @@ fn attach_context_receipt(response: &mut ProviderResponse, request: &ProviderReq
         return;
     };
     let cache = CacheObservation {
+        provider: plan.provider.clone(),
         model: plan.model.clone(),
         prefix_fingerprint: plan.cache.prefix_fingerprint.clone(),
         prompt_tokens: response.usage.prompt_tokens,
         cache_hit_tokens: response.usage.cache_hit_tokens,
         cache_miss_tokens: response.usage.cache_miss_tokens,
         estimated: response.usage.estimated,
+        observed_at_ms: now_ms(),
     };
     response.context = Some(ContextReceipt {
         inclusion: Some(plan.inclusion_receipt()),
         cache: Some(cache),
     });
+}
+
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
 }
 
 fn parse_prefix(value: &Value) -> Option<PrefixSignal> {
@@ -532,6 +541,7 @@ mod tests {
             project: "p1".into(),
             session: "s1".into(),
             model: "model-x".into(),
+            provider: "https://example.test/v1".into(),
             reasoning: ReasoningEffort::Off,
             items: vec![
                 ContextItem {

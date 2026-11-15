@@ -27,8 +27,8 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
 - 分层上下文组装初版：`Session/Project/Shared` scope、引用句柄、稳定前缀/动态尾段、印象对比、三值 autonomy、模型/推理 profile 与真实 usage 校准。
 - Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息；`context_search` / `context_add` / `context_read` 让 agent 自主搜索、加入动态上下文并读取句柄；inclusion receipt、实际 cache hit/miss 与按 prefix 聚合的 cache ledger 会被记录。
-- CLI：`--context-catalog <json>` 启用 agent 自主上下文；`--context-read-budget` / `--context-read-max` 限制单轮/单次读取；`--cache-hit-threshold` / `--cache-low-hit-policy keep|demote` 控制校准与低命中策略；运行结束向 stderr 输出 cache ledger。
-- Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 model + prefix 聚合、只使用精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一 model/prefix 至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`。
+- CLI：`--context-catalog <json>` 启用 agent 自主上下文；`--context-read-budget` / `--context-read-max` 限制单轮/单次读取；`--cache-hit-threshold`、`--cache-low-hit-policy`、`--cache-window-samples`/`--cache-window-ms` 控制校准窗口与低命中策略；运行结束向 stderr 输出 cache ledger。
+- Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 provider + model + prefix 聚合、只用窗口内精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一桶至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`。
 - 无头 agent：OpenAI-compatible provider、scripted replay、session JSONL、`--resume`。
 - 文件级 checkpoint/rewind：预检、symlink/类型拒绝、应用失败逆序回滚。
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。

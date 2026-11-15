@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::context_layers::{
-    AgentContext, CacheLedger, ContextCatalog, ContextDetail, ContextPlan, ContextSpan,
+    AgentContext, CacheLedger, CacheWindow, ContextCatalog, ContextDetail, ContextPlan, ContextSpan,
 };
 use crate::provider::ContextPlanner;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest, TurnContext};
@@ -278,6 +278,7 @@ pub struct AgentContextPlanner<R> {
     cache_ledger: Option<Arc<Mutex<CacheLedger>>>,
     hit_threshold_bp: u32,
     low_hit_policy: LowHitPolicy,
+    cache_window: CacheWindow,
 }
 
 impl<R> AgentContextPlanner<R> {
@@ -287,6 +288,7 @@ impl<R> AgentContextPlanner<R> {
             cache_ledger: None,
             hit_threshold_bp: 5_000,
             low_hit_policy: LowHitPolicy::Keep,
+            cache_window: CacheWindow::default(),
         }
     }
 
@@ -302,6 +304,11 @@ impl<R> AgentContextPlanner<R> {
 
     pub fn with_low_hit_policy(mut self, low_hit_policy: LowHitPolicy) -> Self {
         self.low_hit_policy = low_hit_policy;
+        self
+    }
+
+    pub fn with_cache_window(mut self, cache_window: CacheWindow) -> Self {
+        self.cache_window = cache_window;
         self
     }
 }
@@ -322,14 +329,15 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
             let cache_ledger = cache_ledger
                 .lock()
                 .map_err(|_| AgentError::Tool("cache ledger poisoned".into()))?;
-            if let Some(stat) = cache_ledger.stat_for(&plan.model, &plan.cache.prefix_fingerprint) {
-                plan.cache.observed_hit_rate_bp = Some(stat.calibrated_hit_rate_bp());
-                plan.cache.calibration = stat.confidence();
-                if stat.confidence() == trit_orch::Ternary::True {
-                    plan.cache.hit_potential = cache_ledger.hit_potential_for(
-                        &plan.model,
-                        &plan.cache.prefix_fingerprint,
-                        self.hit_threshold_bp,
+            if let Some(stat) =
+                cache_ledger.stat_for(&plan.provider, &plan.model, &plan.cache.prefix_fingerprint)
+            {
+                let window = stat.windowed(now_ms(), self.cache_window);
+                plan.cache.observed_hit_rate_bp = Some(window.calibrated_hit_rate_bp());
+                plan.cache.calibration = window.confidence();
+                if window.confidence() == trit_orch::Ternary::True {
+                    plan.cache.hit_potential = trit_orch::Ternary::from_bool(
+                        window.calibrated_hit_rate_bp() >= self.hit_threshold_bp,
                     );
                     if plan.cache.hit_potential == trit_orch::Ternary::False
                         && self.low_hit_policy == LowHitPolicy::DemotePrefix
@@ -341,6 +349,13 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
         }
         Ok(Some(plan))
     }
+}
+
+fn now_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
 }
 
 fn outcome(request: &ToolRequest, output: String) -> ToolOutcome {

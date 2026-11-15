@@ -40,6 +40,7 @@ fn document(id: &str, full: &str, summary: Option<&str>, tokens: Option<u64>) ->
 fn model(tools: bool, reasoning: bool) -> ModelProfile {
     ModelProfile {
         name: "test-model".into(),
+        provider: "test-provider".into(),
         context_window: 20_000,
         max_output_tokens: 1_000,
         supports_tools: tools,
@@ -704,24 +705,26 @@ fn cache_ledger_calibrates_prefix_hit_potential_from_real_observations() {
     let mut ledger = trit_agent::CacheLedger::default();
     for _ in 0..3 {
         ledger.observe(&trit_agent::CacheObservation {
+            provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:ok".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 80,
             cache_miss_tokens: 20,
             estimated: false,
+            observed_at_ms: None,
         });
     }
     assert_eq!(
-        ledger.hit_potential_for("m", "fnv1a64:ok", 5_000),
+        ledger.hit_potential_for("p", "m", "fnv1a64:ok", 5_000),
         Ternary::True
     );
     assert_eq!(
-        ledger.hit_potential_for("m", "fnv1a64:ok", 9_000),
+        ledger.hit_potential_for("p", "m", "fnv1a64:ok", 9_000),
         Ternary::False
     );
     assert_eq!(
-        ledger.hit_potential_for("m", "fnv1a64:missing", 5_000),
+        ledger.hit_potential_for("p", "m", "fnv1a64:missing", 5_000),
         Ternary::Unknown
     );
 }
@@ -731,29 +734,94 @@ fn estimated_cache_samples_do_not_move_calibrated_rate() {
     let mut ledger = trit_agent::CacheLedger::default();
     for _ in 0..3 {
         ledger.observe(&trit_agent::CacheObservation {
+            provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:mixed".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 20,
             cache_miss_tokens: 80,
             estimated: false,
+            observed_at_ms: None,
         });
     }
     for _ in 0..10 {
         ledger.observe(&trit_agent::CacheObservation {
+            provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:mixed".into(),
             prompt_tokens: 100,
             cache_hit_tokens: 100,
             cache_miss_tokens: 0,
             estimated: true,
+            observed_at_ms: None,
         });
     }
-    let stat = ledger.stat_for("m", "fnv1a64:mixed").unwrap();
+    let stat = ledger.stat_for("p", "m", "fnv1a64:mixed").unwrap();
     assert_eq!(stat.hit_rate_bp(), 8_153);
     assert_eq!(stat.calibrated_hit_rate_bp(), 2000);
     assert_eq!(
-        ledger.hit_potential_for("m", "fnv1a64:mixed", 5000),
+        ledger.hit_potential_for("p", "m", "fnv1a64:mixed", 5000),
+        Ternary::False
+    );
+}
+
+#[test]
+fn cache_window_excludes_old_samples() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    for (at, hit, miss) in [
+        (1_000, 20, 80),
+        (1_000, 20, 80),
+        (1_000, 20, 80),
+        (10_000, 80, 20),
+        (10_000, 80, 20),
+        (10_000, 80, 20),
+    ] {
+        ledger.observe(&trit_agent::CacheObservation {
+            provider: "p".into(),
+            model: "m".into(),
+            prefix_fingerprint: "fnv1a64:window".into(),
+            prompt_tokens: 100,
+            cache_hit_tokens: hit,
+            cache_miss_tokens: miss,
+            estimated: false,
+            observed_at_ms: Some(at),
+        });
+    }
+    let stat = ledger.stat_for("p", "m", "fnv1a64:window").unwrap();
+    let window = stat.windowed(
+        Some(10_000),
+        trit_agent::CacheWindow {
+            max_samples: 64,
+            max_age_ms: Some(5_000),
+        },
+    );
+    assert_eq!(window.calibrated_hit_rate_bp(), 8_000);
+    assert_eq!(window.confidence(), Ternary::True);
+}
+
+#[test]
+fn cache_ledger_separates_provider_endpoints() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    for (provider, hit, miss) in [("https://a", 80, 20), ("https://b", 20, 80)] {
+        for _ in 0..3 {
+            ledger.observe(&trit_agent::CacheObservation {
+                provider: provider.into(),
+                model: "same-model".into(),
+                prefix_fingerprint: "fnv1a64:same".into(),
+                prompt_tokens: 100,
+                cache_hit_tokens: hit,
+                cache_miss_tokens: miss,
+                estimated: false,
+                observed_at_ms: None,
+            });
+        }
+    }
+    assert_eq!(
+        ledger.hit_potential_for("https://a", "same-model", "fnv1a64:same", 5_000),
+        Ternary::True
+    );
+    assert_eq!(
+        ledger.hit_potential_for("https://b", "same-model", "fnv1a64:same", 5_000),
         Ternary::False
     );
 }
