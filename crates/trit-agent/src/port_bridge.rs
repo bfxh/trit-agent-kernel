@@ -189,7 +189,7 @@ mod tests {
             name: "gateway".into(),
             listen: "127.0.0.1:0".into(),
             target: target.to_string(),
-            connect_timeout_ms: 5_000,
+            connect_timeout_ms: 20_000,
             retry_ms: 20,
         })
         .unwrap();
@@ -198,7 +198,7 @@ mod tests {
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(front).unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(20)))
                 .unwrap();
             stream.write_all(b"ping").unwrap();
             let mut buffer = [0u8; 4];

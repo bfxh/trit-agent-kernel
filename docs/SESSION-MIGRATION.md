@@ -133,6 +133,8 @@ CLI 通过 `--supervisor-config <json>` 接入：
   "mcp": [{"name": "tools", "program": "mcp-server", "args": []}],
   "bridges": [{"name": "front", "listen": "127.0.0.1:8080", "target": "127.0.0.1:18080"}],
   "roots": [{"uri": "file:///workspace", "name": "workspace"}],
+  "roots_watch": ["/srv/workspaces"],
+  "roots_watch_interval_ms": 1000,
   "log_level": "info",
   "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
   "interval_ms": 500,
@@ -146,13 +148,15 @@ CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结
 （`--mcp-sampling-model` 可覆盖模型）；库模式仍可注入自定义 `SamplingHandler`。
 
 边界：采样使用配置模型（库模式 `with_model_hints(true)` 才会采用 server 的 model hint），
-`maxTokens` 受 `max_output_tokens` 上限约束；支持 text、image、resource-text，audio 与
-`includeContext` 不额外注入，遇到不支持的内容会 fail closed 返回 JSON-RPC error。roots
-不会自动监控文件系统，宿主需调用 `set_roots` 才会发变更通知。MCP logging 通知会入队，
-`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接只保证前端监听口不断开，
-已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；后台 loop 仍按 interval
-检查通知与进程状态，但进程退出检测本身是 OS wait 事件；恢复包是自定义通知，服务端
-不支持时应忽略而不是断连。
+`maxTokens` 受 `max_output_tokens` 上限约束；支持 text、image、audio（映射到 OpenAI
+`input_audio`）、resource-text，未知内容 fail closed。`includeContext=thisServer/allServers`
+会把受管 MCP 的 roots/tools/resources/prompts 元数据注入 systemPrompt，总长限制 6000
+字符，不读取资源正文。`roots_watch` 轮询监视目录的直接子目录，变化时自动更新 roots 并
+发送 `notifications/roots/list_changed`，不递归、只把目录作为 root。MCP logging 通知会
+入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接只保证前端监听口
+不断开，已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；后台 loop 仍按
+interval 检查通知与进程状态，但进程退出检测本身是 OS wait 事件；恢复包是自定义通知，
+服务端不支持时应忽略而不是断连。
 
 ## 8. 当前边界
 
@@ -161,4 +165,5 @@ CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结
 - 旧版本摘要不重新生成，因此迁移不会“变聪明”，只保证不丢已有信息。
 - 钩子运行时不在本仓库；MCP 客户端已覆盖握手、工具/资源/提示词发现与调用、
   sampling/roots 服务端请求应答、roots 变更通知与 logging 级别设置。
+- roots 文件监听是轮询而非 OS inotify/FSEvents；只扫描一级子目录，不读取文件内容。
 - 端口桥接只覆盖新连接的等待与重试；没有连接排空、FD 交接或请求级重放。

@@ -100,6 +100,10 @@ fn default_mcp_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_roots_watch_interval_ms() -> u64 {
+    1_000
+}
+
 /// 宿主/CLI 的 supervisor 声明；可直接从 JSON 解析。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorConfig {
@@ -111,6 +115,11 @@ pub struct SupervisorConfig {
     pub bridges: Vec<PortBridgeSpec>,
     #[serde(default)]
     pub roots: Vec<McpRoot>,
+    /// 监视这些目录的直接子目录，自动生成 roots 并发送 roots/list_changed。
+    #[serde(default)]
+    pub roots_watch: Vec<std::path::PathBuf>,
+    #[serde(default = "default_roots_watch_interval_ms")]
+    pub roots_watch_interval_ms: u64,
     #[serde(default)]
     pub log_level: Option<McpLogLevel>,
     #[serde(default)]
@@ -128,6 +137,8 @@ impl Default for SupervisorConfig {
             mcp: Vec::new(),
             bridges: Vec::new(),
             roots: Vec::new(),
+            roots_watch: Vec::new(),
+            roots_watch_interval_ms: default_roots_watch_interval_ms(),
             log_level: None,
             restart: RestartPolicy::default(),
             interval_ms: default_interval_ms(),
@@ -406,13 +417,33 @@ impl McpNotificationState {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct McpContextSnapshot {
+    pub server: String,
+    pub roots: Vec<McpRoot>,
+    pub tools: Vec<McpTool>,
+    pub resources: Vec<McpResource>,
+    pub prompts: Vec<McpPrompt>,
+}
+
+type McpContextRegistry = Arc<Mutex<std::collections::BTreeMap<String, McpContextSnapshot>>>;
+
 #[derive(Clone, Default)]
 struct McpFeatures {
     sampling: Option<Arc<dyn SamplingHandler>>,
     roots: Arc<Mutex<Vec<McpRoot>>>,
+    server: String,
+    context_registry: Arc<Mutex<std::collections::BTreeMap<String, McpContextSnapshot>>>,
 }
 
 impl McpFeatures {
+    fn new(server: impl Into<String>) -> Self {
+        Self {
+            server: server.into(),
+            ..Self::default()
+        }
+    }
+
     fn capabilities(&self) -> serde_json::Value {
         let mut capabilities = serde_json::json!({
             "roots": {"listChanged": true}
@@ -450,9 +481,13 @@ fn server_request_response(
             Ok(serde_json::json!({"roots": roots}))
         }
         "sampling/createMessage" => match &features.sampling {
-            Some(handler) => handler
-                .create_message(params)
-                .map_err(|message| (-32000, message)),
+            Some(handler) => {
+                let mut params = params;
+                inject_sampling_context(features, &mut params);
+                handler
+                    .create_message(params)
+                    .map_err(|message| (-32000, message))
+            }
             None => Err((-32601, "sampling/createMessage is not supported".to_owned())),
         },
         "ping" => Ok(serde_json::json!({})),
@@ -464,6 +499,79 @@ fn server_request_response(
             serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
         }
     }
+}
+
+fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Value) {
+    let include = params
+        .get("includeContext")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    if include != "thisServer" && include != "allServers" {
+        return;
+    }
+    let Ok(registry) = features.context_registry.lock() else {
+        return;
+    };
+    let mut snapshots: Vec<&McpContextSnapshot> = registry.values().collect();
+    if include == "thisServer" {
+        snapshots.retain(|snapshot| snapshot.server == features.server);
+    } else {
+        snapshots.sort_by(|left, right| left.server.cmp(&right.server));
+    }
+    if snapshots.is_empty() {
+        return;
+    }
+    let mut context = String::from("MCP context available to this request:\n");
+    for snapshot in snapshots {
+        context.push_str(&format!("[{}]\n", snapshot.server));
+        if !snapshot.roots.is_empty() {
+            let roots: Vec<&str> = snapshot
+                .roots
+                .iter()
+                .map(|root| root.uri.as_str())
+                .collect();
+            context.push_str(&format!("roots: {}\n", roots.join(", ")));
+        }
+        if !snapshot.tools.is_empty() {
+            let tools: Vec<&str> = snapshot
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            context.push_str(&format!("tools: {}\n", tools.join(", ")));
+        }
+        if !snapshot.resources.is_empty() {
+            let resources: Vec<String> = snapshot
+                .resources
+                .iter()
+                .map(|resource| format!("{} ({})", resource.uri, resource.name))
+                .collect();
+            context.push_str(&format!("resources: {}\n", resources.join(", ")));
+        }
+        if !snapshot.prompts.is_empty() {
+            let prompts: Vec<&str> = snapshot
+                .prompts
+                .iter()
+                .map(|prompt| prompt.name.as_str())
+                .collect();
+            context.push_str(&format!("prompts: {}\n", prompts.join(", ")));
+        }
+    }
+    const MAX_CONTEXT_CHARS: usize = 6000;
+    if context.chars().count() > MAX_CONTEXT_CHARS {
+        context = context.chars().take(MAX_CONTEXT_CHARS).collect();
+        context.push_str("...");
+    }
+    let system = params
+        .get("systemPrompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let combined = if system.is_empty() {
+        context
+    } else {
+        format!("{system}\n\n{context}")
+    };
+    params["systemPrompt"] = serde_json::Value::String(combined);
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1103,6 +1211,7 @@ pub struct McpSupervisor {
 
 impl McpSupervisor {
     pub fn new(spec: ProcessSpec, policy: RestartPolicy) -> Self {
+        let server = spec.name.clone();
         Self {
             spec,
             policy,
@@ -1113,7 +1222,7 @@ impl McpSupervisor {
             resource_templates: Vec::new(),
             prompts: Vec::new(),
             notifications: Arc::new(McpNotificationState::default()),
-            features: McpFeatures::default(),
+            features: McpFeatures::new(server),
             log_level: None,
             launched: false,
             restarts: 0,
@@ -1137,6 +1246,30 @@ impl McpSupervisor {
     pub fn with_log_level(mut self, level: McpLogLevel) -> Self {
         self.log_level = Some(level);
         self
+    }
+
+    fn with_context_registry(mut self, registry: McpContextRegistry) -> Self {
+        self.features.context_registry = registry;
+        self
+    }
+
+    fn sync_context(&self) {
+        let snapshot = McpContextSnapshot {
+            server: self.spec.name.clone(),
+            roots: self.roots(),
+            tools: self.tools.clone(),
+            resources: self.resources.clone(),
+            prompts: self.prompts.clone(),
+        };
+        if let Ok(mut registry) = self.features.context_registry.lock() {
+            registry.insert(self.spec.name.clone(), snapshot);
+        }
+    }
+
+    fn clear_context(&self) {
+        if let Ok(mut registry) = self.features.context_registry.lock() {
+            registry.remove(&self.spec.name);
+        }
     }
 
     /// 声明 sampling handler；握手时会向服务端广告 sampling capability。
@@ -1189,6 +1322,7 @@ impl McpSupervisor {
         {
             self.connected()?.notify_roots_changed()?;
         }
+        self.sync_context();
         Ok(())
     }
 
@@ -1234,6 +1368,7 @@ impl McpSupervisor {
         let was_connected = self.launched;
         if was_connected && self.restarts >= self.policy.max_attempts {
             self.connection = None;
+            self.clear_context();
             return Ok(McpStatus::GaveUp);
         }
         self.connection = None;
@@ -1261,6 +1396,7 @@ impl McpSupervisor {
         self.prompts = connection.prompts.clone();
         self.connection = Some(connection);
         self.launched = true;
+        self.sync_context();
         if was_connected {
             Ok(McpStatus::Reconnected)
         } else {
@@ -1315,6 +1451,7 @@ impl McpSupervisor {
             connection.tools = tools.clone();
         }
         self.tools = tools;
+        self.sync_context();
         Ok(&self.tools)
     }
 
@@ -1332,6 +1469,7 @@ impl McpSupervisor {
         }
         self.resources = resources;
         self.resource_templates = templates;
+        self.sync_context();
         Ok(&self.resources)
     }
 
@@ -1347,6 +1485,7 @@ impl McpSupervisor {
             connection.prompts = prompts.clone();
         }
         self.prompts = prompts;
+        self.sync_context();
         Ok(&self.prompts)
     }
 
@@ -1386,6 +1525,7 @@ impl McpSupervisor {
             }
             self.prompts = prompts;
         }
+        self.sync_context();
         Ok(())
     }
 
@@ -1456,10 +1596,12 @@ impl McpSupervisor {
         self.connection = None;
         self.launched = false;
         self.restarts = 0;
+        self.clear_context();
     }
 
     pub fn stop(&mut self) {
         self.stopped = true;
+        self.clear_context();
         if let Some(mut connection) = self.connection.take() {
             connection.stop();
         }
@@ -1546,6 +1688,118 @@ impl Drop for SupervisorLoop {
     }
 }
 
+fn path_to_root_uri(path: &std::path::Path) -> String {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = absolute.to_string_lossy().replace('\\', "/");
+    format!("file:///{}", text.trim_start_matches('/'))
+}
+
+fn scan_watch_roots(paths: &[std::path::PathBuf]) -> Vec<McpRoot> {
+    let mut roots = std::collections::BTreeMap::new();
+    for base in paths {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let is_dir = entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false);
+            if !is_dir {
+                continue;
+            }
+            let path = entry.path();
+            let uri = path_to_root_uri(&path);
+            roots.entry(uri.clone()).or_insert(McpRoot {
+                uri,
+                name: entry.file_name().to_str().map(str::to_owned),
+            });
+        }
+    }
+    roots.into_values().collect()
+}
+
+fn merge_roots(static_roots: Vec<McpRoot>, watched: Vec<McpRoot>) -> Vec<McpRoot> {
+    let mut roots = std::collections::BTreeMap::new();
+    for root in static_roots.into_iter().chain(watched) {
+        roots.entry(root.uri.clone()).or_insert(root);
+    }
+    roots.into_values().collect()
+}
+
+fn watch_roots<F>(
+    paths: Vec<std::path::PathBuf>,
+    static_roots: Vec<McpRoot>,
+    interval: Duration,
+    initial: Vec<McpRoot>,
+    stop: Arc<AtomicBool>,
+    mut on_change: F,
+) -> JoinHandle<()>
+where
+    F: FnMut(Vec<McpRoot>) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut last = initial;
+        while !stop.load(Ordering::Relaxed) {
+            let roots = merge_roots(static_roots.clone(), scan_watch_roots(&paths));
+            if roots != last {
+                last = roots.clone();
+                on_change(roots);
+            }
+            std::thread::sleep(interval);
+        }
+    })
+}
+
+struct RootsWatchHandle {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl RootsWatchHandle {
+    fn start(
+        paths: Vec<std::path::PathBuf>,
+        static_roots: Vec<McpRoot>,
+        interval: Duration,
+        initial: Vec<McpRoot>,
+        supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = watch_roots(
+            paths,
+            static_roots,
+            interval,
+            initial,
+            thread_stop,
+            move |roots| {
+                for supervisor in &supervisors {
+                    if let Ok(mut supervisor) = supervisor.lock() {
+                        let _ = supervisor.set_roots(roots.clone());
+                    }
+                }
+            },
+        );
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RootsWatchHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// 一组 gateway/MCP sidecar：启动一次，后台持续重启/重连，drop 时全部停止。
 pub struct SupervisorRuntime {
     bridges: Vec<PortBridge>,
@@ -1553,6 +1807,7 @@ pub struct SupervisorRuntime {
     mcps: Vec<Arc<Mutex<McpSupervisor>>>,
     recovery: Arc<Mutex<RecoveryContext>>,
     loops: Vec<SupervisorLoop>,
+    roots_watch: Option<RootsWatchHandle>,
 }
 
 impl SupervisorRuntime {
@@ -1577,6 +1832,7 @@ impl SupervisorRuntime {
             mcps: Vec::new(),
             recovery: Arc::new(Mutex::new(recovery)),
             loops: Vec::new(),
+            roots_watch: None,
         };
         for spec in &config.bridges {
             let bridge = PortBridge::start(spec).map_err(|error| SupervisorError::Port {
@@ -1603,10 +1859,15 @@ impl SupervisorRuntime {
             ));
             runtime.gateways.push(supervisor);
         }
+        let context_registry: McpContextRegistry =
+            Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+        let initial_roots =
+            merge_roots(config.roots.clone(), scan_watch_roots(&config.roots_watch));
         for spec in &config.mcp {
             let supervisor = McpSupervisor::new(spec.clone(), config.restart)
                 .with_timeout(timeout)
-                .with_roots(config.roots.clone());
+                .with_roots(initial_roots.clone())
+                .with_context_registry(Arc::clone(&context_registry));
             let supervisor = match config.log_level {
                 Some(level) => supervisor.with_log_level(level),
                 None => supervisor,
@@ -1638,6 +1899,15 @@ impl SupervisorRuntime {
             ));
             runtime.mcps.push(supervisor);
         }
+        if !config.roots_watch.is_empty() && !runtime.mcps.is_empty() {
+            runtime.roots_watch = Some(RootsWatchHandle::start(
+                config.roots_watch.clone(),
+                config.roots.clone(),
+                Duration::from_millis(config.roots_watch_interval_ms.max(50)),
+                initial_roots,
+                runtime.mcps.clone(),
+            ));
+        }
         Ok(runtime)
     }
 
@@ -1664,6 +1934,9 @@ impl SupervisorRuntime {
     }
 
     pub fn stop(&mut self) {
+        if let Some(mut watch) = self.roots_watch.take() {
+            watch.stop();
+        }
         while let Some(mut loop_handle) = self.loops.pop() {
             loop_handle.stop();
         }
@@ -1778,6 +2051,112 @@ mod tests {
             recovery.validate(),
             Err(SupervisorError::RecoveryRejected(_))
         ));
+    }
+
+    #[test]
+    fn roots_watch_detects_directory_changes() {
+        let base = std::env::temp_dir().join(format!(
+            "trit-roots-watch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws1")).unwrap();
+        let initial = scan_watch_roots(std::slice::from_ref(&base));
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].uri.starts_with("file:///"));
+        assert!(!initial[0].uri.contains("?/"));
+        assert!(initial[0].uri.ends_with("ws1"));
+
+        let (sender, updates) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = watch_roots(
+            vec![base.clone()],
+            Vec::new(),
+            Duration::from_millis(20),
+            initial,
+            Arc::clone(&stop),
+            move |roots| {
+                let _ = sender.send(roots);
+            },
+        );
+
+        std::fs::create_dir_all(base.join("ws2")).unwrap();
+        let roots = updates.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(roots.iter().any(|root| root.uri.ends_with("ws2")));
+
+        std::fs::remove_dir_all(base.join("ws2")).unwrap();
+        let roots = updates.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!roots.iter().any(|root| root.uri.ends_with("ws2")));
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sampling_context_injection_respects_scope() {
+        let features = McpFeatures::new("server-a");
+        {
+            let mut registry = features.context_registry.lock().unwrap();
+            registry.insert(
+                "server-a".into(),
+                McpContextSnapshot {
+                    server: "server-a".into(),
+                    roots: vec![McpRoot {
+                        uri: "file:///a".into(),
+                        name: None,
+                    }],
+                    tools: vec![McpTool {
+                        name: "tool-a".into(),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                    }],
+                    resources: vec![McpResource {
+                        uri: "file:///a/doc".into(),
+                        name: "doc-a".into(),
+                        ..McpResource::default()
+                    }],
+                    prompts: vec![McpPrompt {
+                        name: "prompt-a".into(),
+                        ..McpPrompt::default()
+                    }],
+                },
+            );
+            registry.insert(
+                "server-b".into(),
+                McpContextSnapshot {
+                    server: "server-b".into(),
+                    tools: vec![McpTool {
+                        name: "tool-b".into(),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                    }],
+                    ..McpContextSnapshot::default()
+                },
+            );
+        }
+
+        let mut params = serde_json::json!({
+            "includeContext": "thisServer",
+            "systemPrompt": "base"
+        });
+        inject_sampling_context(&features, &mut params);
+        let system = params["systemPrompt"].as_str().unwrap();
+        assert!(system.starts_with("base\n\n"));
+        assert!(system.contains("tool-a"));
+        assert!(!system.contains("tool-b"));
+
+        let mut params = serde_json::json!({"includeContext": "allServers"});
+        inject_sampling_context(&features, &mut params);
+        let system = params["systemPrompt"].as_str().unwrap();
+        assert!(system.contains("tool-a"));
+        assert!(system.contains("tool-b"));
+        assert!(system.contains("file:///a/doc"));
+
+        let mut params = serde_json::json!({"includeContext": "none"});
+        inject_sampling_context(&features, &mut params);
+        assert!(params.get("systemPrompt").is_none());
     }
 
     #[test]
@@ -1900,6 +2279,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$log"; done
                 r#"$log = $env:TRIT_MCP_STUB_LOG
 $greeted = $false
 $notified = $false
+$resampled = $false
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   [IO.File]::AppendAllText($log, $line + "`n")
   $id = 0
@@ -1932,6 +2312,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
   } elseif ($line -like '*"method":"tools/call"*') {
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"ok"}]}}')
+    if (-not $resampled) {
+      Write-Output '{"jsonrpc":"2.0","id":903,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":"context?"}],"maxTokens":16,"includeContext":"allServers"}}'
+      $resampled = $true
+    }
   } elseif ($line -like '*"method":"resources/templates/list"*') {
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"file-template","description":"File","mimeType":"text/plain"}]}}')
   } elseif ($line -like '*"method":"resources/list"*') {
@@ -1966,6 +2350,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 log="$TRIT_MCP_STUB_LOG"
 greeted=0
 notified=0
+resampled=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -1992,7 +2377,12 @@ while IFS= read -r line; do
         printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"stub","data":{"message":"hi"}}}'
         notified=1
       fi ;;
-    *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+    *'"method":"tools/call"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"ok"}]}}'
+      if [ "$resampled" -eq 0 ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":903,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":"context?"}],"maxTokens":16,"includeContext":"allServers"}}'
+        resampled=1
+      fi ;;
     *'"method":"resources/templates/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"file-template","description":"File","mimeType":"text/plain"}]}}' ;;
     *'"method":"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5}]}}' ;;
     *'"method":"resources/read"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}' ;;
@@ -2021,6 +2411,8 @@ done
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("mcp-tool-stub.log");
+        let sampled_requests = Arc::new(Mutex::new(Vec::new()));
+        let sampled = Arc::clone(&sampled_requests);
         let mut supervisor = McpSupervisor::new(
             mcp_tool_stub_spec(&dir, &log),
             RestartPolicy {
@@ -2033,8 +2425,9 @@ done
             uri: "file:///workspace".into(),
             name: Some("workspace".into()),
         }])
-        .with_sampling_handler(|request: serde_json::Value| {
+        .with_sampling_handler(move |request: serde_json::Value| {
             assert_eq!(request["maxTokens"].as_u64(), Some(16));
+            sampled.lock().unwrap().push(request.clone());
             Ok(serde_json::json!({
                 "role": "assistant",
                 "content": {"type": "text", "text": "sampled"},
@@ -2091,6 +2484,23 @@ done
             )
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
+        let mut saw_context = false;
+        for _ in 0..3000 {
+            saw_context = sampled_requests.lock().unwrap().iter().any(|request| {
+                request["includeContext"] == "allServers"
+                    && request["systemPrompt"].as_str().is_some_and(|system| {
+                        system.contains("file:///doc.txt") && system.contains("echo")
+                    })
+            });
+            if saw_context {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_context,
+            "allServers sampling should receive MCP tool/resource context"
+        );
 
         let resources = supervisor.resources();
         assert_eq!(resources.len(), 1);
@@ -2470,6 +2880,8 @@ done
                 "gateway": [{"name": "gw", "program": "gateway-bin"}],
                 "bridges": [{"name": "front", "listen": "127.0.0.1:0", "target": "127.0.0.1:9"}],
                 "roots": [{"uri": "file:///workspace", "name": "workspace"}],
+                "roots_watch": ["/tmp/workspaces"],
+                "roots_watch_interval_ms": 250,
                 "log_level": "warning",
                 "restart": {"max_attempts": 1}
             }"#,
@@ -2483,6 +2895,8 @@ done
         assert_eq!(config.bridges[0].retry_ms, 50);
         assert_eq!(config.roots.len(), 1);
         assert_eq!(config.roots[0].uri, "file:///workspace");
+        assert_eq!(config.roots_watch.len(), 1);
+        assert_eq!(config.roots_watch_interval_ms, 250);
         assert_eq!(config.log_level, Some(McpLogLevel::Warning));
         assert_eq!(config.restart.max_attempts, 1);
         assert_eq!(config.restart.max_backoff_ms, 1_000);
@@ -2506,6 +2920,8 @@ done
             mcp: vec![mcp_stub_spec(&dir, &log)],
             bridges: vec![PortBridgeSpec::new("front", "127.0.0.1:0", "127.0.0.1:9")],
             roots: Vec::new(),
+            roots_watch: Vec::new(),
+            roots_watch_interval_ms: 1_000,
             log_level: Some(McpLogLevel::Info),
             restart: RestartPolicy {
                 max_attempts: 2,

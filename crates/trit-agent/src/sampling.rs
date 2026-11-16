@@ -181,6 +181,27 @@ fn convert_block(block: &Value) -> Result<Value, String> {
                 "image_url": {"url": format!("data:{mime};base64,{data}")}
             }))
         }
+        Some("audio") => {
+            let data = block
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "sampling audio block is missing data".to_owned())?;
+            let mime = block
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "sampling audio block is missing mimeType".to_owned())?;
+            let format = match mime {
+                "audio/wav" | "audio/x-wav" => "wav",
+                "audio/mpeg" | "audio/mp3" => "mp3",
+                other => other
+                    .strip_prefix("audio/")
+                    .ok_or_else(|| format!("unsupported audio mime type: {other}"))?,
+            };
+            Ok(json!({
+                "type": "input_audio",
+                "input_audio": {"data": data, "format": format}
+            }))
+        }
         Some("resource") => block
             .get("resource")
             .and_then(|resource| resource.get("text"))
@@ -258,7 +279,8 @@ mod tests {
         let request = json!({
             "messages": [
                 {"role": "user", "content": {"type": "text", "text": "hello"}},
-                {"role": "user", "content": {"type": "image", "data": "aGk=", "mimeType": "image/png"}}
+                {"role": "user", "content": {"type": "image", "data": "aGk=", "mimeType": "image/png"}},
+                {"role": "user", "content": {"type": "audio", "data": "aGk=", "mimeType": "audio/wav"}}
             ],
             "systemPrompt": "be brief",
             "maxTokens": 32,
@@ -280,6 +302,11 @@ mod tests {
         assert_eq!(
             body["messages"][2]["content"][0]["image_url"]["url"],
             "data:image/png;base64,aGk="
+        );
+        assert_eq!(body["messages"][3]["content"][0]["type"], "input_audio");
+        assert_eq!(
+            body["messages"][3]["content"][0]["input_audio"]["format"],
+            "wav"
         );
 
         let response = json!({

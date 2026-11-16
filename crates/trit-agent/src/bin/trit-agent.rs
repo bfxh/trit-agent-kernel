@@ -656,13 +656,14 @@ fn usage() {
          cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\
          cache-search-scale-bp: scales context_search candidates on low cache hit.\n\
          supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec],\n\
-         bridges:[PortBridgeSpec], roots:[McpRoot], log_level:debug|info|warning|error,\n\
-         restart:{{...}}, interval_ms, mcp_timeout_ms}}; starts supervised sidecars and\n\
+         bridges:[PortBridgeSpec], roots:[McpRoot], roots_watch:[path],\n\
+         roots_watch_interval_ms, log_level:debug|info|warning|error, restart:{{...}},\n\
+         interval_ms, mcp_timeout_ms}}; starts supervised sidecars and\n\
          keep-alive port bridges, restarts them after exit, discovers MCP tools/resources/\n\
          prompts, auto-refreshes list_changed, and reconnects MCP with session state/cache\n\
          recovery. --mcp-sampling serves sampling/createMessage with the OpenAI-compatible\n\
-         provider (optionally --mcp-sampling-model); roots/list_changed is sent when roots\n\
-         change through the library API.\n\n\
+         provider (optionally --mcp-sampling-model); roots_watch directories contribute\n\
+         roots automatically and changes emit roots/list_changed.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
