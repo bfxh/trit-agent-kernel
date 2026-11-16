@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::context_layers::{
-    AgentContext, CacheLedger, CacheWindow, ContextCatalog, ContextDetail, ContextPlan, ContextSpan,
+    AgentContext, CacheLedger, CacheWindow, ContextCatalog, ContextDetail, ContextPlan,
+    ContextSpan, SearchOrder,
 };
 use crate::provider::ContextPlanner;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest, TurnContext};
@@ -279,6 +280,10 @@ pub struct CachePressurePolicy {
     pub dynamic_budget_scale_bp: u32,
     /// 低命中时 context_search 候选数的缩放（基点）。
     pub search_limit_scale_bp: u32,
+    /// 低命中时 context_search 的候选排序。
+    pub search_order: SearchOrder,
+    /// 低命中时建议的任务选批压力。
+    pub task_selection: trit_orch::SelectionPressure,
 }
 
 impl Default for CachePressurePolicy {
@@ -286,13 +291,17 @@ impl Default for CachePressurePolicy {
         Self {
             dynamic_budget_scale_bp: 10_000,
             search_limit_scale_bp: 10_000,
+            search_order: SearchOrder::Resolver,
+            task_selection: trit_orch::SelectionPressure::Normal,
         }
     }
 }
 
 impl CachePressurePolicy {
     pub fn enabled(self) -> bool {
-        self.dynamic_budget_scale_bp < 10_000 || self.search_limit_scale_bp < 10_000
+        self.dynamic_budget_scale_bp < 10_000
+            || self.search_limit_scale_bp < 10_000
+            || self.task_selection != trit_orch::SelectionPressure::Normal
     }
 }
 
@@ -357,6 +366,8 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
         drop(context);
         let mut pressure_scale_bp = 10_000;
         let mut search_scale_bp = 10_000;
+        let mut search_order = SearchOrder::Resolver;
+        let mut task_selection = trit_orch::SelectionPressure::Normal;
         if let Some(cache_ledger) = &self.cache_ledger {
             let cache_ledger = cache_ledger
                 .lock()
@@ -378,6 +389,8 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
                         if self.cache_pressure.enabled() {
                             pressure_scale_bp = self.cache_pressure.dynamic_budget_scale_bp;
                             search_scale_bp = self.cache_pressure.search_limit_scale_bp;
+                            search_order = self.cache_pressure.search_order;
+                            task_selection = self.cache_pressure.task_selection;
                         }
                     }
                 }
@@ -389,7 +402,9 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
             .map_err(|_| AgentError::Tool("context state poisoned".into()))?;
         context.set_dynamic_budget_scale_bp(pressure_scale_bp);
         context.set_search_limit_scale_bp(search_scale_bp);
+        context.set_search_order(search_order);
         drop(context);
+        plan.cache.task_selection = task_selection;
         Ok(Some(plan))
     }
 }

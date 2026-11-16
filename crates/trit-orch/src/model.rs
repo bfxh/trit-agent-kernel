@@ -73,6 +73,15 @@ pub struct Limits {
     pub tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionPressure {
+    #[default]
+    Normal,
+    /// 低 cache 命中：同一优先级内优先选择 token 成本更低的任务。
+    LowCacheHit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Pending,

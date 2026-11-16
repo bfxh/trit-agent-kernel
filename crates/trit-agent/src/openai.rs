@@ -588,6 +588,7 @@ mod tests {
                 calibration: Ternary::Unknown,
                 prefix_fingerprint: "fnv1a64:abc".into(),
                 hit_potential: Ternary::True,
+                task_selection: trit_orch::SelectionPressure::Normal,
                 invalidated: Vec::new(),
             },
             autonomy: Default::default(),

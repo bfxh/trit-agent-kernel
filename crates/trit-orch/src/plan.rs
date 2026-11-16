@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
-    ClaimSet, Error, Ledger, Limits, MAX_TASKS, Observation, Phase, PlanPatch, Selection, Snapshot,
-    TaskSpec, selection,
+    ClaimSet, Error, Ledger, Limits, MAX_TASKS, Observation, Phase, PlanPatch, Selection,
+    SelectionPressure, Snapshot, TaskSpec, selection,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,7 +164,23 @@ impl Plan {
     }
 
     pub fn select(&self, snapshot: &Snapshot, limits: &Limits) -> Result<Selection, Error> {
-        self.select_internal(snapshot, limits, &Ledger::new(), None)
+        self.select_internal(
+            snapshot,
+            limits,
+            &Ledger::new(),
+            None,
+            SelectionPressure::Normal,
+        )
+    }
+
+    /// 低命中缓存压力下的选批：同一优先级内优先低 token 成本任务。
+    pub fn select_with_pressure(
+        &self,
+        snapshot: &Snapshot,
+        limits: &Limits,
+        pressure: SelectionPressure,
+    ) -> Result<Selection, Error> {
+        self.select_internal(snapshot, limits, &Ledger::new(), None, pressure)
     }
 
     /// 带效果台账选批：在途/未知效果不会进入批次，而是产生对账义务。
@@ -176,7 +192,17 @@ impl Plan {
         limits: &Limits,
         ledger: &Ledger,
     ) -> Result<Selection, Error> {
-        self.select_internal(snapshot, limits, ledger, None)
+        self.select_internal(snapshot, limits, ledger, None, SelectionPressure::Normal)
+    }
+
+    pub fn select_with_effects_and_pressure(
+        &self,
+        snapshot: &Snapshot,
+        limits: &Limits,
+        ledger: &Ledger,
+        pressure: SelectionPressure,
+    ) -> Result<Selection, Error> {
+        self.select_internal(snapshot, limits, ledger, None, pressure)
     }
 
     /// 带 claim 门选批：任务必须由当前 owner 完整覆盖其声明路径。
@@ -186,7 +212,13 @@ impl Plan {
         limits: &Limits,
         claims: &ClaimSet<'_>,
     ) -> Result<Selection, Error> {
-        self.select_internal(snapshot, limits, &Ledger::new(), Some(claims))
+        self.select_internal(
+            snapshot,
+            limits,
+            &Ledger::new(),
+            Some(claims),
+            SelectionPressure::Normal,
+        )
     }
 
     /// 同时带效果台账与 claim 门选批。
@@ -197,7 +229,24 @@ impl Plan {
         ledger: &Ledger,
         claims: &ClaimSet<'_>,
     ) -> Result<Selection, Error> {
-        self.select_internal(snapshot, limits, ledger, Some(claims))
+        self.select_internal(
+            snapshot,
+            limits,
+            ledger,
+            Some(claims),
+            SelectionPressure::Normal,
+        )
+    }
+
+    pub fn select_with_effects_and_claims_and_pressure(
+        &self,
+        snapshot: &Snapshot,
+        limits: &Limits,
+        ledger: &Ledger,
+        claims: &ClaimSet<'_>,
+        pressure: SelectionPressure,
+    ) -> Result<Selection, Error> {
+        self.select_internal(snapshot, limits, ledger, Some(claims), pressure)
     }
 
     fn select_internal(
@@ -206,17 +255,40 @@ impl Plan {
         limits: &Limits,
         ledger: &Ledger,
         claims: Option<&ClaimSet<'_>>,
+        pressure: SelectionPressure,
     ) -> Result<Selection, Error> {
+        let order = self.order_for(pressure);
         selection::select(
             self.revision,
             &self.tasks,
             &self.predecessors,
-            &self.order,
+            &order,
             snapshot,
             limits,
             ledger,
             claims,
         )
+    }
+
+    fn order_for(&self, pressure: SelectionPressure) -> Vec<usize> {
+        match pressure {
+            SelectionPressure::Normal => self.order.clone(),
+            SelectionPressure::LowCacheHit => {
+                let mut order: Vec<usize> = (0..self.tasks.len()).collect();
+                order.sort_unstable_by(|&left, &right| {
+                    let left = &self.tasks[left];
+                    let right = &self.tasks[right];
+                    right
+                        .task
+                        .priority
+                        .cmp(&left.task.priority)
+                        .then_with(|| left.max_tokens.cmp(&right.max_tokens))
+                        .then_with(|| left.task.duration.cmp(&right.task.duration))
+                        .then_with(|| left.task.id.cmp(&right.task.id))
+                });
+                order
+            }
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use trit_orch::{Ternary, TokenUsage};
+use trit_orch::{SelectionPressure, Ternary, TokenUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +40,16 @@ pub enum Sensitivity {
     Public,
     Internal,
     Secret,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchOrder {
+    /// 保留 catalog 自己的顺序。
+    #[default]
+    Resolver,
+    /// 低命中压力：动态候选排在稳定前缀候选之前。
+    PreferDynamic,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +465,9 @@ pub struct CacheReport {
     pub prefix_fingerprint: String,
     /// 稳定前缀本轮的复用把握：True 同印象，False 已失效/不可缓存，Unknown 未校准。
     pub hit_potential: Ternary,
+    /// 低命中时建议的任务选批压力；Normal 表示不改变任务顺序。
+    #[serde(default)]
+    pub task_selection: SelectionPressure,
     pub invalidated: Vec<String>,
 }
 
@@ -469,6 +482,7 @@ impl Default for CacheReport {
             calibration: Ternary::Unknown,
             prefix_fingerprint: String::new(),
             hit_potential: Ternary::Unknown,
+            task_selection: SelectionPressure::Normal,
             invalidated: Vec::new(),
         }
     }
@@ -1296,6 +1310,7 @@ pub struct AgentContext<R> {
     plan: ContextPlan,
     dynamic_budget_scale_bp: u32,
     search_limit_scale_bp: u32,
+    search_order: SearchOrder,
 }
 
 impl<R: ContextCatalog> AgentContext<R> {
@@ -1306,6 +1321,7 @@ impl<R: ContextCatalog> AgentContext<R> {
             plan,
             dynamic_budget_scale_bp: 10_000,
             search_limit_scale_bp: 10_000,
+            search_order: SearchOrder::Resolver,
         }
     }
 
@@ -1335,11 +1351,27 @@ impl<R: ContextCatalog> AgentContext<R> {
         self.search_limit_scale_bp = scale_bp.min(10_000);
     }
 
+    pub fn search_order(&self) -> SearchOrder {
+        self.search_order
+    }
+
+    pub fn set_search_order(&mut self, search_order: SearchOrder) {
+        self.search_order = search_order;
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<ContextRef> {
         let scaled = limit
             .saturating_mul(usize::try_from(self.search_limit_scale_bp).unwrap_or(usize::MAX))
             / 10_000;
-        self.resolver.search(query, scaled.max(1))
+        let mut hits = self.resolver.search(query, scaled.max(1));
+        if self.search_order == SearchOrder::PreferDynamic {
+            hits.sort_by(|left, right| {
+                (left.cache == CacheClass::StablePrefix)
+                    .cmp(&(right.cache == CacheClass::StablePrefix))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        hits
     }
 
     /// 智能体主动添加一个动态 ref；成功返回新句柄项。

@@ -308,16 +308,34 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         .with_cache_pressure_policy(CachePressurePolicy {
             dynamic_budget_scale_bp: 5_000,
             search_limit_scale_bp: 5_000,
+            search_order: trit_agent::SearchOrder::PreferDynamic,
+            task_selection: trit_orch::SelectionPressure::LowCacheHit,
         });
-    planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
     assert_eq!(shared.lock().unwrap().dynamic_budget_scale_bp(), 5_000);
     assert_eq!(shared.lock().unwrap().search_limit_scale_bp(), 5_000);
+    assert_eq!(
+        shared.lock().unwrap().search_order(),
+        trit_agent::SearchOrder::PreferDynamic
+    );
+    assert_eq!(
+        plan.cache.task_selection,
+        trit_orch::SelectionPressure::LowCacheHit
+    );
     let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
         .with_cache_ledger(ledger)
         .with_hit_threshold_bp(5_000);
-    planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
     assert_eq!(shared.lock().unwrap().dynamic_budget_scale_bp(), 10_000);
     assert_eq!(shared.lock().unwrap().search_limit_scale_bp(), 10_000);
+    assert_eq!(
+        shared.lock().unwrap().search_order(),
+        trit_agent::SearchOrder::Resolver
+    );
+    assert_eq!(
+        plan.cache.task_selection,
+        trit_orch::SelectionPressure::Normal
+    );
 }
 
 #[test]
@@ -353,4 +371,10 @@ fn cache_pressure_scales_search_candidates() {
     assert_eq!(agent.search("doc", 10).len(), 5);
     agent.set_search_limit_scale_bp(10_000);
     assert_eq!(agent.search("doc", 10).len(), 10);
+    agent.set_search_order(trit_agent::SearchOrder::PreferDynamic);
+    let ordered = agent.search("doc", 10);
+    assert_eq!(
+        ordered.last().map(|reference| reference.id.as_str()),
+        Some("doc")
+    );
 }

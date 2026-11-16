@@ -789,6 +789,8 @@ pub mod openai;
 pub mod provider;
 pub mod session;
 pub mod tools;
+pub use trit_orch::SelectionPressure;
+
 pub use checkpoint::{
     CHECKPOINT_SCHEMA, Checkpoint, CheckpointRecorder, CheckpointStore, CheckpointingTools,
     RewindReport, RewindScope, rewind_session, rewind_session_with_policy,
@@ -801,7 +803,7 @@ pub use context_layers::{
     ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef, ContextRequest,
     ContextResolver, ContextScope, ContextSelection, ContextSpan, DroppedContext, ImpressionDelta,
     InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression, ReasoningEffort,
-    ResolvedContext, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
+    ResolvedContext, SearchOrder, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,

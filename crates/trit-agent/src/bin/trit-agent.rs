@@ -9,8 +9,9 @@ use trit_agent::{
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
     ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
     LowHitPolicy, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal, ProviderModel,
-    ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, Session, ToolExecutor,
-    rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
+    ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, SearchOrder, SelectionPressure,
+    Session, ToolExecutor, rewind_session_git_with_policy, rewind_session_with_policy,
+    run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -69,6 +70,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut cache_window_ms: Option<u64> = None;
     let mut cache_pressure_scale_bp: u32 = 10_000;
     let mut cache_search_scale_bp: u32 = 10_000;
+    let mut cache_search_order = SearchOrder::Resolver;
+    let mut cache_task_selection = SelectionPressure::Normal;
     let mut cache_ledger_path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -181,6 +184,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 cache_search_scale_bp = next(&mut args, "--cache-search-scale-bp")?
                     .parse()
                     .map_err(|error| fail(format!("bad --cache-search-scale-bp: {error}")))?;
+            }
+            "--cache-search-order" => {
+                cache_search_order = parse_search_order(&next(&mut args, "--cache-search-order")?)?;
+            }
+            "--cache-task-selection" => {
+                cache_task_selection =
+                    parse_task_selection(&next(&mut args, "--cache-task-selection")?)?;
             }
             "--cache-ledger" => {
                 cache_ledger_path = Some(PathBuf::from(next(&mut args, "--cache-ledger")?));
@@ -324,6 +334,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         pressure: CachePressurePolicy {
             dynamic_budget_scale_bp: cache_pressure_scale_bp,
             search_limit_scale_bp: cache_search_scale_bp,
+            search_order: cache_search_order,
+            task_selection: cache_task_selection,
         },
     };
     let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
@@ -480,6 +492,22 @@ fn load_context_catalog(path: &Path) -> Result<InMemoryContext, Box<dyn Error>> 
     Ok(catalog)
 }
 
+fn parse_search_order(value: &str) -> Result<SearchOrder, Box<dyn Error>> {
+    match value {
+        "keep" => Ok(SearchOrder::Resolver),
+        "dynamic-first" => Ok(SearchOrder::PreferDynamic),
+        other => Err(fail(format!("bad --cache-search-order: {other}"))),
+    }
+}
+
+fn parse_task_selection(value: &str) -> Result<SelectionPressure, Box<dyn Error>> {
+    match value {
+        "normal" => Ok(SelectionPressure::Normal),
+        "low-cost" => Ok(SelectionPressure::LowCacheHit),
+        other => Err(fail(format!("bad --cache-task-selection: {other}"))),
+    }
+}
+
 fn parse_low_hit_policy(value: &str) -> Result<LowHitPolicy, Box<dyn Error>> {
     match value {
         "keep" => Ok(LowHitPolicy::Keep),
@@ -524,7 +552,8 @@ fn usage() {
          [--cache-hit-threshold BP] [--cache-low-hit-policy keep|demote] \\\n    \
          [--cache-window-samples N] [--cache-window-ms N] \\\n    \
          [--cache-pressure-scale-bp N] [--cache-search-scale-bp N] \\\n    \
-         [--cache-ledger <json>]]\n\n\
+         [--cache-search-order keep|dynamic-first] \\\n    \
+         [--cache-task-selection normal|low-cost] [--cache-ledger <json>]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\

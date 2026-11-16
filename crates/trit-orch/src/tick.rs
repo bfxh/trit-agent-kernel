@@ -6,8 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     AdherenceReport, AdmissionObligation, ClaimSet, Error, GuidanceMetrics, InterventionPlan,
-    InterventionPolicy, Ledger, Limits, Phase, Plan, Selection, Snapshot, TaskBrief, TraceLog,
-    check_adherence, check_adherence_with_trace, plan_interventions, task_brief,
+    InterventionPolicy, Ledger, Limits, Phase, Plan, Selection, SelectionPressure, Snapshot,
+    TaskBrief, TraceLog, check_adherence, check_adherence_with_trace, plan_interventions,
+    task_brief,
 };
 
 pub struct TickInput<'a> {
@@ -41,16 +42,27 @@ pub struct Tick {
 }
 
 pub fn tick(input: TickInput<'_>) -> Result<Tick, Error> {
+    tick_with_pressure(input, SelectionPressure::Normal)
+}
+
+pub fn tick_with_pressure(
+    input: TickInput<'_>,
+    pressure: SelectionPressure,
+) -> Result<Tick, Error> {
     let selection = match input.claims {
-        Some(claims) => input.plan.select_with_effects_and_claims(
+        Some(claims) => input.plan.select_with_effects_and_claims_and_pressure(
             input.snapshot,
             input.limits,
             input.ledger,
             claims,
+            pressure,
         )?,
-        None => input
-            .plan
-            .select_with_effects(input.snapshot, input.limits, input.ledger)?,
+        None => input.plan.select_with_effects_and_pressure(
+            input.snapshot,
+            input.limits,
+            input.ledger,
+            pressure,
+        )?,
     };
 
     let mut briefs = Vec::with_capacity(selection.selected.len());

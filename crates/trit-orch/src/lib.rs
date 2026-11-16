@@ -75,7 +75,7 @@ pub use lanes::{LaneDispute, LaneDriver, LaneReport, LaneState, resolve_lanes};
 pub use mass::{UndecidedMass, undecided_mass};
 pub use model::{
     BlockReason, CheckReport, CheckResult, Decision, EvidenceVerdict, Limits, Observation, Phase,
-    PlanPatch, Selection, Snapshot, TaskGuidance, TaskSpec, TokenUsage,
+    PlanPatch, Selection, SelectionPressure, Snapshot, TaskGuidance, TaskSpec, TokenUsage,
 };
 pub use obligation::{
     AdmissionObligation, ObligationBatch, ObligationBudget, ObligationCost, ObligationKind,

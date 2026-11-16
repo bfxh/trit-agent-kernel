@@ -137,8 +137,10 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
   `--cache-hit-threshold`、`--cache-window-samples`、`--cache-window-ms` 可调窗口/阈值。
   默认 `--cache-low-hit-policy keep`，只有显式 `demote` 才会在确认低命中时把稳定前缀
   降级为动态尾段。`--cache-pressure-scale-bp < 10000` / `--cache-search-scale-bp < 10000`
-  会启用独立的 CachePressurePolicy：低命中时同时收紧 agent 动态添加预算和
-  `context_search` 候选数，但不改稳定前缀。CLI 结束向 stderr 打印 ledger；
+  会启用独立的 CachePressurePolicy：低命中时收紧 agent 动态添加预算、
+  `context_search` 候选数与候选排序，并把 `CacheReport.task_selection` 标成
+  `SelectionPressure::LowCacheHit`；宿主可把它传给 `Plan::select_with_pressure`
+  （或 `tick_with_pressure`），同一优先级内优先低 token 任务。稳定前缀不参与缩放/降级。CLI 结束向 stderr 打印 ledger；
   `--cache-ledger <json>` 可加载/写回独立 JSON 旁路（与 session replay 合并）。
 - 边界：token 仍是粗估；校准用最大值而非分位数；“印象”只比较 revision/hash，不做语义 diff。
 
