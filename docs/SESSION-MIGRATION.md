@@ -95,29 +95,21 @@ preserve_superseded  // 是否保留旧摘要
 
 默认开启，但宿主/用户可全部关闭；关闭时迁移计划保持目标状态不变。
 
-## 7. 网关与 MCP 自动重启（提案）
+## 7. 网关与 MCP 自动重启（基础实现）
 
-现有仓库没有网关/MCP 运行时，不能假装已经实现。建议的 supervisor 契约：
+`crates/trit-agent/src/supervisor.rs` 已实现：
 
-```text
-SupervisorPolicy {
-  enabled,
-  restart: Never | OnFailure { max_attempts, backoff_ms },
-  health: { interval_ms, timeout_ms },
-  migrate_session: bool,
-  migrate_hooks: bool,
-}
-```
+- `ProcessSupervisor`：启动/监控/退避重启子进程，`max_attempts=0` 表示只启动不重启；
+- `SupervisorLoop`：后台线程按 interval 自动调用 `ensure_running` / `ensure_connected`，
+  不需要调用方逐次检查；
+- `McpSupervisor`：stdio JSON-RPC `initialize` 握手、初始化通知、断线重连；
+- 重连后发送 `notifications/trit/recovered`，携带 `RecoveryContext`：
+  session_id、状态层（含校验结论）、钩子契约、cache ledger；
+- `GatewaySupervisor = ProcessSupervisor`，网关协议由网关自己处理；
+- `Session::recovery_context()` 可直接构造 session/state/cache 部分，hooks 由宿主补齐。
 
-- **网关重启**：supervisor 只管理子进程，不重启整个桌面应用；重启后从 session log /
-  cache ledger 恢复，必要时重新执行迁移计划。
-- **MCP 自动重启**：每个 MCP server 独立 supervised；健康检查失败先重连，超过
-  backoff 上限才上报；工具调用在重启窗口返回可重试错误，不让模型误判为“工具不存在”。
-- **钩子**：supervisor 重启前后必须走同一个 hook contract 校验；不兼容的 hook 不恢复。
-- **缓存**：进程重启后从 session replay 重建 ledger；只有 provider/model/prefix 不变才继续复用。
-- **用户开关**：`SupervisorPolicy.enabled` 和 per-server/session 开关；关闭后回到手动重启。
-
-这部分仍是设计，不应在文档里标成已完成。
+边界：MCP 目前只做 initialize/重连，不做完整 capability 协商；没有端口级零停机；
+后台 loop 是轮询而非 OS 事件；恢复包是自定义通知，服务端不支持时应忽略而不是断连。
 
 ## 8. 当前边界
 

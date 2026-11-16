@@ -356,6 +356,22 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
         Ok(self.state_layer()?.validation)
     }
 
+    /// supervisor 重连时可发送的恢复包；hooks 由宿主从迁移 bundle 补充。
+    pub fn recovery_context(&self) -> Result<crate::supervisor::RecoveryContext, AgentError> {
+        let state = Some(self.state_layer()?);
+        let cache = self
+            .cache_ledger()
+            .lock()
+            .map_err(|_| AgentError::SessionState("cache ledger is poisoned".into()))?
+            .clone();
+        Ok(crate::supervisor::RecoveryContext {
+            session_id: Some(self.log.path().display().to_string()),
+            state,
+            hooks: Vec::new(),
+            cache: Some(cache),
+        })
+    }
+
     pub fn cache_ledger(
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<crate::context_layers::CacheLedger>> {
