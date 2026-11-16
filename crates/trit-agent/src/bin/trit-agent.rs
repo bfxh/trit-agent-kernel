@@ -624,9 +624,11 @@ fn usage() {
          cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\
          cache-search-scale-bp: scales context_search candidates on low cache hit.\n\
          supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec],\n\
-         bridges:[PortBridgeSpec], restart:{{...}}, interval_ms, mcp_timeout_ms}};\n\
-         starts supervised sidecars and keep-alive port bridges, restarts them after exit,\n\
-         negotiates MCP tools, and reconnects MCP with session state/cache recovery.\n\n\
+         bridges:[PortBridgeSpec], roots:[McpRoot], restart:{{...}}, interval_ms,\n\
+         mcp_timeout_ms}}; starts supervised sidecars and keep-alive port bridges,\n\
+         restarts them after exit, discovers MCP tools/resources/prompts, auto-refreshes\n\
+         list_changed, and reconnects MCP with session state/cache recovery.\n\
+         sampling/createMessage needs a host-registered SamplingHandler in library mode.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"

@@ -106,7 +106,12 @@ preserve_superseded  // 是否保留旧摘要
 - `McpSupervisor`：stdio JSON-RPC `initialize` 握手、初始化通知、断线重连；
   协议版本在 2024-11-05 / 2025-03-26 / 2025-06-18 白名单内协商，未知版本 fail closed；
   解析 serverInfo 与完整 capabilities（tools/resources/prompts/logging/experimental/扩展字段），
-  按 `tools/list` 游标分页发现工具，提供 `call_tool` 与 `refresh_tools`；
+  对 tools/resources/templates/prompts 全部按游标分页发现；提供 `call_tool`、
+  `read_resource`、`subscribe_resource`/`unsubscribe_resource`、`get_prompt`；
+  服务端发起的 `roots/list` 与 `sampling/createMessage` 由独立 dispatcher 应答，
+  sampling 通过宿主注入的 `SamplingHandler` 产生 assistant message；
+- 服务端通知（tools/prompts/resources `list_changed`、`resources/updated`、日志）
+  进入通知队列；`SupervisorLoop` 自动调用 `refresh_pending` 刷新已声明的集合；
 - 重连后发送 `notifications/trit/recovered`，携带 `RecoveryContext`：
   session_id、状态层（含校验结论）、钩子契约、cache ledger；
 - `GatewaySupervisor = ProcessSupervisor`，网关协议由网关自己处理；
@@ -126,6 +131,7 @@ CLI 通过 `--supervisor-config <json>` 接入：
   "gateway": [{"name": "gw", "program": "gateway-bin", "args": ["--stdio"]}],
   "mcp": [{"name": "tools", "program": "mcp-server", "args": []}],
   "bridges": [{"name": "front", "listen": "127.0.0.1:8080", "target": "127.0.0.1:18080"}],
+  "roots": [{"uri": "file:///workspace", "name": "workspace"}],
   "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
   "interval_ms": 500,
   "mcp_timeout_ms": 30000
@@ -135,17 +141,17 @@ CLI 通过 `--supervisor-config <json>` 接入：
 CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结束后从新日志重建并
 `refresh_recovery`。运行中崩溃会使用最近一次快照，宿主可自行在关键点刷新。
 
-边界：MCP 解析 capabilities 与工具列表，但不实现 resources/prompts/sampling/roots 调用，
-`tools/list_changed` 只记录能力标志，刷新由宿主调用 `refresh_tools`；端口桥接只保证
-前端监听口不断开，已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；
-后台 loop 仍按 interval 检查，但进程退出检测本身是 OS wait 事件；
-恢复包是自定义通知，服务端不支持时应忽略而不是断连。
+边界：sampling 只是协议管道，真正的模型调用由宿主 `SamplingHandler` 提供；roots 是静态
+列表，不主动发送 `roots/list_changed`；MCP logging 通知会入队，但不实现
+`logging/setLevel`；端口桥接只保证前端监听口不断开，已建立连接会随后端进程退出而断，
+不是内核 FD 交接或连接迁移；后台 loop 仍按 interval 检查通知与进程状态，但进程退出
+检测本身是 OS wait 事件；恢复包是自定义通知，服务端不支持时应忽略而不是断连。
 
 ## 8. 当前边界
 
 - 迁移目前是纯计划，不直接改目标 session/文件；宿主需要把 `MigrationPlan` 落地。
 - 缓存只迁移 ledger，不迁移 provider 内部 KV cache；跨 provider 本来也不可复用。
 - 旧版本摘要不重新生成，因此迁移不会“变聪明”，只保证不丢已有信息。
-- 钩子运行时不在本仓库；MCP 客户端实现了 stdio 握手、capability/工具发现与工具调用，
-  但没有实现 resources/prompts/sampling/roots 的客户端行为。
+- 钩子运行时不在本仓库；MCP 客户端已覆盖握手、工具/资源/提示词发现与调用、
+  sampling/roots 服务端请求应答；sampling 的模型调用与 roots 变更通知仍由宿主负责。
 - 端口桥接只覆盖新连接的等待与重试；没有连接排空、FD 交接或请求级重放。

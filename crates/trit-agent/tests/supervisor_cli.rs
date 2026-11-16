@@ -48,6 +48,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
         gateway: vec![gateway],
         mcp: Vec::new(),
         bridges: Vec::new(),
+        roots: Vec::new(),
         restart: RestartPolicy {
             max_attempts: 0,
             initial_backoff_ms: 0,

@@ -836,8 +836,10 @@ pub use state_layer::{
     StateLayer, StateValidation, state_layer,
 };
 pub use supervisor::{
-    GatewaySupervisor, McpCapabilities, McpHandshake, McpPromptsCapability, McpResourcesCapability,
-    McpServerInfo, McpStatus, McpSupervisor, McpTool, McpToolsCapability, ProcessSpec,
-    ProcessSupervisor, RecoveryContext, RestartPolicy, SupervisorConfig, SupervisorError,
-    SupervisorLoop, SupervisorRuntime, SupervisorStatus,
+    GatewaySupervisor, McpCapabilities, McpHandshake, McpNotification, McpPrompt,
+    McpPromptArgument, McpPromptsCapability, McpResource, McpResourceContent, McpResourceRead,
+    McpResourceTemplate, McpResourcesCapability, McpRoot, McpServerInfo, McpStatus, McpSupervisor,
+    McpTool, McpToolsCapability, ProcessSpec, ProcessSupervisor, RecoveryContext, RestartPolicy,
+    SamplingHandler, SupervisorConfig, SupervisorError, SupervisorLoop, SupervisorRuntime,
+    SupervisorStatus,
 };

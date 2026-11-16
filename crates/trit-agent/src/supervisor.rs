@@ -110,6 +110,8 @@ pub struct SupervisorConfig {
     #[serde(default)]
     pub bridges: Vec<PortBridgeSpec>,
     #[serde(default)]
+    pub roots: Vec<McpRoot>,
+    #[serde(default)]
     pub restart: RestartPolicy,
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
@@ -123,6 +125,7 @@ impl Default for SupervisorConfig {
             gateway: Vec::new(),
             mcp: Vec::new(),
             bridges: Vec::new(),
+            roots: Vec::new(),
             restart: RestartPolicy::default(),
             interval_ms: default_interval_ms(),
             mcp_timeout_ms: default_mcp_timeout_ms(),
@@ -202,6 +205,242 @@ pub struct McpTool {
     pub description: Option<String>,
     #[serde(rename = "inputSchema", default)]
     pub input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpResource {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+    pub size: Option<u64>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpResourceTemplate {
+    pub uri_template: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpResourceContent {
+    pub uri: String,
+    pub mime_type: Option<String>,
+    pub text: Option<String>,
+    pub blob: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpResourceRead {
+    pub contents: Vec<McpResourceContent>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpPromptArgument {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpPrompt {
+    pub name: String,
+    pub description: Option<String>,
+    pub arguments: Vec<McpPromptArgument>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRoot {
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// 服务端发起的 sampling/createMessage；返回完整的 assistant message。
+pub trait SamplingHandler: Send + Sync {
+    fn create_message(&self, request: serde_json::Value) -> Result<serde_json::Value, String>;
+}
+
+impl<F> SamplingHandler for F
+where
+    F: Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync,
+{
+    fn create_message(&self, request: serde_json::Value) -> Result<serde_json::Value, String> {
+        self(request)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpNotification {
+    ToolsListChanged,
+    PromptsListChanged,
+    ResourcesListChanged,
+    ResourceUpdated {
+        uri: String,
+    },
+    LoggingMessage {
+        level: String,
+        logger: Option<String>,
+        data: serde_json::Value,
+    },
+    Other {
+        method: String,
+    },
+}
+
+#[derive(Default)]
+struct McpNotificationState {
+    tools_changed: AtomicBool,
+    prompts_changed: AtomicBool,
+    resources_changed: AtomicBool,
+    queue: Mutex<Vec<McpNotification>>,
+}
+
+impl McpNotificationState {
+    fn record(&self, method: &str, params: &serde_json::Value) {
+        let notification = match method {
+            "notifications/tools/list_changed" => {
+                self.tools_changed.store(true, Ordering::Relaxed);
+                McpNotification::ToolsListChanged
+            }
+            "notifications/prompts/list_changed" => {
+                self.prompts_changed.store(true, Ordering::Relaxed);
+                McpNotification::PromptsListChanged
+            }
+            "notifications/resources/list_changed" => {
+                self.resources_changed.store(true, Ordering::Relaxed);
+                McpNotification::ResourcesListChanged
+            }
+            "notifications/resources/updated" => McpNotification::ResourceUpdated {
+                uri: params
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
+            "notifications/message" => McpNotification::LoggingMessage {
+                level: params
+                    .get("level")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("info")
+                    .to_owned(),
+                logger: params
+                    .get("logger")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                data: params
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            },
+            other => McpNotification::Other {
+                method: other.to_owned(),
+            },
+        };
+        if let Ok(mut queue) = self.queue.lock() {
+            if queue.len() >= 1024 {
+                queue.remove(0);
+            }
+            queue.push(notification);
+        }
+    }
+
+    fn drain(&self) -> Vec<McpNotification> {
+        self.queue
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    }
+
+    fn clear_list_flags(&self) {
+        self.tools_changed.store(false, Ordering::Relaxed);
+        self.prompts_changed.store(false, Ordering::Relaxed);
+        self.resources_changed.store(false, Ordering::Relaxed);
+    }
+
+    fn take_tools_changed(&self) -> bool {
+        self.tools_changed.swap(false, Ordering::Relaxed)
+    }
+
+    fn take_prompts_changed(&self) -> bool {
+        self.prompts_changed.swap(false, Ordering::Relaxed)
+    }
+
+    fn take_resources_changed(&self) -> bool {
+        self.resources_changed.swap(false, Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Default)]
+struct McpFeatures {
+    sampling: Option<Arc<dyn SamplingHandler>>,
+    roots: Vec<McpRoot>,
+}
+
+impl McpFeatures {
+    fn capabilities(&self) -> serde_json::Value {
+        let mut capabilities = serde_json::json!({
+            "roots": {"listChanged": false}
+        });
+        if self.sampling.is_some() {
+            capabilities["sampling"] = serde_json::json!({});
+        }
+        capabilities
+    }
+}
+
+fn server_request_response(
+    features: &McpFeatures,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let method = request
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let params = request
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let result = match method {
+        "roots/list" => Ok(serde_json::json!({"roots": features.roots})),
+        "sampling/createMessage" => match &features.sampling {
+            Some(handler) => handler
+                .create_message(params)
+                .map_err(|message| (-32000, message)),
+            None => Err((-32601, "sampling/createMessage is not supported".to_owned())),
+        },
+        "ping" => Ok(serde_json::json!({})),
+        other => Err((-32601, format!("server request method not found: {other}"))),
+    };
+    match result {
+        Ok(result) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err((code, message)) => {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,15 +667,23 @@ impl Drop for ProcessSupervisor {
 struct McpConnection {
     name: String,
     child: WaitedChild,
-    stdin: ChildStdin,
-    lines: Receiver<String>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    responses: Receiver<String>,
     next_id: u64,
     handshake: McpHandshake,
     tools: Vec<McpTool>,
+    resources: Vec<McpResource>,
+    resource_templates: Vec<McpResourceTemplate>,
+    prompts: Vec<McpPrompt>,
 }
 
 impl McpConnection {
-    fn open(spec: &ProcessSpec, timeout: Duration) -> Result<Self, SupervisorError> {
+    fn open(
+        spec: &ProcessSpec,
+        timeout: Duration,
+        features: McpFeatures,
+        notifications: Arc<McpNotificationState>,
+    ) -> Result<Self, SupervisorError> {
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
         for (key, value) in &spec.env {
@@ -462,13 +709,48 @@ impl McpConnection {
             name: spec.name.clone(),
             message: "missing stdout".into(),
         })?;
-        let (sender, lines) = mpsc::channel();
+        let stdin = Arc::new(Mutex::new(stdin));
+        let (response_sender, responses) = mpsc::channel();
+        let (request_sender, requests) = mpsc::channel::<serde_json::Value>();
+        let reader_notifications = Arc::clone(&notifications);
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else {
                     break;
                 };
-                if sender.send(line).is_err() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(method) = value.get("method").and_then(serde_json::Value::as_str)
+                {
+                    if value.get("id").is_some() {
+                        if request_sender.send(value).is_err() {
+                            break;
+                        }
+                    } else {
+                        let params = value
+                            .get("params")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        reader_notifications.record(method, &params);
+                    }
+                    continue;
+                }
+                if response_sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let dispatcher_stdin = Arc::clone(&stdin);
+        let dispatcher_features = features.clone();
+        std::thread::spawn(move || {
+            while let Ok(request) = requests.recv() {
+                let response = server_request_response(&dispatcher_features, &request);
+                let Ok(line) = serde_json::to_string(&response) else {
+                    continue;
+                };
+                let Ok(mut stdin) = dispatcher_stdin.lock() else {
+                    break;
+                };
+                if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
                     break;
                 }
             }
@@ -477,15 +759,26 @@ impl McpConnection {
             name: spec.name.clone(),
             child: WaitedChild::spawn(child),
             stdin,
-            lines,
+            responses,
             next_id: 1,
             handshake: McpHandshake::default(),
             tools: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
         };
-        let handshake = connection.negotiate(timeout)?;
+        let handshake = connection.negotiate(timeout, &features)?;
         connection.handshake = handshake;
         if connection.handshake.capabilities.tools.is_some() {
             connection.tools = connection.discover_tools(timeout)?;
+        }
+        if connection.handshake.capabilities.resources.is_some() {
+            let (resources, templates) = connection.discover_resources(timeout)?;
+            connection.resources = resources;
+            connection.resource_templates = templates;
+        }
+        if connection.handshake.capabilities.prompts.is_some() {
+            connection.prompts = connection.discover_prompts(timeout)?;
         }
         Ok(connection)
     }
@@ -499,11 +792,15 @@ impl McpConnection {
             name: self.name.clone(),
             message: format!("encode: {error}"),
         })?;
-        writeln!(self.stdin, "{line}").map_err(|error| SupervisorError::Mcp {
+        let mut stdin = self.stdin.lock().map_err(|_| SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: "stdin lock is poisoned".into(),
+        })?;
+        writeln!(stdin, "{line}").map_err(|error| SupervisorError::Mcp {
             name: self.name.clone(),
             message: format!("write: {error}"),
         })?;
-        self.stdin.flush().map_err(|error| SupervisorError::Mcp {
+        stdin.flush().map_err(|error| SupervisorError::Mcp {
             name: self.name.clone(),
             message: format!("flush: {error}"),
         })
@@ -532,7 +829,7 @@ impl McpConnection {
             "params": params
         }))?;
         loop {
-            let line = match self.lines.recv_timeout(timeout) {
+            let line = match self.responses.recv_timeout(timeout) {
                 Ok(line) => line,
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(SupervisorError::Mcp {
@@ -566,12 +863,16 @@ impl McpConnection {
         }
     }
 
-    fn negotiate(&mut self, timeout: Duration) -> Result<McpHandshake, SupervisorError> {
+    fn negotiate(
+        &mut self,
+        timeout: Duration,
+        features: &McpFeatures,
+    ) -> Result<McpHandshake, SupervisorError> {
         let result = self.request(
             "initialize",
             serde_json::json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
-                "capabilities": {},
+                "capabilities": features.capabilities(),
                 "clientInfo": {"name": "trit-agent", "version": "0.1.0"}
             }),
             timeout,
@@ -598,15 +899,33 @@ impl McpConnection {
     }
 
     fn discover_tools(&mut self, timeout: Duration) -> Result<Vec<McpTool>, SupervisorError> {
-        #[derive(serde::Deserialize)]
-        struct ToolsPage {
-            #[serde(default)]
-            tools: Vec<McpTool>,
-            #[serde(default, rename = "nextCursor")]
-            next_cursor: Option<String>,
-        }
+        let values = self.paginate("tools/list", "tools", timeout)?;
+        self.decode("tools/list", values)
+    }
 
-        let mut tools = Vec::new();
+    fn discover_resources(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(Vec<McpResource>, Vec<McpResourceTemplate>), SupervisorError> {
+        let values = self.paginate("resources/list", "resources", timeout)?;
+        let resources = self.decode("resources/list", values)?;
+        let values = self.paginate("resources/templates/list", "resourceTemplates", timeout)?;
+        let templates = self.decode("resources/templates/list", values)?;
+        Ok((resources, templates))
+    }
+
+    fn discover_prompts(&mut self, timeout: Duration) -> Result<Vec<McpPrompt>, SupervisorError> {
+        let values = self.paginate("prompts/list", "prompts", timeout)?;
+        self.decode("prompts/list", values)
+    }
+
+    fn paginate(
+        &mut self,
+        method: &str,
+        field: &str,
+        timeout: Duration,
+    ) -> Result<Vec<serde_json::Value>, SupervisorError> {
+        let mut values = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..256 {
@@ -614,28 +933,47 @@ impl McpConnection {
                 Some(cursor) => serde_json::json!({"cursor": cursor}),
                 None => serde_json::json!({}),
             };
-            let result = self.request("tools/list", params, timeout)?;
-            let page: ToolsPage =
-                serde_json::from_value(result).map_err(|error| SupervisorError::Mcp {
-                    name: self.name.clone(),
-                    message: format!("tools/list result: {error}"),
-                })?;
-            tools.extend(page.tools);
-            cursor = page.next_cursor;
+            let result = self.request(method, params, timeout)?;
+            let page = result
+                .get(field)
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            values.extend(page);
+            cursor = result
+                .get("nextCursor")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             let Some(next) = cursor.as_ref() else {
-                return Ok(tools);
+                return Ok(values);
             };
             if !seen.insert(next.clone()) {
                 return Err(SupervisorError::Mcp {
                     name: self.name.clone(),
-                    message: format!("tools/list repeated cursor {next}"),
+                    message: format!("{method} repeated cursor {next}"),
                 });
             }
         }
         Err(SupervisorError::Mcp {
             name: self.name.clone(),
-            message: "tools/list exceeded 256 pages".into(),
+            message: format!("{method} exceeded 256 pages"),
         })
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        values: Vec<serde_json::Value>,
+    ) -> Result<Vec<T>, SupervisorError> {
+        values
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value(value).map_err(|error| SupervisorError::Mcp {
+                    name: self.name.clone(),
+                    message: format!("{method} item: {error}"),
+                })
+            })
+            .collect()
     }
 
     fn call_tool(
@@ -649,6 +987,41 @@ impl McpConnection {
             serde_json::json!({"name": name, "arguments": arguments}),
             timeout,
         )
+    }
+
+    fn read_resource(
+        &mut self,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<McpResourceRead, SupervisorError> {
+        let result = self.request("resources/read", serde_json::json!({"uri": uri}), timeout)?;
+        serde_json::from_value(result).map_err(|error| SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: format!("resources/read result: {error}"),
+        })
+    }
+
+    fn subscribe_resource(
+        &mut self,
+        method: &str,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<(), SupervisorError> {
+        self.request(method, serde_json::json!({"uri": uri}), timeout)?;
+        Ok(())
+    }
+
+    fn get_prompt(
+        &mut self,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SupervisorError> {
+        let mut params = serde_json::json!({"name": name});
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        self.request("prompts/get", params, timeout)
     }
 
     fn send_recovery(&mut self, recovery: &RecoveryContext) -> Result<(), SupervisorError> {
@@ -676,6 +1049,11 @@ pub struct McpSupervisor {
     connection: Option<McpConnection>,
     handshake: Option<McpHandshake>,
     tools: Vec<McpTool>,
+    resources: Vec<McpResource>,
+    resource_templates: Vec<McpResourceTemplate>,
+    prompts: Vec<McpPrompt>,
+    notifications: Arc<McpNotificationState>,
+    features: McpFeatures,
     launched: bool,
     restarts: usize,
     stopped: bool,
@@ -690,6 +1068,11 @@ impl McpSupervisor {
             connection: None,
             handshake: None,
             tools: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            notifications: Arc::new(McpNotificationState::default()),
+            features: McpFeatures::default(),
             launched: false,
             restarts: 0,
             stopped: false,
@@ -699,6 +1082,21 @@ impl McpSupervisor {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// 声明 roots；握手时会向服务端广告 roots capability。
+    pub fn with_roots(mut self, roots: Vec<McpRoot>) -> Self {
+        self.features.roots = roots;
+        self
+    }
+
+    /// 声明 sampling handler；握手时会向服务端广告 sampling capability。
+    pub fn with_sampling_handler<H>(mut self, handler: H) -> Self
+    where
+        H: SamplingHandler + 'static,
+    {
+        self.features.sampling = Some(Arc::new(handler));
         self
     }
 
@@ -730,10 +1128,19 @@ impl McpSupervisor {
         if was_connected {
             std::thread::sleep(self.policy.backoff(self.restarts));
         }
-        let mut connection = McpConnection::open(&self.spec, self.timeout)?;
+        self.notifications.clear_list_flags();
+        let mut connection = McpConnection::open(
+            &self.spec,
+            self.timeout,
+            self.features.clone(),
+            Arc::clone(&self.notifications),
+        )?;
         connection.send_recovery(recovery)?;
         self.handshake = Some(connection.handshake.clone());
         self.tools = connection.tools.clone();
+        self.resources = connection.resources.clone();
+        self.resource_templates = connection.resource_templates.clone();
+        self.prompts = connection.prompts.clone();
         self.connection = Some(connection);
         self.launched = true;
         if was_connected {
@@ -752,6 +1159,32 @@ impl McpSupervisor {
         &self.tools
     }
 
+    pub fn resources(&self) -> &[McpResource] {
+        &self.resources
+    }
+
+    pub fn resource_templates(&self) -> &[McpResourceTemplate] {
+        &self.resource_templates
+    }
+
+    pub fn prompts(&self) -> &[McpPrompt] {
+        &self.prompts
+    }
+
+    /// 取走已收到的服务端通知；list_changed 标志由 refresh_pending 单独消费。
+    pub fn drain_notifications(&self) -> Vec<McpNotification> {
+        self.notifications.drain()
+    }
+
+    fn connected(&mut self) -> Result<&mut McpConnection, SupervisorError> {
+        self.connection
+            .as_mut()
+            .ok_or_else(|| SupervisorError::Mcp {
+                name: self.spec.name.clone(),
+                message: "not connected".into(),
+            })
+    }
+
     /// 重新拉取 tools/list；连接已断开时先按恢复包重连。
     pub fn refresh_tools(
         &mut self,
@@ -759,11 +1192,84 @@ impl McpSupervisor {
     ) -> Result<&[McpTool], SupervisorError> {
         self.ensure_connected(recovery)?;
         let timeout = self.timeout;
-        let connection = self.connection.as_mut().ok_or(SupervisorError::Stopped)?;
-        let tools = connection.discover_tools(timeout)?;
-        connection.tools = tools.clone();
+        let tools = self.connected()?.discover_tools(timeout)?;
+        self.notifications.take_tools_changed();
+        if let Some(connection) = self.connection.as_mut() {
+            connection.tools = tools.clone();
+        }
         self.tools = tools;
         Ok(&self.tools)
+    }
+
+    pub fn refresh_resources(
+        &mut self,
+        recovery: &RecoveryContext,
+    ) -> Result<&[McpResource], SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let timeout = self.timeout;
+        let (resources, templates) = self.connected()?.discover_resources(timeout)?;
+        self.notifications.take_resources_changed();
+        if let Some(connection) = self.connection.as_mut() {
+            connection.resources = resources.clone();
+            connection.resource_templates = templates.clone();
+        }
+        self.resources = resources;
+        self.resource_templates = templates;
+        Ok(&self.resources)
+    }
+
+    pub fn refresh_prompts(
+        &mut self,
+        recovery: &RecoveryContext,
+    ) -> Result<&[McpPrompt], SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let timeout = self.timeout;
+        let prompts = self.connected()?.discover_prompts(timeout)?;
+        self.notifications.take_prompts_changed();
+        if let Some(connection) = self.connection.as_mut() {
+            connection.prompts = prompts.clone();
+        }
+        self.prompts = prompts;
+        Ok(&self.prompts)
+    }
+
+    /// 自动处理 list_changed：只刷新服务端声明过 capability 的集合。
+    pub fn refresh_pending(&mut self, recovery: &RecoveryContext) -> Result<(), SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let Some(connection) = self.connection.as_ref() else {
+            return Ok(());
+        };
+        let capabilities = &connection.handshake.capabilities;
+        let refresh_tools = self.notifications.take_tools_changed() && capabilities.tools.is_some();
+        let refresh_resources =
+            self.notifications.take_resources_changed() && capabilities.resources.is_some();
+        let refresh_prompts =
+            self.notifications.take_prompts_changed() && capabilities.prompts.is_some();
+        let timeout = self.timeout;
+        if refresh_tools {
+            let tools = self.connected()?.discover_tools(timeout)?;
+            if let Some(connection) = self.connection.as_mut() {
+                connection.tools = tools.clone();
+            }
+            self.tools = tools;
+        }
+        if refresh_resources {
+            let (resources, templates) = self.connected()?.discover_resources(timeout)?;
+            if let Some(connection) = self.connection.as_mut() {
+                connection.resources = resources.clone();
+                connection.resource_templates = templates.clone();
+            }
+            self.resources = resources;
+            self.resource_templates = templates;
+        }
+        if refresh_prompts {
+            let prompts = self.connected()?.discover_prompts(timeout)?;
+            if let Some(connection) = self.connection.as_mut() {
+                connection.prompts = prompts.clone();
+            }
+            self.prompts = prompts;
+        }
+        Ok(())
     }
 
     /// 调用 MCP 工具；断线时先重连并重新握手/发现工具。
@@ -775,8 +1281,50 @@ impl McpSupervisor {
         timeout: Duration,
     ) -> Result<serde_json::Value, SupervisorError> {
         self.ensure_connected(recovery)?;
-        let connection = self.connection.as_mut().ok_or(SupervisorError::Stopped)?;
-        connection.call_tool(name, arguments, timeout)
+        self.connected()?.call_tool(name, arguments, timeout)
+    }
+
+    pub fn read_resource(
+        &mut self,
+        recovery: &RecoveryContext,
+        uri: &str,
+        timeout: Duration,
+    ) -> Result<McpResourceRead, SupervisorError> {
+        self.ensure_connected(recovery)?;
+        self.connected()?.read_resource(uri, timeout)
+    }
+
+    pub fn subscribe_resource(
+        &mut self,
+        recovery: &RecoveryContext,
+        uri: &str,
+    ) -> Result<(), SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let timeout = self.timeout;
+        self.connected()?
+            .subscribe_resource("resources/subscribe", uri, timeout)
+    }
+
+    pub fn unsubscribe_resource(
+        &mut self,
+        recovery: &RecoveryContext,
+        uri: &str,
+    ) -> Result<(), SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let timeout = self.timeout;
+        self.connected()?
+            .subscribe_resource("resources/unsubscribe", uri, timeout)
+    }
+
+    pub fn get_prompt(
+        &mut self,
+        recovery: &RecoveryContext,
+        name: &str,
+        arguments: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SupervisorError> {
+        self.ensure_connected(recovery)?;
+        self.connected()?.get_prompt(name, arguments, timeout)
     }
 
     /// 模拟外部崩溃：杀掉子进程但保留“曾经连接过”的事实，下一次 ensure 会重启。
@@ -844,8 +1392,10 @@ impl SupervisorLoop {
                 Ok(recovery) => recovery.clone(),
                 Err(_) => return,
             };
-            if let Ok(mut supervisor) = supervisor.lock() {
-                let _ = supervisor.ensure_connected(&recovery);
+            if let Ok(mut supervisor) = supervisor.lock()
+                && supervisor.ensure_connected(&recovery).is_ok()
+            {
+                let _ = supervisor.refresh_pending(&recovery);
             }
         })
     }
@@ -930,7 +1480,9 @@ impl SupervisorRuntime {
         }
         for spec in &config.mcp {
             let supervisor = Arc::new(Mutex::new(
-                McpSupervisor::new(spec.clone(), config.restart).with_timeout(timeout),
+                McpSupervisor::new(spec.clone(), config.restart)
+                    .with_timeout(timeout)
+                    .with_roots(config.roots.clone()),
             ));
             let initial = runtime
                 .recovery
@@ -1182,20 +1734,48 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$log"; done
             std::fs::write(
                 &script,
                 r#"$log = $env:TRIT_MCP_STUB_LOG
+$greeted = $false
+$notified = $false
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   [IO.File]::AppendAllText($log, $line + "`n")
   $id = 0
   if ($line -match '"id":([0-9]+)') { $id = $Matches[1] }
   if ($line -like '*"method":"initialize"*') {
-    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":false},"prompts":{"listChanged":true},"logging":{},"completions":{}},"serverInfo":{"name":"tool-stub","version":"1.2"}}}')
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":true},"prompts":{"listChanged":true},"logging":{},"completions":{}},"serverInfo":{"name":"tool-stub","version":"1.2"}}}')
+  } elseif ($line -like '*"method":"notifications/initialized"*') {
+    if (-not $greeted) {
+      Write-Output '{"jsonrpc":"2.0","id":900,"method":"roots/list","params":{}}'
+      Write-Output '{"jsonrpc":"2.0","id":901,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"sample"}}],"maxTokens":16}}'
+      $greeted = $true
+    }
   } elseif ($line -like '*"method":"tools/list"*') {
     if ($line -like '*"cursor"*') {
       Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"echo2","inputSchema":{"type":"object"}}]}}')
     } else {
       Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}],"nextCursor":"page2"}}')
     }
+    if (-not $notified) {
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}'
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}'
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///doc.txt"}}'
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"stub","data":{"message":"hi"}}}'
+      $notified = $true
+    }
   } elseif ($line -like '*"method":"tools/call"*') {
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"ok"}]}}')
+  } elseif ($line -like '*"method":"resources/templates/list"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"file-template","description":"File","mimeType":"text/plain"}]}}')
+  } elseif ($line -like '*"method":"resources/list"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5}]}}')
+  } elseif ($line -like '*"method":"resources/read"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}')
+  } elseif ($line -like '*"method":"resources/subscribe"*' -or $line -like '*"method":"resources/unsubscribe"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{}}')
+  } elseif ($line -like '*"method":"prompts/list"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"prompts":[{"name":"summarize","description":"Summarize","arguments":[{"name":"topic","description":"Topic","required":true}]}]}}')
+  } elseif ($line -like '*"method":"prompts/get"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"description":"Prompt","messages":[{"role":"user","content":{"type":"text","text":"prompt-ok"}}]}}')
   }
 }
 "#,
@@ -1216,17 +1796,39 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 &script,
                 r#"#!/bin/sh
 log="$TRIT_MCP_STUB_LOG"
+greeted=0
+notified=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":false},"prompts":{"listChanged":true},"logging":{},"completions":{}},"serverInfo":{"name":"tool-stub","version":"1.2"}}}' ;;
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":true},"prompts":{"listChanged":true},"logging":{},"completions":{}},"serverInfo":{"name":"tool-stub","version":"1.2"}}}' ;;
+    *'"method":"notifications/initialized"'*)
+      if [ "$greeted" -eq 0 ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":900,"method":"roots/list","params":{}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":901,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"sample"}}],"maxTokens":16}}'
+        greeted=1
+      fi ;;
     *'"method":"tools/list"'*)
       case "$line" in
         *'"cursor"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo2","inputSchema":{"type":"object"}}]}}' ;;
         *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}],"nextCursor":"page2"}}' ;;
-      esac ;;
+      esac
+      if [ "$notified" -eq 0 ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///doc.txt"}}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"stub","data":{"message":"hi"}}}'
+        notified=1
+      fi ;;
     *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+    *'"method":"resources/templates/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"file-template","description":"File","mimeType":"text/plain"}]}}' ;;
+    *'"method":"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5}]}}' ;;
+    *'"method":"resources/read"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}' ;;
+    *'"method":"resources/subscribe"'*|*'"method":"resources/unsubscribe"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{}}' ;;
+    *'"method":"prompts/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"prompts":[{"name":"summarize","description":"Summarize","arguments":[{"name":"topic","description":"Topic","required":true}]}]}}' ;;
+    *'"method":"prompts/get"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"description":"Prompt","messages":[{"role":"user","content":{"type":"text","text":"prompt-ok"}}]}}' ;;
   esac
 done
 "#,
@@ -1256,7 +1858,19 @@ done
                 initial_backoff_ms: 0,
                 max_backoff_ms: 0,
             },
-        );
+        )
+        .with_roots(vec![McpRoot {
+            uri: "file:///workspace".into(),
+            name: Some("workspace".into()),
+        }])
+        .with_sampling_handler(|request: serde_json::Value| {
+            assert_eq!(request["maxTokens"].as_u64(), Some(16));
+            Ok(serde_json::json!({
+                "role": "assistant",
+                "content": {"type": "text", "text": "sampled"},
+                "model": "test-model"
+            }))
+        });
         let recovery = RecoveryContext::default();
         assert_eq!(
             supervisor.ensure_connected(&recovery).unwrap(),
@@ -1308,6 +1922,77 @@ done
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
 
+        let resources = supervisor.resources();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].uri, "file:///doc.txt");
+        assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(supervisor.resource_templates().len(), 1);
+        assert_eq!(
+            supervisor.resource_templates()[0].uri_template,
+            "file:///{path}"
+        );
+        let prompts = supervisor.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "summarize");
+        assert_eq!(prompts[0].arguments[0].name, "topic");
+        assert!(prompts[0].arguments[0].required);
+
+        let read = supervisor
+            .read_resource(&recovery, "file:///doc.txt", Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(read.contents[0].text.as_deref(), Some("hello"));
+        supervisor
+            .subscribe_resource(&recovery, "file:///doc.txt")
+            .unwrap();
+        supervisor
+            .unsubscribe_resource(&recovery, "file:///doc.txt")
+            .unwrap();
+        let prompt = supervisor
+            .get_prompt(
+                &recovery,
+                "summarize",
+                Some(serde_json::json!({"topic": "rust"})),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(prompt["messages"][0]["content"]["text"], "prompt-ok");
+
+        let mut notifications = Vec::new();
+        for _ in 0..3000 {
+            notifications.extend(supervisor.drain_notifications());
+            if notifications.len() >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(notifications.contains(&McpNotification::ToolsListChanged));
+        assert!(notifications.contains(&McpNotification::PromptsListChanged));
+        assert!(notifications.contains(&McpNotification::ResourcesListChanged));
+        assert!(notifications.contains(&McpNotification::ResourceUpdated {
+            uri: "file:///doc.txt".into()
+        }));
+        assert!(notifications.iter().any(|notification| matches!(
+            notification,
+            McpNotification::LoggingMessage { level, logger, data }
+                if level == "info" && logger.as_deref() == Some("stub") && data["message"] == "hi"
+        )));
+        supervisor.refresh_pending(&recovery).unwrap();
+        assert_eq!(supervisor.tools().len(), 2);
+        assert_eq!(supervisor.resources().len(), 1);
+        assert_eq!(supervisor.prompts().len(), 1);
+
+        let mut log_text = String::new();
+        for _ in 0..3000 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            if log_text.contains("file:///workspace") && log_text.contains("\"sampled\"") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(log_text.contains("file:///workspace"));
+        assert!(log_text.contains("\"text\":\"sampled\""));
+        assert!(log_text.contains("\"sampling\":{}"));
+
         supervisor.kill_connection();
         let result = supervisor
             .call_tool(
@@ -1323,6 +2008,57 @@ done
         let refreshed = supervisor.refresh_tools(&recovery).unwrap();
         assert_eq!(refreshed.len(), 2);
         supervisor.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supervisor_loop_auto_refreshes_list_changed() {
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-auto-refresh-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-tool-stub.log");
+        let supervisor = Arc::new(Mutex::new(
+            McpSupervisor::new(
+                mcp_tool_stub_spec(&dir, &log),
+                RestartPolicy {
+                    max_attempts: 1,
+                    initial_backoff_ms: 0,
+                    max_backoff_ms: 0,
+                },
+            )
+            .with_timeout(Duration::from_secs(30)),
+        ));
+        let recovery = Arc::new(Mutex::new(RecoveryContext::default()));
+        let mut loop_handle = SupervisorLoop::spawn_mcp_shared(
+            Arc::clone(&supervisor),
+            recovery,
+            Duration::from_millis(20),
+        );
+        let mut log_text = String::new();
+        for _ in 0..3000 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            let resources_lists = log_text.matches("\"method\":\"resources/list\"").count();
+            let prompts_lists = log_text.matches("\"method\":\"prompts/list\"").count();
+            if resources_lists >= 2 && prompts_lists >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            log_text.matches("\"method\":\"resources/list\"").count() >= 2,
+            "list_changed should trigger another resources/list"
+        );
+        assert!(
+            log_text.matches("\"method\":\"prompts/list\"").count() >= 2,
+            "list_changed should trigger another prompts/list"
+        );
+        loop_handle.stop();
+        supervisor.lock().unwrap().stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1524,6 +2260,7 @@ done
             r#"{
                 "gateway": [{"name": "gw", "program": "gateway-bin"}],
                 "bridges": [{"name": "front", "listen": "127.0.0.1:0", "target": "127.0.0.1:9"}],
+                "roots": [{"uri": "file:///workspace", "name": "workspace"}],
                 "restart": {"max_attempts": 1}
             }"#,
         )
@@ -1534,6 +2271,8 @@ done
         assert_eq!(config.bridges.len(), 1);
         assert_eq!(config.bridges[0].connect_timeout_ms, 30_000);
         assert_eq!(config.bridges[0].retry_ms, 50);
+        assert_eq!(config.roots.len(), 1);
+        assert_eq!(config.roots[0].uri, "file:///workspace");
         assert_eq!(config.restart.max_attempts, 1);
         assert_eq!(config.restart.max_backoff_ms, 1_000);
         assert_eq!(config.interval_ms, 500);
@@ -1555,6 +2294,7 @@ done
             gateway: vec![exit_spec()],
             mcp: vec![mcp_stub_spec(&dir, &log)],
             bridges: vec![PortBridgeSpec::new("front", "127.0.0.1:0", "127.0.0.1:9")],
+            roots: Vec::new(),
             restart: RestartPolicy {
                 max_attempts: 2,
                 initial_backoff_ms: 0,
