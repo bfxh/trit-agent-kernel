@@ -109,7 +109,9 @@ preserve_superseded  // 是否保留旧摘要
   对 tools/resources/templates/prompts 全部按游标分页发现；提供 `call_tool`、
   `read_resource`、`subscribe_resource`/`unsubscribe_resource`、`get_prompt`；
   `McpToolExecutor` 把发现的工具以 `mcp__<server>__<tool>` 暴露给模型，
-  `ToolRequest.arguments` 携带 MCP JSON 参数，调用失败转 failed receipt、超时标 in_doubt；
+  `ToolRequest.arguments` 携带 MCP JSON 参数；`ProviderModel` 每轮从 `ToolCatalog`
+  重新取工具列表，list_changed 后新增/删除工具无需重启即可生效；删除后的旧名字
+  fail closed，调用失败转 failed receipt、超时标 in_doubt；
   服务端发起的 `roots/list` 与 `sampling/createMessage` 由独立 dispatcher 应答；
   roots 是共享可变状态，`set_roots` 更新后发送 `notifications/roots/list_changed`；
   `logging/setLevel` 可设置并记住期望级别，重连后自动重新应用；

@@ -3,6 +3,7 @@
 //! 这里只有同步、纯数据的接口；真实 OpenAI-compatible 传输层由宿主实现。
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +27,11 @@ pub struct ToolSpec {
 /// 每轮由宿主提供的上下文计划；ProviderModel 不知道 catalog/ACL。
 /// 启用后宿主还必须用 `ContextReadTools` 包装 ToolExecutor，否则模型调用
 /// `context_read` 时执行器会报 unknown tool。
+/// 动态工具目录；ProviderModel 每次提议前重新取一次（MCP list_changed）。
+pub trait ToolCatalog: Send + Sync {
+    fn tools(&self) -> Vec<ToolSpec>;
+}
+
 pub trait ContextPlanner {
     fn plan(
         &mut self,
@@ -63,6 +69,7 @@ pub trait Provider {
 pub struct ProviderModel<P> {
     provider: P,
     tools: Vec<ToolSpec>,
+    tool_catalog: Option<Arc<dyn ToolCatalog>>,
     context_planner: Option<Box<dyn ContextPlanner>>,
 }
 
@@ -71,6 +78,7 @@ impl<P: Provider> ProviderModel<P> {
         Self {
             provider,
             tools: default_tools(),
+            tool_catalog: None,
             context_planner: None,
         }
     }
@@ -79,8 +87,14 @@ impl<P: Provider> ProviderModel<P> {
         Self {
             provider,
             tools,
+            tool_catalog: None,
             context_planner: None,
         }
+    }
+
+    pub fn with_tool_catalog(mut self, catalog: Arc<dyn ToolCatalog>) -> Self {
+        self.tool_catalog = Some(catalog);
+        self
     }
 
     pub fn with_context_planner(mut self, planner: Box<dyn ContextPlanner>) -> Self {
@@ -104,13 +118,16 @@ impl<P: Provider> Model for ProviderModel<P> {
             None => None,
         };
         // 没有上下文计划时不要向模型暴露 context_read：CLI 默认没有 catalog。
+        let mut tools = self.tools.clone();
+        if let Some(catalog) = &self.tool_catalog {
+            tools.extend(catalog.tools());
+        }
         let tools = if plan.is_some() {
-            self.tools.clone()
+            tools
         } else {
-            self.tools
-                .iter()
+            tools
+                .into_iter()
                 .filter(|tool| !tool.name.starts_with("context_"))
-                .cloned()
                 .collect()
         };
         let response = self.provider.complete(&ProviderRequest {
@@ -204,5 +221,99 @@ impl Provider for ScriptedProvider {
     fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
         self.requests.push(request.clone());
         self.queue.pop_front().ok_or(AgentError::ModelExhausted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trit_orch::Ternary;
+
+    struct Capture {
+        requests: Arc<std::sync::Mutex<Vec<Vec<ToolSpec>>>>,
+    }
+
+    impl Provider for Capture {
+        fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
+            self.requests.lock().unwrap().push(request.tools.clone());
+            Ok(ProviderResponse {
+                tool_calls: Vec::new(),
+                completion: None,
+                usage: HostUsage::default(),
+                prefix: None,
+                context: None,
+            })
+        }
+    }
+
+    struct Catalog {
+        tools: Arc<std::sync::Mutex<Vec<ToolSpec>>>,
+    }
+
+    impl ToolCatalog for Catalog {
+        fn tools(&self) -> Vec<ToolSpec> {
+            self.tools.lock().unwrap().clone()
+        }
+    }
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: name.into(),
+            read_only: true,
+            input_schema: Some(serde_json::json!({"type": "object"})),
+        }
+    }
+
+    #[test]
+    fn tool_catalog_is_refreshed_before_each_proposal() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let catalog_tools = Arc::new(std::sync::Mutex::new(vec![spec("mcp__stub__echo")]));
+        let mut model = ProviderModel::with_tools(
+            Capture {
+                requests: Arc::clone(&captured),
+            },
+            default_tools(),
+        )
+        .with_tool_catalog(Arc::new(Catalog {
+            tools: Arc::clone(&catalog_tools),
+        }));
+        let brief = TaskBrief {
+            task: "t".into(),
+            epoch: 0,
+            guidance: Default::default(),
+            resolves: Vec::new(),
+            produces: Default::default(),
+            effects: Vec::new(),
+            requirements: Default::default(),
+            max_tokens: 0,
+            admission: Ternary::True,
+            granted_tokens: 0,
+            blockers: Vec::new(),
+            obligations: Vec::new(),
+        };
+        let context = TurnContext {
+            task: "t".into(),
+            step: 0,
+            usage: TokenUsage::default(),
+            receipts: Vec::new(),
+            digest: None,
+        };
+        model.proposal(&brief, &context).unwrap();
+        *catalog_tools.lock().unwrap() = vec![spec("mcp__stub__echo"), spec("mcp__stub__echo2")];
+        model.proposal(&brief, &context).unwrap();
+        *catalog_tools.lock().unwrap() = vec![spec("mcp__stub__other")];
+        model.proposal(&brief, &context).unwrap();
+
+        let requests = captured.lock().unwrap();
+        let first: Vec<_> = requests[0].iter().map(|tool| tool.name.as_str()).collect();
+        let second: Vec<_> = requests[1].iter().map(|tool| tool.name.as_str()).collect();
+        let third: Vec<_> = requests[2].iter().map(|tool| tool.name.as_str()).collect();
+        assert!(first.contains(&"mcp__stub__echo"));
+        assert!(!first.contains(&"mcp__stub__echo2"));
+        assert!(second.contains(&"mcp__stub__echo2"));
+        assert!(!third.contains(&"mcp__stub__echo"));
+        assert!(!third.contains(&"mcp__stub__echo2"));
+        assert!(third.contains(&"mcp__stub__other"));
     }
 }

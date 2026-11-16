@@ -2911,6 +2911,169 @@ done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn mcp_dynamic_stub_spec(dir: &std::path::Path) -> ProcessSpec {
+        if cfg!(windows) {
+            let script = dir.join("mcp-dynamic-stub.ps1");
+            std::fs::write(
+                &script,
+                r#"$hasEcho2 = 0
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $id = 0
+  if ($line -match '"id":([0-9]+)') { $id = $Matches[1] }
+  if ($line -like '*"method":"initialize"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"dyn","version":"0"}}}')
+  } elseif ($line -like '*"method":"tools/list"*') {
+    $tools = '{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}}'
+    if ($hasEcho2 -eq 1) { $tools = $tools + ',{"name":"echo2","inputSchema":{"type":"object"}}' }
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[' + $tools + ']}}')
+  } elseif ($line -like '*"method":"tools/call"*') {
+    if ($line -like '*"name":"add"*') {
+      $hasEcho2 = 1
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"added"}]}}')
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+    } elseif ($line -like '*"name":"remove"*') {
+      $hasEcho2 = 0
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"removed"}]}}')
+      Write-Output '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+    } elseif ($line -like '*"name":"fail"*') {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"error":{"code":-32000,"message":"boom"}}')
+    } elseif ($line -like '*"name":"slow"*') {
+    } elseif ($line -like '*"name":"echo2"*') {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"echo2-ok"}]}}')
+    } else {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"ok"}]}}')
+    }
+  }
+}
+"#,
+            )
+            .unwrap();
+            ProcessSpec::new("powershell").with_args([
+                "-NoProfile".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-File".to_string(),
+                script.display().to_string(),
+            ])
+        } else {
+            let script = dir.join("mcp-dynamic-stub.sh");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+hasEcho2=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"dyn","version":"0"}}}' ;;
+    *'"method":"tools/list"'*)
+      if [ "$hasEcho2" -eq 1 ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}},{"name":"echo2","inputSchema":{"type":"object"}}]}}'
+      else
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}}]}}'
+      fi ;;
+    *'"method":"tools/call"'*)
+      case "$line" in
+        *'"name":"add"'*) hasEcho2=1; printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"added"}]}}'; printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' ;;
+        *'"name":"remove"'*) hasEcho2=0; printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"removed"}]}}'; printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}' ;;
+        *'"name":"fail"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32000,"message":"boom"}}' ;;
+        *'"name":"slow"'*) ;;
+        *'"name":"echo2"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"echo2-ok"}]}}' ;;
+        *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+      esac ;;
+  esac
+done
+"#,
+            )
+            .unwrap();
+            ProcessSpec::new("sh").with_args([script.display().to_string()])
+        }
+    }
+
+    #[test]
+    fn mcp_tool_catalog_tracks_list_changed_and_reports_failures() {
+        use crate::mcp_tools::McpToolExecutor;
+        use crate::{ScriptedTools, ToolExecutor, ToolRequest};
+
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-dynamic-tools-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut spec = mcp_dynamic_stub_spec(&dir);
+        spec.name = "dyn".into();
+        let config = SupervisorConfig {
+            mcp: vec![spec],
+            interval_ms: 20,
+            mcp_timeout_ms: 30_000,
+            ..SupervisorConfig::default()
+        };
+        let mut runtime = SupervisorRuntime::start(&config, RecoveryContext::default()).unwrap();
+        let client = Arc::new(runtime.tool_client_with_timeout(Duration::from_secs(1)));
+        let has_tool = |name: &str| {
+            client
+                .routes()
+                .iter()
+                .any(|route| route.exposed_name == name)
+        };
+        assert!(has_tool("mcp__dyn__echo"));
+        assert!(!has_tool("mcp__dyn__echo2"));
+
+        let mut executor = McpToolExecutor::new(Arc::clone(&client), ScriptedTools::new(vec![]));
+        let request = |name: &str| ToolRequest {
+            call_id: name.into(),
+            tool: format!("mcp__dyn__{name}"),
+            arguments: Some(serde_json::json!({})),
+            ..ToolRequest::default()
+        };
+
+        let added = executor.execute(&request("add")).unwrap();
+        assert!(added.passed);
+        for _ in 0..500 {
+            if has_tool("mcp__dyn__echo2") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(has_tool("mcp__dyn__echo2"));
+        assert!(
+            client
+                .routes()
+                .iter()
+                .any(|route| route.exposed_name == "mcp__dyn__echo2")
+        );
+        let called = executor.execute(&request("echo2")).unwrap();
+        assert!(called.passed);
+        assert!(called.output.contains("echo2-ok"));
+
+        executor.execute(&request("remove")).unwrap();
+        for _ in 0..500 {
+            if !has_tool("mcp__dyn__echo2") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let removed = executor.execute(&request("echo2")).unwrap();
+        assert!(!removed.passed);
+        assert!(!removed.in_doubt);
+        assert!(removed.output.contains("unknown MCP tool"));
+
+        let failed = executor.execute(&request("fail")).unwrap();
+        assert!(!failed.passed);
+        assert!(!failed.in_doubt);
+        assert!(failed.output.contains("boom"));
+
+        let timed_out = executor.execute(&request("slow")).unwrap();
+        assert!(!timed_out.passed);
+        assert!(timed_out.in_doubt);
+        assert!(timed_out.output.to_ascii_lowercase().contains("timeout"));
+
+        runtime.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn mcp_tool_executor_bridges_discovered_tools() {
         use crate::mcp_tools::McpToolExecutor;
@@ -2955,7 +3118,7 @@ done
             in_doubt: false,
             output: "local".into(),
         };
-        let mut executor = McpToolExecutor::new(client, ScriptedTools::new(vec![local]));
+        let mut executor = McpToolExecutor::new(Arc::new(client), ScriptedTools::new(vec![local]));
         let mcp = ToolRequest {
             call_id: "mcp-1".into(),
             tool: "mcp__stub__echo".into(),

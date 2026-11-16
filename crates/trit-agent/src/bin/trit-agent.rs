@@ -11,7 +11,7 @@ use trit_agent::{
     LowHitPolicy, McpToolExecutor, Model, ModelProfile, OpenAiConfig, OpenAiProvider,
     OpenAiSamplingHandler, Proposal, ProviderModel, ReasoningEffort, RecoveryContext,
     ResolvedContext, RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure,
-    Session, SupervisorConfig, SupervisorRuntime, ToolExecutor, ToolSpec, default_tools,
+    Session, SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, default_tools,
     recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
     run_headless,
 };
@@ -397,26 +397,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     let mcp_tool_client = supervisor_runtime
         .as_ref()
-        .map(SupervisorRuntime::tool_client)
+        .map(|runtime| Arc::new(runtime.tool_client()))
         .filter(|client| !client.is_empty());
-    let mcp_tool_specs: Vec<ToolSpec> = mcp_tool_client
+    let mcp_tool_catalog: Option<Arc<dyn ToolCatalog>> = mcp_tool_client
         .as_ref()
-        .map(|client| {
-            client
-                .routes()
-                .iter()
-                .map(|route| ToolSpec {
-                    name: route.exposed_name.clone(),
-                    description: format!(
-                        "{} (MCP {} / {})",
-                        route.description, route.server, route.tool
-                    ),
-                    read_only: route.read_only,
-                    input_schema: Some(route.input_schema.clone()),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+        .map(|client| Arc::clone(client) as Arc<dyn ToolCatalog>);
     let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
         let model = build_model(
@@ -425,7 +410,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             context_agent.as_ref(),
             &shared_cache_ledger,
             &cache_options,
-            &mcp_tool_specs,
+            mcp_tool_catalog.clone(),
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
@@ -475,7 +460,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some(shared),
             &shared_cache_ledger,
             &cache_options,
-            &mcp_tool_specs,
+            mcp_tool_catalog.clone(),
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools = AgentContextTools::new(local, Arc::clone(shared))
@@ -509,7 +494,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             None,
             &shared_cache_ledger,
             &cache_options,
-            &mcp_tool_specs,
+            mcp_tool_catalog.clone(),
         )?;
         if let Some(client) = mcp_tool_client.as_ref() {
             let local = LocalTools::new(config.workspace.clone())?;
@@ -605,15 +590,16 @@ fn build_model(
     context: Option<&Arc<Mutex<AgentContext<InMemoryContext>>>>,
     cache_ledger: &Arc<Mutex<CacheLedger>>,
     cache_options: &CacheOptions,
-    extra_tools: &[ToolSpec],
+    tool_catalog: Option<Arc<dyn ToolCatalog>>,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
     let config = config.ok_or_else(|| fail("--provider openai requires OPENAI_* env"))?;
-    let mut tools = default_tools();
-    tools.extend(extra_tools.iter().cloned());
-    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), tools);
+    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), default_tools());
+    if let Some(catalog) = tool_catalog {
+        model = model.with_tool_catalog(catalog);
+    }
     if let Some(shared) = context {
         model = model.with_context_planner(Box::new(
             AgentContextPlanner::new(Arc::clone(shared))

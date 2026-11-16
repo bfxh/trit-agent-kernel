@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::provider::{ToolCatalog, ToolSpec};
 use crate::supervisor::{McpSupervisor, RecoveryContext};
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
@@ -26,7 +27,6 @@ pub struct McpToolRoute {
 pub struct McpToolClient {
     supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
     recovery: Arc<Mutex<RecoveryContext>>,
-    routes: Arc<Vec<McpToolRoute>>,
     timeout: Duration,
 }
 
@@ -36,14 +36,25 @@ impl McpToolClient {
         recovery: Arc<Mutex<RecoveryContext>>,
         timeout: Duration,
     ) -> Self {
+        Self {
+            supervisors,
+            recovery,
+            timeout,
+        }
+    }
+
+    /// 每次都从 supervisor 当前 tools 重建，list_changed 后无需重启。
+    pub fn routes(&self) -> Vec<McpToolRoute> {
         let mut used = std::collections::BTreeSet::new();
         let mut routes = Vec::new();
-        for (index, supervisor) in supervisors.iter().enumerate() {
+        for (index, supervisor) in self.supervisors.iter().enumerate() {
             let Ok(supervisor) = supervisor.lock() else {
                 continue;
             };
             let server = supervisor.name().to_owned();
-            for tool in supervisor.tools() {
+            let mut tools: Vec<_> = supervisor.tools().iter().collect();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            for tool in tools {
                 let exposed_name = unique_exposed_name(&server, &tool.name, &mut used);
                 let description = tool
                     .description
@@ -68,25 +79,16 @@ impl McpToolClient {
                 });
             }
         }
-        Self {
-            supervisors,
-            recovery,
-            routes: Arc::new(routes),
-            timeout,
-        }
-    }
-
-    pub fn routes(&self) -> &[McpToolRoute] {
-        &self.routes
+        routes
     }
 
     pub fn is_empty(&self) -> bool {
-        self.routes.is_empty()
+        self.routes().is_empty()
     }
 
-    fn route(&self, exposed_name: &str) -> Option<&McpToolRoute> {
-        self.routes
-            .iter()
+    fn route(&self, exposed_name: &str) -> Option<McpToolRoute> {
+        self.routes()
+            .into_iter()
             .find(|route| route.exposed_name == exposed_name)
     }
 
@@ -114,20 +116,37 @@ impl McpToolClient {
     }
 }
 
+impl ToolCatalog for McpToolClient {
+    fn tools(&self) -> Vec<ToolSpec> {
+        self.routes()
+            .into_iter()
+            .map(|route| ToolSpec {
+                name: route.exposed_name,
+                description: format!(
+                    "{} (MCP {} / {})",
+                    route.description, route.server, route.tool
+                ),
+                read_only: route.read_only,
+                input_schema: Some(route.input_schema),
+            })
+            .collect()
+    }
+}
+
 pub struct McpToolExecutor<T> {
-    client: McpToolClient,
+    client: Arc<McpToolClient>,
     inner: T,
 }
 
 impl<T: ToolExecutor> McpToolExecutor<T> {
-    pub fn new(client: McpToolClient, inner: T) -> Self {
+    pub fn new(client: Arc<McpToolClient>, inner: T) -> Self {
         Self { client, inner }
     }
 }
 
 impl<T: ToolExecutor> ToolExecutor for McpToolExecutor<T> {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
-        if self.client.route(&request.tool).is_some() {
+        if request.tool.starts_with("mcp__") {
             let arguments = request
                 .arguments
                 .clone()

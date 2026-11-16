@@ -826,7 +826,7 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
-    ToolSpec, default_tools,
+    ToolCatalog, ToolSpec, default_tools,
 };
 pub use sampling::OpenAiSamplingHandler;
 pub use session::{
