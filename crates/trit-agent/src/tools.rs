@@ -97,6 +97,32 @@ pub struct LocalTools {
     shell_session: Option<ShellSession>,
 }
 
+fn persistent_shell_candidates() -> Vec<(PathBuf, Vec<&'static str>)> {
+    let mut candidates = Vec::new();
+    if let Ok(shell) = std::env::var("TRIT_SHELL") {
+        candidates.push((PathBuf::from(shell), vec!["--noprofile", "--norc"]));
+    }
+    #[cfg(windows)]
+    {
+        for path in [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ] {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                candidates.push((path, vec!["--noprofile", "--norc"]));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        candidates.push((PathBuf::from("bash"), vec!["--noprofile", "--norc"]));
+        candidates.push((PathBuf::from("sh"), Vec::new()));
+    }
+    candidates
+}
+
 struct ShellSession {
     child: Child,
     stdin: ChildStdin,
@@ -107,8 +133,8 @@ struct ShellSession {
 impl ShellSession {
     fn spawn(root: &Path) -> Result<Self, AgentError> {
         let mut last_error = None;
-        for (program, args) in [("bash", vec!["--noprofile", "--norc"]), ("sh", Vec::new())] {
-            let mut command = Command::new(program);
+        for (program, args) in persistent_shell_candidates() {
+            let mut command = Command::new(&program);
             command
                 .args(args)
                 .current_dir(root)

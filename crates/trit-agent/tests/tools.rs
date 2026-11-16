@@ -202,14 +202,30 @@ fn native_search_and_glob_work_without_shell() {
 }
 
 fn shell_session_available() -> bool {
-    std::process::Command::new("bash")
-        .arg("--version")
-        .output()
-        .is_ok()
-        || std::process::Command::new("sh")
-            .args(["-c", "true"])
+    if let Ok(shell) = std::env::var("TRIT_SHELL") {
+        return std::path::Path::new(&shell).is_file();
+    }
+    #[cfg(windows)]
+    {
+        [
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        ]
+        .iter()
+        .any(|path| std::path::Path::new(path).is_file())
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("bash")
+            .arg("--version")
             .output()
             .is_ok()
+            || std::process::Command::new("sh")
+                .args(["-c", "true"])
+                .output()
+                .is_ok()
+    }
 }
 
 #[test]
