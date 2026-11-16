@@ -17,6 +17,9 @@ ureq = "2.12"
 cap-std = "3"
 cap-fs-ext = "3"
 notify = "8"
+ignore = "0.4"
+regex = "1"
+globset = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

@@ -108,6 +108,138 @@ fn writes_and_shell_require_explicit_permission() {
 }
 
 #[test]
+fn native_search_and_glob_work_without_shell() {
+    let root = temp_workspace("native-search");
+    std::fs::create_dir_all(root.join("src/nested")).unwrap();
+    std::fs::create_dir_all(root.join(".hidden")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        "fn alpha() {}
+// needle here
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/nested/c.rs"),
+        "// needle nested
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/b.py"),
+        "needle in python
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("README.md"),
+        "needle docs
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".hidden/secret.txt"),
+        "needle hidden
+",
+    )
+    .unwrap();
+    std::fs::write(root.join("binary.bin"), b"needle\0binary").unwrap();
+    let mut tools = make_tools(&root, false, false);
+
+    let search = ToolRequest {
+        call_id: "s1".into(),
+        tool: "search_code".into(),
+        arguments: Some(serde_json::json!({"query": "needle"})),
+        ..ToolRequest::default()
+    };
+    let outcome = tools.execute(&search).unwrap();
+    assert!(outcome.passed);
+    assert!(outcome.output.contains("src/a.rs:2:"));
+    assert!(outcome.output.contains("src/b.py:1:"));
+    assert!(outcome.output.contains("README.md:1:"));
+    assert!(!outcome.output.contains(".hidden/secret.txt"));
+    assert!(!outcome.output.contains("binary.bin"));
+
+    let regex = ToolRequest {
+        call_id: "s2".into(),
+        tool: "search_code".into(),
+        arguments: Some(serde_json::json!({
+            "query": r"needle\s+in",
+            "regex": true
+        })),
+        ..ToolRequest::default()
+    };
+    let outcome = tools.execute(&regex).unwrap();
+    assert!(outcome.output.contains("src/b.py:1:"));
+    assert!(!outcome.output.contains("src/a.rs"));
+
+    let filtered = ToolRequest {
+        call_id: "s3".into(),
+        tool: "search_code".into(),
+        arguments: Some(serde_json::json!({
+            "query": "needle",
+            "glob": "**/*.rs"
+        })),
+        ..ToolRequest::default()
+    };
+    let outcome = tools.execute(&filtered).unwrap();
+    assert!(outcome.output.contains("src/a.rs"));
+    assert!(outcome.output.contains("src/nested/c.rs"));
+    assert!(!outcome.output.contains("src/b.py"));
+
+    let glob = ToolRequest {
+        call_id: "g1".into(),
+        tool: "glob".into(),
+        arguments: Some(serde_json::json!({"pattern": "**/*.rs"})),
+        ..ToolRequest::default()
+    };
+    let outcome = tools.execute(&glob).unwrap();
+    assert!(outcome.passed);
+    assert!(outcome.output.contains("src/a.rs"));
+    assert!(outcome.output.contains("src/nested/c.rs"));
+    assert!(!outcome.output.contains("README.md"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn shell_session_available() -> bool {
+    std::process::Command::new("bash")
+        .arg("--version")
+        .output()
+        .is_ok()
+        || std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .output()
+            .is_ok()
+}
+
+#[test]
+fn persistent_shell_keeps_cwd_and_environment() {
+    if !shell_session_available() {
+        eprintln!("no bash/sh available; skipping persistent shell test");
+        return;
+    }
+    let root = temp_workspace("persistent-shell");
+    let mut tools = make_tools(&root, false, true);
+    let setup = tools
+        .execute(&ToolRequest::shell(
+            "s1",
+            "export TRIT_KEEP=42; mkdir -p sub; cd sub",
+        ))
+        .unwrap();
+    assert!(setup.passed, "{}", setup.output);
+    let check = tools
+        .execute(&ToolRequest::shell(
+            "s2",
+            "printf 'KEEP=%s CWD=%s' \"$TRIT_KEEP\" \"$(pwd)\"",
+        ))
+        .unwrap();
+    assert!(check.passed, "{}", check.output);
+    assert!(check.output.contains("KEEP=42"), "{}", check.output);
+    assert!(check.output.contains("sub"), "{}", check.output);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn headless_run_writes_and_proves_from_local_receipts() {
     let root = temp_workspace("headless");
     let model = ScriptedModel::new(vec![Proposal {

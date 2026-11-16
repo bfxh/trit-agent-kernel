@@ -35,7 +35,7 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 无头 agent：OpenAI-compatible provider、scripted replay、session JSONL、`--resume`。
 - 文件级 checkpoint/rewind：预检、symlink/类型拒绝、应用失败逆序回滚。
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。
-- 工具边界：`cap-std` 目录能力、symlink/硬链接拒绝、shell 默认拒绝并要求外部 OS 沙箱。
+- 工具边界：`cap-std` 目录能力、symlink/硬链接拒绝、shell 默认拒绝并要求外部 OS 沙箱；原生 `search_code`/`glob` 使用 ripgrep 同源 ignore/regex/globset，尊重 `.gitignore`，无需 shell；无沙箱 shell 默认复用持久 bash 会话（cwd/env 保持），沙箱模式仍逐条执行。
 
 ## 快速开始
 
@@ -73,6 +73,7 @@ cargo run -p trit-agent -- rewind \
 ## 安全边界
 
 - `bash` 默认关闭；开启后需要宿主提供外部 OS 沙箱（bwrap / sandbox-exec / 自定义 wrapper），或显式 `--allow-unsandboxed-shell` 降级。
+- 持久 bash 仅在无沙箱降级路径启用，cwd/env 会跨命令保留；沙箱模式为每条命令独立进程。
 - 检查点回退默认对 shell 命令 fail-closed；`--allow-unrewindable` 才放行。
 - Git 后端只管理非忽略的普通文件与受支持的 symlink；`.gitignore` 路径、嵌套仓库/子模块、工作区外路径、网络/数据库等副作用不可回退。
 - 回退的“原子”是进程内语义：应用失败会回滚；进程中途崩溃没有持久化 journal，不会自动恢复半完成回退。

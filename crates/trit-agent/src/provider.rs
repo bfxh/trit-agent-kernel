@@ -170,6 +170,38 @@ pub fn default_tools() -> Vec<ToolSpec> {
             input_schema: None,
         },
         ToolSpec {
+            name: "search_code".into(),
+            description:
+                "Search workspace text with literal or regex matching; respects .gitignore.".into(),
+            read_only: true,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "max_results": {"type": "integer"}
+                },
+                "required": ["query"]
+            })),
+        },
+        ToolSpec {
+            name: "glob".into(),
+            description: "List workspace files matching a glob pattern.".into(),
+            read_only: true,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "max_results": {"type": "integer"}
+                },
+                "required": ["pattern"]
+            })),
+        },
+        ToolSpec {
             name: "context_search".into(),
             description: "Search the context catalog and return candidate ids/labels.".into(),
             read_only: true,

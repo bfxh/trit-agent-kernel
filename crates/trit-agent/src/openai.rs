@@ -674,6 +674,8 @@ mod tests {
                 "read_file",
                 "write_file",
                 "bash",
+                "search_code",
+                "glob",
                 "context_search",
                 "context_add",
                 "context_read",
