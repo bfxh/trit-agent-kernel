@@ -788,6 +788,7 @@ pub mod git_checkpoint;
 pub mod openai;
 pub mod provider;
 pub mod session;
+pub mod session_migration;
 pub mod tools;
 pub use trit_orch::SelectionPressure;
 
@@ -820,4 +821,9 @@ pub use provider::{
 pub use session::{
     SESSION_SCHEMA, Session, SessionEvent, SessionLog, SessionRecord, SessionState, TurnRecord,
     recover,
+};
+pub use session_migration::{
+    CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,
+    MigrationPolicy, MigrationReport, MigrationTarget, SESSION_MIGRATION_SCHEMA,
+    SessionMigrationBundle, SessionRole, plan_migration,
 };

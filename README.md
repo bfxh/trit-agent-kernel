@@ -26,6 +26,7 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 影子策略学习：安全选择、增量/加权/窗口/跨宿主合并、Beta 先验与漂移窗口。
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
 - 分层上下文组装初版：`Session/Project/Shared` scope、引用句柄、稳定前缀/动态尾段、印象对比、三值 autonomy、模型/推理 profile 与真实 usage 校准。
+- 会话迁移：`SessionMigrationBundle` 携带上下文版本、钩子契约和 cache ledger；缓存只在 provider/model/prefix 兼容时复用，旧上下文只保留已有摘要。
 - Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息；`context_search` / `context_add` / `context_read` 让 agent 自主搜索、加入动态上下文并读取句柄；inclusion receipt、实际 cache hit/miss 与按 prefix 聚合的 cache ledger 会被记录。
 - CLI：`--context-catalog <json>` 启用 agent 自主上下文；`--context-read-budget` / `--context-read-max` 限制单轮/单次读取；`--cache-hit-threshold`、`--cache-low-hit-policy`、`--cache-window-samples`/`--cache-window-ms`、`--cache-pressure-scale-bp`、`--cache-search-scale-bp`、`--cache-search-order`、`--cache-task-selection`、`--cache-ledger <json>` 控制校准窗口、低命中策略、搜索排序/候选、动态预算、任务选批压力与可选 ledger 持久化；运行结束向 stderr 输出 cache ledger。
 - Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 provider + model + prefix 聚合、只用窗口内精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一桶至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`。
@@ -78,6 +79,7 @@ cargo run -p trit-agent -- rewind \
 ## 文档
 
 - [CONTEXT-ORCHESTRATION.md](docs/CONTEXT-ORCHESTRATION.md)：上下文引用/复用、会话地址、推理记录、语义判断、调用缝合与交互式 UI 提案。
+- [SESSION-MIGRATION.md](docs/SESSION-MIGRATION.md)：会话/缓存/上下文版本/钩子迁移契约，以及网关/MCP 自动重启的 supervisor 提案。
 - [KERNEL-REASONIX-FUSION.md](docs/KERNEL-REASONIX-FUSION.md)：与 Reasonix 的组合边界、认证平面与 Rust 迁移策略。
 - [TERNARY-ORCHESTRATION.md](docs/TERNARY-ORCHESTRATION.md)：三值编排模型。
 - [TRACE-AND-TIME.md](docs/TRACE-AND-TIME.md)：轨迹、重放与时间语义。
