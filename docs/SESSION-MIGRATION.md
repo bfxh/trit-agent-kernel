@@ -151,8 +151,9 @@ CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结
 `maxTokens` 受 `max_output_tokens` 上限约束；支持 text、image、audio（映射到 OpenAI
 `input_audio`）、resource-text，未知内容 fail closed。`includeContext=thisServer/allServers`
 会把受管 MCP 的 roots/tools/resources/prompts 元数据注入 systemPrompt，并在采样请求发生时
-通过同一 MCP 连接实时 `resources/read` 所有列出资源的文本正文，不设数量/字符上限；单次
-读取沿用 MCP request timeout，读取失败的资源跳过。`roots_watch` 用 notify 的 OS 文件
+通过同一 MCP 连接并发发起 `resources/read`，跨 server/资源并行读取所有列出资源的文本
+正文并按原顺序汇总，不设数量/字符上限；单次读取沿用 MCP request timeout，单个资源读取
+失败只跳过该资源。`roots_watch` 用 notify 的 OS 文件
 事件（inotify/FSEvents/ReadDirectoryChangesW）监听目录的直接子目录，事件经 debounce
 合并后自动更新 roots 并发送 `notifications/roots/list_changed`；只把目录作为 root。
 MCP logging 通知会入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接

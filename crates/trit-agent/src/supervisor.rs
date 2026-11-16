@@ -533,28 +533,63 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
     if entries.is_empty() {
         return;
     }
-    let mut context = String::from(
-        "MCP context available to this request:
-",
-    );
-    for entry in entries {
+
+    let mut reads: Vec<(usize, usize, String, Arc<McpClient>)> = Vec::new();
+    for (entry_index, entry) in entries.iter().enumerate() {
+        if let Some(client) = entry.client.as_ref() {
+            for (resource_index, resource) in entry.snapshot.resources.iter().enumerate() {
+                reads.push((
+                    entry_index,
+                    resource_index,
+                    resource.uri.clone(),
+                    Arc::clone(client),
+                ));
+            }
+        }
+    }
+    let results: std::collections::BTreeMap<(usize, usize), String> = if reads.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        let (sender, receiver) = mpsc::channel();
+        let timeout = features.request_timeout;
+        std::thread::scope(|scope| {
+            for (entry_index, resource_index, uri, client) in reads {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    let text = client
+                        .request("resources/read", serde_json::json!({"uri": uri}), timeout)
+                        .ok()
+                        .and_then(|result| serde_json::from_value::<McpResourceRead>(result).ok())
+                        .map(|read| {
+                            read.contents
+                                .into_iter()
+                                .filter_map(|content| content.text)
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|text| !text.is_empty());
+                    let _ = sender.send(((entry_index, resource_index), text));
+                });
+            }
+            drop(sender);
+            receiver
+                .into_iter()
+                .filter_map(|(key, text)| text.map(|text| (key, text)))
+                .collect()
+        })
+    };
+
+    let mut context = String::from("MCP context available to this request:\n");
+    for (entry_index, entry) in entries.iter().enumerate() {
         let snapshot = &entry.snapshot;
-        context.push_str(&format!(
-            "[{}]
-",
-            snapshot.server
-        ));
+        context.push_str(&format!("[{}]\n", snapshot.server));
         if !snapshot.roots.is_empty() {
             let roots: Vec<&str> = snapshot
                 .roots
                 .iter()
                 .map(|root| root.uri.as_str())
                 .collect();
-            context.push_str(&format!(
-                "roots: {}
-",
-                roots.join(", ")
-            ));
+            context.push_str(&format!("roots: {}\n", roots.join(", ")));
         }
         if !snapshot.tools.is_empty() {
             let tools: Vec<&str> = snapshot
@@ -562,11 +597,7 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect();
-            context.push_str(&format!(
-                "tools: {}
-",
-                tools.join(", ")
-            ));
+            context.push_str(&format!("tools: {}\n", tools.join(", ")));
         }
         if !snapshot.resources.is_empty() {
             let resources: Vec<String> = snapshot
@@ -574,38 +605,16 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .iter()
                 .map(|resource| format!("{} ({})", resource.uri, resource.name))
                 .collect();
-            context.push_str(&format!(
-                "resources: {}
-",
-                resources.join(", ")
-            ));
-            if let Some(client) = entry.client.as_ref() {
-                context.push_str(
-                    "resource contents:
-",
-                );
-                for resource in &snapshot.resources {
-                    let Ok(result) = client.request(
-                        "resources/read",
-                        serde_json::json!({"uri": resource.uri}),
-                        features.request_timeout,
-                    ) else {
-                        continue;
-                    };
-                    let Ok(read) = serde_json::from_value::<McpResourceRead>(result) else {
-                        continue;
-                    };
-                    for content in read.contents {
-                        if let Some(text) = content.text {
-                            context.push_str(&format!(
-                                "--- {}
-{}
-",
-                                content.uri, text
-                            ));
-                        }
-                    }
+            context.push_str(&format!("resources: {}\n", resources.join(", ")));
+            let mut bodies = String::new();
+            for (resource_index, resource) in snapshot.resources.iter().enumerate() {
+                if let Some(text) = results.get(&(entry_index, resource_index)) {
+                    bodies.push_str(&format!("--- {}\n{}\n", resource.uri, text));
                 }
+            }
+            if !bodies.is_empty() {
+                context.push_str("resource contents:\n");
+                context.push_str(&bodies);
             }
         }
         if !snapshot.prompts.is_empty() {
@@ -614,11 +623,7 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .iter()
                 .map(|prompt| prompt.name.as_str())
                 .collect();
-            context.push_str(&format!(
-                "prompts: {}
-",
-                prompts.join(", ")
-            ));
+            context.push_str(&format!("prompts: {}\n", prompts.join(", ")));
         }
     }
     let system = params
@@ -2436,6 +2441,8 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$log"; done
 $greeted = $false
 $notified = $false
 $resampled = $false
+$slowA = 0
+$slowB = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   [IO.File]::AppendAllText($log, $line + "`n")
   $id = 0
@@ -2475,9 +2482,21 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   } elseif ($line -like '*"method":"resources/templates/list"*') {
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"file-template","description":"File","mimeType":"text/plain"}]}}')
   } elseif ($line -like '*"method":"resources/list"*') {
-    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5}]}}')
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5},{"uri":"file:///slow-a.txt","name":"slow-a","mimeType":"text/plain"},{"uri":"file:///slow-b.txt","name":"slow-b","mimeType":"text/plain"},{"uri":"file:///fail.txt","name":"fail","mimeType":"text/plain"}]}}')
   } elseif ($line -like '*"method":"resources/read"*') {
-    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}')
+    if ($line -like '*slow-a*') { $slowA = $id }
+    elseif ($line -like '*slow-b*') { $slowB = $id }
+    elseif ($line -like '*fail*') {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"error":{"code":-32000,"message":"boom"}}')
+    } else {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}')
+    }
+    if ($slowA -ne 0 -and $slowB -ne 0) {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $slowA + ',"result":{"contents":[{"uri":"file:///slow-a.txt","mimeType":"text/plain","text":"slow-a-body"}]}}')
+      Write-Output ('{"jsonrpc":"2.0","id":' + $slowB + ',"result":{"contents":[{"uri":"file:///slow-b.txt","mimeType":"text/plain","text":"slow-b-body"}]}}')
+      $slowA = 0
+      $slowB = 0
+    }
   } elseif ($line -like '*"method":"resources/subscribe"*' -or $line -like '*"method":"resources/unsubscribe"*') {
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{}}')
   } elseif ($line -like '*"method":"prompts/list"*') {
@@ -2507,6 +2526,8 @@ log="$TRIT_MCP_STUB_LOG"
 greeted=0
 notified=0
 resampled=0
+slowA=""
+slowB=""
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "$log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -2540,8 +2561,20 @@ while IFS= read -r line; do
         resampled=1
       fi ;;
     *'"method":"resources/templates/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resourceTemplates":[{"uriTemplate":"file:///{path}","name":"file-template","description":"File","mimeType":"text/plain"}]}}' ;;
-    *'"method":"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5}]}}' ;;
-    *'"method":"resources/read"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}' ;;
+    *'"method":"resources/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"resources":[{"uri":"file:///doc.txt","name":"doc","description":"Doc","mimeType":"text/plain","size":5},{"uri":"file:///slow-a.txt","name":"slow-a","mimeType":"text/plain"},{"uri":"file:///slow-b.txt","name":"slow-b","mimeType":"text/plain"},{"uri":"file:///fail.txt","name":"fail","mimeType":"text/plain"}]}}' ;;
+    *'"method":"resources/read"'*)
+      case "$line" in
+        *slow-a*) slowA="$id" ;;
+        *slow-b*) slowB="$id" ;;
+        *fail*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32000,"message":"boom"}}' ;;
+        *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"contents":[{"uri":"file:///doc.txt","mimeType":"text/plain","text":"hello"}]}}' ;;
+      esac
+      if [ -n "$slowA" ] && [ -n "$slowB" ]; then
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$slowA"',"result":{"contents":[{"uri":"file:///slow-a.txt","mimeType":"text/plain","text":"slow-a-body"}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$slowB"',"result":{"contents":[{"uri":"file:///slow-b.txt","mimeType":"text/plain","text":"slow-b-body"}]}}'
+        slowA=""
+        slowB=""
+      fi ;;
     *'"method":"resources/subscribe"'*|*'"method":"resources/unsubscribe"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{}}' ;;
     *'"method":"prompts/list"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"prompts":[{"name":"summarize","description":"Summarize","arguments":[{"name":"topic","description":"Topic","required":true}]}]}}' ;;
     *'"method":"prompts/get"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"description":"Prompt","messages":[{"role":"user","content":{"type":"text","text":"prompt-ok"}}]}}' ;;
@@ -2589,7 +2622,8 @@ done
                 "content": {"type": "text", "text": "sampled"},
                 "model": "test-model"
             }))
-        });
+        })
+        .with_timeout(Duration::from_secs(2));
         let recovery = RecoveryContext::default();
         assert_eq!(
             supervisor.ensure_connected(&recovery).unwrap(),
@@ -2648,6 +2682,9 @@ done
                         system.contains("file:///doc.txt")
                             && system.contains("echo")
                             && system.contains("hello")
+                            && system.contains("slow-a-body")
+                            && system.contains("slow-b-body")
+                            && !system.contains("boom")
                     })
             });
             if saw_context {
@@ -2661,9 +2698,19 @@ done
         );
 
         let resources = supervisor.resources();
-        assert_eq!(resources.len(), 1);
+        assert_eq!(resources.len(), 4);
         assert_eq!(resources[0].uri, "file:///doc.txt");
         assert_eq!(resources[0].mime_type.as_deref(), Some("text/plain"));
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.uri.ends_with("slow-a.txt"))
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.uri.ends_with("fail.txt"))
+        );
         assert_eq!(supervisor.resource_templates().len(), 1);
         assert_eq!(
             supervisor.resource_templates()[0].uri_template,
@@ -2716,7 +2763,7 @@ done
         )));
         supervisor.refresh_pending(&recovery).unwrap();
         assert_eq!(supervisor.tools().len(), 2);
-        assert_eq!(supervisor.resources().len(), 1);
+        assert_eq!(supervisor.resources().len(), 4);
         assert_eq!(supervisor.prompts().len(), 1);
 
         let mut log_text = String::new();
