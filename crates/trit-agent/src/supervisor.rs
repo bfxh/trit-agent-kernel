@@ -112,6 +112,8 @@ pub struct SupervisorConfig {
     #[serde(default)]
     pub roots: Vec<McpRoot>,
     #[serde(default)]
+    pub log_level: Option<McpLogLevel>,
+    #[serde(default)]
     pub restart: RestartPolicy,
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
@@ -126,6 +128,7 @@ impl Default for SupervisorConfig {
             mcp: Vec::new(),
             bridges: Vec::new(),
             roots: Vec::new(),
+            log_level: None,
             restart: RestartPolicy::default(),
             interval_ms: default_interval_ms(),
             mcp_timeout_ms: default_mcp_timeout_ms(),
@@ -274,6 +277,19 @@ pub struct McpRoot {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpLogLevel {
+    Debug,
+    Info,
+    Notice,
+    Warning,
+    Error,
+    Critical,
+    Alert,
+    Emergency,
+}
+
 /// 服务端发起的 sampling/createMessage；返回完整的 assistant message。
 pub trait SamplingHandler: Send + Sync {
     fn create_message(&self, request: serde_json::Value) -> Result<serde_json::Value, String>;
@@ -393,13 +409,13 @@ impl McpNotificationState {
 #[derive(Clone, Default)]
 struct McpFeatures {
     sampling: Option<Arc<dyn SamplingHandler>>,
-    roots: Vec<McpRoot>,
+    roots: Arc<Mutex<Vec<McpRoot>>>,
 }
 
 impl McpFeatures {
     fn capabilities(&self) -> serde_json::Value {
         let mut capabilities = serde_json::json!({
-            "roots": {"listChanged": false}
+            "roots": {"listChanged": true}
         });
         if self.sampling.is_some() {
             capabilities["sampling"] = serde_json::json!({});
@@ -425,7 +441,14 @@ fn server_request_response(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let result = match method {
-        "roots/list" => Ok(serde_json::json!({"roots": features.roots})),
+        "roots/list" => {
+            let roots = features
+                .roots
+                .lock()
+                .map(|roots| roots.clone())
+                .unwrap_or_default();
+            Ok(serde_json::json!({"roots": roots}))
+        }
         "sampling/createMessage" => match &features.sampling {
             Some(handler) => handler
                 .create_message(params)
@@ -1024,6 +1047,23 @@ impl McpConnection {
         self.request("prompts/get", params, timeout)
     }
 
+    fn notify_roots_changed(&mut self) -> Result<(), SupervisorError> {
+        self.notify("notifications/roots/list_changed", serde_json::json!({}))
+    }
+
+    fn set_log_level(
+        &mut self,
+        level: McpLogLevel,
+        timeout: Duration,
+    ) -> Result<(), SupervisorError> {
+        self.request(
+            "logging/setLevel",
+            serde_json::json!({"level": level}),
+            timeout,
+        )?;
+        Ok(())
+    }
+
     fn send_recovery(&mut self, recovery: &RecoveryContext) -> Result<(), SupervisorError> {
         let params = serde_json::to_value(recovery).map_err(|error| SupervisorError::Mcp {
             name: self.name.clone(),
@@ -1054,6 +1094,7 @@ pub struct McpSupervisor {
     prompts: Vec<McpPrompt>,
     notifications: Arc<McpNotificationState>,
     features: McpFeatures,
+    log_level: Option<McpLogLevel>,
     launched: bool,
     restarts: usize,
     stopped: bool,
@@ -1073,6 +1114,7 @@ impl McpSupervisor {
             prompts: Vec::new(),
             notifications: Arc::new(McpNotificationState::default()),
             features: McpFeatures::default(),
+            log_level: None,
             launched: false,
             restarts: 0,
             stopped: false,
@@ -1085,9 +1127,15 @@ impl McpSupervisor {
         self
     }
 
-    /// 声明 roots；握手时会向服务端广告 roots capability。
+    /// 声明 roots；握手时广告 `roots.listChanged=true`。
     pub fn with_roots(mut self, roots: Vec<McpRoot>) -> Self {
-        self.features.roots = roots;
+        self.features.roots = Arc::new(Mutex::new(roots));
+        self
+    }
+
+    /// 期望的服务端日志级别；每次重连握手后自动重新应用。
+    pub fn with_log_level(mut self, level: McpLogLevel) -> Self {
+        self.log_level = Some(level);
         self
     }
 
@@ -1100,8 +1148,72 @@ impl McpSupervisor {
         self
     }
 
+    pub fn with_sampling_arc(mut self, handler: Arc<dyn SamplingHandler>) -> Self {
+        self.features.sampling = Some(handler);
+        self
+    }
+
     pub fn restarts(&self) -> usize {
         self.restarts
+    }
+
+    pub fn roots(&self) -> Vec<McpRoot> {
+        self.features
+            .roots
+            .lock()
+            .map(|roots| roots.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn log_level(&self) -> Option<McpLogLevel> {
+        self.log_level
+    }
+
+    /// 更新 roots 并通知服务端重新 `roots/list`；断线时只保存，下次握手生效。
+    pub fn set_roots(&mut self, roots: Vec<McpRoot>) -> Result<(), SupervisorError> {
+        if self.stopped {
+            return Err(SupervisorError::Stopped);
+        }
+        *self
+            .features
+            .roots
+            .lock()
+            .map_err(|_| SupervisorError::Mcp {
+                name: self.spec.name.clone(),
+                message: "roots lock is poisoned".into(),
+            })? = roots;
+        if self
+            .connection
+            .as_mut()
+            .is_some_and(McpConnection::is_alive)
+        {
+            self.connected()?.notify_roots_changed()?;
+        }
+        Ok(())
+    }
+
+    /// 设置服务端日志级别；服务端未广告 logging capability 时 fail closed。
+    pub fn set_log_level(
+        &mut self,
+        recovery: &RecoveryContext,
+        level: McpLogLevel,
+    ) -> Result<(), SupervisorError> {
+        self.ensure_connected(recovery)?;
+        if self
+            .handshake
+            .as_ref()
+            .and_then(|handshake| handshake.capabilities.logging.as_ref())
+            .is_none()
+        {
+            return Err(SupervisorError::Mcp {
+                name: self.spec.name.clone(),
+                message: "server does not advertise logging capability".into(),
+            });
+        }
+        let timeout = self.timeout;
+        self.connected()?.set_log_level(level, timeout)?;
+        self.log_level = Some(level);
+        Ok(())
     }
 
     pub fn ensure_connected(
@@ -1127,6 +1239,7 @@ impl McpSupervisor {
         self.connection = None;
         if was_connected {
             std::thread::sleep(self.policy.backoff(self.restarts));
+            self.restarts += 1;
         }
         self.notifications.clear_list_flags();
         let mut connection = McpConnection::open(
@@ -1135,6 +1248,11 @@ impl McpSupervisor {
             self.features.clone(),
             Arc::clone(&self.notifications),
         )?;
+        if let Some(level) = self.log_level
+            && connection.handshake.capabilities.logging.is_some()
+        {
+            connection.set_log_level(level, self.timeout)?;
+        }
         connection.send_recovery(recovery)?;
         self.handshake = Some(connection.handshake.clone());
         self.tools = connection.tools.clone();
@@ -1144,7 +1262,6 @@ impl McpSupervisor {
         self.connection = Some(connection);
         self.launched = true;
         if was_connected {
-            self.restarts += 1;
             Ok(McpStatus::Reconnected)
         } else {
             Ok(McpStatus::Connected)
@@ -1443,6 +1560,14 @@ impl SupervisorRuntime {
         config: &SupervisorConfig,
         recovery: RecoveryContext,
     ) -> Result<Self, SupervisorError> {
+        Self::start_with_sampling(config, recovery, None)
+    }
+
+    pub fn start_with_sampling(
+        config: &SupervisorConfig,
+        recovery: RecoveryContext,
+        sampling: Option<Arc<dyn SamplingHandler>>,
+    ) -> Result<Self, SupervisorError> {
         recovery.validate()?;
         let interval = Duration::from_millis(config.interval_ms.max(1));
         let timeout = Duration::from_millis(config.mcp_timeout_ms.max(1));
@@ -1479,11 +1604,18 @@ impl SupervisorRuntime {
             runtime.gateways.push(supervisor);
         }
         for spec in &config.mcp {
-            let supervisor = Arc::new(Mutex::new(
-                McpSupervisor::new(spec.clone(), config.restart)
-                    .with_timeout(timeout)
-                    .with_roots(config.roots.clone()),
-            ));
+            let supervisor = McpSupervisor::new(spec.clone(), config.restart)
+                .with_timeout(timeout)
+                .with_roots(config.roots.clone());
+            let supervisor = match config.log_level {
+                Some(level) => supervisor.with_log_level(level),
+                None => supervisor,
+            };
+            let supervisor = match sampling.as_ref() {
+                Some(handler) => supervisor.with_sampling_arc(Arc::clone(handler)),
+                None => supervisor,
+            };
+            let supervisor = Arc::new(Mutex::new(supervisor));
             let initial = runtime
                 .recovery
                 .lock()
@@ -1679,6 +1811,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn mcp_supervisor_rejects_log_level_without_capability() {
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-logging-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-stub.log");
+        let mut supervisor = McpSupervisor::new(
+            mcp_stub_spec(&dir, &log),
+            RestartPolicy {
+                max_attempts: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+        );
+        let recovery = RecoveryContext::default();
+        supervisor.ensure_connected(&recovery).unwrap();
+        let error = supervisor
+            .set_log_level(&recovery, McpLogLevel::Debug)
+            .unwrap_err();
+        assert!(
+            matches!(&error, SupervisorError::Mcp { message, .. } if message.contains("logging")),
+            "{error}"
+        );
+        supervisor.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// MCP stub 会启动真实 PowerShell/Node 进程，串行化避免 CI 冷启动互相挤压。
     fn serialize_mcp_test() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
@@ -1748,6 +1912,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       Write-Output '{"jsonrpc":"2.0","id":901,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"sample"}}],"maxTokens":16}}'
       $greeted = $true
     }
+  } elseif ($line -like '*"method":"notifications/roots/list_changed"*') {
+    Write-Output '{"jsonrpc":"2.0","id":902,"method":"roots/list","params":{}}'
+  } elseif ($line -like '*"method":"logging/setLevel"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{}}')
   } elseif ($line -like '*"method":"tools/list"*') {
     if ($line -like '*"cursor"*') {
       Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"echo2","inputSchema":{"type":"object"}}]}}')
@@ -1809,6 +1977,8 @@ while IFS= read -r line; do
         printf '%s\n' '{"jsonrpc":"2.0","id":901,"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"sample"}}],"maxTokens":16}}'
         greeted=1
       fi ;;
+    *'"method":"notifications/roots/list_changed"'*) printf '%s\n' '{"jsonrpc":"2.0","id":902,"method":"roots/list","params":{}}' ;;
+    *'"method":"logging/setLevel"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{}}' ;;
     *'"method":"tools/list"'*)
       case "$line" in
         *'"cursor"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo2","inputSchema":{"type":"object"}}]}}' ;;
@@ -1992,6 +2162,34 @@ done
         assert!(log_text.contains("file:///workspace"));
         assert!(log_text.contains("\"text\":\"sampled\""));
         assert!(log_text.contains("\"sampling\":{}"));
+        assert!(log_text.contains("\"roots\":{\"listChanged\":true}"));
+
+        supervisor
+            .set_log_level(&recovery, McpLogLevel::Debug)
+            .unwrap();
+        assert_eq!(supervisor.log_level(), Some(McpLogLevel::Debug));
+        supervisor
+            .set_roots(vec![McpRoot {
+                uri: "file:///new-root".into(),
+                name: Some("new".into()),
+            }])
+            .unwrap();
+        assert_eq!(supervisor.roots()[0].uri, "file:///new-root");
+        for _ in 0..3000 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            if log_text.contains("file:///new-root")
+                && log_text.contains("\"method\":\"notifications/roots/list_changed\"")
+                && log_text.contains("\"method\":\"logging/setLevel\"")
+                && log_text.contains("\"level\":\"debug\"")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(log_text.contains("file:///new-root"));
+        assert!(log_text.contains("\"method\":\"notifications/roots/list_changed\""));
+        assert!(log_text.contains("\"method\":\"logging/setLevel\""));
+        assert!(log_text.contains("\"level\":\"debug\""));
 
         supervisor.kill_connection();
         let result = supervisor
@@ -2004,6 +2202,17 @@ done
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
         assert_eq!(supervisor.restarts(), 1);
+        for _ in 0..3000 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            if log_text.matches("\"method\":\"logging/setLevel\"").count() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            log_text.matches("\"method\":\"logging/setLevel\"").count() >= 2,
+            "desired log level should be reapplied after reconnect"
+        );
 
         let refreshed = supervisor.refresh_tools(&recovery).unwrap();
         assert_eq!(refreshed.len(), 2);
@@ -2261,6 +2470,7 @@ done
                 "gateway": [{"name": "gw", "program": "gateway-bin"}],
                 "bridges": [{"name": "front", "listen": "127.0.0.1:0", "target": "127.0.0.1:9"}],
                 "roots": [{"uri": "file:///workspace", "name": "workspace"}],
+                "log_level": "warning",
                 "restart": {"max_attempts": 1}
             }"#,
         )
@@ -2273,6 +2483,7 @@ done
         assert_eq!(config.bridges[0].retry_ms, 50);
         assert_eq!(config.roots.len(), 1);
         assert_eq!(config.roots[0].uri, "file:///workspace");
+        assert_eq!(config.log_level, Some(McpLogLevel::Warning));
         assert_eq!(config.restart.max_attempts, 1);
         assert_eq!(config.restart.max_backoff_ms, 1_000);
         assert_eq!(config.interval_ms, 500);
@@ -2295,6 +2506,7 @@ done
             mcp: vec![mcp_stub_spec(&dir, &log)],
             bridges: vec![PortBridgeSpec::new("front", "127.0.0.1:0", "127.0.0.1:9")],
             roots: Vec::new(),
+            log_level: Some(McpLogLevel::Info),
             restart: RestartPolicy {
                 max_attempts: 2,
                 initial_backoff_ms: 0,

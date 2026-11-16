@@ -17,6 +17,29 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 #[test]
+fn cli_rejects_sampling_without_openai_provider() {
+    let root = temp_dir("sampling");
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))
+        .args([
+            "run",
+            "--task",
+            "sample",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--mcp-sampling",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("--mcp-sampling requires --provider openai"),
+        "stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn cli_starts_supervised_gateway_and_reports_it() {
     let root = temp_dir("run");
     let script_path = root.join("proposal.json");
@@ -49,6 +72,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
         mcp: Vec::new(),
         bridges: Vec::new(),
         roots: Vec::new(),
+        log_level: None,
         restart: RestartPolicy {
             max_attempts: 0,
             initial_backoff_ms: 0,

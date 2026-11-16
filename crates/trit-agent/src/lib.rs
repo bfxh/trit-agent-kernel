@@ -788,6 +788,7 @@ pub mod git_checkpoint;
 pub mod openai;
 pub mod port_bridge;
 pub mod provider;
+pub mod sampling;
 pub mod session;
 pub mod session_migration;
 pub mod state_layer;
@@ -822,6 +823,7 @@ pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
     ToolSpec, default_tools,
 };
+pub use sampling::OpenAiSamplingHandler;
 pub use session::{
     SESSION_SCHEMA, Session, SessionEvent, SessionLog, SessionRecord, SessionState, TurnRecord,
     recover, recovery_context_for_session,
@@ -836,7 +838,7 @@ pub use state_layer::{
     StateLayer, StateValidation, state_layer,
 };
 pub use supervisor::{
-    GatewaySupervisor, McpCapabilities, McpHandshake, McpNotification, McpPrompt,
+    GatewaySupervisor, McpCapabilities, McpHandshake, McpLogLevel, McpNotification, McpPrompt,
     McpPromptArgument, McpPromptsCapability, McpResource, McpResourceContent, McpResourceRead,
     McpResourceTemplate, McpResourcesCapability, McpRoot, McpServerInfo, McpStatus, McpSupervisor,
     McpTool, McpToolsCapability, ProcessSpec, ProcessSupervisor, RecoveryContext, RestartPolicy,

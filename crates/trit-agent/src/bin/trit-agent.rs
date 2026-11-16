@@ -8,11 +8,11 @@ use trit_agent::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
     ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
-    LowHitPolicy, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal, ProviderModel,
-    ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope, ScriptedModel, SearchOrder,
-    SelectionPressure, Session, SupervisorConfig, SupervisorRuntime, ToolExecutor,
-    recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
-    run_headless,
+    LowHitPolicy, Model, ModelProfile, OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler,
+    Proposal, ProviderModel, ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope,
+    SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure, Session, SupervisorConfig,
+    SupervisorRuntime, ToolExecutor, recovery_context_for_session, rewind_session_git_with_policy,
+    rewind_session_with_policy, run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -75,6 +75,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut cache_task_selection = SelectionPressure::Normal;
     let mut cache_ledger_path: Option<PathBuf> = None;
     let mut supervisor_config: Option<SupervisorConfig> = None;
+    let mut mcp_sampling = false;
+    let mut mcp_sampling_model: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -210,6 +212,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .map_err(|error| fail(format!("parse supervisor config: {error}")))?,
                 );
             }
+            "--mcp-sampling" => mcp_sampling = true,
+            "--mcp-sampling-model" => {
+                mcp_sampling_model = Some(next(&mut args, "--mcp-sampling-model")?);
+            }
             "--help" | "-h" => {
                 usage();
                 return Ok(());
@@ -243,6 +249,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if context_catalog.is_some() && provider != "openai" {
         return Err(fail("--context-catalog requires --provider openai"));
+    }
+    if mcp_sampling_model.is_some() && !mcp_sampling {
+        return Err(fail("--mcp-sampling-model requires --mcp-sampling"));
+    }
+    if mcp_sampling && provider != "openai" {
+        return Err(fail("--mcp-sampling requires --provider openai"));
     }
     let workspace_root = workspace.clone();
     let mut workspace = WorkspaceConfig::new(workspace);
@@ -284,6 +296,22 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     let openai_config = if provider == "openai" {
         Some(OpenAiConfig::from_env()?)
+    } else {
+        None
+    };
+    let sampling_handler: Option<Arc<dyn SamplingHandler>> = if mcp_sampling {
+        let config = openai_config
+            .as_ref()
+            .ok_or_else(|| fail("--mcp-sampling requires --provider openai"))?;
+        let mut sampling_config = config.clone();
+        if sampling_config.max_output_tokens.is_none() {
+            sampling_config.max_output_tokens = Some(model_max_output);
+        }
+        let handler = match mcp_sampling_model.as_ref() {
+            Some(model) => OpenAiSamplingHandler::with_model(sampling_config, model.clone()),
+            None => OpenAiSamplingHandler::new(sampling_config),
+        };
+        Some(Arc::new(handler))
     } else {
         None
     };
@@ -358,7 +386,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(supervisor_config) => {
             let recovery =
                 supervisor_recovery(supervisor_session_path.as_deref(), &shared_cache_ledger)?;
-            Some(SupervisorRuntime::start(supervisor_config, recovery)?)
+            Some(SupervisorRuntime::start_with_sampling(
+                supervisor_config,
+                recovery,
+                sampling_handler,
+            )?)
         }
         None => None,
     };
@@ -610,7 +642,7 @@ fn usage() {
          [--cache-pressure-scale-bp N] [--cache-search-scale-bp N] \\\n    \
          [--cache-search-order keep|dynamic-first] \\\n    \
          [--cache-task-selection normal|low-cost] [--cache-ledger <json>] \\\n    \
-         [--supervisor-config <json>]]\n\n\
+         [--supervisor-config <json>] [--mcp-sampling [--mcp-sampling-model <name>]]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
@@ -624,11 +656,13 @@ fn usage() {
          cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\
          cache-search-scale-bp: scales context_search candidates on low cache hit.\n\
          supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec],\n\
-         bridges:[PortBridgeSpec], roots:[McpRoot], restart:{{...}}, interval_ms,\n\
-         mcp_timeout_ms}}; starts supervised sidecars and keep-alive port bridges,\n\
-         restarts them after exit, discovers MCP tools/resources/prompts, auto-refreshes\n\
-         list_changed, and reconnects MCP with session state/cache recovery.\n\
-         sampling/createMessage needs a host-registered SamplingHandler in library mode.\n\n\
+         bridges:[PortBridgeSpec], roots:[McpRoot], log_level:debug|info|warning|error,\n\
+         restart:{{...}}, interval_ms, mcp_timeout_ms}}; starts supervised sidecars and\n\
+         keep-alive port bridges, restarts them after exit, discovers MCP tools/resources/\n\
+         prompts, auto-refreshes list_changed, and reconnects MCP with session state/cache\n\
+         recovery. --mcp-sampling serves sampling/createMessage with the OpenAI-compatible\n\
+         provider (optionally --mcp-sampling-model); roots/list_changed is sent when roots\n\
+         change through the library API.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"

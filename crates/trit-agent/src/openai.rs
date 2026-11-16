@@ -71,11 +71,8 @@ impl OpenAiProvider {
         let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
         Self { config, agent }
     }
-}
 
-impl Provider for OpenAiProvider {
-    fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
-        let body = build_request_body(&self.config, request);
+    fn post_chat(&self, body: &Value) -> Result<String, AgentError> {
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -87,20 +84,32 @@ impl Provider for OpenAiProvider {
             .set("Content-Type", "application/json")
             .send_string(&body.to_string());
         match response {
-            Ok(response) => {
-                let text = response
-                    .into_string()
-                    .map_err(|error| AgentError::Provider(format!("read response: {error}")))?;
-                let mut response = parse_response(&text)?;
-                attach_context_receipt(&mut response, request);
-                Ok(response)
-            }
+            Ok(response) => response
+                .into_string()
+                .map_err(|error| AgentError::Provider(format!("read response: {error}"))),
             Err(ureq::Error::Status(code, response)) => {
                 let text = response.into_string().unwrap_or_default();
                 Err(AgentError::Provider(format!("HTTP {code}: {text}")))
             }
             Err(error) => Err(AgentError::Provider(format!("transport: {error}"))),
         }
+    }
+
+    /// 原始 chat completion：供 MCP sampling 等非工具循环调用。
+    pub fn complete_chat(&self, body: &Value) -> Result<Value, AgentError> {
+        let text = self.post_chat(body)?;
+        serde_json::from_str(&text)
+            .map_err(|error| AgentError::Provider(format!("bad json: {error}")))
+    }
+}
+
+impl Provider for OpenAiProvider {
+    fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
+        let body = build_request_body(&self.config, request);
+        let text = self.post_chat(&body)?;
+        let mut response = parse_response(&text)?;
+        attach_context_receipt(&mut response, request);
+        Ok(response)
     }
 }
 
