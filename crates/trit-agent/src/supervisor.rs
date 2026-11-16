@@ -4,10 +4,11 @@
 //! 握手/重连，并在重连后把 session 状态层、钩子契约和 cache ledger 作为恢复包发回。
 //! 不做端口级零停机承诺，只保证自动恢复路径和可审计的重启次数。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -340,7 +341,6 @@ struct McpNotificationState {
     tools_changed: AtomicBool,
     prompts_changed: AtomicBool,
     resources_changed: AtomicBool,
-    contents_changed: AtomicBool,
     queue: Mutex<Vec<McpNotification>>,
 }
 
@@ -359,16 +359,13 @@ impl McpNotificationState {
                 self.resources_changed.store(true, Ordering::Relaxed);
                 McpNotification::ResourcesListChanged
             }
-            "notifications/resources/updated" => {
-                self.contents_changed.store(true, Ordering::Relaxed);
-                McpNotification::ResourceUpdated {
-                    uri: params
-                        .get("uri")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                }
-            }
+            "notifications/resources/updated" => McpNotification::ResourceUpdated {
+                uri: params
+                    .get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            },
             "notifications/message" => McpNotification::LoggingMessage {
                 level: params
                     .get("level")
@@ -407,7 +404,6 @@ impl McpNotificationState {
         self.tools_changed.store(false, Ordering::Relaxed);
         self.prompts_changed.store(false, Ordering::Relaxed);
         self.resources_changed.store(false, Ordering::Relaxed);
-        self.contents_changed.store(false, Ordering::Relaxed);
     }
 
     fn take_tools_changed(&self) -> bool {
@@ -421,10 +417,6 @@ impl McpNotificationState {
     fn take_resources_changed(&self) -> bool {
         self.resources_changed.swap(false, Ordering::Relaxed)
     }
-
-    fn take_contents_changed(&self) -> bool {
-        self.contents_changed.swap(false, Ordering::Relaxed)
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -433,24 +425,31 @@ pub struct McpContextSnapshot {
     pub roots: Vec<McpRoot>,
     pub tools: Vec<McpTool>,
     pub resources: Vec<McpResource>,
-    pub resource_contents: std::collections::BTreeMap<String, String>,
     pub prompts: Vec<McpPrompt>,
 }
 
-type McpContextRegistry = Arc<Mutex<std::collections::BTreeMap<String, McpContextSnapshot>>>;
+#[derive(Clone)]
+struct McpContextEntry {
+    snapshot: McpContextSnapshot,
+    client: Option<Arc<McpClient>>,
+}
+
+type McpContextRegistry = Arc<Mutex<std::collections::BTreeMap<String, McpContextEntry>>>;
 
 #[derive(Clone, Default)]
 struct McpFeatures {
     sampling: Option<Arc<dyn SamplingHandler>>,
     roots: Arc<Mutex<Vec<McpRoot>>>,
     server: String,
-    context_registry: Arc<Mutex<std::collections::BTreeMap<String, McpContextSnapshot>>>,
+    context_registry: Arc<Mutex<std::collections::BTreeMap<String, McpContextEntry>>>,
+    request_timeout: Duration,
 }
 
 impl McpFeatures {
     fn new(server: impl Into<String>) -> Self {
         Self {
             server: server.into(),
+            request_timeout: Duration::from_secs(30),
             ..Self::default()
         }
     }
@@ -520,28 +519,42 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
     if include != "thisServer" && include != "allServers" {
         return;
     }
-    let Ok(registry) = features.context_registry.lock() else {
-        return;
+    let mut entries: Vec<McpContextEntry> = {
+        let Ok(registry) = features.context_registry.lock() else {
+            return;
+        };
+        registry.values().cloned().collect()
     };
-    let mut snapshots: Vec<&McpContextSnapshot> = registry.values().collect();
     if include == "thisServer" {
-        snapshots.retain(|snapshot| snapshot.server == features.server);
+        entries.retain(|entry| entry.snapshot.server == features.server);
     } else {
-        snapshots.sort_by(|left, right| left.server.cmp(&right.server));
+        entries.sort_by(|left, right| left.snapshot.server.cmp(&right.snapshot.server));
     }
-    if snapshots.is_empty() {
+    if entries.is_empty() {
         return;
     }
-    let mut context = String::from("MCP context available to this request:\n");
-    for snapshot in snapshots {
-        context.push_str(&format!("[{}]\n", snapshot.server));
+    let mut context = String::from(
+        "MCP context available to this request:
+",
+    );
+    for entry in entries {
+        let snapshot = &entry.snapshot;
+        context.push_str(&format!(
+            "[{}]
+",
+            snapshot.server
+        ));
         if !snapshot.roots.is_empty() {
             let roots: Vec<&str> = snapshot
                 .roots
                 .iter()
                 .map(|root| root.uri.as_str())
                 .collect();
-            context.push_str(&format!("roots: {}\n", roots.join(", ")));
+            context.push_str(&format!(
+                "roots: {}
+",
+                roots.join(", ")
+            ));
         }
         if !snapshot.tools.is_empty() {
             let tools: Vec<&str> = snapshot
@@ -549,7 +562,11 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect();
-            context.push_str(&format!("tools: {}\n", tools.join(", ")));
+            context.push_str(&format!(
+                "tools: {}
+",
+                tools.join(", ")
+            ));
         }
         if !snapshot.resources.is_empty() {
             let resources: Vec<String> = snapshot
@@ -557,12 +574,38 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .iter()
                 .map(|resource| format!("{} ({})", resource.uri, resource.name))
                 .collect();
-            context.push_str(&format!("resources: {}\n", resources.join(", ")));
-        }
-        if !snapshot.resource_contents.is_empty() {
-            context.push_str("resource contents:\n");
-            for (uri, text) in &snapshot.resource_contents {
-                context.push_str(&format!("--- {uri}\n{text}\n"));
+            context.push_str(&format!(
+                "resources: {}
+",
+                resources.join(", ")
+            ));
+            if let Some(client) = entry.client.as_ref() {
+                context.push_str(
+                    "resource contents:
+",
+                );
+                for resource in &snapshot.resources {
+                    let Ok(result) = client.request(
+                        "resources/read",
+                        serde_json::json!({"uri": resource.uri}),
+                        features.request_timeout,
+                    ) else {
+                        continue;
+                    };
+                    let Ok(read) = serde_json::from_value::<McpResourceRead>(result) else {
+                        continue;
+                    };
+                    for content in read.contents {
+                        if let Some(text) = content.text {
+                            context.push_str(&format!(
+                                "--- {}
+{}
+",
+                                content.uri, text
+                            ));
+                        }
+                    }
+                }
             }
         }
         if !snapshot.prompts.is_empty() {
@@ -571,13 +614,12 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .iter()
                 .map(|prompt| prompt.name.as_str())
                 .collect();
-            context.push_str(&format!("prompts: {}\n", prompts.join(", ")));
+            context.push_str(&format!(
+                "prompts: {}
+",
+                prompts.join(", ")
+            ));
         }
-    }
-    const MAX_CONTEXT_CHARS: usize = 6000;
-    if context.chars().count() > MAX_CONTEXT_CHARS {
-        context = context.chars().take(MAX_CONTEXT_CHARS).collect();
-        context.push_str("...");
     }
     let system = params
         .get("systemPrompt")
@@ -814,12 +856,117 @@ impl Drop for ProcessSupervisor {
     }
 }
 
+struct McpClient {
+    name: String,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>,
+    next_id: AtomicU64,
+}
+
+impl McpClient {
+    fn new(name: String, stdin: Arc<Mutex<ChildStdin>>) -> Self {
+        Self {
+            name,
+            stdin,
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn write_json(&self, value: &serde_json::Value) -> Result<(), SupervisorError> {
+        let line = serde_json::to_string(value).map_err(|error| SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: format!("encode: {error}"),
+        })?;
+        let mut stdin = self.stdin.lock().map_err(|_| SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: "stdin lock is poisoned".into(),
+        })?;
+        writeln!(stdin, "{line}").map_err(|error| SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: format!("write: {error}"),
+        })?;
+        stdin.flush().map_err(|error| SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: format!("flush: {error}"),
+        })
+    }
+
+    fn notify(&self, method: &str, params: serde_json::Value) -> Result<(), SupervisorError> {
+        self.write_json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        }))
+    }
+
+    fn remove_pending(&self, id: u64) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&id);
+        }
+    }
+
+    /// 支持同一连接上的并发请求；响应按 JSON-RPC id 路由。
+    fn request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SupervisorError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .map_err(|_| SupervisorError::Mcp {
+                name: self.name.clone(),
+                message: "pending lock is poisoned".into(),
+            })?
+            .insert(id, sender);
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        if let Err(error) = self.write_json(&request) {
+            self.remove_pending(id);
+            return Err(error);
+        }
+        match receiver.recv_timeout(timeout) {
+            Ok(value) => {
+                if let Some(error) = value.get("error") {
+                    return Err(SupervisorError::Mcp {
+                        name: self.name.clone(),
+                        message: format!("{method}: {error}"),
+                    });
+                }
+                Ok(value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.remove_pending(id);
+                Err(SupervisorError::Mcp {
+                    name: self.name.clone(),
+                    message: format!("timeout waiting for {method} id {id}"),
+                })
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.remove_pending(id);
+                Err(SupervisorError::Mcp {
+                    name: self.name.clone(),
+                    message: "stdout closed".into(),
+                })
+            }
+        }
+    }
+}
+
 struct McpConnection {
     name: String,
     child: WaitedChild,
-    stdin: Arc<Mutex<ChildStdin>>,
-    responses: Receiver<String>,
-    next_id: u64,
+    client: Arc<McpClient>,
     handshake: McpHandshake,
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
@@ -860,17 +1007,19 @@ impl McpConnection {
             message: "missing stdout".into(),
         })?;
         let stdin = Arc::new(Mutex::new(stdin));
-        let (response_sender, responses) = mpsc::channel();
+        let client = Arc::new(McpClient::new(spec.name.clone(), Arc::clone(&stdin)));
         let (request_sender, requests) = mpsc::channel::<serde_json::Value>();
         let reader_notifications = Arc::clone(&notifications);
+        let reader_client = Arc::clone(&client);
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else {
                     break;
                 };
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
-                    && let Some(method) = value.get("method").and_then(serde_json::Value::as_str)
-                {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                if let Some(method) = value.get("method").and_then(serde_json::Value::as_str) {
                     if value.get("id").is_some() {
                         if request_sender.send(value).is_err() {
                             break;
@@ -884,8 +1033,16 @@ impl McpConnection {
                     }
                     continue;
                 }
-                if response_sender.send(line).is_err() {
-                    break;
+                let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) else {
+                    continue;
+                };
+                let sender = reader_client
+                    .pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.remove(&id));
+                if let Some(sender) = sender {
+                    let _ = sender.send(value);
                 }
             }
         });
@@ -908,9 +1065,7 @@ impl McpConnection {
         let mut connection = Self {
             name: spec.name.clone(),
             child: WaitedChild::spawn(child),
-            stdin,
-            responses,
-            next_id: 1,
+            client,
             handshake: McpHandshake::default(),
             tools: Vec::new(),
             resources: Vec::new(),
@@ -937,31 +1092,8 @@ impl McpConnection {
         self.child.is_running()
     }
 
-    fn write_json(&mut self, value: &serde_json::Value) -> Result<(), SupervisorError> {
-        let line = serde_json::to_string(value).map_err(|error| SupervisorError::Mcp {
-            name: self.name.clone(),
-            message: format!("encode: {error}"),
-        })?;
-        let mut stdin = self.stdin.lock().map_err(|_| SupervisorError::Mcp {
-            name: self.name.clone(),
-            message: "stdin lock is poisoned".into(),
-        })?;
-        writeln!(stdin, "{line}").map_err(|error| SupervisorError::Mcp {
-            name: self.name.clone(),
-            message: format!("write: {error}"),
-        })?;
-        stdin.flush().map_err(|error| SupervisorError::Mcp {
-            name: self.name.clone(),
-            message: format!("flush: {error}"),
-        })
-    }
-
     fn notify(&mut self, method: &str, params: serde_json::Value) -> Result<(), SupervisorError> {
-        self.write_json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params
-        }))
+        self.client.notify(method, params)
     }
 
     fn request(
@@ -970,47 +1102,7 @@ impl McpConnection {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, SupervisorError> {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        self.write_json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params
-        }))?;
-        loop {
-            let line = match self.responses.recv_timeout(timeout) {
-                Ok(line) => line,
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(SupervisorError::Mcp {
-                        name: self.name.clone(),
-                        message: format!("timeout waiting for {method} id {id}"),
-                    });
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(SupervisorError::Mcp {
-                        name: self.name.clone(),
-                        message: "stdout closed".into(),
-                    });
-                }
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if value.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = value.get("error") {
-                return Err(SupervisorError::Mcp {
-                    name: self.name.clone(),
-                    message: format!("{method}: {error}"),
-                });
-            }
-            return Ok(value
-                .get("result")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null));
-        }
+        self.client.request(method, params, timeout)
     }
 
     fn negotiate(
@@ -1218,7 +1310,6 @@ pub struct McpSupervisor {
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
     resource_templates: Vec<McpResourceTemplate>,
-    resource_contents: std::collections::BTreeMap<String, String>,
     prompts: Vec<McpPrompt>,
     notifications: Arc<McpNotificationState>,
     features: McpFeatures,
@@ -1240,7 +1331,6 @@ impl McpSupervisor {
             tools: Vec::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
-            resource_contents: std::collections::BTreeMap::new(),
             prompts: Vec::new(),
             notifications: Arc::new(McpNotificationState::default()),
             features: McpFeatures::new(server),
@@ -1254,6 +1344,7 @@ impl McpSupervisor {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self.features.request_timeout = timeout;
         self
     }
 
@@ -1272,69 +1363,6 @@ impl McpSupervisor {
     fn with_context_registry(mut self, registry: McpContextRegistry) -> Self {
         self.features.context_registry = registry;
         self
-    }
-
-    fn sync_context(&self) {
-        let snapshot = McpContextSnapshot {
-            server: self.spec.name.clone(),
-            roots: self.roots(),
-            tools: self.tools.clone(),
-            resources: self.resources.clone(),
-            resource_contents: self.resource_contents.clone(),
-            prompts: self.prompts.clone(),
-        };
-        if let Ok(mut registry) = self.features.context_registry.lock() {
-            registry.insert(self.spec.name.clone(), snapshot);
-        }
-    }
-
-    fn clear_context(&self) {
-        if let Ok(mut registry) = self.features.context_registry.lock() {
-            registry.remove(&self.spec.name);
-        }
-    }
-
-    /// 预取文本资源正文；失败或超预算的资源跳过，不影响连接。
-    fn load_resource_contents(&mut self) {
-        const MAX_RESOURCES: usize = 8;
-        const MAX_CHARS: usize = 2000;
-        self.resource_contents.clear();
-        let resources: Vec<String> = self
-            .resources
-            .iter()
-            .filter(|resource| {
-                resource.mime_type.as_deref().is_none_or(|mime| {
-                    mime.starts_with("text/")
-                        || mime.contains("json")
-                        || mime.contains("xml")
-                        || mime.contains("yaml")
-                })
-            })
-            .take(MAX_RESOURCES)
-            .map(|resource| resource.uri.clone())
-            .collect();
-        let timeout = self.timeout.min(Duration::from_secs(2));
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        for uri in resources {
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            let Ok(read) = self
-                .connected()
-                .and_then(|connection| connection.read_resource(&uri, timeout))
-            else {
-                continue;
-            };
-            let Some(text) = read.contents.into_iter().find_map(|content| content.text) else {
-                continue;
-            };
-            let text = if text.chars().count() > MAX_CHARS {
-                text.chars().take(MAX_CHARS).collect()
-            } else {
-                text
-            };
-            self.resource_contents.insert(uri, text);
-        }
     }
 
     /// 声明 sampling handler；握手时会向服务端广告 sampling capability。
@@ -1437,6 +1465,7 @@ impl McpSupervisor {
             return Ok(McpStatus::GaveUp);
         }
         self.connection = None;
+        self.clear_context();
         if was_connected {
             std::thread::sleep(self.policy.backoff(self.restarts));
             self.restarts += 1;
@@ -1461,7 +1490,6 @@ impl McpSupervisor {
         self.prompts = connection.prompts.clone();
         self.connection = Some(connection);
         self.launched = true;
-        self.load_resource_contents();
         self.sync_context();
         if was_connected {
             Ok(McpStatus::Reconnected)
@@ -1493,6 +1521,29 @@ impl McpSupervisor {
     /// 取走已收到的服务端通知；list_changed 标志由 refresh_pending 单独消费。
     pub fn drain_notifications(&self) -> Vec<McpNotification> {
         self.notifications.drain()
+    }
+
+    fn sync_context(&self) {
+        let snapshot = McpContextSnapshot {
+            server: self.spec.name.clone(),
+            roots: self.roots(),
+            tools: self.tools.clone(),
+            resources: self.resources.clone(),
+            prompts: self.prompts.clone(),
+        };
+        let client = self
+            .connection
+            .as_ref()
+            .map(|connection| Arc::clone(&connection.client));
+        if let Ok(mut registry) = self.features.context_registry.lock() {
+            registry.insert(self.spec.name.clone(), McpContextEntry { snapshot, client });
+        }
+    }
+
+    fn clear_context(&self) {
+        if let Ok(mut registry) = self.features.context_registry.lock() {
+            registry.remove(&self.spec.name);
+        }
     }
 
     fn connected(&mut self) -> Result<&mut McpConnection, SupervisorError> {
@@ -1535,7 +1586,6 @@ impl McpSupervisor {
         }
         self.resources = resources;
         self.resource_templates = templates;
-        self.load_resource_contents();
         self.sync_context();
         Ok(&self.resources)
     }
@@ -1568,7 +1618,6 @@ impl McpSupervisor {
             self.notifications.take_resources_changed() && capabilities.resources.is_some();
         let refresh_prompts =
             self.notifications.take_prompts_changed() && capabilities.prompts.is_some();
-        let contents_changed = self.notifications.take_contents_changed();
         let timeout = self.timeout;
         if refresh_tools {
             let tools = self.connected()?.discover_tools(timeout)?;
@@ -1585,7 +1634,6 @@ impl McpSupervisor {
             }
             self.resources = resources;
             self.resource_templates = templates;
-            self.load_resource_contents();
         }
         if refresh_prompts {
             let prompts = self.connected()?.discover_prompts(timeout)?;
@@ -1593,9 +1641,6 @@ impl McpSupervisor {
                 connection.prompts = prompts.clone();
             }
             self.prompts = prompts;
-        }
-        if contents_changed && !refresh_resources {
-            self.load_resource_contents();
         }
         self.sync_context();
         Ok(())
@@ -2206,42 +2251,44 @@ mod tests {
             let mut registry = features.context_registry.lock().unwrap();
             registry.insert(
                 "server-a".into(),
-                McpContextSnapshot {
-                    server: "server-a".into(),
-                    roots: vec![McpRoot {
-                        uri: "file:///a".into(),
-                        name: None,
-                    }],
-                    tools: vec![McpTool {
-                        name: "tool-a".into(),
-                        description: None,
-                        input_schema: serde_json::json!({}),
-                    }],
-                    resources: vec![McpResource {
-                        uri: "file:///a/doc".into(),
-                        name: "doc-a".into(),
-                        ..McpResource::default()
-                    }],
-                    resource_contents: std::collections::BTreeMap::from([(
-                        "file:///a/doc".to_owned(),
-                        "body-text".to_owned(),
-                    )]),
-                    prompts: vec![McpPrompt {
-                        name: "prompt-a".into(),
-                        ..McpPrompt::default()
-                    }],
+                McpContextEntry {
+                    client: None,
+                    snapshot: McpContextSnapshot {
+                        server: "server-a".into(),
+                        roots: vec![McpRoot {
+                            uri: "file:///a".into(),
+                            name: None,
+                        }],
+                        tools: vec![McpTool {
+                            name: "tool-a".into(),
+                            description: None,
+                            input_schema: serde_json::json!({}),
+                        }],
+                        resources: vec![McpResource {
+                            uri: "file:///a/doc".into(),
+                            name: "doc-a".into(),
+                            ..McpResource::default()
+                        }],
+                        prompts: vec![McpPrompt {
+                            name: "prompt-a".into(),
+                            ..McpPrompt::default()
+                        }],
+                    },
                 },
             );
             registry.insert(
                 "server-b".into(),
-                McpContextSnapshot {
-                    server: "server-b".into(),
-                    tools: vec![McpTool {
-                        name: "tool-b".into(),
-                        description: None,
-                        input_schema: serde_json::json!({}),
-                    }],
-                    ..McpContextSnapshot::default()
+                McpContextEntry {
+                    client: None,
+                    snapshot: McpContextSnapshot {
+                        server: "server-b".into(),
+                        tools: vec![McpTool {
+                            name: "tool-b".into(),
+                            description: None,
+                            input_schema: serde_json::json!({}),
+                        }],
+                        ..McpContextSnapshot::default()
+                    },
                 },
             );
         }
@@ -2262,7 +2309,6 @@ mod tests {
         assert!(system.contains("tool-a"));
         assert!(system.contains("tool-b"));
         assert!(system.contains("file:///a/doc"));
-        assert!(system.contains("body-text"));
 
         let mut params = serde_json::json!({"includeContext": "none"});
         inject_sampling_context(&features, &mut params);

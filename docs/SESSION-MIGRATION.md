@@ -150,8 +150,9 @@ CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结
 边界：采样使用配置模型（库模式 `with_model_hints(true)` 才会采用 server 的 model hint），
 `maxTokens` 受 `max_output_tokens` 上限约束；支持 text、image、audio（映射到 OpenAI
 `input_audio`）、resource-text，未知内容 fail closed。`includeContext=thisServer/allServers`
-会把受管 MCP 的 roots/tools/resources/prompts 元数据注入 systemPrompt，并预取最多 8 个
-文本资源正文（每个 2000 字符，总上下文 6000 字符）。`roots_watch` 用 notify 的 OS 文件
+会把受管 MCP 的 roots/tools/resources/prompts 元数据注入 systemPrompt，并在采样请求发生时
+通过同一 MCP 连接实时 `resources/read` 所有列出资源的文本正文，不设数量/字符上限；单次
+读取沿用 MCP request timeout，读取失败的资源跳过。`roots_watch` 用 notify 的 OS 文件
 事件（inotify/FSEvents/ReadDirectoryChangesW）监听目录的直接子目录，事件经 debounce
 合并后自动更新 roots 并发送 `notifications/roots/list_changed`；只把目录作为 root。
 MCP logging 通知会入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接
@@ -166,5 +167,5 @@ MCP logging 通知会入队，`logging/setLevel` 已实现但不会改写内核�
 - 旧版本摘要不重新生成，因此迁移不会“变聪明”，只保证不丢已有信息。
 - 钩子运行时不在本仓库；MCP 客户端已覆盖握手、工具/资源/提示词发现与调用、
   sampling/roots 服务端请求应答、roots 变更通知与 logging 级别设置。
-- roots 文件监听只扫描一级子目录；资源正文预取有 8 个资源 / 2000 字符的上限。
+- roots 文件监听只扫描一级子目录；资源正文按需实时读取，单次超时沿用 MCP timeout。
 - 端口桥接只覆盖新连接的等待与重试；没有连接排空、FD 交接或请求级重放。
