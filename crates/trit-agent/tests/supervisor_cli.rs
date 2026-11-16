@@ -141,6 +141,79 @@ stderr: {stderr}"
 }
 
 #[test]
+fn cli_executes_native_search_tools() {
+    let root = temp_dir("native-search");
+    let script_path = root.join("proposal.json");
+    std::fs::write(
+        root.join("notes.txt"),
+        "needle in notes
+",
+    )
+    .unwrap();
+    let proposals = vec![
+        Proposal {
+            tool_calls: vec![ToolRequest {
+                call_id: "search-1".into(),
+                tool: "search_code".into(),
+                read_only: true,
+                arguments: Some(serde_json::json!({"query": "needle"})),
+                ..ToolRequest::default()
+            }],
+            ..Proposal::default()
+        },
+        Proposal {
+            tool_calls: vec![ToolRequest::write("w1", "write_file", "a.txt", "done")],
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "c1".into(),
+                    kind: CriterionKind::Diff {
+                        paths: vec!["a.txt".into()],
+                    },
+                }],
+            }),
+            usage: HostUsage::default(),
+            ..Proposal::default()
+        },
+    ];
+    std::fs::write(&script_path, serde_json::to_string(&proposals).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))
+        .args([
+            "run",
+            "--task",
+            "native search",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}
+stderr: {stderr}"
+    );
+    let outcome: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        outcome["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|receipt| {
+                receipt["tool"] == "search_code"
+                    && receipt["passed"] == true
+                    && receipt["output"]
+                        .as_str()
+                        .is_some_and(|value| value.contains("notes.txt"))
+            })
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn cli_rejects_sampling_without_openai_provider() {
     let root = temp_dir("sampling");
     let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))

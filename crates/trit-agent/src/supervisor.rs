@@ -2945,7 +2945,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   if ($line -like '*"method":"initialize"*') {
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"dyn","version":"0"}}}')
   } elseif ($line -like '*"method":"tools/list"*') {
-    $tools = '{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}}'
+    $tools = '{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}}'
     if ($hasEcho2 -eq 1) { $tools = $tools + ',{"name":"echo2","inputSchema":{"type":"object"}}' }
     Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[' + $tools + ']}}')
   } elseif ($line -like '*"method":"tools/call"*') {
@@ -2989,9 +2989,9 @@ while IFS= read -r line; do
     *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true}},"serverInfo":{"name":"dyn","version":"0"}}}' ;;
     *'"method":"tools/list"'*)
       if [ "$hasEcho2" -eq 1 ]; then
-        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}},{"name":"echo2","inputSchema":{"type":"object"}}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}},{"name":"echo2","inputSchema":{"type":"object"}}]}}'
       else
-        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}}]}}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"add","inputSchema":{"type":"object"}},{"name":"echo","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},{"name":"fail","inputSchema":{"type":"object"}},{"name":"remove","inputSchema":{"type":"object"}},{"name":"slow","inputSchema":{"type":"object"}}]}}'
       fi ;;
     *'"method":"tools/call"'*)
       case "$line" in
@@ -3042,6 +3042,18 @@ done
         };
         assert!(has_tool("mcp__dyn__echo"));
         assert!(!has_tool("mcp__dyn__echo2"));
+        let echo = client
+            .routes()
+            .into_iter()
+            .find(|route| route.exposed_name == "mcp__dyn__echo")
+            .unwrap();
+        assert!(echo.read_only);
+        let fail = client
+            .routes()
+            .into_iter()
+            .find(|route| route.exposed_name == "mcp__dyn__fail")
+            .unwrap();
+        assert!(!fail.read_only);
 
         let mut executor = McpToolExecutor::new(Arc::clone(&client), ScriptedTools::new(vec![]));
         let request = |name: &str| ToolRequest {
@@ -3093,6 +3105,36 @@ done
         assert!(timed_out.output.to_ascii_lowercase().contains("timeout"));
 
         runtime.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_handshake_accepts_response_before_request() {
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-early-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-stub.log");
+        let mut supervisor = McpSupervisor::new(
+            mcp_stub_spec(&dir, &log),
+            RestartPolicy {
+                max_attempts: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+        );
+        assert_eq!(
+            supervisor
+                .ensure_connected(&RecoveryContext::default())
+                .unwrap(),
+            McpStatus::Connected
+        );
+        assert_eq!(supervisor.handshake().unwrap().server_info.name, "stub");
+        supervisor.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -298,6 +298,26 @@ mod tests {
     }
 
     #[test]
+    fn default_tools_include_native_search_schemas() {
+        let tools = default_tools();
+        let search = tools
+            .iter()
+            .find(|tool| tool.name == "search_code")
+            .expect("search_code");
+        assert!(search.read_only);
+        assert_eq!(
+            search.input_schema.as_ref().unwrap()["properties"]["query"]["type"],
+            "string"
+        );
+        let glob = tools.iter().find(|tool| tool.name == "glob").expect("glob");
+        assert!(glob.read_only);
+        assert_eq!(
+            glob.input_schema.as_ref().unwrap()["required"][0],
+            "pattern"
+        );
+    }
+
+    #[test]
     fn tool_catalog_is_refreshed_before_each_proposal() {
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let catalog_tools = Arc::new(std::sync::Mutex::new(vec![spec("mcp__stub__echo")]));

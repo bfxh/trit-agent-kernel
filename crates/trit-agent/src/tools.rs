@@ -177,7 +177,7 @@ impl ShellSession {
             self.counter
         );
         let wrapped = format!(
-            "{{ {command}\n}} 2>&1; __trit_status=$?; printf '\\n{marker}%s\\n' \"$__trit_status\""
+            "{{ {command}\n}} 2>&1; __trit_status=$?; printf '\\036{marker}%s\\n' \"$__trit_status\""
         );
         writeln!(self.stdin, "{wrapped}")
             .map_err(|error| AgentError::Io(format!("shell write: {error}")))?;
@@ -197,25 +197,31 @@ impl ShellSession {
                 break;
             }
             let text = String::from_utf8_lossy(&line).into_owned();
-            let trimmed = text.trim_end_matches(['\r', '\n']);
-            if let Some(rest) = trimmed.strip_prefix(&marker) {
-                status = rest.trim().parse::<i32>().ok();
-                break;
-            }
-            if !truncated {
-                if output.len() + text.len() <= max.saturating_mul(4) {
-                    output.push_str(&text);
+            let (body, marker_part) = match text.split_once('\u{1e}') {
+                Some((body, rest)) => (body, Some(rest)),
+                None => (text.as_str(), None),
+            };
+            if !truncated && !body.is_empty() {
+                if output.len() + body.len() <= max.saturating_mul(4) {
+                    output.push_str(body);
                 } else {
                     let remaining = max.saturating_mul(4).saturating_sub(output.len());
                     if remaining > 0 {
                         let mut end = remaining;
-                        while end > 0 && !text.is_char_boundary(end) {
+                        while end > 0 && !body.is_char_boundary(end) {
                             end -= 1;
                         }
-                        output.push_str(&text[..end]);
+                        output.push_str(&body[..end]);
                     }
                     truncated = true;
                 }
+            }
+            if let Some(rest) = marker_part {
+                let trimmed = rest.trim_end_matches(['\r', '\n']);
+                if let Some(value) = trimmed.strip_prefix(&marker) {
+                    status = value.trim().parse::<i32>().ok();
+                }
+                break;
             }
         }
         Ok((status.map(|status| status == 0), truncate(output, max)))
