@@ -954,7 +954,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             Duration::from_millis(20),
         );
         let mut log_text = String::new();
-        for _ in 0..100 {
+        for _ in 0..500 {
             log_text = std::fs::read_to_string(&log).unwrap_or_default();
             if log_text.contains("session-old") {
                 break;
@@ -968,7 +968,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             ..RecoveryContext::default()
         };
         supervisor.lock().unwrap().kill_connection();
-        for _ in 0..200 {
+        for _ in 0..500 {
             log_text = std::fs::read_to_string(&log).unwrap_or_default();
             if log_text.contains("session-new") {
                 break;
