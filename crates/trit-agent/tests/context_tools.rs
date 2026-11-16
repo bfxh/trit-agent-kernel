@@ -307,12 +307,50 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         .with_hit_threshold_bp(5_000)
         .with_cache_pressure_policy(CachePressurePolicy {
             dynamic_budget_scale_bp: 5_000,
+            search_limit_scale_bp: 5_000,
         });
     planner.plan(&brief(), &turn_context()).unwrap().unwrap();
     assert_eq!(shared.lock().unwrap().dynamic_budget_scale_bp(), 5_000);
+    assert_eq!(shared.lock().unwrap().search_limit_scale_bp(), 5_000);
     let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
         .with_cache_ledger(ledger)
         .with_hit_threshold_bp(5_000);
     planner.plan(&brief(), &turn_context()).unwrap().unwrap();
     assert_eq!(shared.lock().unwrap().dynamic_budget_scale_bp(), 10_000);
+    assert_eq!(shared.lock().unwrap().search_limit_scale_bp(), 10_000);
+}
+
+#[test]
+fn cache_pressure_scales_search_candidates() {
+    let (plan, mut context, request) = plan_and_context();
+    for index in 0..10 {
+        context
+            .insert(
+                ContextRef {
+                    id: format!("doc-{index}"),
+                    label: format!("doc-{index}"),
+                    kind: ContextKind::Doc,
+                    scope: ContextScope::Project,
+                    project: Some("p1".into()),
+                    session: None,
+                    revision: "rev1".into(),
+                    content_hash: None,
+                    sensitivity: Sensitivity::Internal,
+                    cache: CacheClass::DynamicTail,
+                },
+                ContextDocument {
+                    id: format!("doc-{index}"),
+                    full: "x".into(),
+                    summary: None,
+                    tokens: Some(1),
+                },
+            )
+            .unwrap();
+    }
+    let mut agent = AgentContext::new(request, context, plan);
+    assert_eq!(agent.search("doc", 10).len(), 10);
+    agent.set_search_limit_scale_bp(5_000);
+    assert_eq!(agent.search("doc", 10).len(), 5);
+    agent.set_search_limit_scale_bp(10_000);
+    assert_eq!(agent.search("doc", 10).len(), 10);
 }

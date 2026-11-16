@@ -275,21 +275,24 @@ pub enum LowHitPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachePressurePolicy {
-    /// 低命中时动态添加预算的缩放（基点）；10000 表示关闭。
+    /// 低命中时动态添加/选批预算的缩放（基点）；10000 表示不缩放。
     pub dynamic_budget_scale_bp: u32,
+    /// 低命中时 context_search 候选数的缩放（基点）。
+    pub search_limit_scale_bp: u32,
 }
 
 impl Default for CachePressurePolicy {
     fn default() -> Self {
         Self {
             dynamic_budget_scale_bp: 10_000,
+            search_limit_scale_bp: 10_000,
         }
     }
 }
 
 impl CachePressurePolicy {
     pub fn enabled(self) -> bool {
-        self.dynamic_budget_scale_bp < 10_000
+        self.dynamic_budget_scale_bp < 10_000 || self.search_limit_scale_bp < 10_000
     }
 }
 
@@ -353,6 +356,7 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
         let mut plan = context.plan().clone();
         drop(context);
         let mut pressure_scale_bp = 10_000;
+        let mut search_scale_bp = 10_000;
         if let Some(cache_ledger) = &self.cache_ledger {
             let cache_ledger = cache_ledger
                 .lock()
@@ -373,6 +377,7 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
                         }
                         if self.cache_pressure.enabled() {
                             pressure_scale_bp = self.cache_pressure.dynamic_budget_scale_bp;
+                            search_scale_bp = self.cache_pressure.search_limit_scale_bp;
                         }
                     }
                 }
@@ -383,6 +388,7 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
             .lock()
             .map_err(|_| AgentError::Tool("context state poisoned".into()))?;
         context.set_dynamic_budget_scale_bp(pressure_scale_bp);
+        context.set_search_limit_scale_bp(search_scale_bp);
         drop(context);
         Ok(Some(plan))
     }

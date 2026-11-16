@@ -68,6 +68,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut cache_window_samples: usize = 64;
     let mut cache_window_ms: Option<u64> = None;
     let mut cache_pressure_scale_bp: u32 = 10_000;
+    let mut cache_search_scale_bp: u32 = 10_000;
     let mut cache_ledger_path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
@@ -175,6 +176,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 cache_pressure_scale_bp = next(&mut args, "--cache-pressure-scale-bp")?
                     .parse()
                     .map_err(|error| fail(format!("bad --cache-pressure-scale-bp: {error}")))?;
+            }
+            "--cache-search-scale-bp" => {
+                cache_search_scale_bp = next(&mut args, "--cache-search-scale-bp")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --cache-search-scale-bp: {error}")))?;
             }
             "--cache-ledger" => {
                 cache_ledger_path = Some(PathBuf::from(next(&mut args, "--cache-ledger")?));
@@ -317,6 +323,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         },
         pressure: CachePressurePolicy {
             dynamic_budget_scale_bp: cache_pressure_scale_bp,
+            search_limit_scale_bp: cache_search_scale_bp,
         },
     };
     let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
@@ -516,7 +523,8 @@ fn usage() {
          [--context-read-budget N] [--context-read-max N] \\\n    \
          [--cache-hit-threshold BP] [--cache-low-hit-policy keep|demote] \\\n    \
          [--cache-window-samples N] [--cache-window-ms N] \\\n    \
-         [--cache-pressure-scale-bp N] [--cache-ledger <json>]]\n\n\
+         [--cache-pressure-scale-bp N] [--cache-search-scale-bp N] \\\n    \
+         [--cache-ledger <json>]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
@@ -527,7 +535,8 @@ fn usage() {
          context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\
          context_search / context_add / context_read with dynamic-tail-only additions.\n\
          cache-hit-threshold: basis points (default 5000); low-hit-policy keep|demote (default keep).\n\
-         cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\n\
+         cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\
+         cache-search-scale-bp: scales context_search candidates on low cache hit.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"

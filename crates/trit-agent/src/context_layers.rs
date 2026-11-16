@@ -1295,6 +1295,7 @@ pub struct AgentContext<R> {
     resolver: R,
     plan: ContextPlan,
     dynamic_budget_scale_bp: u32,
+    search_limit_scale_bp: u32,
 }
 
 impl<R: ContextCatalog> AgentContext<R> {
@@ -1304,6 +1305,7 @@ impl<R: ContextCatalog> AgentContext<R> {
             resolver,
             plan,
             dynamic_budget_scale_bp: 10_000,
+            search_limit_scale_bp: 10_000,
         }
     }
 
@@ -1325,8 +1327,19 @@ impl<R: ContextCatalog> AgentContext<R> {
         self.dynamic_budget_scale_bp = scale_bp.min(10_000);
     }
 
+    pub fn search_limit_scale_bp(&self) -> u32 {
+        self.search_limit_scale_bp
+    }
+
+    pub fn set_search_limit_scale_bp(&mut self, scale_bp: u32) {
+        self.search_limit_scale_bp = scale_bp.min(10_000);
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<ContextRef> {
-        self.resolver.search(query, limit)
+        let scaled = limit
+            .saturating_mul(usize::try_from(self.search_limit_scale_bp).unwrap_or(usize::MAX))
+            / 10_000;
+        self.resolver.search(query, scaled.max(1))
     }
 
     /// 智能体主动添加一个动态 ref；成功返回新句柄项。
