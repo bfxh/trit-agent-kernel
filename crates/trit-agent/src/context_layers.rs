@@ -668,6 +668,10 @@ impl CacheStat {
     pub fn windowed(&self, now_ms: Option<u64>, window: CacheWindow) -> CacheWindowStats {
         let mut stats = CacheWindowStats::default();
         for sample in self.recent.iter().rev().take(window.max_samples.max(1)) {
+            if window.max_age_ms.is_some() && sample.at_ms.is_none() {
+                // 有时间窗时，无法证明“新”的无时间戳旧样本不参与校准。
+                continue;
+            }
             if let (Some(max_age), Some(now), Some(at)) = (window.max_age_ms, now_ms, sample.at_ms)
                 && now.saturating_sub(at) > max_age
             {
@@ -1290,6 +1294,7 @@ pub struct AgentContext<R> {
     request: ContextRequest,
     resolver: R,
     plan: ContextPlan,
+    dynamic_budget_scale_bp: u32,
 }
 
 impl<R: ContextCatalog> AgentContext<R> {
@@ -1298,6 +1303,7 @@ impl<R: ContextCatalog> AgentContext<R> {
             request,
             resolver,
             plan,
+            dynamic_budget_scale_bp: 10_000,
         }
     }
 
@@ -1308,6 +1314,15 @@ impl<R: ContextCatalog> AgentContext<R> {
 
     pub fn plan(&self) -> &ContextPlan {
         &self.plan
+    }
+
+    pub fn dynamic_budget_scale_bp(&self) -> u32 {
+        self.dynamic_budget_scale_bp
+    }
+
+    /// 缓存压力策略设置；10000 表示不缩放。
+    pub fn set_dynamic_budget_scale_bp(&mut self, scale_bp: u32) {
+        self.dynamic_budget_scale_bp = scale_bp.min(10_000);
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<ContextRef> {
@@ -1357,7 +1372,9 @@ impl<R: ContextCatalog> AgentContext<R> {
         let remaining = self
             .plan
             .budget_tokens
-            .saturating_sub(self.plan.estimated_tokens);
+            .saturating_sub(self.plan.estimated_tokens)
+            .saturating_mul(u64::from(self.dynamic_budget_scale_bp))
+            / 10_000;
         let mut chosen = None;
         for detail in detail_chain(
             preferred,

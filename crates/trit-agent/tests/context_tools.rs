@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use trit_agent::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentError, CacheClass, CacheLedger,
-    CacheObservation, ContextDocument, ContextKind, ContextPlan, ContextPlanner, ContextReadTools,
-    ContextRef, ContextRequest, ContextScope, ContextSelection, ContextSpan, InMemoryContext,
-    LowHitPolicy, ModelProfile, ReasoningEffort, ScriptedTools, Sensitivity, ToolExecutor,
-    ToolRequest, TurnContext, assemble_context,
+    CacheObservation, CachePressurePolicy, ContextDocument, ContextKind, ContextPlan,
+    ContextPlanner, ContextReadTools, ContextRef, ContextRequest, ContextScope, ContextSelection,
+    ContextSpan, InMemoryContext, LowHitPolicy, ModelProfile, ReasoningEffort, ScriptedTools,
+    Sensitivity, ToolExecutor, ToolRequest, TurnContext, assemble_context,
 };
 use trit_orch::{TaskBrief, Ternary, TokenUsage};
 
@@ -287,13 +287,32 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
     assert_eq!(plan.cache.observed_hit_rate_bp, Some(2_000));
     assert_eq!(plan.cache.calibration, Ternary::True);
     assert_eq!(plan.cache.prefix_items, 1, "keep policy preserves prefix");
+    assert_eq!(
+        shared.lock().unwrap().dynamic_budget_scale_bp(),
+        10_000,
+        "pressure policy is opt-in"
+    );
 
     let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
-        .with_cache_ledger(low)
+        .with_cache_ledger(Arc::clone(&low))
         .with_hit_threshold_bp(5_000)
         .with_low_hit_policy(LowHitPolicy::DemotePrefix);
     let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
     assert_eq!(plan.cache.hit_potential, Ternary::False);
     assert_eq!(plan.cache.prefix_items, 0);
     assert!(plan.cache.prefix_fingerprint.is_empty());
+
+    let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
+        .with_cache_ledger(Arc::clone(&low))
+        .with_hit_threshold_bp(5_000)
+        .with_cache_pressure_policy(CachePressurePolicy {
+            dynamic_budget_scale_bp: 5_000,
+        });
+    planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    assert_eq!(shared.lock().unwrap().dynamic_budget_scale_bp(), 5_000);
+    let mut planner = AgentContextPlanner::new(Arc::clone(&shared))
+        .with_cache_ledger(ledger)
+        .with_hit_threshold_bp(5_000);
+    planner.plan(&brief(), &turn_context()).unwrap().unwrap();
+    assert_eq!(shared.lock().unwrap().dynamic_budget_scale_bp(), 10_000);
 }

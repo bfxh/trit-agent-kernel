@@ -136,12 +136,15 @@ parse -> resolve -> ACL/scope -> revision/freshness -> size/token cap
   `hit_potential_for(provider, model, prefix, threshold)` 把观测折叠成三值；
   `--cache-hit-threshold`、`--cache-window-samples`、`--cache-window-ms` 可调窗口/阈值。
   默认 `--cache-low-hit-policy keep`，只有显式 `demote` 才会在确认低命中时把稳定前缀
-  降级为动态尾段。CLI 结束向 stderr 打印 ledger。
+  降级为动态尾段。`--cache-pressure-scale-bp < 10000` 会启用独立的 CachePressurePolicy：
+  低命中时缩放 agent 动态添加预算，但不改前缀。CLI 结束向 stderr 打印 ledger；
+  `--cache-ledger <json>` 可加载/写回独立 JSON 旁路（与 session replay 合并）。
 - 边界：token 仍是粗估；校准用最大值而非分位数；“印象”只比较 revision/hash，不做语义 diff。
 
 - 旧 session 若没有 `Proposal.context`（早期日志/第三方日志），无法还原当时的 cache 观测；
   ledger 只能从已有 receipt 重建，缺失部分按无观测处理。
-- ledger 是 session 派生的内存视图，不是独立持久化数据库；进程内按 session 重建。
+- ledger 默认是 session 派生的内存视图，按 session 重建；`--cache-ledger <json>` 提供
+  可选的独立 JSON 旁路，但不是事务数据库，仍以 session 日志为审计源。
 
 ### 3.6 非目标
 

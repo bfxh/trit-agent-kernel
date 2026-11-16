@@ -273,12 +273,33 @@ pub enum LowHitPolicy {
     DemotePrefix,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachePressurePolicy {
+    /// 低命中时动态添加预算的缩放（基点）；10000 表示关闭。
+    pub dynamic_budget_scale_bp: u32,
+}
+
+impl Default for CachePressurePolicy {
+    fn default() -> Self {
+        Self {
+            dynamic_budget_scale_bp: 10_000,
+        }
+    }
+}
+
+impl CachePressurePolicy {
+    pub fn enabled(self) -> bool {
+        self.dynamic_budget_scale_bp < 10_000
+    }
+}
+
 pub struct AgentContextPlanner<R> {
     context: Arc<Mutex<AgentContext<R>>>,
     cache_ledger: Option<Arc<Mutex<CacheLedger>>>,
     hit_threshold_bp: u32,
     low_hit_policy: LowHitPolicy,
     cache_window: CacheWindow,
+    cache_pressure: CachePressurePolicy,
 }
 
 impl<R> AgentContextPlanner<R> {
@@ -289,6 +310,7 @@ impl<R> AgentContextPlanner<R> {
             hit_threshold_bp: 5_000,
             low_hit_policy: LowHitPolicy::Keep,
             cache_window: CacheWindow::default(),
+            cache_pressure: CachePressurePolicy::default(),
         }
     }
 
@@ -311,6 +333,11 @@ impl<R> AgentContextPlanner<R> {
         self.cache_window = cache_window;
         self
     }
+
+    pub fn with_cache_pressure_policy(mut self, cache_pressure: CachePressurePolicy) -> Self {
+        self.cache_pressure = cache_pressure;
+        self
+    }
 }
 
 impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
@@ -325,6 +352,7 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
             .map_err(|_| AgentError::Tool("context state poisoned".into()))?;
         let mut plan = context.plan().clone();
         drop(context);
+        let mut pressure_scale_bp = 10_000;
         if let Some(cache_ledger) = &self.cache_ledger {
             let cache_ledger = cache_ledger
                 .lock()
@@ -339,14 +367,23 @@ impl<R: ContextCatalog> ContextPlanner for AgentContextPlanner<R> {
                     plan.cache.hit_potential = trit_orch::Ternary::from_bool(
                         window.calibrated_hit_rate_bp() >= self.hit_threshold_bp,
                     );
-                    if plan.cache.hit_potential == trit_orch::Ternary::False
-                        && self.low_hit_policy == LowHitPolicy::DemotePrefix
-                    {
-                        plan.demote_stable_prefix();
+                    if plan.cache.hit_potential == trit_orch::Ternary::False {
+                        if self.low_hit_policy == LowHitPolicy::DemotePrefix {
+                            plan.demote_stable_prefix();
+                        }
+                        if self.cache_pressure.enabled() {
+                            pressure_scale_bp = self.cache_pressure.dynamic_budget_scale_bp;
+                        }
                     }
                 }
             }
         }
+        let mut context = self
+            .context
+            .lock()
+            .map_err(|_| AgentError::Tool("context state poisoned".into()))?;
+        context.set_dynamic_budget_scale_bp(pressure_scale_bp);
+        drop(context);
         Ok(Some(plan))
     }
 }

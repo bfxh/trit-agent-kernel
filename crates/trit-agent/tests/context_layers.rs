@@ -825,3 +825,55 @@ fn cache_ledger_separates_provider_endpoints() {
         Ternary::False
     );
 }
+
+#[test]
+fn time_window_excludes_untimestamped_legacy_samples() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    ledger.observe(&trit_agent::CacheObservation {
+        provider: "p".into(),
+        model: "m".into(),
+        prefix_fingerprint: "fnv1a64:legacy".into(),
+        prompt_tokens: 100,
+        cache_hit_tokens: 80,
+        cache_miss_tokens: 20,
+        estimated: false,
+        observed_at_ms: None,
+    });
+    let stat = ledger.stat_for("p", "m", "fnv1a64:legacy").unwrap();
+    let no_age = stat.windowed(
+        Some(10_000),
+        trit_agent::CacheWindow {
+            max_samples: 64,
+            max_age_ms: None,
+        },
+    );
+    assert_eq!(no_age.samples, 1);
+    let with_age = stat.windowed(
+        Some(10_000),
+        trit_agent::CacheWindow {
+            max_samples: 64,
+            max_age_ms: Some(5_000),
+        },
+    );
+    assert_eq!(with_age.samples, 0);
+}
+
+#[test]
+fn cache_ledger_roundtrips_through_json() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    ledger.observe(&trit_agent::CacheObservation {
+        provider: "p".into(),
+        model: "m".into(),
+        prefix_fingerprint: "fnv1a64:persist".into(),
+        prompt_tokens: 100,
+        cache_hit_tokens: 80,
+        cache_miss_tokens: 20,
+        estimated: false,
+        observed_at_ms: Some(1_000),
+    });
+    let text = serde_json::to_string(&ledger).unwrap();
+    let restored: trit_agent::CacheLedger = serde_json::from_str(&text).unwrap();
+    let stat = restored.stat_for("p", "m", "fnv1a64:persist").unwrap();
+    assert_eq!(stat.cache_hit_tokens, 80);
+    assert_eq!(stat.recent.len(), 1);
+}

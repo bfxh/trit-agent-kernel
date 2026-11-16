@@ -804,8 +804,8 @@ pub use context_layers::{
     ResolvedContext, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
 };
 pub use context_tools::{
-    AgentContextPlanner, AgentContextTools, ContextAddRecord, ContextReadRecord, ContextReadTools,
-    LowHitPolicy,
+    AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
+    ContextReadRecord, ContextReadTools, LowHitPolicy,
 };
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,

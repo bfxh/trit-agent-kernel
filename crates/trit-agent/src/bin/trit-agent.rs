@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_agent::{
-    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger, CacheWindow,
-    CheckpointStore, CheckpointingTools, ContextPolicy, ContextRequest, GitCheckpointStore,
-    GitCheckpointingTools, HeadlessConfig, InMemoryContext, LowHitPolicy, Model, ModelProfile,
-    OpenAiConfig, OpenAiProvider, Proposal, ProviderModel, ReasoningEffort, ResolvedContext,
-    RewindScope, ScriptedModel, Session, ToolExecutor, rewind_session_git_with_policy,
-    rewind_session_with_policy, run_headless,
+    AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
+    CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
+    ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
+    LowHitPolicy, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal, ProviderModel,
+    ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, Session, ToolExecutor,
+    rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -67,6 +67,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut low_hit_policy = LowHitPolicy::Keep;
     let mut cache_window_samples: usize = 64;
     let mut cache_window_ms: Option<u64> = None;
+    let mut cache_pressure_scale_bp: u32 = 10_000;
+    let mut cache_ledger_path: Option<PathBuf> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -168,6 +170,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .parse()
                         .map_err(|error| fail(format!("bad --cache-window-ms: {error}")))?,
                 );
+            }
+            "--cache-pressure-scale-bp" => {
+                cache_pressure_scale_bp = next(&mut args, "--cache-pressure-scale-bp")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --cache-pressure-scale-bp: {error}")))?;
+            }
+            "--cache-ledger" => {
+                cache_ledger_path = Some(PathBuf::from(next(&mut args, "--cache-ledger")?));
             }
             "--help" | "-h" => {
                 usage();
@@ -288,21 +298,35 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
-    let shared_cache_ledger = Arc::new(Mutex::new(CacheLedger::default()));
-    let cache_window = CacheWindow {
-        max_samples: cache_window_samples,
-        max_age_ms: cache_window_ms,
+    let loaded_cache_ledger = match cache_ledger_path.as_ref() {
+        Some(path) if path.exists() => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| fail(format!("read cache ledger {}: {error}", path.display())))?;
+            serde_json::from_str::<CacheLedger>(&text)
+                .map_err(|error| fail(format!("parse cache ledger: {error}")))?
+        }
+        _ => CacheLedger::default(),
     };
-    let (outcome, cache_ledger) = if resume || checkpoint_dir.is_some() {
+    let shared_cache_ledger = Arc::new(Mutex::new(loaded_cache_ledger));
+    let cache_options = CacheOptions {
+        hit_threshold_bp: cache_hit_threshold,
+        low_hit_policy,
+        window: CacheWindow {
+            max_samples: cache_window_samples,
+            max_age_ms: cache_window_ms,
+        },
+        pressure: CachePressurePolicy {
+            dynamic_budget_scale_bp: cache_pressure_scale_bp,
+        },
+    };
+    let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
         let model = build_model(
             scripted,
             openai_config.as_ref(),
             context_agent.as_ref(),
             &shared_cache_ledger,
-            cache_hit_threshold,
-            low_hit_policy,
-            cache_window,
+            &cache_options,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
@@ -347,9 +371,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             openai_config.as_ref(),
             Some(shared),
             &shared_cache_ledger,
-            cache_hit_threshold,
-            low_hit_policy,
-            cache_window,
+            &cache_options,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools = AgentContextTools::new(local, Arc::clone(shared))
@@ -378,23 +400,22 @@ fn run() -> Result<(), Box<dyn Error>> {
             openai_config.as_ref(),
             None,
             &shared_cache_ledger,
-            cache_hit_threshold,
-            low_hit_policy,
-            cache_window,
+            &cache_options,
         )?;
         (run_headless(turn, model, config)?, None)
     };
 
-    if context_agent.is_some()
-        && let Some(ledger) = cache_ledger
-    {
-        let ledger = ledger
+    if context_agent.is_some() {
+        let ledger = shared_cache_ledger
             .lock()
             .map_err(|_| fail("cache ledger is poisoned"))?;
-        eprintln!(
-            "cache ledger: {}",
-            serde_json::to_string_pretty(&*ledger).map_err(|error| fail(error.to_string()))?
-        );
+        let text = serde_json::to_string_pretty(&*ledger)
+            .map_err(|error| fail(format!("encode cache ledger: {error}")))?;
+        if let Some(path) = cache_ledger_path.as_ref() {
+            std::fs::write(path, text.as_bytes())
+                .map_err(|error| fail(format!("write cache ledger {}: {error}", path.display())))?;
+        }
+        eprintln!("cache ledger: {text}");
     }
     let mut stdout = std::io::stdout().lock();
     writeln!(
@@ -408,14 +429,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+struct CacheOptions {
+    hit_threshold_bp: u32,
+    low_hit_policy: LowHitPolicy,
+    window: CacheWindow,
+    pressure: CachePressurePolicy,
+}
+
 fn build_model(
     scripted: Option<Vec<Proposal>>,
     config: Option<&OpenAiConfig>,
     context: Option<&Arc<Mutex<AgentContext<InMemoryContext>>>>,
     cache_ledger: &Arc<Mutex<CacheLedger>>,
-    cache_hit_threshold: u32,
-    low_hit_policy: LowHitPolicy,
-    cache_window: CacheWindow,
+    cache_options: &CacheOptions,
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
@@ -426,9 +452,10 @@ fn build_model(
         model = model.with_context_planner(Box::new(
             AgentContextPlanner::new(Arc::clone(shared))
                 .with_cache_ledger(Arc::clone(cache_ledger))
-                .with_hit_threshold_bp(cache_hit_threshold)
-                .with_low_hit_policy(low_hit_policy)
-                .with_cache_window(cache_window),
+                .with_hit_threshold_bp(cache_options.hit_threshold_bp)
+                .with_low_hit_policy(cache_options.low_hit_policy)
+                .with_cache_window(cache_options.window)
+                .with_cache_pressure_policy(cache_options.pressure),
         ));
     }
     Ok(Box::new(model))
@@ -488,7 +515,8 @@ fn usage() {
          [--supports-reasoning] [--reasoning off|low|medium|high] \\\n    \
          [--context-read-budget N] [--context-read-max N] \\\n    \
          [--cache-hit-threshold BP] [--cache-low-hit-policy keep|demote] \\\n    \
-         [--cache-window-samples N] [--cache-window-ms N]]\n\n\
+         [--cache-window-samples N] [--cache-window-ms N] \\\n    \
+         [--cache-pressure-scale-bp N] [--cache-ledger <json>]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
@@ -498,7 +526,8 @@ fn usage() {
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
          context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\
          context_search / context_add / context_read with dynamic-tail-only additions.\n\
-         cache-hit-threshold: basis points (default 5000); low-hit-policy keep|demote (default keep).\n\n\
+         cache-hit-threshold: basis points (default 5000); low-hit-policy keep|demote (default keep).\n\
+         cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
