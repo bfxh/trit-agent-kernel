@@ -96,7 +96,7 @@ fn default_interval_ms() -> u64 {
 }
 
 fn default_mcp_timeout_ms() -> u64 {
-    5_000
+    30_000
 }
 
 /// 宿主/CLI 的 supervisor 声明；可直接从 JSON 解析。
@@ -788,6 +788,12 @@ mod tests {
         ));
     }
 
+    /// MCP stub 会启动真实 PowerShell/Node 进程，串行化避免 CI 冷启动互相挤压。
+    fn serialize_mcp_test() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn mcp_stub_spec(dir: &std::path::Path, log: &std::path::Path) -> ProcessSpec {
         if cfg!(windows) {
             let script = dir.join("mcp-stub.ps1");
@@ -825,6 +831,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 
     #[test]
     fn mcp_supervisor_handshakes_reconnects_and_sends_recovery() {
+        let _guard = serialize_mcp_test();
         let dir = std::env::temp_dir().join(format!(
             "trit-mcp-supervisor-{}-{:?}",
             std::process::id(),
@@ -842,7 +849,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 max_backoff_ms: 0,
             },
         )
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(Duration::from_secs(30));
         let recovery = RecoveryContext {
             session_id: Some("session-1".into()),
             state: Some(StateLayer::default()),
@@ -882,6 +889,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 
     #[test]
     fn mcp_supervisor_gives_up_until_explicit_reset() {
+        let _guard = serialize_mcp_test();
         let dir = std::env::temp_dir().join(format!(
             "trit-mcp-giveup-{}-{:?}",
             std::process::id(),
@@ -898,7 +906,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 max_backoff_ms: 0,
             },
         )
-        .with_timeout(Duration::from_secs(5));
+        .with_timeout(Duration::from_secs(30));
         let recovery = RecoveryContext::default();
         assert_eq!(
             supervisor.ensure_connected(&recovery).unwrap(),
@@ -925,6 +933,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 
     #[test]
     fn supervisor_loop_reconnects_with_latest_recovery_snapshot() {
+        let _guard = serialize_mcp_test();
         let dir = std::env::temp_dir().join(format!(
             "trit-mcp-latest-{}-{:?}",
             std::process::id(),
@@ -942,7 +951,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                     max_backoff_ms: 0,
                 },
             )
-            .with_timeout(Duration::from_secs(5)),
+            .with_timeout(Duration::from_secs(30)),
         ));
         let recovery = Arc::new(Mutex::new(RecoveryContext {
             session_id: Some("session-old".into()),
@@ -954,7 +963,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             Duration::from_millis(20),
         );
         let mut log_text = String::new();
-        for _ in 0..500 {
+        for _ in 0..3000 {
             log_text = std::fs::read_to_string(&log).unwrap_or_default();
             if log_text.contains("session-old") {
                 break;
@@ -968,7 +977,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             ..RecoveryContext::default()
         };
         supervisor.lock().unwrap().kill_connection();
-        for _ in 0..500 {
+        for _ in 0..3000 {
             log_text = std::fs::read_to_string(&log).unwrap_or_default();
             if log_text.contains("session-new") {
                 break;
@@ -1027,11 +1036,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         assert_eq!(config.restart.max_attempts, 1);
         assert_eq!(config.restart.max_backoff_ms, 1_000);
         assert_eq!(config.interval_ms, 500);
-        assert_eq!(config.mcp_timeout_ms, 5_000);
+        assert_eq!(config.mcp_timeout_ms, 30_000);
     }
 
     #[test]
     fn supervisor_runtime_starts_sidecars_and_refreshes_recovery() {
+        let _guard = serialize_mcp_test();
         let dir = std::env::temp_dir().join(format!(
             "trit-supervisor-runtime-{}-{:?}",
             std::process::id(),
@@ -1049,7 +1059,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 max_backoff_ms: 0,
             },
             interval_ms: 10,
-            mcp_timeout_ms: 5_000,
+            mcp_timeout_ms: 30_000,
         };
         let mut runtime = SupervisorRuntime::start(
             &config,

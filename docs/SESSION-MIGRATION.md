@@ -121,7 +121,7 @@ CLI 通过 `--supervisor-config <json>` 接入：
   "mcp": [{"name": "tools", "program": "mcp-server", "args": []}],
   "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
   "interval_ms": 500,
-  "mcp_timeout_ms": 5000
+  "mcp_timeout_ms": 30000
 }
 ```
 
