@@ -602,6 +602,9 @@ pub struct CacheStat {
     /// 最近样本（用于时间/样本窗口校准）；旧日志无时间戳也会保留。
     #[serde(default)]
     pub recent: VecDeque<CacheSample>,
+    /// 最后访问时间（Unix 秒），用于 TTL 过期判断
+    #[serde(default)]
+    pub last_accessed: u64,
 }
 
 impl CacheStat {
@@ -719,18 +722,60 @@ const MAX_RECENT_CACHE_SAMPLES: usize = 256;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheLedger {
     entries: BTreeMap<String, CacheStat>,
+    // LRU 追踪：键按最近访问时间排序
+    lru_order: Vec<String>,
+    // TTL 配置：条目最大存活时间（秒），0 表示不过期
+    ttl_secs: u64,
+    // 最大条目数，0 表示不限制
+    max_entries: usize,
 }
 
 impl CacheLedger {
+    fn make_key(&self, provider: &str, model: &str, prefix_fingerprint: &str) -> String {
+        format!("{}|{}|{}", provider, model, prefix_fingerprint)
+    }
+
     pub fn observe(&mut self, observation: &CacheObservation) {
+        let key = self.make_key(&observation.provider, &observation.model, &observation.prefix_fingerprint);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // 更新 LRU 顺序
+        let full_key = self.make_key(&observation.provider, &observation.model, &observation.prefix_fingerprint);
+        if let Some(pos) = self.lru_order.iter().position(|k| k == &full_key) {
+            self.lru_order.remove(pos);
+        }
+        self.lru_order.push(full_key.clone());
+
+        // 更新/插入条目
         self.entries
-            .entry(cache_key(
-                &observation.provider,
-                &observation.model,
-                &observation.prefix_fingerprint,
-            ))
+            .entry(key)
             .or_default()
             .observe(observation);
+
+        // 清理过期条目
+        if self.ttl_secs > 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.entries.retain(|_, stat| {
+                now.saturating_sub(stat.last_accessed) <= self.ttl_secs
+            });
+            // 同步 LRU 顺序
+            self.lru_order.retain(|k| self.entries.contains_key(k));
+        }
+
+        // 限制最大条目数
+        if self.max_entries > 0 && self.entries.len() > self.max_entries {
+            let excess = self.entries.len() - self.max_entries;
+            let to_remove: Vec<String> = self.lru_order.drain(..excess).collect();
+            for key in to_remove {
+                self.entries.remove(&key);
+            }
+        }
     }
 
     pub fn merge(&mut self, other: &CacheLedger) {
