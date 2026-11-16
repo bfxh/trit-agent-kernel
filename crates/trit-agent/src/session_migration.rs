@@ -58,6 +58,9 @@ pub struct SessionMigrationBundle {
     pub hooks: Vec<HookDescriptor>,
     #[serde(default)]
     pub cache: CacheLedger,
+    /// 来源会话的状态层；迁移前可用于展示和校验。
+    #[serde(default)]
+    pub state: Option<crate::state_layer::StateLayer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +89,7 @@ pub struct MigrationPolicy {
     pub enabled: bool,
     pub migrate_cache: bool,
     pub migrate_hooks: bool,
+    pub migrate_state: bool,
     pub conflict: ContextConflictPolicy,
     pub preserve_superseded: bool,
 }
@@ -96,6 +100,7 @@ impl Default for MigrationPolicy {
             enabled: true,
             migrate_cache: true,
             migrate_hooks: true,
+            migrate_state: true,
             conflict: ContextConflictPolicy::PreferIncoming,
             preserve_superseded: true,
         }
@@ -121,6 +126,9 @@ pub struct MigrationReport {
     pub migrated_hooks: Vec<String>,
     pub rejected_hooks: Vec<String>,
     pub cache_dropped: Option<CacheDropReason>,
+    /// 来源状态层的校验结论；没有迁移状态时为 None。
+    #[serde(default)]
+    pub state_verdict: Option<trit_orch::Ternary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +138,7 @@ pub struct MigrationPlan {
     pub superseded: Vec<ContextVersion>,
     pub hooks: Vec<HookDescriptor>,
     pub cache: Option<CacheLedger>,
+    pub state: Option<crate::state_layer::StateLayer>,
     pub report: MigrationReport,
 }
 
@@ -148,6 +157,7 @@ pub fn plan_migration(
             superseded,
             hooks: Vec::new(),
             cache: None,
+            state: None,
             report,
         };
     }
@@ -227,11 +237,21 @@ pub fn plan_migration(
         Some(source.cache.clone())
     };
 
+    let state = if policy.migrate_state {
+        source.state.clone()
+    } else {
+        None
+    };
+    if let Some(state) = &state {
+        report.state_verdict = Some(state.validation.verdict);
+    }
+
     MigrationPlan {
         contexts,
         superseded,
         hooks,
         cache,
+        state,
         report,
     }
 }
@@ -268,6 +288,7 @@ mod tests {
                 enabled: true,
             }],
             cache: CacheLedger::default(),
+            state: None,
         }
     }
 
@@ -348,6 +369,26 @@ mod tests {
         assert_eq!(plan.contexts["doc"].version, 1);
         assert!(plan.hooks.is_empty());
         assert!(plan.cache.is_none());
+    }
+
+    #[test]
+    fn state_layer_moves_with_bundle_and_can_be_disabled() {
+        let mut source = bundle();
+        source.state = Some(crate::state_layer::StateLayer::default());
+        let plan = plan_migration(&source, &target(), &MigrationPolicy::default());
+        assert!(plan.state.is_some());
+        assert_eq!(plan.report.state_verdict, Some(trit_orch::Ternary::True));
+
+        let plan = plan_migration(
+            &source,
+            &target(),
+            &MigrationPolicy {
+                migrate_state: false,
+                ..MigrationPolicy::default()
+            },
+        );
+        assert!(plan.state.is_none());
+        assert!(plan.report.state_verdict.is_none());
     }
 
     #[test]

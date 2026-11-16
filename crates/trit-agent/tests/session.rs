@@ -304,3 +304,28 @@ fn reopening_a_session_rebuilds_the_cache_ledger() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn session_exposes_state_layer_and_validation() {
+    let root = temp_workspace("state-layer");
+    let path = temp_file("state-layer");
+    let mut session = Session::open(
+        ScriptedModel::new(vec![proposal()]),
+        ScriptedTools::new(vec![write_outcome()]),
+        &path,
+    )
+    .unwrap();
+    session.run_turn(&turn()).unwrap();
+    let state = session.state_layer().unwrap();
+    assert_eq!(state.state, trit_agent::AgentState::Finished);
+    assert_eq!(state.turns, 1);
+    assert_eq!(state.completed_turns, 1);
+    assert!(state.in_progress.is_none());
+    assert_eq!(state.validation.verdict, trit_orch::Ternary::True);
+    assert_eq!(
+        session.validate_state().unwrap().verdict,
+        trit_orch::Ternary::True
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&root);
+}

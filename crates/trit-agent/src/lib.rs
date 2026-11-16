@@ -789,6 +789,7 @@ pub mod openai;
 pub mod provider;
 pub mod session;
 pub mod session_migration;
+pub mod state_layer;
 pub mod tools;
 pub use trit_orch::SelectionPressure;
 
@@ -826,4 +827,8 @@ pub use session_migration::{
     CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,
     MigrationPolicy, MigrationReport, MigrationTarget, SESSION_MIGRATION_SCHEMA,
     SessionMigrationBundle, SessionRole, plan_migration,
+};
+pub use state_layer::{
+    AgentState, CompactionState, InProgressState, StateIssue, StateIssueCode, StateIssueSeverity,
+    StateLayer, StateValidation, state_layer,
 };

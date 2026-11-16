@@ -348,6 +348,14 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
         &self.log
     }
 
+    pub fn state_layer(&self) -> Result<crate::state_layer::StateLayer, AgentError> {
+        Ok(crate::state_layer::state_layer(&self.log.load()?))
+    }
+
+    pub fn validate_state(&self) -> Result<crate::state_layer::StateValidation, AgentError> {
+        Ok(self.state_layer()?.validation)
+    }
+
     pub fn cache_ledger(
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<crate::context_layers::CacheLedger>> {

@@ -13,7 +13,8 @@ SessionMigrationBundle {
   provider, model, prefix_fingerprint,
   contexts: [ContextVersion],
   hooks: [HookDescriptor],
-  cache: CacheLedger
+  cache: CacheLedger,
+  state: Option<StateLayer>
 }
 ```
 
@@ -21,6 +22,7 @@ SessionMigrationBundle {
 - **上下文版本**：`id + version + content_hash + summary`。
 - **钩子**：`id + event + contract_hash + enabled`；没有 contract 的钩子不迁移。
 - **缓存**：按 `provider + model + prefix_fingerprint` 复用的实际 cache ledger。
+- **状态层**：当前状态、进行中的 turn/step/tool、每次压缩后的状态与摘要、校验结论。
 
 ## 2. 缓存迁移契约
 
@@ -33,7 +35,21 @@ SessionMigrationBundle {
 否则不迁移，并记录明确原因（`ProviderMismatch` / `ModelMismatch` / `PrefixMismatch`）。
 不兼容时不做“近似复用”——错误复用会把另一个模型的命中率当成当前模型的。
 
-## 3. 新想法 vs 旧想法
+## 3. 状态层
+
+`StateLayer` 从 `SessionLog` 事件重建：
+
+- `state`：`Idle / Planning / ToolsRunning / Compacting / Judging / Finished / Failed`；
+- `in_progress`：当前 turn、step、pending tools；
+- `compactions[]`：每次压缩的 step、dropped/truncated、digest、`state_after`；
+- `usage`：Proposal 事件的聚合用量；
+- `validation`：`True / Unknown / False`，附 issue code 与 seq。
+
+校验覆盖：turn 外事件、嵌套 turn 开始、无 start 的 finish、step 回退、压缩缺 digest、
+无压缩却有 digest、未完成 turn（warning）。迁移前可先 `session.validate_state()`；
+`MigrationPolicy.migrate_state=false` 时状态层不随 bundle 迁移。
+
+## 4. 新想法 vs 旧想法
 
 上下文按 `version` 合并：
 
@@ -54,7 +70,7 @@ SessionMigrationBundle {
 **零额外模型成本**：迁移不调用模型、不重新 embed、不重新摘要；旧版本只复用已有
 `summary`。如果旧版本没有摘要，就只记录被替换，不生成新摘要。
 
-## 4. 钩子迁移
+## 5. 钩子迁移
 
 钩子必须匹配目标端的 `contract_hash` 才迁移；不匹配的进入
 `rejected_hooks`，由宿主重新注册，不能静默沿用旧钩子的副作用。
@@ -63,7 +79,7 @@ SessionMigrationBundle {
 - 钩子 `enabled=false`：跳过；
 - 未来可增加 per-hook 开关和权限审查。
 
-## 5. 用户开关
+## 6. 用户开关
 
 `MigrationPolicy`：
 
@@ -77,7 +93,7 @@ preserve_superseded  // 是否保留旧摘要
 
 默认开启，但宿主/用户可全部关闭；关闭时迁移计划保持目标状态不变。
 
-## 6. 网关与 MCP 自动重启（提案）
+## 7. 网关与 MCP 自动重启（提案）
 
 现有仓库没有网关/MCP 运行时，不能假装已经实现。建议的 supervisor 契约：
 
@@ -101,7 +117,7 @@ SupervisorPolicy {
 
 这部分仍是设计，不应在文档里标成已完成。
 
-## 7. 当前边界
+## 8. 当前边界
 
 - 迁移目前是纯计划，不直接改目标 session/文件；宿主需要把 `MigrationPlan` 落地。
 - 缓存只迁移 ledger，不迁移 provider 内部 KV cache；跨 provider 本来也不可复用。
