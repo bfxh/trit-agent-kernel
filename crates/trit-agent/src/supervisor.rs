@@ -876,6 +876,7 @@ struct McpClient {
     name: String,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>,
+    early: Mutex<HashMap<u64, serde_json::Value>>,
     next_id: AtomicU64,
 }
 
@@ -885,6 +886,7 @@ impl McpClient {
             name,
             stdin,
             pending: Mutex::new(HashMap::new()),
+            early: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -916,6 +918,23 @@ impl McpClient {
         }))
     }
 
+    fn response_value(
+        &self,
+        method: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, SupervisorError> {
+        if let Some(error) = value.get("error") {
+            return Err(SupervisorError::Mcp {
+                name: self.name.clone(),
+                message: format!("{method}: {error}"),
+            });
+        }
+        Ok(value
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
     fn remove_pending(&self, id: u64) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(&id);
@@ -938,6 +957,15 @@ impl McpClient {
                 message: "pending lock is poisoned".into(),
             })?
             .insert(id, sender);
+        let early = self
+            .early
+            .lock()
+            .ok()
+            .and_then(|mut early| early.remove(&id));
+        if let Some(value) = early {
+            self.remove_pending(id);
+            return self.response_value(method, value);
+        }
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -949,18 +977,7 @@ impl McpClient {
             return Err(error);
         }
         match receiver.recv_timeout(timeout) {
-            Ok(value) => {
-                if let Some(error) = value.get("error") {
-                    return Err(SupervisorError::Mcp {
-                        name: self.name.clone(),
-                        message: format!("{method}: {error}"),
-                    });
-                }
-                Ok(value
-                    .get("result")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null))
-            }
+            Ok(value) => self.response_value(method, value),
             Err(RecvTimeoutError::Timeout) => {
                 self.remove_pending(id);
                 Err(SupervisorError::Mcp {
@@ -1059,6 +1076,11 @@ impl McpConnection {
                     .and_then(|mut pending| pending.remove(&id));
                 if let Some(sender) = sender {
                     let _ = sender.send(value);
+                } else if let Ok(mut early) = reader_client.early.lock() {
+                    if early.len() >= 64 {
+                        early.clear();
+                    }
+                    early.insert(id, value);
                 }
             }
         });
