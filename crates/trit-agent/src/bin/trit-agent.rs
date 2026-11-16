@@ -8,11 +8,12 @@ use trit_agent::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
     ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
-    LowHitPolicy, Model, ModelProfile, OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler,
-    Proposal, ProviderModel, ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope,
-    SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure, Session, SupervisorConfig,
-    SupervisorRuntime, ToolExecutor, recovery_context_for_session, rewind_session_git_with_policy,
-    rewind_session_with_policy, run_headless,
+    LowHitPolicy, McpToolExecutor, Model, ModelProfile, OpenAiConfig, OpenAiProvider,
+    OpenAiSamplingHandler, Proposal, ProviderModel, ReasoningEffort, RecoveryContext,
+    ResolvedContext, RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure,
+    Session, SupervisorConfig, SupervisorRuntime, ToolExecutor, ToolSpec, default_tools,
+    recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
+    run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -394,6 +395,28 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         None => None,
     };
+    let mcp_tool_client = supervisor_runtime
+        .as_ref()
+        .map(SupervisorRuntime::tool_client)
+        .filter(|client| !client.is_empty());
+    let mcp_tool_specs: Vec<ToolSpec> = mcp_tool_client
+        .as_ref()
+        .map(|client| {
+            client
+                .routes()
+                .iter()
+                .map(|route| ToolSpec {
+                    name: route.exposed_name.clone(),
+                    description: format!(
+                        "{} (MCP {} / {})",
+                        route.description, route.server, route.tool
+                    ),
+                    read_only: route.read_only,
+                    input_schema: Some(route.input_schema.clone()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
         let model = build_model(
@@ -402,6 +425,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             context_agent.as_ref(),
             &shared_cache_ledger,
             &cache_options,
+            &mcp_tool_specs,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools: Box<dyn ToolExecutor> = match checkpoint_dir {
@@ -433,6 +457,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             ),
             None => tools,
         };
+        let tools: Box<dyn ToolExecutor> = match mcp_tool_client.as_ref() {
+            Some(client) => Box::new(McpToolExecutor::new(client.clone(), tools)),
+            None => tools,
+        };
         let mut session = Session::open(model, tools, &path)?
             .with_max_steps(max_steps)
             .with_context(context)
@@ -447,11 +475,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some(shared),
             &shared_cache_ledger,
             &cache_options,
+            &mcp_tool_specs,
         )?;
         let local = LocalTools::new(config.workspace.clone())?;
         let tools = AgentContextTools::new(local, Arc::clone(shared))
             .with_max_chars(context_read_max)
             .with_read_budget(context_read_budget);
+        let tools: Box<dyn ToolExecutor> = match mcp_tool_client.as_ref() {
+            Some(client) => Box::new(McpToolExecutor::new(client.clone(), tools)),
+            None => Box::new(tools),
+        };
         if let Some(path) = config.session.as_ref() {
             let mut session = Session::open(model, tools, path)?
                 .with_max_steps(max_steps)
@@ -476,8 +509,31 @@ fn run() -> Result<(), Box<dyn Error>> {
             None,
             &shared_cache_ledger,
             &cache_options,
+            &mcp_tool_specs,
         )?;
-        (run_headless(turn, model, config)?, None)
+        if let Some(client) = mcp_tool_client.as_ref() {
+            let local = LocalTools::new(config.workspace.clone())?;
+            let tools = McpToolExecutor::new(client.clone(), local);
+            if let Some(path) = config.session.as_ref() {
+                let mut session = Session::open(model, tools, path)?
+                    .with_max_steps(max_steps)
+                    .with_context(context)
+                    .with_cache_ledger(Arc::clone(&shared_cache_ledger));
+                let outcome = session.run_turn(&turn)?;
+                let ledger = session.cache_ledger();
+                (outcome, Some(ledger))
+            } else {
+                let mut host = AgentHost::new(model, tools)
+                    .with_max_steps(max_steps)
+                    .with_context(context)
+                    .with_cache_ledger(Arc::clone(&shared_cache_ledger));
+                let outcome = host.run_turn(&turn)?;
+                let ledger = host.cache_ledger().clone();
+                (outcome, Some(ledger))
+            }
+        } else {
+            (run_headless(turn, model, config)?, None)
+        }
     };
 
     if let Some(runtime) = supervisor_runtime.as_ref() {
@@ -549,12 +605,15 @@ fn build_model(
     context: Option<&Arc<Mutex<AgentContext<InMemoryContext>>>>,
     cache_ledger: &Arc<Mutex<CacheLedger>>,
     cache_options: &CacheOptions,
+    extra_tools: &[ToolSpec],
 ) -> Result<Box<dyn Model>, Box<dyn Error>> {
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
     let config = config.ok_or_else(|| fail("--provider openai requires OPENAI_* env"))?;
-    let mut model = ProviderModel::new(OpenAiProvider::new(config.clone()));
+    let mut tools = default_tools();
+    tools.extend(extra_tools.iter().cloned());
+    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), tools);
     if let Some(shared) = context {
         model = model.with_context_planner(Box::new(
             AgentContextPlanner::new(Arc::clone(shared))

@@ -108,6 +108,8 @@ preserve_superseded  // 是否保留旧摘要
   解析 serverInfo 与完整 capabilities（tools/resources/prompts/logging/experimental/扩展字段），
   对 tools/resources/templates/prompts 全部按游标分页发现；提供 `call_tool`、
   `read_resource`、`subscribe_resource`/`unsubscribe_resource`、`get_prompt`；
+  `McpToolExecutor` 把发现的工具以 `mcp__<server>__<tool>` 暴露给模型，
+  `ToolRequest.arguments` 携带 MCP JSON 参数，调用失败转 failed receipt、超时标 in_doubt；
   服务端发起的 `roots/list` 与 `sampling/createMessage` 由独立 dispatcher 应答；
   roots 是共享可变状态，`set_roots` 更新后发送 `notifications/roots/list_changed`；
   `logging/setLevel` 可设置并记住期望级别，重连后自动重新应用；
@@ -156,7 +158,8 @@ CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结
 失败只跳过该资源。`roots_watch` 用 notify 的 OS 文件
 事件（inotify/FSEvents/ReadDirectoryChangesW）监听目录的直接子目录，事件经 debounce
 合并后自动更新 roots 并发送 `notifications/roots/list_changed`；只把目录作为 root。
-MCP logging 通知会入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接
+MCP logging 通知会入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。MCP 工具结果
+只能作为工具输出，不是本地 Diff/命令证据，完成裁决仍要求本地可核验条件。端口桥接
 只保证前端监听口不断开，已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；
 后台 loop 仍按 interval 检查通知与进程状态，但进程退出检测本身是 OS wait 事件；恢复包
 是自定义通知，服务端不支持时应忽略而不是断连。

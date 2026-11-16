@@ -81,6 +81,9 @@ pub struct ToolRequest {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<crate::context_layers::ContextSpan>,
+    /// MCP 等动态工具的原始参数对象；本地工具不使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
 }
 
 impl ToolRequest {
@@ -785,6 +788,7 @@ pub mod context;
 pub mod context_layers;
 pub mod context_tools;
 pub mod git_checkpoint;
+pub mod mcp_tools;
 pub mod openai;
 pub mod port_bridge;
 pub mod provider;
@@ -817,6 +821,7 @@ pub use context_tools::{
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };
+pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{

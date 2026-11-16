@@ -18,6 +18,9 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub read_only: bool,
+    /// 动态工具（如 MCP）的 JSON Schema；内置工具为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// 每轮由宿主提供的上下文计划；ProviderModel 不知道 catalog/ACL。
@@ -135,37 +138,44 @@ pub fn default_tools() -> Vec<ToolSpec> {
             name: "read_file".into(),
             description: "Read a UTF-8 file inside the workspace.".into(),
             read_only: true,
+            input_schema: None,
         },
         ToolSpec {
             name: "write_file".into(),
             description: "Write a UTF-8 file inside the workspace; requires allow-write.".into(),
             read_only: false,
+            input_schema: None,
         },
         ToolSpec {
             name: "bash".into(),
             description: "Run a shell command in the workspace; requires allow-shell.".into(),
             read_only: false,
+            input_schema: None,
         },
         ToolSpec {
             name: "context_search".into(),
             description: "Search the context catalog and return candidate ids/labels.".into(),
             read_only: true,
+            input_schema: None,
         },
         ToolSpec {
             name: "context_add".into(),
             description: "Add a searched context ref to the dynamic tail and return its handle."
                 .into(),
             read_only: false,
+            input_schema: None,
         },
         ToolSpec {
             name: "context_read".into(),
             description: "Expand a context handle (C1, C2, ...) into its full text.".into(),
             read_only: true,
+            input_schema: None,
         },
         ToolSpec {
             name: "complete_subtask".into(),
             description: "Submit a completion claim with criteria backed by tool receipts.".into(),
             read_only: true,
+            input_schema: None,
         },
     ]
 }

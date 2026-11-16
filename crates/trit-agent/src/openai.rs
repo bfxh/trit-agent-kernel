@@ -107,7 +107,7 @@ impl Provider for OpenAiProvider {
     fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
         let body = build_request_body(&self.config, request);
         let text = self.post_chat(&body)?;
-        let mut response = parse_response(&text)?;
+        let mut response = parse_response(&text, &request.tools)?;
         attach_context_receipt(&mut response, request);
         Ok(response)
     }
@@ -159,76 +159,80 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
-            let parameters = match tool.name.as_str() {
-                "read_file" => json!({
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]
-                }),
-                "write_file" => json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"}
-                    },
-                    "required": ["path", "content"]
-                }),
-                "bash" => json!({
-                    "type": "object",
-                    "properties": {
-                        "command": {"type": "string"},
-                        "read_only": {"type": "boolean"}
-                    },
-                    "required": ["command"]
-                }),
-                "context_search" => json!({
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "limit": {"type": "integer"}
-                    },
-                    "required": ["query"]
-                }),
-                "context_add" => json!({
-                    "type": "object",
-                    "properties": {"id": {"type": "string"}},
-                    "required": ["id"]
-                }),
-                "context_read" => json!({
-                    "type": "object",
-                    "properties": {
-                        "handle": {"type": "string"},
-                        "offset": {"type": "integer"},
-                        "length": {"type": "integer"}
-                    },
-                    "required": ["handle"]
-                }),
-                "complete_subtask" => json!({
-                    "type": "object",
-                    "properties": {
-                        "criteria": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "id": {"type": "string"},
-                                    "kind": {
-                                        "type": "string",
-                                        "enum": ["verification", "diff", "manual"]
+            let parameters = if let Some(schema) = &tool.input_schema {
+                schema.clone()
+            } else {
+                match tool.name.as_str() {
+                    "read_file" => json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                    "write_file" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"}
+                        },
+                        "required": ["path", "content"]
+                    }),
+                    "bash" => json!({
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"},
+                            "read_only": {"type": "boolean"}
+                        },
+                        "required": ["command"]
+                    }),
+                    "context_search" => json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": "integer"}
+                        },
+                        "required": ["query"]
+                    }),
+                    "context_add" => json!({
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "required": ["id"]
+                    }),
+                    "context_read" => json!({
+                        "type": "object",
+                        "properties": {
+                            "handle": {"type": "string"},
+                            "offset": {"type": "integer"},
+                            "length": {"type": "integer"}
+                        },
+                        "required": ["handle"]
+                    }),
+                    "complete_subtask" => json!({
+                        "type": "object",
+                        "properties": {
+                            "criteria": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": ["verification", "diff", "manual"]
+                                        },
+                                        "command": {"type": "string"},
+                                        "paths": {
+                                            "type": "array",
+                                            "items": {"type": "string"}
+                                        }
                                     },
-                                    "command": {"type": "string"},
-                                    "paths": {
-                                        "type": "array",
-                                        "items": {"type": "string"}
-                                    }
-                                },
-                                "required": ["id", "kind"]
+                                    "required": ["id", "kind"]
+                                }
                             }
-                        }
-                    },
-                    "required": ["criteria"]
-                }),
-                _ => json!({"type": "object"}),
+                        },
+                        "required": ["criteria"]
+                    }),
+                    _ => json!({"type": "object"}),
+                }
             };
             json!({
                 "type": "function",
@@ -242,7 +246,7 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-fn parse_response(body: &str) -> Result<ProviderResponse, AgentError> {
+fn parse_response(body: &str, tools: &[ToolSpec]) -> Result<ProviderResponse, AgentError> {
     let value: Value = serde_json::from_str(body)
         .map_err(|error| AgentError::Provider(format!("bad json: {error}")))?;
     if let Some(error) = value.get("error") {
@@ -336,7 +340,17 @@ fn parse_response(body: &str) -> Result<ProviderResponse, AgentError> {
                     completion = Some(parse_claim(&arguments, &call_id)?);
                 }
                 other => {
-                    return Err(AgentError::Provider(format!("unknown tool: {other}")));
+                    if let Some(spec) = tools.iter().find(|spec| spec.name == other) {
+                        tool_calls.push(ToolRequest {
+                            call_id,
+                            tool: other.to_owned(),
+                            read_only: spec.read_only,
+                            arguments: Some(arguments),
+                            ..ToolRequest::default()
+                        });
+                    } else {
+                        return Err(AgentError::Provider(format!("unknown tool: {other}")));
+                    }
                 }
             }
         }
@@ -703,7 +717,7 @@ mod tests {
                 {"id": "call-1", "function": {"name": "context_read", "arguments": "{\"handle\":\"C1\",\"offset\":2,\"length\":3}"}}
             ]}}]
         }"#;
-        let response = parse_response(body).unwrap();
+        let response = parse_response(body, &[]).unwrap();
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].tool, "context_read");
         assert_eq!(response.tool_calls[0].paths, ["C1"]);
@@ -727,7 +741,7 @@ mod tests {
             "usage": {"prompt_tokens": 100, "completion_tokens": 5,
                       "prompt_tokens_details": {"cached_tokens": 80}}
         }"#;
-        let response = parse_response(body).unwrap();
+        let response = parse_response(body, &[]).unwrap();
         assert_eq!(response.tool_calls.len(), 2);
         assert_eq!(response.tool_calls[0].tool, "read_file");
         assert!(response.tool_calls[0].read_only);
@@ -748,7 +762,7 @@ mod tests {
                 }}
             ]}}]
         }"#;
-        let response = parse_response(body).unwrap();
+        let response = parse_response(body, &[]).unwrap();
         let completion = response.completion.unwrap();
         assert_eq!(completion.criteria.len(), 3);
         assert!(matches!(
@@ -767,16 +781,54 @@ mod tests {
                 "prefix_change_reasons": ["compaction", "tool schema"]
             }
         }"#;
-        let response = parse_response(body).unwrap();
+        let response = parse_response(body, &[]).unwrap();
         let prefix = response.prefix.unwrap();
         assert!(prefix.changed);
         assert_eq!(prefix.reasons, ["compaction", "tool schema"]);
     }
 
     #[test]
+    fn dynamic_tool_schema_and_arguments_round_trip() {
+        let spec = ToolSpec {
+            name: "mcp__stub__echo".into(),
+            description: "Echo".into(),
+            read_only: true,
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"]
+            })),
+        };
+        let schemas = tool_schemas(std::slice::from_ref(&spec));
+        assert_eq!(
+            schemas[0]["function"]["parameters"]["properties"]["text"]["type"],
+            "string"
+        );
+        assert_eq!(schemas[0]["function"]["name"], "mcp__stub__echo");
+
+        let body = json!({
+            "choices": [{"message": {"tool_calls": [{
+                "id": "call-1",
+                "function": {
+                    "name": "mcp__stub__echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                }
+            }]}}]
+        });
+        let response = parse_response(&body.to_string(), &[spec]).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].tool, "mcp__stub__echo");
+        assert_eq!(
+            response.tool_calls[0].arguments,
+            Some(json!({"text": "hi"}))
+        );
+        assert!(response.tool_calls[0].read_only);
+    }
+
+    #[test]
     fn malformed_or_unknown_tools_fail_closed() {
         assert!(matches!(
-            parse_response("not-json"),
+            parse_response("not-json", &[]),
             Err(AgentError::Provider(_))
         ));
         let body = r#"{
@@ -785,7 +837,7 @@ mod tests {
             ]}}]
         }"#;
         assert!(matches!(
-            parse_response(body),
+            parse_response(body, &[]),
             Err(AgentError::Provider(message)) if message.contains("unknown tool")
         ));
     }

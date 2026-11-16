@@ -214,13 +214,24 @@ pub struct McpHandshake {
     pub server_info: McpServerInfo,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    pub read_only_hint: bool,
+    pub destructive_hint: Option<bool>,
+    pub idempotent_hint: Option<bool>,
+    pub open_world_hint: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpTool {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(rename = "inputSchema", default)]
     pub input_schema: serde_json::Value,
+    #[serde(default)]
+    pub annotations: Option<McpToolAnnotations>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1388,6 +1399,10 @@ impl McpSupervisor {
         self.restarts
     }
 
+    pub fn name(&self) -> &str {
+        &self.spec.name
+    }
+
     pub fn roots(&self) -> Vec<McpRoot> {
         self.features
             .roots
@@ -2080,6 +2095,14 @@ impl SupervisorRuntime {
         self.bridges.len()
     }
 
+    pub fn tool_client(&self) -> crate::mcp_tools::McpToolClient {
+        self.tool_client_with_timeout(Duration::from_secs(60))
+    }
+
+    pub fn tool_client_with_timeout(&self, timeout: Duration) -> crate::mcp_tools::McpToolClient {
+        crate::mcp_tools::McpToolClient::new(self.mcps.clone(), Arc::clone(&self.recovery), timeout)
+    }
+
     /// 更新下一次重连使用的恢复包；状态层校验失败时拒绝。
     pub fn refresh_recovery(&self, recovery: RecoveryContext) -> Result<(), SupervisorError> {
         recovery.validate()?;
@@ -2268,6 +2291,7 @@ mod tests {
                             name: "tool-a".into(),
                             description: None,
                             input_schema: serde_json::json!({}),
+                            annotations: None,
                         }],
                         resources: vec![McpResource {
                             uri: "file:///a/doc".into(),
@@ -2291,6 +2315,7 @@ mod tests {
                             name: "tool-b".into(),
                             description: None,
                             input_schema: serde_json::json!({}),
+                            annotations: None,
                         }],
                         ..McpContextSnapshot::default()
                     },
@@ -2883,6 +2908,75 @@ done
         );
         loop_handle.stop();
         supervisor.lock().unwrap().stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_tool_executor_bridges_discovered_tools() {
+        use crate::mcp_tools::McpToolExecutor;
+        use crate::{ScriptedTools, ToolExecutor, ToolOutcome, ToolRequest};
+
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-tool-bridge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-tool-stub.log");
+        let mut spec = mcp_tool_stub_spec(&dir, &log);
+        spec.name = "stub".into();
+        let config = SupervisorConfig {
+            mcp: vec![spec],
+            interval_ms: 20,
+            mcp_timeout_ms: 30_000,
+            ..SupervisorConfig::default()
+        };
+        let mut runtime = SupervisorRuntime::start(&config, RecoveryContext::default()).unwrap();
+        let client = runtime.tool_client();
+        let routes = client.routes();
+        assert_eq!(routes.len(), 2);
+        let route = routes
+            .iter()
+            .find(|route| route.exposed_name == "mcp__stub__echo")
+            .unwrap();
+        assert_eq!(route.server, "stub");
+        assert_eq!(route.tool, "echo");
+        assert_eq!(route.input_schema["properties"]["text"]["type"], "string");
+
+        let local = ToolOutcome {
+            call_id: "local".into(),
+            tool: "local".into(),
+            command: None,
+            passed: true,
+            assertions: 1,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: "local".into(),
+        };
+        let mut executor = McpToolExecutor::new(client, ScriptedTools::new(vec![local]));
+        let mcp = ToolRequest {
+            call_id: "mcp-1".into(),
+            tool: "mcp__stub__echo".into(),
+            arguments: Some(serde_json::json!({"text": "hi"})),
+            ..ToolRequest::default()
+        };
+        let outcome = executor.execute(&mcp).unwrap();
+        assert!(outcome.passed);
+        assert_eq!(outcome.tool, "mcp__stub__echo");
+        assert!(outcome.output.contains("ok"));
+
+        let local = executor
+            .execute(&ToolRequest {
+                call_id: "local-1".into(),
+                tool: "local".into(),
+                ..ToolRequest::default()
+            })
+            .unwrap();
+        assert_eq!(local.tool, "local");
+
+        runtime.stop();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
