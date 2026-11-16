@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -100,7 +101,7 @@ fn default_mcp_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_roots_watch_interval_ms() -> u64 {
+fn default_roots_watch_debounce_ms() -> u64 {
     1_000
 }
 
@@ -118,8 +119,8 @@ pub struct SupervisorConfig {
     /// 监视这些目录的直接子目录，自动生成 roots 并发送 roots/list_changed。
     #[serde(default)]
     pub roots_watch: Vec<std::path::PathBuf>,
-    #[serde(default = "default_roots_watch_interval_ms")]
-    pub roots_watch_interval_ms: u64,
+    #[serde(default = "default_roots_watch_debounce_ms")]
+    pub roots_watch_debounce_ms: u64,
     #[serde(default)]
     pub log_level: Option<McpLogLevel>,
     #[serde(default)]
@@ -138,7 +139,7 @@ impl Default for SupervisorConfig {
             bridges: Vec::new(),
             roots: Vec::new(),
             roots_watch: Vec::new(),
-            roots_watch_interval_ms: default_roots_watch_interval_ms(),
+            roots_watch_debounce_ms: default_roots_watch_debounce_ms(),
             log_level: None,
             restart: RestartPolicy::default(),
             interval_ms: default_interval_ms(),
@@ -339,6 +340,7 @@ struct McpNotificationState {
     tools_changed: AtomicBool,
     prompts_changed: AtomicBool,
     resources_changed: AtomicBool,
+    contents_changed: AtomicBool,
     queue: Mutex<Vec<McpNotification>>,
 }
 
@@ -357,13 +359,16 @@ impl McpNotificationState {
                 self.resources_changed.store(true, Ordering::Relaxed);
                 McpNotification::ResourcesListChanged
             }
-            "notifications/resources/updated" => McpNotification::ResourceUpdated {
-                uri: params
-                    .get("uri")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            },
+            "notifications/resources/updated" => {
+                self.contents_changed.store(true, Ordering::Relaxed);
+                McpNotification::ResourceUpdated {
+                    uri: params
+                        .get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
+            }
             "notifications/message" => McpNotification::LoggingMessage {
                 level: params
                     .get("level")
@@ -402,6 +407,7 @@ impl McpNotificationState {
         self.tools_changed.store(false, Ordering::Relaxed);
         self.prompts_changed.store(false, Ordering::Relaxed);
         self.resources_changed.store(false, Ordering::Relaxed);
+        self.contents_changed.store(false, Ordering::Relaxed);
     }
 
     fn take_tools_changed(&self) -> bool {
@@ -415,6 +421,10 @@ impl McpNotificationState {
     fn take_resources_changed(&self) -> bool {
         self.resources_changed.swap(false, Ordering::Relaxed)
     }
+
+    fn take_contents_changed(&self) -> bool {
+        self.contents_changed.swap(false, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -423,6 +433,7 @@ pub struct McpContextSnapshot {
     pub roots: Vec<McpRoot>,
     pub tools: Vec<McpTool>,
     pub resources: Vec<McpResource>,
+    pub resource_contents: std::collections::BTreeMap<String, String>,
     pub prompts: Vec<McpPrompt>,
 }
 
@@ -548,6 +559,12 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
                 .collect();
             context.push_str(&format!("resources: {}\n", resources.join(", ")));
         }
+        if !snapshot.resource_contents.is_empty() {
+            context.push_str("resource contents:\n");
+            for (uri, text) in &snapshot.resource_contents {
+                context.push_str(&format!("--- {uri}\n{text}\n"));
+            }
+        }
         if !snapshot.prompts.is_empty() {
             let prompts: Vec<&str> = snapshot
                 .prompts
@@ -608,6 +625,8 @@ pub enum SupervisorError {
     Mcp { name: String, message: String },
     #[error("port bridge {name}: {message}")]
     Port { name: String, message: String },
+    #[error("roots watch: {0}")]
+    Watch(String),
     #[error("recovery rejected: {0}")]
     RecoveryRejected(String),
     #[error("supervisor stopped")]
@@ -1199,6 +1218,7 @@ pub struct McpSupervisor {
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
     resource_templates: Vec<McpResourceTemplate>,
+    resource_contents: std::collections::BTreeMap<String, String>,
     prompts: Vec<McpPrompt>,
     notifications: Arc<McpNotificationState>,
     features: McpFeatures,
@@ -1220,6 +1240,7 @@ impl McpSupervisor {
             tools: Vec::new(),
             resources: Vec::new(),
             resource_templates: Vec::new(),
+            resource_contents: std::collections::BTreeMap::new(),
             prompts: Vec::new(),
             notifications: Arc::new(McpNotificationState::default()),
             features: McpFeatures::new(server),
@@ -1259,6 +1280,7 @@ impl McpSupervisor {
             roots: self.roots(),
             tools: self.tools.clone(),
             resources: self.resources.clone(),
+            resource_contents: self.resource_contents.clone(),
             prompts: self.prompts.clone(),
         };
         if let Ok(mut registry) = self.features.context_registry.lock() {
@@ -1269,6 +1291,49 @@ impl McpSupervisor {
     fn clear_context(&self) {
         if let Ok(mut registry) = self.features.context_registry.lock() {
             registry.remove(&self.spec.name);
+        }
+    }
+
+    /// 预取文本资源正文；失败或超预算的资源跳过，不影响连接。
+    fn load_resource_contents(&mut self) {
+        const MAX_RESOURCES: usize = 8;
+        const MAX_CHARS: usize = 2000;
+        self.resource_contents.clear();
+        let resources: Vec<String> = self
+            .resources
+            .iter()
+            .filter(|resource| {
+                resource.mime_type.as_deref().is_none_or(|mime| {
+                    mime.starts_with("text/")
+                        || mime.contains("json")
+                        || mime.contains("xml")
+                        || mime.contains("yaml")
+                })
+            })
+            .take(MAX_RESOURCES)
+            .map(|resource| resource.uri.clone())
+            .collect();
+        let timeout = self.timeout.min(Duration::from_secs(2));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        for uri in resources {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let Ok(read) = self
+                .connected()
+                .and_then(|connection| connection.read_resource(&uri, timeout))
+            else {
+                continue;
+            };
+            let Some(text) = read.contents.into_iter().find_map(|content| content.text) else {
+                continue;
+            };
+            let text = if text.chars().count() > MAX_CHARS {
+                text.chars().take(MAX_CHARS).collect()
+            } else {
+                text
+            };
+            self.resource_contents.insert(uri, text);
         }
     }
 
@@ -1396,6 +1461,7 @@ impl McpSupervisor {
         self.prompts = connection.prompts.clone();
         self.connection = Some(connection);
         self.launched = true;
+        self.load_resource_contents();
         self.sync_context();
         if was_connected {
             Ok(McpStatus::Reconnected)
@@ -1469,6 +1535,7 @@ impl McpSupervisor {
         }
         self.resources = resources;
         self.resource_templates = templates;
+        self.load_resource_contents();
         self.sync_context();
         Ok(&self.resources)
     }
@@ -1501,6 +1568,7 @@ impl McpSupervisor {
             self.notifications.take_resources_changed() && capabilities.resources.is_some();
         let refresh_prompts =
             self.notifications.take_prompts_changed() && capabilities.prompts.is_some();
+        let contents_changed = self.notifications.take_contents_changed();
         let timeout = self.timeout;
         if refresh_tools {
             let tools = self.connected()?.discover_tools(timeout)?;
@@ -1517,6 +1585,7 @@ impl McpSupervisor {
             }
             self.resources = resources;
             self.resource_templates = templates;
+            self.load_resource_contents();
         }
         if refresh_prompts {
             let prompts = self.connected()?.discover_prompts(timeout)?;
@@ -1524,6 +1593,9 @@ impl McpSupervisor {
                 connection.prompts = prompts.clone();
             }
             self.prompts = prompts;
+        }
+        if contents_changed && !refresh_resources {
+            self.load_resource_contents();
         }
         self.sync_context();
         Ok(())
@@ -1727,32 +1799,20 @@ fn merge_roots(static_roots: Vec<McpRoot>, watched: Vec<McpRoot>) -> Vec<McpRoot
     roots.into_values().collect()
 }
 
-fn watch_roots<F>(
-    paths: Vec<std::path::PathBuf>,
-    static_roots: Vec<McpRoot>,
-    interval: Duration,
-    initial: Vec<McpRoot>,
-    stop: Arc<AtomicBool>,
-    mut on_change: F,
-) -> JoinHandle<()>
-where
-    F: FnMut(Vec<McpRoot>) + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let mut last = initial;
-        while !stop.load(Ordering::Relaxed) {
-            let roots = merge_roots(static_roots.clone(), scan_watch_roots(&paths));
-            if roots != last {
-                last = roots.clone();
-                on_change(roots);
-            }
-            std::thread::sleep(interval);
+fn watch_anchor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut candidate = absolute.parent()?.to_path_buf();
+    loop {
+        if candidate.is_dir() {
+            return Some(candidate);
         }
-    })
+        candidate = candidate.parent()?.to_path_buf();
+    }
 }
 
 struct RootsWatchHandle {
     stop: Arc<AtomicBool>,
+    watcher: Option<RecommendedWatcher>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -1760,34 +1820,78 @@ impl RootsWatchHandle {
     fn start(
         paths: Vec<std::path::PathBuf>,
         static_roots: Vec<McpRoot>,
-        interval: Duration,
+        debounce: Duration,
         initial: Vec<McpRoot>,
         supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
-    ) -> Self {
+    ) -> Result<Self, SupervisorError> {
+        Self::start_with(paths, static_roots, debounce, initial, move |roots| {
+            for supervisor in &supervisors {
+                if let Ok(mut supervisor) = supervisor.lock() {
+                    let _ = supervisor.set_roots(roots.clone());
+                }
+            }
+        })
+    }
+
+    fn start_with<F>(
+        paths: Vec<std::path::PathBuf>,
+        static_roots: Vec<McpRoot>,
+        debounce: Duration,
+        initial: Vec<McpRoot>,
+        mut on_change: F,
+    ) -> Result<Self, SupervisorError>
+    where
+        F: FnMut(Vec<McpRoot>) + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let _ = sender.send(event);
+            })
+            .map_err(|error| SupervisorError::Watch(error.to_string()))?;
+        let mut anchors = std::collections::BTreeSet::new();
+        for path in &paths {
+            if let Some(anchor) = watch_anchor(path) {
+                anchors.insert(anchor);
+            }
+        }
+        for anchor in anchors {
+            watcher
+                .watch(&anchor, RecursiveMode::Recursive)
+                .map_err(|error| {
+                    SupervisorError::Watch(format!("{}: {error}", anchor.display()))
+                })?;
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let handle = watch_roots(
-            paths,
-            static_roots,
-            interval,
-            initial,
-            thread_stop,
-            move |roots| {
-                for supervisor in &supervisors {
-                    if let Ok(mut supervisor) = supervisor.lock() {
-                        let _ = supervisor.set_roots(roots.clone());
-                    }
+        let handle = std::thread::spawn(move || {
+            let mut last = initial;
+            while let Ok(event) = receiver.recv() {
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
                 }
-            },
-        );
-        Self {
+                if event.is_err() {
+                    continue;
+                }
+                std::thread::sleep(debounce);
+                while receiver.try_recv().is_ok() {}
+                let roots = merge_roots(static_roots.clone(), scan_watch_roots(&paths));
+                if roots != last {
+                    last = roots.clone();
+                    on_change(roots);
+                }
+            }
+        });
+        Ok(Self {
             stop,
+            watcher: Some(watcher),
             handle: Some(handle),
-        }
+        })
     }
 
     fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.watcher.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1903,10 +2007,10 @@ impl SupervisorRuntime {
             runtime.roots_watch = Some(RootsWatchHandle::start(
                 config.roots_watch.clone(),
                 config.roots.clone(),
-                Duration::from_millis(config.roots_watch_interval_ms.max(50)),
+                Duration::from_millis(config.roots_watch_debounce_ms.clamp(50, 1_000)),
                 initial_roots,
                 runtime.mcps.clone(),
-            ));
+            )?);
         }
         Ok(runtime)
     }
@@ -2069,17 +2173,16 @@ mod tests {
         assert!(initial[0].uri.ends_with("ws1"));
 
         let (sender, updates) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let handle = watch_roots(
+        let mut handle = RootsWatchHandle::start_with(
             vec![base.clone()],
             Vec::new(),
             Duration::from_millis(20),
             initial,
-            Arc::clone(&stop),
             move |roots| {
                 let _ = sender.send(roots);
             },
-        );
+        )
+        .unwrap();
 
         std::fs::create_dir_all(base.join("ws2")).unwrap();
         let roots = updates.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2089,8 +2192,7 @@ mod tests {
         let roots = updates.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(!roots.iter().any(|root| root.uri.ends_with("ws2")));
 
-        stop.store(true, Ordering::Relaxed);
-        let _ = handle.join();
+        handle.stop();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2117,6 +2219,10 @@ mod tests {
                         name: "doc-a".into(),
                         ..McpResource::default()
                     }],
+                    resource_contents: std::collections::BTreeMap::from([(
+                        "file:///a/doc".to_owned(),
+                        "body-text".to_owned(),
+                    )]),
                     prompts: vec![McpPrompt {
                         name: "prompt-a".into(),
                         ..McpPrompt::default()
@@ -2153,6 +2259,7 @@ mod tests {
         assert!(system.contains("tool-a"));
         assert!(system.contains("tool-b"));
         assert!(system.contains("file:///a/doc"));
+        assert!(system.contains("body-text"));
 
         let mut params = serde_json::json!({"includeContext": "none"});
         inject_sampling_context(&features, &mut params);
@@ -2489,7 +2596,9 @@ done
             saw_context = sampled_requests.lock().unwrap().iter().any(|request| {
                 request["includeContext"] == "allServers"
                     && request["systemPrompt"].as_str().is_some_and(|system| {
-                        system.contains("file:///doc.txt") && system.contains("echo")
+                        system.contains("file:///doc.txt")
+                            && system.contains("echo")
+                            && system.contains("hello")
                     })
             });
             if saw_context {
@@ -2881,7 +2990,7 @@ done
                 "bridges": [{"name": "front", "listen": "127.0.0.1:0", "target": "127.0.0.1:9"}],
                 "roots": [{"uri": "file:///workspace", "name": "workspace"}],
                 "roots_watch": ["/tmp/workspaces"],
-                "roots_watch_interval_ms": 250,
+                "roots_watch_debounce_ms": 250,
                 "log_level": "warning",
                 "restart": {"max_attempts": 1}
             }"#,
@@ -2896,7 +3005,7 @@ done
         assert_eq!(config.roots.len(), 1);
         assert_eq!(config.roots[0].uri, "file:///workspace");
         assert_eq!(config.roots_watch.len(), 1);
-        assert_eq!(config.roots_watch_interval_ms, 250);
+        assert_eq!(config.roots_watch_debounce_ms, 250);
         assert_eq!(config.log_level, Some(McpLogLevel::Warning));
         assert_eq!(config.restart.max_attempts, 1);
         assert_eq!(config.restart.max_backoff_ms, 1_000);
@@ -2921,7 +3030,7 @@ done
             bridges: vec![PortBridgeSpec::new("front", "127.0.0.1:0", "127.0.0.1:9")],
             roots: Vec::new(),
             roots_watch: Vec::new(),
-            roots_watch_interval_ms: 1_000,
+            roots_watch_debounce_ms: 1_000,
             log_level: Some(McpLogLevel::Info),
             restart: RestartPolicy {
                 max_attempts: 2,

@@ -657,7 +657,7 @@ fn usage() {
          cache-search-scale-bp: scales context_search candidates on low cache hit.\n\
          supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec],\n\
          bridges:[PortBridgeSpec], roots:[McpRoot], roots_watch:[path],\n\
-         roots_watch_interval_ms, log_level:debug|info|warning|error, restart:{{...}},\n\
+         roots_watch_debounce_ms, log_level:debug|info|warning|error, restart:{{...}},\n\
          interval_ms, mcp_timeout_ms}}; starts supervised sidecars and\n\
          keep-alive port bridges, restarts them after exit, discovers MCP tools/resources/\n\
          prompts, auto-refreshes list_changed, and reconnects MCP with session state/cache\n\

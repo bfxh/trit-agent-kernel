@@ -73,7 +73,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
         bridges: Vec::new(),
         roots: Vec::new(),
         roots_watch: Vec::new(),
-        roots_watch_interval_ms: 1_000,
+        roots_watch_debounce_ms: 50,
         log_level: None,
         restart: RestartPolicy {
             max_attempts: 0,

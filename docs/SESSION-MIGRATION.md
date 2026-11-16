@@ -134,7 +134,7 @@ CLI 通过 `--supervisor-config <json>` 接入：
   "bridges": [{"name": "front", "listen": "127.0.0.1:8080", "target": "127.0.0.1:18080"}],
   "roots": [{"uri": "file:///workspace", "name": "workspace"}],
   "roots_watch": ["/srv/workspaces"],
-  "roots_watch_interval_ms": 1000,
+  "roots_watch_debounce_ms": 50,
   "log_level": "info",
   "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
   "interval_ms": 500,
@@ -150,13 +150,14 @@ CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结
 边界：采样使用配置模型（库模式 `with_model_hints(true)` 才会采用 server 的 model hint），
 `maxTokens` 受 `max_output_tokens` 上限约束；支持 text、image、audio（映射到 OpenAI
 `input_audio`）、resource-text，未知内容 fail closed。`includeContext=thisServer/allServers`
-会把受管 MCP 的 roots/tools/resources/prompts 元数据注入 systemPrompt，总长限制 6000
-字符，不读取资源正文。`roots_watch` 轮询监视目录的直接子目录，变化时自动更新 roots 并
-发送 `notifications/roots/list_changed`，不递归、只把目录作为 root。MCP logging 通知会
-入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接只保证前端监听口
-不断开，已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；后台 loop 仍按
-interval 检查通知与进程状态，但进程退出检测本身是 OS wait 事件；恢复包是自定义通知，
-服务端不支持时应忽略而不是断连。
+会把受管 MCP 的 roots/tools/resources/prompts 元数据注入 systemPrompt，并预取最多 8 个
+文本资源正文（每个 2000 字符，总上下文 6000 字符）。`roots_watch` 用 notify 的 OS 文件
+事件（inotify/FSEvents/ReadDirectoryChangesW）监听目录的直接子目录，事件经 debounce
+合并后自动更新 roots 并发送 `notifications/roots/list_changed`；只把目录作为 root。
+MCP logging 通知会入队，`logging/setLevel` 已实现但不会改写内核自身日志级别。端口桥接
+只保证前端监听口不断开，已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；
+后台 loop 仍按 interval 检查通知与进程状态，但进程退出检测本身是 OS wait 事件；恢复包
+是自定义通知，服务端不支持时应忽略而不是断连。
 
 ## 8. 当前边界
 
@@ -165,5 +166,5 @@ interval 检查通知与进程状态，但进程退出检测本身是 OS wait �
 - 旧版本摘要不重新生成，因此迁移不会“变聪明”，只保证不丢已有信息。
 - 钩子运行时不在本仓库；MCP 客户端已覆盖握手、工具/资源/提示词发现与调用、
   sampling/roots 服务端请求应答、roots 变更通知与 logging 级别设置。
-- roots 文件监听是轮询而非 OS inotify/FSEvents；只扫描一级子目录，不读取文件内容。
+- roots 文件监听只扫描一级子目录；资源正文预取有 8 个资源 / 2000 字符的上限。
 - 端口桥接只覆盖新连接的等待与重试；没有连接排空、FD 交接或请求级重放。
