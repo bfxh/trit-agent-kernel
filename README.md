@@ -88,6 +88,12 @@ cargo run -p trit-agent -- rewind \
 - [TRACE-AND-TIME.md](docs/TRACE-AND-TIME.md)：轨迹、重放与时间语义。
 - [crates/trit-orch/docs/COORDINATION.md](crates/trit-orch/docs/COORDINATION.md)：协调/派发设计。
 
+## 平台支持
+
+- CI 覆盖 Ubuntu、Windows、macOS：fmt / clippy / 全量测试三套矩阵。
+- Linux 使用 inotify、macOS 使用 FSEvents、Windows 使用 ReadDirectoryChangesW 做 roots 监听；持久 shell 优先 bash，Windows 显式走 Git Bash。
+- 国产系统（麒麟 / 统信 UOS、ARM64 / LoongArch 等）尚未验证。后续适配重点是 bash 路径探测、文件通知后端、OS 沙箱封装和 Git/其他 VCS 的可用性；在完成前不宣称支持。
+
 ## 来源与状态
 
 代码抽取自 `bfxh/trit` 的 `1a91f6f`，并包含随后完成的检查点原子回退与 Git 保真契约改动。原仓库保留完整历史与其它工具链 crate。
