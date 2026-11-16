@@ -1799,15 +1799,21 @@ fn merge_roots(static_roots: Vec<McpRoot>, watched: Vec<McpRoot>) -> Vec<McpRoot
     roots.into_values().collect()
 }
 
-fn watch_anchor(path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut candidate = absolute.parent()?.to_path_buf();
-    loop {
-        if candidate.is_dir() {
-            return Some(candidate);
+fn watch_targets(paths: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, bool)> {
+    let mut targets: std::collections::BTreeMap<std::path::PathBuf, bool> =
+        std::collections::BTreeMap::new();
+    for path in paths {
+        let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        if absolute.is_dir() {
+            targets.insert(absolute.clone(), true);
         }
-        candidate = candidate.parent()?.to_path_buf();
+        if let Some(parent) = absolute.parent()
+            && parent.is_dir()
+        {
+            targets.entry(parent.to_path_buf()).or_insert(false);
+        }
     }
+    targets.into_iter().collect()
 }
 
 struct RootsWatchHandle {
@@ -1849,18 +1855,15 @@ impl RootsWatchHandle {
                 let _ = sender.send(event);
             })
             .map_err(|error| SupervisorError::Watch(error.to_string()))?;
-        let mut anchors = std::collections::BTreeSet::new();
-        for path in &paths {
-            if let Some(anchor) = watch_anchor(path) {
-                anchors.insert(anchor);
-            }
-        }
-        for anchor in anchors {
+        for (path, recursive) in watch_targets(&paths) {
+            let mode = if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
             watcher
-                .watch(&anchor, RecursiveMode::Recursive)
-                .map_err(|error| {
-                    SupervisorError::Watch(format!("{}: {error}", anchor.display()))
-                })?;
+                .watch(&path, mode)
+                .map_err(|error| SupervisorError::Watch(format!("{}: {error}", path.display())))?;
         }
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);

@@ -175,10 +175,17 @@ mod tests {
 
     fn echo_once(listener: TcpListener) -> JoinHandle<()> {
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0u8; 16];
-            let read = stream.read(&mut buffer).unwrap();
-            stream.write_all(&buffer[..read]).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 16];
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    // 连接重试可能在监听器启动前完成握手又被丢弃；跳过空连接。
+                    continue;
+                }
+                stream.write_all(&buffer[..read]).unwrap();
+                return;
+            }
         })
     }
 
