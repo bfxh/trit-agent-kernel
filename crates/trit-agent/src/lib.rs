@@ -822,7 +822,7 @@ pub use provider::{
 };
 pub use session::{
     SESSION_SCHEMA, Session, SessionEvent, SessionLog, SessionRecord, SessionState, TurnRecord,
-    recover,
+    recover, recovery_context_for_session,
 };
 pub use session_migration::{
     CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,
@@ -835,5 +835,6 @@ pub use state_layer::{
 };
 pub use supervisor::{
     GatewaySupervisor, McpStatus, McpSupervisor, ProcessSpec, ProcessSupervisor, RecoveryContext,
-    RestartPolicy, SupervisorError, SupervisorLoop, SupervisorStatus,
+    RestartPolicy, SupervisorConfig, SupervisorError, SupervisorLoop, SupervisorRuntime,
+    SupervisorStatus,
 };

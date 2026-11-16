@@ -9,8 +9,9 @@ use trit_agent::{
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
     ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
     LowHitPolicy, Model, ModelProfile, OpenAiConfig, OpenAiProvider, Proposal, ProviderModel,
-    ReasoningEffort, ResolvedContext, RewindScope, ScriptedModel, SearchOrder, SelectionPressure,
-    Session, ToolExecutor, rewind_session_git_with_policy, rewind_session_with_policy,
+    ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope, ScriptedModel, SearchOrder,
+    SelectionPressure, Session, SupervisorConfig, SupervisorRuntime, ToolExecutor,
+    recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
     run_headless,
 };
 use trit_reasonix::TurnSpec;
@@ -73,6 +74,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut cache_search_order = SearchOrder::Resolver;
     let mut cache_task_selection = SelectionPressure::Normal;
     let mut cache_ledger_path: Option<PathBuf> = None;
+    let mut supervisor_config: Option<SupervisorConfig> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -194,6 +196,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "--cache-ledger" => {
                 cache_ledger_path = Some(PathBuf::from(next(&mut args, "--cache-ledger")?));
+            }
+            "--supervisor-config" => {
+                let path = PathBuf::from(next(&mut args, "--supervisor-config")?);
+                let text = std::fs::read_to_string(&path).map_err(|error| {
+                    fail(format!(
+                        "read supervisor config {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                supervisor_config = Some(
+                    serde_json::from_str::<SupervisorConfig>(&text)
+                        .map_err(|error| fail(format!("parse supervisor config: {error}")))?,
+                );
             }
             "--help" | "-h" => {
                 usage();
@@ -338,6 +353,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             task_selection: cache_task_selection,
         },
     };
+    let supervisor_session_path = session_path.clone();
+    let mut supervisor_runtime = match supervisor_config.as_ref() {
+        Some(supervisor_config) => {
+            let recovery =
+                supervisor_recovery(supervisor_session_path.as_deref(), &shared_cache_ledger)?;
+            Some(SupervisorRuntime::start(supervisor_config, recovery)?)
+        }
+        None => None,
+    };
     let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
         let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
         let model = build_model(
@@ -424,6 +448,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         (run_headless(turn, model, config)?, None)
     };
 
+    if let Some(runtime) = supervisor_runtime.as_ref() {
+        let recovery =
+            supervisor_recovery(supervisor_session_path.as_deref(), &shared_cache_ledger)?;
+        runtime.refresh_recovery(recovery)?;
+        eprintln!(
+            "supervisor: gateways={} mcp={}",
+            runtime.gateway_count(),
+            runtime.mcp_count()
+        );
+    }
+
     if context_agent.is_some() {
         let ledger = shared_cache_ledger
             .lock()
@@ -443,9 +478,29 @@ fn run() -> Result<(), Box<dyn Error>> {
         serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
     )?;
     if !outcome.judgment.is_complete() {
+        if let Some(runtime) = supervisor_runtime.as_mut() {
+            runtime.stop();
+        }
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn supervisor_recovery(
+    session_path: Option<&Path>,
+    cache: &Arc<Mutex<CacheLedger>>,
+) -> Result<RecoveryContext, Box<dyn Error>> {
+    if let Some(path) = session_path {
+        return Ok(recovery_context_for_session(path)?);
+    }
+    let cache = cache
+        .lock()
+        .map_err(|_| fail("cache ledger is poisoned"))?
+        .clone();
+    Ok(RecoveryContext {
+        cache: Some(cache),
+        ..RecoveryContext::default()
+    })
 }
 
 struct CacheOptions {
@@ -553,7 +608,8 @@ fn usage() {
          [--cache-window-samples N] [--cache-window-ms N] \\\n    \
          [--cache-pressure-scale-bp N] [--cache-search-scale-bp N] \\\n    \
          [--cache-search-order keep|dynamic-first] \\\n    \
-         [--cache-task-selection normal|low-cost] [--cache-ledger <json>]]\n\n\
+         [--cache-task-selection normal|low-cost] [--cache-ledger <json>] \\\n    \
+         [--supervisor-config <json>]]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
@@ -565,7 +621,10 @@ fn usage() {
          context_search / context_add / context_read with dynamic-tail-only additions.\n\
          cache-hit-threshold: basis points (default 5000); low-hit-policy keep|demote (default keep).\n\
          cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\
-         cache-search-scale-bp: scales context_search candidates on low cache hit.\n\n\
+         cache-search-scale-bp: scales context_search candidates on low cache hit.\n\
+         supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec], restart:{{...}},\n\
+         interval_ms, mcp_timeout_ms}}; starts supervised sidecars, restarts them after exit,\n\
+         and reconnects MCP with session state/cache recovery.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"

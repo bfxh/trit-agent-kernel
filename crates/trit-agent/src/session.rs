@@ -172,6 +172,19 @@ impl SessionLog {
     }
 }
 
+/// 从 session log 重建 supervisor 恢复包（状态层 + 日志中的 cache 观测）。
+pub fn recovery_context_for_session(
+    path: &Path,
+) -> Result<crate::supervisor::RecoveryContext, AgentError> {
+    let records = read_records(path)?;
+    Ok(crate::supervisor::RecoveryContext {
+        session_id: Some(path.display().to_string()),
+        state: Some(crate::state_layer::state_layer(&records)),
+        hooks: Vec::new(),
+        cache: Some(cache_ledger_from_records(&records)),
+    })
+}
+
 fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -358,17 +371,17 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
 
     /// supervisor 重连时可发送的恢复包；hooks 由宿主从迁移 bundle 补充。
     pub fn recovery_context(&self) -> Result<crate::supervisor::RecoveryContext, AgentError> {
-        let state = Some(self.state_layer()?);
-        let cache = self
-            .cache_ledger()
-            .lock()
-            .map_err(|_| AgentError::SessionState("cache ledger is poisoned".into()))?
-            .clone();
+        let cache = Some(
+            self.cache_ledger()
+                .lock()
+                .map_err(|_| AgentError::SessionState("cache ledger is poisoned".into()))?
+                .clone(),
+        );
         Ok(crate::supervisor::RecoveryContext {
             session_id: Some(self.log.path().display().to_string()),
-            state,
+            state: Some(self.state_layer()?),
             hooks: Vec::new(),
-            cache: Some(cache),
+            cache,
         })
     }
 

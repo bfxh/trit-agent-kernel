@@ -106,7 +106,27 @@ preserve_superseded  // 是否保留旧摘要
 - 重连后发送 `notifications/trit/recovered`，携带 `RecoveryContext`：
   session_id、状态层（含校验结论）、钩子契约、cache ledger；
 - `GatewaySupervisor = ProcessSupervisor`，网关协议由网关自己处理；
-- `Session::recovery_context()` 可直接构造 session/state/cache 部分，hooks 由宿主补齐。
+- `Session::recovery_context()` / `recovery_context_for_session()` 可直接构造
+  session/状态层/cache 恢复包，hooks 由宿主补齐；
+- `SupervisorRuntime` 从 `SupervisorConfig` 启动所有 sidecar：首启失败即报错，后台
+  loop 自动重启/重连，`refresh_recovery` 更新下一次重连使用的恢复包；
+- 重启预算耗尽后保持 `GaveUp`，后续 `ensure_*` 不会当作首次启动重新拉起；
+  只有显式 `drop_connection`（或新建 supervisor）才重置。
+
+CLI 通过 `--supervisor-config <json>` 接入：
+
+```json
+{
+  "gateway": [{"name": "gw", "program": "gateway-bin", "args": ["--stdio"]}],
+  "mcp": [{"name": "tools", "program": "mcp-server", "args": []}],
+  "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
+  "interval_ms": 500,
+  "mcp_timeout_ms": 5000
+}
+```
+
+CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结束后从新日志重建并
+`refresh_recovery`。运行中崩溃会使用最近一次快照，宿主可自行在关键点刷新。
 
 边界：MCP 目前只做 initialize/重连，不做完整 capability 协商；没有端口级零停机；
 后台 loop 是轮询而非 OS 事件；恢复包是自定义通知，服务端不支持时应忽略而不是断连。

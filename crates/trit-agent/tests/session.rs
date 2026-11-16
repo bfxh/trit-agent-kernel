@@ -4,7 +4,7 @@ use trit_agent::tools::WorkspaceConfig;
 use trit_agent::{
     AgentError, CacheObservation, ContextReceipt, HeadlessConfig, Proposal, SESSION_SCHEMA,
     ScriptedModel, ScriptedTools, Session, SessionEvent, SessionLog, ToolOutcome, ToolRequest,
-    run_headless,
+    recovery_context_for_session, run_headless,
 };
 use trit_orch::{EvidenceVerdict, TokenUsage};
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, TurnSpec};
@@ -301,6 +301,33 @@ fn reopening_a_session_rebuilds_the_cache_ledger() {
         .expect("replayed ledger should contain the prefix");
     assert_eq!(stat.cache_hit_tokens, 80);
     assert_eq!(stat.cache_miss_tokens, 20);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recovery_context_rebuilds_from_session_log() {
+    let root = temp_workspace("recovery-context");
+    let path = temp_file("recovery-context");
+    let mut session = Session::open(
+        ScriptedModel::new(vec![proposal()]),
+        ScriptedTools::new(vec![write_outcome()]),
+        &path,
+    )
+    .unwrap();
+    session.run_turn(&turn()).unwrap();
+
+    let recovery = recovery_context_for_session(&path).unwrap();
+    assert_eq!(recovery.session_id.as_deref(), path.to_str());
+    let state = recovery.state.expect("state layer");
+    assert_eq!(state.state, trit_agent::AgentState::Finished);
+    assert_eq!(state.turns, 1);
+    assert_eq!(state.validation.verdict, trit_orch::Ternary::True);
+    assert!(recovery.cache.is_some());
+    assert!(recovery.hooks.is_empty());
+
+    let live = session.recovery_context().unwrap();
+    assert_eq!(live.state.unwrap().turns, 1);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&root);
 }

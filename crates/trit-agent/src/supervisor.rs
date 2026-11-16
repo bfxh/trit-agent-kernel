@@ -65,6 +65,7 @@ impl ProcessSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RestartPolicy {
     /// 0 表示不自动重启；首次启动不算重启次数。
     pub max_attempts: usize,
@@ -87,6 +88,41 @@ impl RestartPolicy {
         let exponent = attempt.min(20) as u32;
         let base = self.initial_backoff_ms.saturating_mul(1u64 << exponent);
         Duration::from_millis(base.min(self.max_backoff_ms))
+    }
+}
+
+fn default_interval_ms() -> u64 {
+    500
+}
+
+fn default_mcp_timeout_ms() -> u64 {
+    5_000
+}
+
+/// 宿主/CLI 的 supervisor 声明；可直接从 JSON 解析。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorConfig {
+    #[serde(default)]
+    pub gateway: Vec<ProcessSpec>,
+    #[serde(default)]
+    pub mcp: Vec<ProcessSpec>,
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_mcp_timeout_ms")]
+    pub mcp_timeout_ms: u64,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        Self {
+            gateway: Vec::new(),
+            mcp: Vec::new(),
+            restart: RestartPolicy::default(),
+            interval_ms: default_interval_ms(),
+            mcp_timeout_ms: default_mcp_timeout_ms(),
+        }
     }
 }
 
@@ -150,6 +186,7 @@ pub struct ProcessSupervisor {
     spec: ProcessSpec,
     policy: RestartPolicy,
     child: Option<Child>,
+    launched: bool,
     restarts: usize,
     stopped: bool,
 }
@@ -160,6 +197,7 @@ impl ProcessSupervisor {
             spec,
             policy,
             child: None,
+            launched: false,
             restarts: 0,
             stopped: false,
         }
@@ -188,7 +226,7 @@ impl ProcessSupervisor {
         if self.is_running() {
             return Ok(SupervisorStatus::AlreadyRunning);
         }
-        let was_started = self.child.is_some();
+        let was_started = self.launched;
         if was_started && self.restarts >= self.policy.max_attempts {
             self.child = None;
             return Ok(SupervisorStatus::GaveUp);
@@ -214,6 +252,7 @@ impl ProcessSupervisor {
                 message: error.to_string(),
             })?;
         self.child = Some(child);
+        self.launched = true;
         if was_started {
             self.restarts += 1;
             Ok(SupervisorStatus::Restarted)
@@ -407,6 +446,7 @@ pub struct McpSupervisor {
     spec: ProcessSpec,
     policy: RestartPolicy,
     connection: Option<McpConnection>,
+    launched: bool,
     restarts: usize,
     stopped: bool,
     timeout: Duration,
@@ -418,6 +458,7 @@ impl McpSupervisor {
             spec,
             policy,
             connection: None,
+            launched: false,
             restarts: 0,
             stopped: false,
             timeout: Duration::from_secs(5),
@@ -448,7 +489,7 @@ impl McpSupervisor {
             return Ok(McpStatus::AlreadyConnected);
         }
         recovery.validate()?;
-        let was_connected = self.connection.is_some();
+        let was_connected = self.launched;
         if was_connected && self.restarts >= self.policy.max_attempts {
             self.connection = None;
             return Ok(McpStatus::GaveUp);
@@ -460,6 +501,7 @@ impl McpSupervisor {
         let mut connection = McpConnection::open(&self.spec, self.timeout)?;
         connection.send_recovery(recovery)?;
         self.connection = Some(connection);
+        self.launched = true;
         if was_connected {
             self.restarts += 1;
             Ok(McpStatus::Reconnected)
@@ -475,9 +517,11 @@ impl McpSupervisor {
         }
     }
 
-    /// 显式断开（不保留重连计数），下一次 ensure 会走首次连接路径。
+    /// 显式断开并重置重连计数；下一次 ensure 会走首次连接路径。
     pub fn drop_connection(&mut self) {
         self.connection = None;
+        self.launched = false;
+        self.restarts = 0;
     }
 
     pub fn stop(&mut self) {
@@ -517,7 +561,20 @@ impl SupervisorLoop {
         recovery: RecoveryContext,
         interval: Duration,
     ) -> Self {
+        Self::spawn_mcp_shared(supervisor, Arc::new(Mutex::new(recovery)), interval)
+    }
+
+    /// 恢复包可在运行中更新；下一次重连使用最新快照。
+    pub fn spawn_mcp_shared(
+        supervisor: Arc<Mutex<McpSupervisor>>,
+        recovery: Arc<Mutex<RecoveryContext>>,
+        interval: Duration,
+    ) -> Self {
         Self::spawn(interval, move || {
+            let recovery = match recovery.lock() {
+                Ok(recovery) => recovery.clone(),
+                Err(_) => return,
+            };
             if let Ok(mut supervisor) = supervisor.lock() {
                 let _ = supervisor.ensure_connected(&recovery);
             }
@@ -548,6 +605,116 @@ impl SupervisorLoop {
 }
 
 impl Drop for SupervisorLoop {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 一组 gateway/MCP sidecar：启动一次，后台持续重启/重连，drop 时全部停止。
+pub struct SupervisorRuntime {
+    gateways: Vec<Arc<Mutex<ProcessSupervisor>>>,
+    mcps: Vec<Arc<Mutex<McpSupervisor>>>,
+    recovery: Arc<Mutex<RecoveryContext>>,
+    loops: Vec<SupervisorLoop>,
+}
+
+impl SupervisorRuntime {
+    pub fn start(
+        config: &SupervisorConfig,
+        recovery: RecoveryContext,
+    ) -> Result<Self, SupervisorError> {
+        recovery.validate()?;
+        let interval = Duration::from_millis(config.interval_ms.max(1));
+        let timeout = Duration::from_millis(config.mcp_timeout_ms.max(1));
+        let mut runtime = Self {
+            gateways: Vec::new(),
+            mcps: Vec::new(),
+            recovery: Arc::new(Mutex::new(recovery)),
+            loops: Vec::new(),
+        };
+        for spec in &config.gateway {
+            let supervisor = Arc::new(Mutex::new(ProcessSupervisor::new(
+                spec.clone(),
+                config.restart,
+            )));
+            supervisor
+                .lock()
+                .map_err(|_| SupervisorError::Process {
+                    name: spec.name.clone(),
+                    message: "supervisor lock is poisoned".into(),
+                })?
+                .ensure_running()?;
+            runtime.loops.push(SupervisorLoop::spawn_process(
+                Arc::clone(&supervisor),
+                interval,
+            ));
+            runtime.gateways.push(supervisor);
+        }
+        for spec in &config.mcp {
+            let supervisor = Arc::new(Mutex::new(
+                McpSupervisor::new(spec.clone(), config.restart).with_timeout(timeout),
+            ));
+            let initial = runtime
+                .recovery
+                .lock()
+                .map_err(|_| SupervisorError::Mcp {
+                    name: spec.name.clone(),
+                    message: "recovery lock is poisoned".into(),
+                })?
+                .clone();
+            supervisor
+                .lock()
+                .map_err(|_| SupervisorError::Mcp {
+                    name: spec.name.clone(),
+                    message: "supervisor lock is poisoned".into(),
+                })?
+                .ensure_connected(&initial)?;
+            runtime.loops.push(SupervisorLoop::spawn_mcp_shared(
+                Arc::clone(&supervisor),
+                Arc::clone(&runtime.recovery),
+                interval,
+            ));
+            runtime.mcps.push(supervisor);
+        }
+        Ok(runtime)
+    }
+
+    pub fn gateway_count(&self) -> usize {
+        self.gateways.len()
+    }
+
+    pub fn mcp_count(&self) -> usize {
+        self.mcps.len()
+    }
+
+    /// 更新下一次重连使用的恢复包；状态层校验失败时拒绝。
+    pub fn refresh_recovery(&self, recovery: RecoveryContext) -> Result<(), SupervisorError> {
+        recovery.validate()?;
+        *self.recovery.lock().map_err(|_| SupervisorError::Mcp {
+            name: "runtime".into(),
+            message: "recovery lock is poisoned".into(),
+        })? = recovery;
+        Ok(())
+    }
+
+    pub fn stop(&mut self) {
+        while let Some(mut loop_handle) = self.loops.pop() {
+            loop_handle.stop();
+        }
+        for supervisor in &self.gateways {
+            if let Ok(mut supervisor) = supervisor.lock() {
+                supervisor.stop();
+            }
+        }
+        for supervisor in &self.mcps {
+            if let Ok(mut supervisor) = supervisor.lock() {
+                supervisor.stop();
+            }
+        }
+    }
+}
+
+impl Drop for SupervisorRuntime {
     fn drop(&mut self) {
         self.stop();
     }
@@ -598,6 +765,11 @@ mod tests {
         assert_eq!(
             supervisor.ensure_running().unwrap(),
             SupervisorStatus::GaveUp
+        );
+        assert_eq!(
+            supervisor.ensure_running().unwrap(),
+            SupervisorStatus::GaveUp,
+            "restart budget exhaustion must be permanent"
         );
         supervisor.stop();
     }
@@ -709,6 +881,107 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
 
     #[test]
+    fn mcp_supervisor_gives_up_until_explicit_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-giveup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-stub.log");
+        let mut supervisor = McpSupervisor::new(
+            mcp_stub_spec(&dir, &log),
+            RestartPolicy {
+                max_attempts: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+        )
+        .with_timeout(Duration::from_secs(5));
+        let recovery = RecoveryContext::default();
+        assert_eq!(
+            supervisor.ensure_connected(&recovery).unwrap(),
+            McpStatus::Connected
+        );
+        supervisor.kill_connection();
+        assert_eq!(
+            supervisor.ensure_connected(&recovery).unwrap(),
+            McpStatus::GaveUp
+        );
+        assert_eq!(
+            supervisor.ensure_connected(&recovery).unwrap(),
+            McpStatus::GaveUp,
+            "restart budget exhaustion must be permanent"
+        );
+        supervisor.drop_connection();
+        assert_eq!(
+            supervisor.ensure_connected(&recovery).unwrap(),
+            McpStatus::Connected
+        );
+        supervisor.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn supervisor_loop_reconnects_with_latest_recovery_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-latest-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-stub.log");
+        let supervisor = Arc::new(Mutex::new(
+            McpSupervisor::new(
+                mcp_stub_spec(&dir, &log),
+                RestartPolicy {
+                    max_attempts: 3,
+                    initial_backoff_ms: 0,
+                    max_backoff_ms: 0,
+                },
+            )
+            .with_timeout(Duration::from_secs(5)),
+        ));
+        let recovery = Arc::new(Mutex::new(RecoveryContext {
+            session_id: Some("session-old".into()),
+            ..RecoveryContext::default()
+        }));
+        let mut loop_handle = SupervisorLoop::spawn_mcp_shared(
+            Arc::clone(&supervisor),
+            Arc::clone(&recovery),
+            Duration::from_millis(20),
+        );
+        let mut log_text = String::new();
+        for _ in 0..100 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            if log_text.contains("session-old") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(log_text.contains("session-old"));
+
+        *recovery.lock().unwrap() = RecoveryContext {
+            session_id: Some("session-new".into()),
+            ..RecoveryContext::default()
+        };
+        supervisor.lock().unwrap().kill_connection();
+        for _ in 0..200 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            if log_text.contains("session-new") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(log_text.contains("session-new"));
+        loop_handle.stop();
+        supervisor.lock().unwrap().stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn supervisor_loop_restarts_without_explicit_ensure() {
         let supervisor = Arc::new(Mutex::new(ProcessSupervisor::new(
             exit_spec(),
@@ -737,5 +1010,82 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         );
         assert_eq!(gateway.ensure_running().unwrap(), SupervisorStatus::Started);
         gateway.stop();
+    }
+
+    #[test]
+    fn supervisor_config_parses_partial_json() {
+        let config: SupervisorConfig = serde_json::from_str(
+            r#"{
+                "gateway": [{"name": "gw", "program": "gateway-bin"}],
+                "restart": {"max_attempts": 1}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.gateway.len(), 1);
+        assert_eq!(config.gateway[0].name, "gw");
+        assert!(config.mcp.is_empty());
+        assert_eq!(config.restart.max_attempts, 1);
+        assert_eq!(config.restart.max_backoff_ms, 1_000);
+        assert_eq!(config.interval_ms, 500);
+        assert_eq!(config.mcp_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn supervisor_runtime_starts_sidecars_and_refreshes_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "trit-supervisor-runtime-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-stub.log");
+        let config = SupervisorConfig {
+            gateway: vec![exit_spec()],
+            mcp: vec![mcp_stub_spec(&dir, &log)],
+            restart: RestartPolicy {
+                max_attempts: 2,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+            interval_ms: 10,
+            mcp_timeout_ms: 5_000,
+        };
+        let mut runtime = SupervisorRuntime::start(
+            &config,
+            RecoveryContext {
+                session_id: Some("session-1".into()),
+                state: Some(StateLayer::default()),
+                ..RecoveryContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.gateway_count(), 1);
+        assert_eq!(runtime.mcp_count(), 1);
+
+        let mut log_text = String::new();
+        for _ in 0..100 {
+            log_text = std::fs::read_to_string(&log).unwrap_or_default();
+            if log_text.contains("session-1") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(log_text.contains("session-1"));
+
+        runtime
+            .refresh_recovery(RecoveryContext {
+                session_id: Some("session-2".into()),
+                ..RecoveryContext::default()
+            })
+            .unwrap();
+        let mut invalid = RecoveryContext::default();
+        let mut state = StateLayer::default();
+        state.validation.verdict = trit_orch::Ternary::False;
+        invalid.state = Some(state);
+        assert!(runtime.refresh_recovery(invalid).is_err());
+
+        runtime.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
