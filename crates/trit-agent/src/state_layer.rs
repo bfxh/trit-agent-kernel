@@ -42,7 +42,8 @@ pub struct CompactionState {
     pub dropped: usize,
     pub truncated: usize,
     pub digest: Option<String>,
-    /// 压缩事件发生时/之后 agent 所处的状态。
+    pub state_before: AgentState,
+    /// 压缩完成、回到可继续执行的状态。
     pub state_after: AgentState,
 }
 
@@ -265,6 +266,7 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                         "digest present without dropped/truncated receipts".into(),
                     );
                 }
+                let state_before = progress.state;
                 progress.step = *step;
                 progress.state = AgentState::Compacting;
                 layer.state = AgentState::Compacting;
@@ -273,7 +275,8 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                     dropped: *dropped,
                     truncated: *truncated,
                     digest: digest.clone(),
-                    state_after: progress.state,
+                    state_before,
+                    state_after: AgentState::Planning,
                 });
             }
             SessionEvent::CompletionClaimed { step, .. } => {
@@ -485,7 +488,11 @@ mod tests {
         ];
         let state = state_layer(&records);
         assert_eq!(state.state, AgentState::Compacting);
-        assert_eq!(state.compressed_state(), Some(AgentState::Compacting));
+        assert_eq!(state.compressed_state(), Some(AgentState::Planning));
+        assert_eq!(
+            state.last_compaction().unwrap().state_before,
+            AgentState::Planning
+        );
         assert_eq!(state.last_compaction().unwrap().dropped, 2);
         assert_eq!(
             state.last_compaction().unwrap().digest.as_deref(),
