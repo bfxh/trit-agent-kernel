@@ -6,7 +6,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::context_layers::CacheLedger;
+use crate::port_bridge::{PortBridge, PortBridgeSpec};
 use crate::session_migration::HookDescriptor;
 use crate::state_layer::StateLayer;
 
@@ -107,6 +108,8 @@ pub struct SupervisorConfig {
     #[serde(default)]
     pub mcp: Vec<ProcessSpec>,
     #[serde(default)]
+    pub bridges: Vec<PortBridgeSpec>,
+    #[serde(default)]
     pub restart: RestartPolicy,
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
@@ -119,6 +122,7 @@ impl Default for SupervisorConfig {
         Self {
             gateway: Vec::new(),
             mcp: Vec::new(),
+            bridges: Vec::new(),
             restart: RestartPolicy::default(),
             interval_ms: default_interval_ms(),
             mcp_timeout_ms: default_mcp_timeout_ms(),
@@ -142,6 +146,62 @@ pub enum McpStatus {
     AlreadyConnected,
     Reconnected,
     GaveUp,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpToolsCapability {
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpResourcesCapability {
+    pub subscribe: bool,
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpPromptsCapability {
+    pub list_changed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpCapabilities {
+    pub tools: Option<McpToolsCapability>,
+    pub resources: Option<McpResourcesCapability>,
+    pub prompts: Option<McpPromptsCapability>,
+    pub logging: Option<serde_json::Value>,
+    pub experimental: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpServerInfo {
+    pub name: String,
+    pub version: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct McpHandshake {
+    pub protocol_version: String,
+    pub capabilities: McpCapabilities,
+    pub server_info: McpServerInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpTool {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(rename = "inputSchema", default)]
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,16 +236,110 @@ pub enum SupervisorError {
     Process { name: String, message: String },
     #[error("MCP {name}: {message}")]
     Mcp { name: String, message: String },
+    #[error("port bridge {name}: {message}")]
+    Port { name: String, message: String },
     #[error("recovery rejected: {0}")]
     RecoveryRejected(String),
     #[error("supervisor stopped")]
     Stopped,
 }
 
+const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_SUPPORTED_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if !handle.is_null() {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+/// 子进程退出由阻塞在 OS wait 上的线程捕获，而不是调用方轮询 `try_wait`。
+struct WaitedChild {
+    pid: u32,
+    exit: Receiver<std::io::Result<ExitStatus>>,
+    monitor: Option<JoinHandle<()>>,
+    terminated: bool,
+}
+
+impl WaitedChild {
+    fn spawn(mut child: Child) -> Self {
+        let pid = child.id();
+        let (sender, exit) = mpsc::channel();
+        let monitor = std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = sender.send(status);
+        });
+        Self {
+            pid,
+            exit,
+            monitor: Some(monitor),
+            terminated: false,
+        }
+    }
+
+    fn is_running(&mut self) -> bool {
+        if self.terminated {
+            return false;
+        }
+        match self.exit.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => true,
+            _ => {
+                self.terminated = true;
+                false
+            }
+        }
+    }
+
+    fn terminate(&mut self) {
+        if self.terminated {
+            if let Some(monitor) = self.monitor.take() {
+                let _ = monitor.join();
+            }
+            return;
+        }
+        if self.is_running() {
+            kill_process(self.pid);
+            match self.exit.recv_timeout(Duration::from_secs(3)) {
+                Ok(_) | Err(RecvTimeoutError::Disconnected) => self.terminated = true,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+        if self.terminated || !self.is_running() {
+            self.terminated = true;
+            if let Some(monitor) = self.monitor.take() {
+                let _ = monitor.join();
+            }
+        } else {
+            // 超时未退出：放弃 join，避免阻塞调用方。
+            let _ = self.monitor.take();
+        }
+    }
+}
+
+impl Drop for WaitedChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 pub struct ProcessSupervisor {
     spec: ProcessSpec,
     policy: RestartPolicy,
-    child: Option<Child>,
+    child: Option<WaitedChild>,
     launched: bool,
     restarts: usize,
     stopped: bool,
@@ -212,11 +366,7 @@ impl ProcessSupervisor {
     }
 
     pub fn is_running(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .and_then(|child| child.try_wait().ok().flatten())
-            .is_none()
-            && self.child.is_some()
+        self.child.as_mut().is_some_and(WaitedChild::is_running)
     }
 
     pub fn ensure_running(&mut self) -> Result<SupervisorStatus, SupervisorError> {
@@ -251,7 +401,7 @@ impl ProcessSupervisor {
                 name: self.spec.name.clone(),
                 message: error.to_string(),
             })?;
-        self.child = Some(child);
+        self.child = Some(WaitedChild::spawn(child));
         self.launched = true;
         if was_started {
             self.restarts += 1;
@@ -264,8 +414,7 @@ impl ProcessSupervisor {
     pub fn stop(&mut self) {
         self.stopped = true;
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.terminate();
         }
     }
 }
@@ -278,10 +427,12 @@ impl Drop for ProcessSupervisor {
 
 struct McpConnection {
     name: String,
-    child: Child,
+    child: WaitedChild,
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    handshake: McpHandshake,
+    tools: Vec<McpTool>,
 }
 
 impl McpConnection {
@@ -324,17 +475,23 @@ impl McpConnection {
         });
         let mut connection = Self {
             name: spec.name.clone(),
-            child,
+            child: WaitedChild::spawn(child),
             stdin,
             lines,
             next_id: 1,
+            handshake: McpHandshake::default(),
+            tools: Vec::new(),
         };
-        connection.handshake(timeout)?;
+        let handshake = connection.negotiate(timeout)?;
+        connection.handshake = handshake;
+        if connection.handshake.capabilities.tools.is_some() {
+            connection.tools = connection.discover_tools(timeout)?;
+        }
         Ok(connection)
     }
 
     fn is_alive(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
+        self.child.is_running()
     }
 
     fn write_json(&mut self, value: &serde_json::Value) -> Result<(), SupervisorError> {
@@ -409,17 +566,89 @@ impl McpConnection {
         }
     }
 
-    fn handshake(&mut self, timeout: Duration) -> Result<(), SupervisorError> {
-        self.request(
+    fn negotiate(&mut self, timeout: Duration) -> Result<McpHandshake, SupervisorError> {
+        let result = self.request(
             "initialize",
             serde_json::json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "trit-agent", "version": "0.1.0"}
             }),
             timeout,
         )?;
-        self.notify("notifications/initialized", serde_json::json!({}))
+        let mut handshake = serde_json::from_value::<McpHandshake>(result).map_err(|error| {
+            SupervisorError::Mcp {
+                name: self.name.clone(),
+                message: format!("initialize result: {error}"),
+            }
+        })?;
+        if handshake.protocol_version.is_empty() {
+            handshake.protocol_version = MCP_PROTOCOL_VERSION.into();
+        } else if !MCP_SUPPORTED_VERSIONS.contains(&handshake.protocol_version.as_str()) {
+            return Err(SupervisorError::Mcp {
+                name: self.name.clone(),
+                message: format!(
+                    "unsupported protocol version {}",
+                    handshake.protocol_version
+                ),
+            });
+        }
+        self.notify("notifications/initialized", serde_json::json!({}))?;
+        Ok(handshake)
+    }
+
+    fn discover_tools(&mut self, timeout: Duration) -> Result<Vec<McpTool>, SupervisorError> {
+        #[derive(serde::Deserialize)]
+        struct ToolsPage {
+            #[serde(default)]
+            tools: Vec<McpTool>,
+            #[serde(default, rename = "nextCursor")]
+            next_cursor: Option<String>,
+        }
+
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            let params = match cursor.as_ref() {
+                Some(cursor) => serde_json::json!({"cursor": cursor}),
+                None => serde_json::json!({}),
+            };
+            let result = self.request("tools/list", params, timeout)?;
+            let page: ToolsPage =
+                serde_json::from_value(result).map_err(|error| SupervisorError::Mcp {
+                    name: self.name.clone(),
+                    message: format!("tools/list result: {error}"),
+                })?;
+            tools.extend(page.tools);
+            cursor = page.next_cursor;
+            let Some(next) = cursor.as_ref() else {
+                return Ok(tools);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(SupervisorError::Mcp {
+                    name: self.name.clone(),
+                    message: format!("tools/list repeated cursor {next}"),
+                });
+            }
+        }
+        Err(SupervisorError::Mcp {
+            name: self.name.clone(),
+            message: "tools/list exceeded 256 pages".into(),
+        })
+    }
+
+    fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SupervisorError> {
+        self.request(
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+            timeout,
+        )
     }
 
     fn send_recovery(&mut self, recovery: &RecoveryContext) -> Result<(), SupervisorError> {
@@ -431,8 +660,7 @@ impl McpConnection {
     }
 
     fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.terminate();
     }
 }
 
@@ -446,6 +674,8 @@ pub struct McpSupervisor {
     spec: ProcessSpec,
     policy: RestartPolicy,
     connection: Option<McpConnection>,
+    handshake: Option<McpHandshake>,
+    tools: Vec<McpTool>,
     launched: bool,
     restarts: usize,
     stopped: bool,
@@ -458,10 +688,12 @@ impl McpSupervisor {
             spec,
             policy,
             connection: None,
+            handshake: None,
+            tools: Vec::new(),
             launched: false,
             restarts: 0,
             stopped: false,
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
         }
     }
 
@@ -500,6 +732,8 @@ impl McpSupervisor {
         }
         let mut connection = McpConnection::open(&self.spec, self.timeout)?;
         connection.send_recovery(recovery)?;
+        self.handshake = Some(connection.handshake.clone());
+        self.tools = connection.tools.clone();
         self.connection = Some(connection);
         self.launched = true;
         if was_connected {
@@ -508,6 +742,41 @@ impl McpSupervisor {
         } else {
             Ok(McpStatus::Connected)
         }
+    }
+
+    pub fn handshake(&self) -> Option<&McpHandshake> {
+        self.handshake.as_ref()
+    }
+
+    pub fn tools(&self) -> &[McpTool] {
+        &self.tools
+    }
+
+    /// 重新拉取 tools/list；连接已断开时先按恢复包重连。
+    pub fn refresh_tools(
+        &mut self,
+        recovery: &RecoveryContext,
+    ) -> Result<&[McpTool], SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let timeout = self.timeout;
+        let connection = self.connection.as_mut().ok_or(SupervisorError::Stopped)?;
+        let tools = connection.discover_tools(timeout)?;
+        connection.tools = tools.clone();
+        self.tools = tools;
+        Ok(&self.tools)
+    }
+
+    /// 调用 MCP 工具；断线时先重连并重新握手/发现工具。
+    pub fn call_tool(
+        &mut self,
+        recovery: &RecoveryContext,
+        name: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, SupervisorError> {
+        self.ensure_connected(recovery)?;
+        let connection = self.connection.as_mut().ok_or(SupervisorError::Stopped)?;
+        connection.call_tool(name, arguments, timeout)
     }
 
     /// 模拟外部崩溃：杀掉子进程但保留“曾经连接过”的事实，下一次 ensure 会重启。
@@ -612,6 +881,7 @@ impl Drop for SupervisorLoop {
 
 /// 一组 gateway/MCP sidecar：启动一次，后台持续重启/重连，drop 时全部停止。
 pub struct SupervisorRuntime {
+    bridges: Vec<PortBridge>,
     gateways: Vec<Arc<Mutex<ProcessSupervisor>>>,
     mcps: Vec<Arc<Mutex<McpSupervisor>>>,
     recovery: Arc<Mutex<RecoveryContext>>,
@@ -627,11 +897,19 @@ impl SupervisorRuntime {
         let interval = Duration::from_millis(config.interval_ms.max(1));
         let timeout = Duration::from_millis(config.mcp_timeout_ms.max(1));
         let mut runtime = Self {
+            bridges: Vec::new(),
             gateways: Vec::new(),
             mcps: Vec::new(),
             recovery: Arc::new(Mutex::new(recovery)),
             loops: Vec::new(),
         };
+        for spec in &config.bridges {
+            let bridge = PortBridge::start(spec).map_err(|error| SupervisorError::Port {
+                name: spec.name.clone(),
+                message: error.to_string(),
+            })?;
+            runtime.bridges.push(bridge);
+        }
         for spec in &config.gateway {
             let supervisor = Arc::new(Mutex::new(ProcessSupervisor::new(
                 spec.clone(),
@@ -687,6 +965,10 @@ impl SupervisorRuntime {
         self.mcps.len()
     }
 
+    pub fn bridge_count(&self) -> usize {
+        self.bridges.len()
+    }
+
     /// 更新下一次重连使用的恢复包；状态层校验失败时拒绝。
     pub fn refresh_recovery(&self, recovery: RecoveryContext) -> Result<(), SupervisorError> {
         recovery.validate()?;
@@ -710,6 +992,9 @@ impl SupervisorRuntime {
             if let Ok(mut supervisor) = supervisor.lock() {
                 supervisor.stop();
             }
+        }
+        while let Some(mut bridge) = self.bridges.pop() {
+            bridge.stop();
         }
     }
 }
@@ -740,6 +1025,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("child did not exit");
+    }
+
+    #[test]
+    fn waited_child_blocks_on_os_wait_and_can_be_terminated() {
+        let child = if cfg!(windows) {
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        } else {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut waited = WaitedChild::spawn(child);
+        assert!(waited.is_running());
+        waited.terminate();
+        assert!(!waited.is_running());
     }
 
     #[test]
@@ -788,6 +1096,37 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mcp_supervisor_rejects_unsupported_protocol_version() {
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-protocol-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-stub.log");
+        let spec = mcp_stub_spec(&dir, &log).with_env("TRIT_MCP_STUB_PROTOCOL", "9999-01-01");
+        let mut supervisor = McpSupervisor::new(
+            spec,
+            RestartPolicy {
+                max_attempts: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+        );
+        let error = supervisor
+            .ensure_connected(&RecoveryContext::default())
+            .unwrap_err();
+        assert!(
+            matches!(&error, SupervisorError::Mcp { message, .. } if message.contains("unsupported protocol version")),
+            "{error}"
+        );
+        supervisor.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// MCP stub 会启动真实 PowerShell/Node 进程，串行化避免 CI 冷启动互相挤压。
     fn serialize_mcp_test() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
@@ -800,7 +1139,9 @@ mod tests {
             std::fs::write(
                 &script,
                 r#"$log = $env:TRIT_MCP_STUB_LOG
-Write-Output '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}'
+$proto = $env:TRIT_MCP_STUB_PROTOCOL
+if (-not $proto) { $proto = '2024-11-05' }
+Write-Output ('{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"' + $proto + '","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}')
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   [IO.File]::AppendAllText($log, $line + "`n")
 }
@@ -820,13 +1161,169 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             let script = dir.join("mcp-stub.sh");
             std::fs::write(
                 &script,
-                "#!/bin/sh\nlog=\"$TRIT_MCP_STUB_LOG\"\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"stub\",\"version\":\"0\"}}}'\nwhile IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$log\"; done\n",
+                r#"#!/bin/sh
+log="$TRIT_MCP_STUB_LOG"
+proto="$TRIT_MCP_STUB_PROTOCOL"
+[ -z "$proto" ] && proto="2024-11-05"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"'"$proto"'","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> "$log"; done
+"#,
             )
             .unwrap();
             ProcessSpec::new("sh")
                 .with_args([script.display().to_string()])
                 .with_env("TRIT_MCP_STUB_LOG", log.display().to_string())
         }
+    }
+
+    fn mcp_tool_stub_spec(dir: &std::path::Path, log: &std::path::Path) -> ProcessSpec {
+        if cfg!(windows) {
+            let script = dir.join("mcp-tool-stub.ps1");
+            std::fs::write(
+                &script,
+                r#"$log = $env:TRIT_MCP_STUB_LOG
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  [IO.File]::AppendAllText($log, $line + "`n")
+  $id = 0
+  if ($line -match '"id":([0-9]+)') { $id = $Matches[1] }
+  if ($line -like '*"method":"initialize"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":false},"prompts":{"listChanged":true},"logging":{},"completions":{}},"serverInfo":{"name":"tool-stub","version":"1.2"}}}')
+  } elseif ($line -like '*"method":"tools/list"*') {
+    if ($line -like '*"cursor"*') {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"echo2","inputSchema":{"type":"object"}}]}}')
+    } else {
+      Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}],"nextCursor":"page2"}}')
+    }
+  } elseif ($line -like '*"method":"tools/call"*') {
+    Write-Output ('{"jsonrpc":"2.0","id":' + $id + ',"result":{"content":[{"type":"text","text":"ok"}]}}')
+  }
+}
+"#,
+            )
+            .unwrap();
+            ProcessSpec::new("powershell")
+                .with_args([
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    script.display().to_string(),
+                ])
+                .with_env("TRIT_MCP_STUB_LOG", log.display().to_string())
+        } else {
+            let script = dir.join("mcp-tool-stub.sh");
+            std::fs::write(
+                &script,
+                r#"#!/bin/sh
+log="$TRIT_MCP_STUB_LOG"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$log"
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":false},"prompts":{"listChanged":true},"logging":{},"completions":{}},"serverInfo":{"name":"tool-stub","version":"1.2"}}}' ;;
+    *'"method":"tools/list"'*)
+      case "$line" in
+        *'"cursor"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo2","inputSchema":{"type":"object"}}]}}' ;;
+        *) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}],"nextCursor":"page2"}}' ;;
+      esac ;;
+    *'"method":"tools/call"'*) printf '%s\n' '{"jsonrpc":"2.0","id":'"$id"',"result":{"content":[{"type":"text","text":"ok"}]}}' ;;
+  esac
+done
+"#,
+            )
+            .unwrap();
+            ProcessSpec::new("sh")
+                .with_args([script.display().to_string()])
+                .with_env("TRIT_MCP_STUB_LOG", log.display().to_string())
+        }
+    }
+
+    #[test]
+    fn mcp_supervisor_negotiates_capabilities_and_calls_tools() {
+        let _guard = serialize_mcp_test();
+        let dir = std::env::temp_dir().join(format!(
+            "trit-mcp-tools-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("mcp-tool-stub.log");
+        let mut supervisor = McpSupervisor::new(
+            mcp_tool_stub_spec(&dir, &log),
+            RestartPolicy {
+                max_attempts: 1,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+        );
+        let recovery = RecoveryContext::default();
+        assert_eq!(
+            supervisor.ensure_connected(&recovery).unwrap(),
+            McpStatus::Connected
+        );
+
+        let handshake = supervisor.handshake().expect("handshake");
+        assert_eq!(handshake.protocol_version, "2024-11-05");
+        assert_eq!(handshake.server_info.name, "tool-stub");
+        assert_eq!(handshake.server_info.version, "1.2");
+        assert!(
+            handshake
+                .capabilities
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.list_changed)
+        );
+        assert!(
+            handshake
+                .capabilities
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.subscribe)
+        );
+        assert!(
+            handshake
+                .capabilities
+                .prompts
+                .as_ref()
+                .is_some_and(|prompts| prompts.list_changed)
+        );
+        assert!(handshake.capabilities.logging.is_some());
+        assert!(handshake.capabilities.extra.contains_key("completions"));
+
+        let tools = supervisor.tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "echo");
+        assert_eq!(tools[0].description.as_deref(), Some("Echo"));
+        assert_eq!(tools[0].input_schema["type"], "object");
+        assert_eq!(tools[1].name, "echo2");
+
+        let result = supervisor
+            .call_tool(
+                &recovery,
+                "echo",
+                serde_json::json!({"text": "hi"}),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "ok");
+
+        supervisor.kill_connection();
+        let result = supervisor
+            .call_tool(
+                &recovery,
+                "echo2",
+                serde_json::json!({}),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "ok");
+        assert_eq!(supervisor.restarts(), 1);
+
+        let refreshed = supervisor.refresh_tools(&recovery).unwrap();
+        assert_eq!(refreshed.len(), 2);
+        supervisor.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1026,6 +1523,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         let config: SupervisorConfig = serde_json::from_str(
             r#"{
                 "gateway": [{"name": "gw", "program": "gateway-bin"}],
+                "bridges": [{"name": "front", "listen": "127.0.0.1:0", "target": "127.0.0.1:9"}],
                 "restart": {"max_attempts": 1}
             }"#,
         )
@@ -1033,6 +1531,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         assert_eq!(config.gateway.len(), 1);
         assert_eq!(config.gateway[0].name, "gw");
         assert!(config.mcp.is_empty());
+        assert_eq!(config.bridges.len(), 1);
+        assert_eq!(config.bridges[0].connect_timeout_ms, 30_000);
+        assert_eq!(config.bridges[0].retry_ms, 50);
         assert_eq!(config.restart.max_attempts, 1);
         assert_eq!(config.restart.max_backoff_ms, 1_000);
         assert_eq!(config.interval_ms, 500);
@@ -1053,6 +1554,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         let config = SupervisorConfig {
             gateway: vec![exit_spec()],
             mcp: vec![mcp_stub_spec(&dir, &log)],
+            bridges: vec![PortBridgeSpec::new("front", "127.0.0.1:0", "127.0.0.1:9")],
             restart: RestartPolicy {
                 max_attempts: 2,
                 initial_backoff_ms: 0,
@@ -1072,6 +1574,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         .unwrap();
         assert_eq!(runtime.gateway_count(), 1);
         assert_eq!(runtime.mcp_count(), 1);
+        assert_eq!(runtime.bridge_count(), 1);
 
         let mut log_text = String::new();
         for _ in 0..100 {

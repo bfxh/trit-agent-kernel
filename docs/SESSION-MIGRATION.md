@@ -95,17 +95,23 @@ preserve_superseded  // 是否保留旧摘要
 
 默认开启，但宿主/用户可全部关闭；关闭时迁移计划保持目标状态不变。
 
-## 7. 网关与 MCP 自动重启（基础实现）
+## 7. 网关与 MCP 自动重启（实现）
 
 `crates/trit-agent/src/supervisor.rs` 已实现：
 
 - `ProcessSupervisor`：启动/监控/退避重启子进程，`max_attempts=0` 表示只启动不重启；
+  子进程退出由阻塞在 OS wait 上的监视线程发事件，不再用 `try_wait` 轮询；
 - `SupervisorLoop`：后台线程按 interval 自动调用 `ensure_running` / `ensure_connected`，
   不需要调用方逐次检查；
 - `McpSupervisor`：stdio JSON-RPC `initialize` 握手、初始化通知、断线重连；
+  协议版本在 2024-11-05 / 2025-03-26 / 2025-06-18 白名单内协商，未知版本 fail closed；
+  解析 serverInfo 与完整 capabilities（tools/resources/prompts/logging/experimental/扩展字段），
+  按 `tools/list` 游标分页发现工具，提供 `call_tool` 与 `refresh_tools`；
 - 重连后发送 `notifications/trit/recovered`，携带 `RecoveryContext`：
   session_id、状态层（含校验结论）、钩子契约、cache ledger；
 - `GatewaySupervisor = ProcessSupervisor`，网关协议由网关自己处理；
+- `PortBridge`：前端监听口常驻，向后端端口转发；后端进程重启期间新连接在超时
+  窗口内重试，而不是立刻 connection refused；
 - `Session::recovery_context()` / `recovery_context_for_session()` 可直接构造
   session/状态层/cache 恢复包，hooks 由宿主补齐；
 - `SupervisorRuntime` 从 `SupervisorConfig` 启动所有 sidecar：首启失败即报错，后台
@@ -119,6 +125,7 @@ CLI 通过 `--supervisor-config <json>` 接入：
 {
   "gateway": [{"name": "gw", "program": "gateway-bin", "args": ["--stdio"]}],
   "mcp": [{"name": "tools", "program": "mcp-server", "args": []}],
+  "bridges": [{"name": "front", "listen": "127.0.0.1:8080", "target": "127.0.0.1:18080"}],
   "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
   "interval_ms": 500,
   "mcp_timeout_ms": 30000
@@ -128,13 +135,17 @@ CLI 通过 `--supervisor-config <json>` 接入：
 CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结束后从新日志重建并
 `refresh_recovery`。运行中崩溃会使用最近一次快照，宿主可自行在关键点刷新。
 
-边界：MCP 目前只做 initialize/重连，不做完整 capability 协商；没有端口级零停机；
-后台 loop 是轮询而非 OS 事件；恢复包是自定义通知，服务端不支持时应忽略而不是断连。
+边界：MCP 解析 capabilities 与工具列表，但不实现 resources/prompts/sampling/roots 调用，
+`tools/list_changed` 只记录能力标志，刷新由宿主调用 `refresh_tools`；端口桥接只保证
+前端监听口不断开，已建立连接会随后端进程退出而断，不是内核 FD 交接或连接迁移；
+后台 loop 仍按 interval 检查，但进程退出检测本身是 OS wait 事件；
+恢复包是自定义通知，服务端不支持时应忽略而不是断连。
 
 ## 8. 当前边界
 
 - 迁移目前是纯计划，不直接改目标 session/文件；宿主需要把 `MigrationPlan` 落地。
 - 缓存只迁移 ledger，不迁移 provider 内部 KV cache；跨 provider 本来也不可复用。
 - 旧版本摘要不重新生成，因此迁移不会“变聪明”，只保证不丢已有信息。
-- 钩子运行时和 MCP 客户端不在本仓库；当前只实现 contract 元数据校验。
-- 没有网络层面的零停机保证；supervisor 只能缩短不可用窗口并保证恢复路径。
+- 钩子运行时不在本仓库；MCP 客户端实现了 stdio 握手、capability/工具发现与工具调用，
+  但没有实现 resources/prompts/sampling/roots 的客户端行为。
+- 端口桥接只覆盖新连接的等待与重试；没有连接排空、FD 交接或请求级重放。

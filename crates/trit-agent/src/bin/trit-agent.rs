@@ -453,9 +453,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             supervisor_recovery(supervisor_session_path.as_deref(), &shared_cache_ledger)?;
         runtime.refresh_recovery(recovery)?;
         eprintln!(
-            "supervisor: gateways={} mcp={}",
+            "supervisor: gateways={} mcp={} bridges={}",
             runtime.gateway_count(),
-            runtime.mcp_count()
+            runtime.mcp_count(),
+            runtime.bridge_count()
         );
     }
 
@@ -622,9 +623,10 @@ fn usage() {
          cache-hit-threshold: basis points (default 5000); low-hit-policy keep|demote (default keep).\n\
          cache-ledger: optional JSON file loaded before the run and rewritten after it.\n\
          cache-search-scale-bp: scales context_search candidates on low cache hit.\n\
-         supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec], restart:{{...}},\n\
-         interval_ms, mcp_timeout_ms}}; starts supervised sidecars, restarts them after exit,\n\
-         and reconnects MCP with session state/cache recovery.\n\n\
+         supervisor-config: JSON {{gateway:[ProcessSpec], mcp:[ProcessSpec],\n\
+         bridges:[PortBridgeSpec], restart:{{...}}, interval_ms, mcp_timeout_ms}};\n\
+         starts supervised sidecars and keep-alive port bridges, restarts them after exit,\n\
+         negotiates MCP tools, and reconnects MCP with session state/cache recovery.\n\n\
          rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"

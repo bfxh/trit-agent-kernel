@@ -786,6 +786,7 @@ pub mod context_layers;
 pub mod context_tools;
 pub mod git_checkpoint;
 pub mod openai;
+pub mod port_bridge;
 pub mod provider;
 pub mod session;
 pub mod session_migration;
@@ -816,6 +817,7 @@ pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };
 pub use openai::{OpenAiConfig, OpenAiProvider};
+pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
     ToolSpec, default_tools,
@@ -834,7 +836,8 @@ pub use state_layer::{
     StateLayer, StateValidation, state_layer,
 };
 pub use supervisor::{
-    GatewaySupervisor, McpStatus, McpSupervisor, ProcessSpec, ProcessSupervisor, RecoveryContext,
-    RestartPolicy, SupervisorConfig, SupervisorError, SupervisorLoop, SupervisorRuntime,
-    SupervisorStatus,
+    GatewaySupervisor, McpCapabilities, McpHandshake, McpPromptsCapability, McpResourcesCapability,
+    McpServerInfo, McpStatus, McpSupervisor, McpTool, McpToolsCapability, ProcessSpec,
+    ProcessSupervisor, RecoveryContext, RestartPolicy, SupervisorConfig, SupervisorError,
+    SupervisorLoop, SupervisorRuntime, SupervisorStatus,
 };

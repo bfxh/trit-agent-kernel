@@ -851,6 +851,7 @@ version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",

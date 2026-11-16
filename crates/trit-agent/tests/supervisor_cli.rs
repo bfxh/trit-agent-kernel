@@ -47,6 +47,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
     let config = SupervisorConfig {
         gateway: vec![gateway],
         mcp: Vec::new(),
+        bridges: Vec::new(),
         restart: RestartPolicy {
             max_attempts: 0,
             initial_backoff_ms: 0,
@@ -75,7 +76,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stderr: {stderr}");
     assert!(
-        stderr.contains("supervisor: gateways=1 mcp=0"),
+        stderr.contains("supervisor: gateways=1 mcp=0 bridges=0"),
         "stderr: {stderr}"
     );
     assert_eq!(
