@@ -14,7 +14,6 @@ use globset::{Glob, GlobMatcher};
 use ignore::WalkBuilder;
 use regex::RegexBuilder;
 
-use crate::resource::ResourceProfile;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,8 +63,6 @@ pub struct WorkspaceConfig {
     /// 无沙箱 shell 使用持久 bash 会话；沙箱模式仍逐条执行。
     pub persistent_shell: bool,
     pub max_search_file_bytes: usize,
-    pub max_search_results: usize,
-    pub max_glob_results: usize,
 }
 
 impl WorkspaceConfig {
@@ -81,18 +78,7 @@ impl WorkspaceConfig {
             max_output_bytes: 32 * 1024,
             persistent_shell: true,
             max_search_file_bytes: 1024 * 1024,
-            max_search_results: 100,
-            max_glob_results: 200,
         }
-    }
-
-    pub fn for_profile(root: impl Into<PathBuf>, profile: ResourceProfile) -> Self {
-        let mut config = Self::new(root);
-        config.max_output_bytes = profile.max_output_bytes();
-        config.max_search_file_bytes = profile.max_search_file_bytes();
-        config.max_search_results = profile.max_search_results();
-        config.max_glob_results = profile.max_glob_results();
-        config
     }
 }
 
@@ -108,8 +94,6 @@ pub struct LocalTools {
     max_output_bytes: usize,
     persistent_shell: bool,
     max_search_file_bytes: usize,
-    max_search_results: usize,
-    max_glob_results: usize,
     shell_session: Option<ShellSession>,
 }
 
@@ -284,8 +268,6 @@ impl LocalTools {
             max_output_bytes: config.max_output_bytes,
             persistent_shell: config.persistent_shell,
             max_search_file_bytes: config.max_search_file_bytes,
-            max_search_results: config.max_search_results,
-            max_glob_results: config.max_glob_results,
             shell_session: None,
         })
     }
@@ -420,8 +402,8 @@ impl LocalTools {
         let max_results = arguments
             .and_then(|arguments| arguments.get("max_results"))
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(self.max_search_results as u64)
-            .clamp(1, self.max_search_results as u64) as usize;
+            .unwrap_or(100)
+            .clamp(1, 1000) as usize;
         let path = arguments
             .and_then(|arguments| arguments.get("path"))
             .and_then(serde_json::Value::as_str);
@@ -516,8 +498,8 @@ impl LocalTools {
         let max_results = arguments
             .and_then(|arguments| arguments.get("max_results"))
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(self.max_glob_results as u64)
-            .clamp(1, self.max_glob_results as u64) as usize;
+            .unwrap_or(200)
+            .clamp(1, 2000) as usize;
         let path = arguments
             .and_then(|arguments| arguments.get("path"))
             .and_then(serde_json::Value::as_str);

@@ -10,10 +10,10 @@ use trit_agent::{
     ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
     LowHitPolicy, McpToolExecutor, Model, ModelProfile, OpenAiConfig, OpenAiProvider,
     OpenAiSamplingHandler, Proposal, ProviderModel, ReasoningEffort, RecoveryContext,
-    ResolvedContext, ResourceProfile, RewindScope, SamplingHandler, ScriptedModel, SearchOrder,
-    SelectionPressure, Session, SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor,
-    default_tools, recovery_context_for_session, rewind_session_git_with_policy,
-    rewind_session_with_policy, run_headless,
+    ResolvedContext, RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure,
+    Session, SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, default_tools,
+    recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
+    run_headless,
 };
 use trit_reasonix::TurnSpec;
 
@@ -39,19 +39,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(fail(format!("unknown command: {command}")));
     }
 
-    let low_resource = std::env::args()
-        .skip(1)
-        .any(|argument| argument == "--low-resource")
-        || ResourceProfile::detect() == ResourceProfile::Low;
-    let profile = if low_resource {
-        ResourceProfile::Low
-    } else {
-        ResourceProfile::Full
-    };
     let mut task = None;
     let mut workspace = PathBuf::from(".");
     let mut script = None;
-    let mut max_steps = profile.max_steps();
+    let mut max_steps = 8usize;
     let mut allow_write = false;
     let mut allow_shell = false;
     let mut session = None;
@@ -61,7 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut allow_unsandboxed_shell = false;
     let mut allow_hardlinks = false;
     let mut resume = false;
-    let mut context = profile.context_policy();
+    let mut context = ContextPolicy::default();
     let mut checkpoint_dir: Option<PathBuf> = None;
     let mut checkpoint_backend = "files".to_owned();
     let mut checkpoint_retain: Option<usize> = None;
@@ -73,11 +64,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut model_max_output: u64 = 8_192;
     let mut supports_reasoning = false;
     let mut reasoning = ReasoningEffort::Off;
-    let mut context_read_budget: usize = profile.context_read_budget();
-    let mut context_read_max: usize = profile.context_read_max();
+    let mut context_read_budget: usize = 16 * 1024;
+    let mut context_read_max: usize = 8 * 1024;
     let mut cache_hit_threshold: u32 = 5_000;
     let mut low_hit_policy = LowHitPolicy::Keep;
-    let mut cache_window_samples: usize = profile.cache_window_samples();
+    let mut cache_window_samples: usize = 64;
     let mut cache_window_ms: Option<u64> = None;
     let mut cache_pressure_scale_bp: u32 = 10_000;
     let mut cache_search_scale_bp: u32 = 10_000;
@@ -106,7 +97,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
-            "--low-resource" => {}
             "--resume" => resume = true,
             "--checkpoint-dir" => {
                 checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
@@ -268,7 +258,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(fail("--mcp-sampling requires --provider openai"));
     }
     let workspace_root = workspace.clone();
-    let mut workspace = WorkspaceConfig::for_profile(workspace, profile);
+    let mut workspace = WorkspaceConfig::new(workspace);
     workspace.allow_write = allow_write;
     workspace.allow_shell = allow_shell;
     workspace.allow_unsandboxed_shell = allow_unsandboxed_shell;

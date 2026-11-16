@@ -792,7 +792,6 @@ pub mod mcp_tools;
 pub mod openai;
 pub mod port_bridge;
 pub mod provider;
-pub mod resource;
 pub mod sampling;
 pub mod session;
 pub mod session_migration;
@@ -829,7 +828,6 @@ pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
     ToolCatalog, ToolSpec, default_tools,
 };
-pub use resource::ResourceProfile;
 pub use sampling::OpenAiSamplingHandler;
 pub use session::{
     SESSION_SCHEMA, Session, SessionEvent, SessionLog, SessionRecord, SessionState, TurnRecord,
