@@ -955,6 +955,7 @@ pub mod frontend_compat;
 pub mod git_checkpoint;
 pub mod mcp_tools;
 pub mod openai;
+pub mod permissions;
 pub mod port_bridge;
 pub mod provider;
 pub mod provider_health;
@@ -1000,6 +1001,10 @@ pub use git_checkpoint::{
 };
 pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};
 pub use openai::{OpenAiConfig, OpenAiProvider};
+pub use permissions::{
+    ClaimingTools, PermissionApprover, PermissionDecision, PermissionGate, PermissionMode,
+    PermissionPolicy, PermissionRule, WriteClaim,
+};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,

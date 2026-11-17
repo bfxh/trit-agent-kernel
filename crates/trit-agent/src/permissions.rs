@@ -1,0 +1,491 @@
+//! 权限策略与 write claim（B7.4 首版）。
+//!
+//! 这里是可组合的 `ToolExecutor` 包装器：默认不改变 `LocalTools` 的行为。
+//! 宿主显式套上 `PermissionGate` / `ClaimingTools` 后才启用逐调用权限和路径 claim。
+
+use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// 写入/命令默认请求审批；没有 approver 时 fail-closed。
+    #[default]
+    Ask,
+    /// 普通写入/命令自动放行；显式 deny / ask 规则仍然生效。
+    Auto,
+    /// 跳过普通审批；显式 deny / ask 规则仍然生效。
+    Yolo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    /// 工具名；`*` 匹配全部。
+    pub tool: String,
+    /// 可选精确 subject：bash 用 command，文件工具用第一个 path。
+    #[serde(default)]
+    pub subject: Option<String>,
+    pub decision: PermissionDecision,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionPolicy {
+    pub mode: PermissionMode,
+    #[serde(default)]
+    pub rules: Vec<PermissionRule>,
+}
+
+impl PermissionPolicy {
+    pub fn new(mode: PermissionMode) -> Self {
+        Self {
+            mode,
+            rules: Vec::new(),
+        }
+    }
+
+    pub fn with_rule(mut self, rule: PermissionRule) -> Self {
+        self.rules.push(rule);
+        self
+    }
+
+    pub fn decide(&self, request: &ToolRequest) -> PermissionDecision {
+        let subject = request
+            .command
+            .as_deref()
+            .or_else(|| request.paths.first().map(String::as_str));
+        let matches = |rule: &PermissionRule| {
+            (rule.tool == "*" || rule.tool == request.tool)
+                && rule
+                    .subject
+                    .as_deref()
+                    .is_none_or(|expected| Some(expected) == subject)
+        };
+        // deny 永远优先于 allow/模式回退。
+        for decision in [
+            PermissionDecision::Deny,
+            PermissionDecision::Ask,
+            PermissionDecision::Allow,
+        ] {
+            if self
+                .rules
+                .iter()
+                .any(|rule| rule.decision == decision && matches(rule))
+            {
+                return decision;
+            }
+        }
+        if request.read_only {
+            return PermissionDecision::Allow;
+        }
+        match self.mode {
+            PermissionMode::Ask => PermissionDecision::Ask,
+            PermissionMode::Auto | PermissionMode::Yolo => PermissionDecision::Allow,
+        }
+    }
+}
+
+pub trait PermissionApprover {
+    fn approve(&mut self, request: &ToolRequest) -> Result<bool, AgentError>;
+}
+
+/// 逐调用权限包装器；`Ask` 没有 approver 或 approver 拒绝时返回 blocked 回执。
+pub struct PermissionGate<T> {
+    inner: T,
+    policy: PermissionPolicy,
+    approver: Option<Box<dyn PermissionApprover>>,
+}
+
+impl<T> PermissionGate<T> {
+    pub fn new(inner: T, policy: PermissionPolicy) -> Self {
+        Self {
+            inner,
+            policy,
+            approver: None,
+        }
+    }
+
+    pub fn with_approver(mut self, approver: impl PermissionApprover + 'static) -> Self {
+        self.approver = Some(Box::new(approver));
+        self
+    }
+
+    pub fn policy(&self) -> &PermissionPolicy {
+        &self.policy
+    }
+
+    pub fn set_policy(&mut self, policy: PermissionPolicy) {
+        self.policy = policy;
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl<T: ToolExecutor> ToolExecutor for PermissionGate<T> {
+    fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        match self.policy.decide(request) {
+            PermissionDecision::Allow => self.inner.execute(request),
+            PermissionDecision::Deny => Ok(blocked(request, "permission denied by policy")),
+            PermissionDecision::Ask => {
+                let approval = match self.approver.as_mut() {
+                    Some(approver) => Some(approver.approve(request)?),
+                    None => None,
+                };
+                match approval {
+                    Some(true) => self.inner.execute(request),
+                    Some(false) => Ok(blocked(request, "permission request rejected")),
+                    None => Ok(blocked(
+                        request,
+                        "approval required; no interactive approver",
+                    )),
+                }
+            }
+        }
+    }
+
+    fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
+        self.inner.begin_turn(turn, objective)
+    }
+
+    fn end_turn(&mut self, complete: bool) -> Result<(), AgentError> {
+        self.inner.end_turn(complete)
+    }
+}
+
+/// 任务级写入范围；只允许已声明路径（文件或目录子树）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteClaim {
+    root: PathBuf,
+    allowed: Vec<PathBuf>,
+}
+
+impl WriteClaim {
+    pub fn new(root: impl Into<PathBuf>, paths: Vec<PathBuf>) -> Result<Self, AgentError> {
+        let root = std::fs::canonicalize(root.into())
+            .map_err(|error| AgentError::Io(format!("write claim root: {error}")))?;
+        let mut allowed = Vec::with_capacity(paths.len());
+        for path in paths {
+            let absolute = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            let absolute = normalize_absolute(&absolute);
+            if !absolute.starts_with(&root) {
+                return Err(AgentError::Tool(format!(
+                    "write claim path escapes root: {}",
+                    absolute.display()
+                )));
+            }
+            allowed.push(absolute);
+        }
+        allowed.sort();
+        allowed.dedup();
+        Ok(Self { root, allowed })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn allowed(&self) -> &[PathBuf] {
+        &self.allowed
+    }
+
+    pub fn allows_path(&self, raw: &str) -> bool {
+        if raw.trim().is_empty() {
+            return false;
+        }
+        let path = self.root.join(raw);
+        let path = normalize_absolute(&path);
+        path.starts_with(&self.root) && self.allowed.iter().any(|allowed| path.starts_with(allowed))
+    }
+
+    pub fn allows_request(&self, request: &ToolRequest) -> bool {
+        if request.read_only {
+            return true;
+        }
+        match request.tool.as_str() {
+            "write_file" => {
+                !request.paths.is_empty() && request.paths.iter().all(|path| self.allows_path(path))
+            }
+            // shell 无法从命令文本证明路径范围；claim 存在时 fail-closed。
+            "bash" => false,
+            _ => true,
+        }
+    }
+}
+
+pub struct ClaimingTools<T> {
+    inner: T,
+    claim: WriteClaim,
+}
+
+impl<T> ClaimingTools<T> {
+    pub fn new(inner: T, claim: WriteClaim) -> Self {
+        Self { inner, claim }
+    }
+
+    pub fn claim(&self) -> &WriteClaim {
+        &self.claim
+    }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl<T: ToolExecutor> ToolExecutor for ClaimingTools<T> {
+    fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        if self.claim.allows_request(request) {
+            self.inner.execute(request)
+        } else {
+            Ok(blocked(
+                request,
+                "write claim does not allow this path or shell command",
+            ))
+        }
+    }
+
+    fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
+        self.inner.begin_turn(turn, objective)
+    }
+
+    fn end_turn(&mut self, complete: bool) -> Result<(), AgentError> {
+        self.inner.end_turn(complete)
+    }
+}
+
+fn blocked(request: &ToolRequest, reason: &str) -> ToolOutcome {
+    ToolOutcome {
+        call_id: request.call_id.clone(),
+        tool: request.tool.clone(),
+        command: request.command.clone(),
+        passed: false,
+        assertions: 0,
+        written_paths: Vec::new(),
+        in_doubt: false,
+        output: format!("blocked: {reason}"),
+    }
+}
+
+fn normalize_absolute(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct FakeTools {
+        calls: usize,
+    }
+
+    impl FakeTools {
+        fn new() -> Self {
+            Self { calls: 0 }
+        }
+    }
+
+    impl ToolExecutor for FakeTools {
+        fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+            self.calls += 1;
+            Ok(ToolOutcome {
+                call_id: request.call_id.clone(),
+                tool: request.tool.clone(),
+                command: request.command.clone(),
+                passed: true,
+                assertions: 0,
+                written_paths: request.paths.clone(),
+                in_doubt: false,
+                output: "ok".into(),
+            })
+        }
+    }
+
+    struct Approve(bool);
+
+    impl PermissionApprover for Approve {
+        fn approve(&mut self, _request: &ToolRequest) -> Result<bool, AgentError> {
+            Ok(self.0)
+        }
+    }
+
+    fn write_request() -> ToolRequest {
+        ToolRequest::write("call-1", "write_file", "src/a.txt", "x")
+    }
+
+    #[test]
+    fn deny_rule_beats_yolo_mode() {
+        let policy = PermissionPolicy::new(PermissionMode::Yolo).with_rule(PermissionRule {
+            tool: "bash".into(),
+            subject: None,
+            decision: PermissionDecision::Deny,
+        });
+        let mut gate = PermissionGate::new(FakeTools::new(), policy);
+        let outcome = gate
+            .execute(&ToolRequest::shell("call-1", "rm -rf build"))
+            .unwrap();
+        assert!(!outcome.passed);
+        assert_eq!(gate.inner().calls, 0);
+    }
+
+    #[test]
+    fn ask_without_approver_fails_closed() {
+        let mut gate = PermissionGate::new(FakeTools::new(), PermissionPolicy::default());
+        let outcome = gate.execute(&write_request()).unwrap();
+        assert!(!outcome.passed);
+        assert!(outcome.output.contains("no interactive approver"));
+        assert_eq!(gate.inner().calls, 0);
+    }
+
+    #[test]
+    fn ask_with_approver_allows_or_rejects() {
+        let policy = PermissionPolicy::default();
+        let mut allow =
+            PermissionGate::new(FakeTools::new(), policy.clone()).with_approver(Approve(true));
+        assert!(allow.execute(&write_request()).unwrap().passed);
+        assert_eq!(allow.inner().calls, 1);
+
+        let mut deny = PermissionGate::new(FakeTools::new(), policy).with_approver(Approve(false));
+        assert!(!deny.execute(&write_request()).unwrap().passed);
+        assert_eq!(deny.inner().calls, 0);
+    }
+
+    #[test]
+    fn read_only_and_auto_writer_fallbacks() {
+        let mut ask = PermissionGate::new(FakeTools::new(), PermissionPolicy::default());
+        assert!(
+            ask.execute(&ToolRequest::read("call-1", "src/a.txt"))
+                .unwrap()
+                .passed
+        );
+
+        let mut auto = PermissionGate::new(
+            FakeTools::new(),
+            PermissionPolicy::new(PermissionMode::Auto),
+        );
+        assert!(auto.execute(&write_request()).unwrap().passed);
+        assert_eq!(auto.inner().calls, 1);
+    }
+
+    #[test]
+    fn subject_deny_only_blocks_matching_command() {
+        let policy = PermissionPolicy::new(PermissionMode::Yolo).with_rule(PermissionRule {
+            tool: "bash".into(),
+            subject: Some("rm -rf build".into()),
+            decision: PermissionDecision::Deny,
+        });
+        let mut gate = PermissionGate::new(FakeTools::new(), policy);
+        assert!(
+            !gate
+                .execute(&ToolRequest::shell("call-1", "rm -rf build"))
+                .unwrap()
+                .passed
+        );
+        assert!(
+            gate.execute(&ToolRequest::shell("call-2", "cargo test"))
+                .unwrap()
+                .passed
+        );
+        assert_eq!(gate.inner().calls, 1);
+    }
+
+    #[test]
+    fn explicit_ask_rule_survives_auto_mode() {
+        let policy = PermissionPolicy::new(PermissionMode::Auto).with_rule(PermissionRule {
+            tool: "write_file".into(),
+            subject: None,
+            decision: PermissionDecision::Ask,
+        });
+        let mut gate = PermissionGate::new(FakeTools::new(), policy);
+        let outcome = gate.execute(&write_request()).unwrap();
+        assert!(!outcome.passed);
+        assert_eq!(gate.inner().calls, 0);
+    }
+
+    #[test]
+    fn write_claim_limits_paths_and_shell() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src")]).unwrap();
+        assert!(claim.allows_path("src/a.txt"));
+        assert!(!claim.allows_path("other.txt"));
+        assert!(!claim.allows_path("../escape.txt"));
+
+        let mut tools = ClaimingTools::new(FakeTools::new(), claim);
+        assert!(
+            tools
+                .execute(&ToolRequest::write(
+                    "call-1",
+                    "write_file",
+                    "src/a.txt",
+                    "x"
+                ))
+                .unwrap()
+                .passed
+        );
+        assert!(
+            !tools
+                .execute(&ToolRequest::write(
+                    "call-2",
+                    "write_file",
+                    "other.txt",
+                    "x"
+                ))
+                .unwrap()
+                .passed
+        );
+        assert!(
+            !tools
+                .execute(&ToolRequest::shell("call-3", "touch other.txt"))
+                .unwrap()
+                .passed
+        );
+        assert!(
+            tools
+                .execute(&ToolRequest::read("call-4", "src/a.txt"))
+                .unwrap()
+                .passed
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

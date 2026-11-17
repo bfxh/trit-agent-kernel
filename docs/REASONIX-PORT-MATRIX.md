@@ -44,8 +44,8 @@
 | 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+恢复+Plan 联动） | 完成裁决要求当前 epoch + freshness True；新证据恢复、Manual 策略、Plan/Observation epoch 已联动；缺跨设备落盘与多任务图迁移 | B7.3 |
 | 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；缺 sidecar 布局、byte parity、重建投影 | B7.7 |
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 已实现；缺持久 journal、operation lease、崩溃恢复 | B7.7 |
-| 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分 | 当前是工具开关/沙箱边界；缺逐调用决策、deny 优先、非交互 fail-closed | B7.4 |
-| 10 | Write claim / 路径范围强制 | `SPEC §3.12`、`OPAQUE_WRITE_ADMISSION_SECURITY.md` | 部分 | 工作区边界已有；缺任务级 write claim、双端 move、越界上报 | B7.4 |
+| 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分（首版） | `PermissionGate` 已有 ask/auto/yolo、deny 优先、无 approver fail-closed；缺交互审批 UI 与 MCP 策略映射 | B7.4 |
+| 10 | Write claim / 路径范围强制 | `SPEC §3.12`、`OPAQUE_WRITE_ADMISSION_SECURITY.md` | 部分（首版） | `WriteClaim` + `ClaimingTools` 限制 write_file 路径子树，shell 写入 fail-closed；缺 move 双端、mutation journal 对账 | B7.4 |
 | 11 | Mutation journal / OS lease | `MUTATION_COORDINATOR_SECURITY.md`、`ISOLATION_OPERATION_LEASE_SECURITY.md` | 缺口 | 宿主 mutation record 作为外部事实；内核不复制文件锁 | B7.4/B7.7 |
 | 12 | 沙箱 / isolation runner | `ISOLATION_*`、`SPEC §3.7` | 部分 | 已有外部 sandbox wrapper；缺 runner 生命周期、fail-closed 矩阵 | B7.4 |
 | 13 | 宿主裁决完成声明 | `SPEC §3.11`、`complete_subtask` | 已有 | 已有 EvidenceRails/义务；需补齐“criterion → 回执”逐条降级与 write scope | B7.5 |
@@ -238,6 +238,8 @@ B7.3 首版已落地：
 - `ProjectionView` 进入 `ProviderRequest` 与 OpenAI user prompt；
 - 完成裁决只接受当前 epoch 的回执，压缩前旧证据不能为压缩后完成声明背书；
 - `SessionMigrationBundle` 携带 canonical 投影、epoch 与边界；目标 prefix 不匹配时 freshness 降为 Unknown；迁移测试覆盖开关与跨 prefix 场景；
+- `PermissionGate`：Ask/Auto/Yolo、deny/ask/allow 规则、subject 精确匹配、deny 优先、无 approver fail-closed；
+- `WriteClaim` + `ClaimingTools`：write_file 路径子树校验；claim 存在时 shell 写入拒绝；read-only 仍放行；
 - `FreshnessRecovery::OnVerifiedEvidence` 默认在新 epoch 的成功且带断言证据后恢复 True，`Manual` 保持 Unknown；完成裁决要求 freshness True；
 - 压缩时 `Plan::rebase_epoch` 推进任务 epoch，Observation epoch / freshness 同步更新，brief 重新生成；
 - `ContextFreshnessRecovered` session 事件进入状态层与 replay，保证 live / replay 一致。
@@ -247,4 +249,5 @@ B7.3 首版已落地：
 1. 录制真实 tool-call 流 fixture；当前真实 fixture 只有文本流，tool delta 用内联 chunk。
 2. 补模型别名、超时分级、可重试错误分类，以及可选的 provider 健康接线。
 3. B7.3 剩余：跨设备/跨存储实际落盘、多任务 Plan 的批量 rebase。
-4. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。
+4. B7.4 继续：交互审批 UI、MCP 工具策略映射、move 双端与 mutation journal 对账。
+5. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。
