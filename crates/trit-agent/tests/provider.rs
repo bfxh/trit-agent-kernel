@@ -124,6 +124,59 @@ fn prefix_change_emits_rebasis_obligation() {
     assert_eq!(outcome.rebasis[0].subject, "prefix");
 }
 
+fn inclusion_receipt(fingerprint: &str) -> ContextReceipt {
+    ContextReceipt {
+        inclusion: Some(InclusionReceipt {
+            project: "p1".into(),
+            session: "s1".into(),
+            prefix_fingerprint: fingerprint.into(),
+            handles: vec!["C1".into()],
+            refs: vec!["doc".into()],
+            estimated_tokens: 10,
+            hit_potential: trit_orch::Ternary::True,
+        }),
+        cache: None,
+    }
+}
+
+#[test]
+fn local_prefix_fingerprint_change_emits_rebasis_without_provider_signal() {
+    let provider = ScriptedProvider::new(vec![
+        ProviderResponse {
+            tool_calls: vec![],
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "m1".into(),
+                    kind: CriterionKind::Manual,
+                }],
+            }),
+            usage: HostUsage::default(),
+            prefix: None,
+            context: Some(inclusion_receipt("fnv1a64:first")),
+        },
+        ProviderResponse {
+            tool_calls: vec![],
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "m2".into(),
+                    kind: CriterionKind::Manual,
+                }],
+            }),
+            usage: HostUsage::default(),
+            prefix: None,
+            context: Some(inclusion_receipt("fnv1a64:second")),
+        },
+    ]);
+    let mut host = AgentHost::new(ProviderModel::new(provider), ScriptedTools::new(vec![]));
+    let first = host.run_turn(&turn()).unwrap();
+    assert!(first.rebasis.is_empty());
+    let second = host.run_turn(&turn()).unwrap();
+    assert_eq!(second.rebasis.len(), 1);
+    assert_eq!(second.rebasis[0].kind, ObligationKind::Rebasis);
+    assert_eq!(second.rebasis[0].subject, "prefix");
+    assert!(second.rebasis[0].detail.contains("context_plan"));
+}
+
 fn verification_outcome(call_id: &str, command: &str) -> ToolOutcome {
     ToolOutcome {
         call_id: call_id.into(),

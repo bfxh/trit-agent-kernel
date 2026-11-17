@@ -350,6 +350,7 @@ pub struct AgentHost<M, T> {
     max_steps: usize,
     context: ContextPolicy,
     cache_ledger: Arc<Mutex<crate::context_layers::CacheLedger>>,
+    last_prefix_fingerprint: Option<String>,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -360,6 +361,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             max_steps: 8,
             context: ContextPolicy::default(),
             cache_ledger: Arc::new(Mutex::new(crate::context_layers::CacheLedger::default())),
+            last_prefix_fingerprint: None,
         }
     }
 
@@ -513,18 +515,49 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     .map_err(|_| AgentError::SessionState("cache ledger is poisoned".into()))?;
                 ledger.observe(cache);
             }
-            if let Some(prefix) = &proposal.prefix
-                && prefix.changed
+            let mut prefix_changed = proposal
+                .prefix
+                .as_ref()
+                .is_some_and(|prefix| prefix.changed);
+            let mut prefix_reasons = proposal
+                .prefix
+                .as_ref()
+                .filter(|prefix| prefix.changed)
+                .map(|prefix| prefix.reasons.clone())
+                .unwrap_or_default();
+            if let Some(inclusion) = proposal
+                .context_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.inclusion.as_ref())
             {
+                let current = (!inclusion.prefix_fingerprint.is_empty())
+                    .then_some(inclusion.prefix_fingerprint.as_str());
+                let local_changed = match (self.last_prefix_fingerprint.as_deref(), current) {
+                    (Some(previous), Some(current)) => previous != current,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if local_changed {
+                    prefix_changed = true;
+                    prefix_reasons.push("context_plan".into());
+                }
+                self.last_prefix_fingerprint = current.map(str::to_owned);
+            }
+            if prefix_changed {
+                if prefix_reasons.is_empty() {
+                    prefix_reasons.push("prefix_signal".into());
+                }
+                prefix_reasons.sort();
+                prefix_reasons.dedup();
                 log_session(
                     &mut session,
                     SessionEvent::PrefixChanged {
                         step,
-                        reasons: prefix.reasons.clone(),
+                        reasons: prefix_reasons.clone(),
                         rebasis: true,
                     },
                 )?;
-                let detail = format!("prompt prefix changed: {:?}", prefix.reasons);
+                let detail = format!("prompt prefix changed: {prefix_reasons:?}");
                 let obligation = AdmissionObligation::new(
                     ObligationKind::Rebasis,
                     &turn.task,

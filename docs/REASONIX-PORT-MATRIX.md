@@ -40,8 +40,8 @@
 | 2 | Provider 流式输出与工具增量 | `SPEC §3.1`、`provider.Stream` | 部分（首版） | SSE / tool delta 已有；缺多 provider、中断恢复、默认路径接入 | B7.2 |
 | 3 | 模型连接健康 / 别名 / 重试 | `MODEL_CONNECTION_HEALTH.md`、`MODEL_DISPLAY_ALIASES.md` | 部分（首版） | 纯健康状态机已有；缺自动探测、别名、超时分级 | B7.2 |
 | 4 | 工具契约 / 注册表 / schema 规范化 | `TOOL_CONTRACT.md`、`SPEC §3.2` | 部分 | `ToolSpec` 已有，缺 schema 规范化、契约对照测试、工具家族 | B7.1/B7.2 |
-| 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分 | `ContextPlan` + `CacheLedger` 已有；缺完整 append-only / checkpoint 投影 | B7.3 |
-| 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分 | `PrefixSignal` 已产生义务；需把压缩点与 epoch/freshness 全链路绑定 | B7.3 |
+| 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（首版） | `ContextPlan` + `CacheLedger` 已有；缺完整 append-only / checkpoint 投影 | B7.3 |
+| 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（首版） | provider signal + 本地 prefix fingerprint 已产生义务；缺压缩点与 epoch/freshness 全链路绑定 | B7.3 |
 | 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；缺 sidecar 布局、byte parity、重建投影 | B7.7 |
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 已实现；缺持久 journal、operation lease、崩溃恢复 | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分 | 当前是工具开关/沙箱边界；缺逐调用决策、deny 优先、非交互 fail-closed | B7.4 |
@@ -228,9 +228,15 @@ B7.2 首版已落地：
 - `ConnectionHealth` 纯状态机：retryable 失败降级、连续失败不可用、auth/quota 立即不可用、成功恢复；
 - 真实录制 DeepSeek SSE fixture（stop / length）与本地 HTTP `complete_stream` 回放测试。
 
+B7.3 首版已落地：
+
+- AgentHost 本地保存上一个 inclusion receipt 的 prefix fingerprint；
+- provider 未上报 `prefix_changed` 时，指纹变化 / 稳定前缀消失也会产生 `PrefixChanged` 与 Rebasis；
+- provider signal 与本地变化合并原因并去重；仍不改写 provider 的同步调用路径。
+
 剩余与下一步：
 
 1. 录制真实 tool-call 流 fixture；当前真实 fixture 只有文本流，tool delta 用内联 chunk。
 2. 补模型别名、超时分级、可重试错误分类，以及可选的 provider 健康接线。
-3. 开 B7.3：缓存优先上下文与 Rebasis；仍不改动现有默认同步路径。
+3. B7.3 继续：append-only 投影、压缩点与 epoch/freshness 全链路绑定、回放一致性。
 4. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。
