@@ -4,10 +4,14 @@
 //! API key 只在 Authorization 头里出现，Debug 输出会脱敏。
 
 use std::fmt;
+use std::io::BufReader;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::provider_stream::{
+    OpenAiStreamAssembler, ProviderStreamEvent, StreamingProvider, read_sse_events,
+};
 use crate::{
     AgentError, CacheObservation, ContextReceipt, PrefixSignal, Provider, ProviderRequest,
     ProviderResponse, ToolRequest, ToolSpec,
@@ -21,6 +25,8 @@ pub struct OpenAiConfig {
     pub model: String,
     pub timeout: Duration,
     pub max_output_tokens: Option<u64>,
+    /// 流式请求是否发送 `stream_options.include_usage`；不支持该字段的兼容网关可关闭。
+    pub stream_include_usage: bool,
 }
 
 impl fmt::Debug for OpenAiConfig {
@@ -31,6 +37,7 @@ impl fmt::Debug for OpenAiConfig {
             .field("api_key", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("max_output_tokens", &self.max_output_tokens)
+            .field("stream_include_usage", &self.stream_include_usage)
             .finish()
     }
 }
@@ -47,7 +54,13 @@ impl OpenAiConfig {
             model: model.into(),
             timeout: Duration::from_secs(120),
             max_output_tokens: None,
+            stream_include_usage: true,
         }
+    }
+
+    pub fn with_stream_include_usage(mut self, include: bool) -> Self {
+        self.stream_include_usage = include;
+        self
     }
 
     pub fn from_env() -> Result<Self, AgentError> {
@@ -108,6 +121,52 @@ impl Provider for OpenAiProvider {
         let body = build_request_body(&self.config, request);
         let text = self.post_chat(&body)?;
         let mut response = parse_response(&text, &request.tools)?;
+        attach_context_receipt(&mut response, request);
+        Ok(response)
+    }
+}
+
+impl StreamingProvider for OpenAiProvider {
+    fn complete_stream(
+        &mut self,
+        request: &ProviderRequest,
+        on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<(), AgentError>,
+    ) -> Result<ProviderResponse, AgentError> {
+        let mut body = build_request_body(&self.config, request);
+        body["stream"] = json!(true);
+        if self.config.stream_include_usage {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {}", self.config.api_key))
+            .set("Content-Type", "application/json")
+            .set("Accept", "text/event-stream")
+            .send_string(&body.to_string());
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Status(code, response)) => {
+                let text = response.into_string().unwrap_or_default();
+                return Err(AgentError::Provider(format!("HTTP {code}: {text}")));
+            }
+            Err(error) => {
+                return Err(AgentError::Provider(format!("transport: {error}")));
+            }
+        };
+
+        let mut assembler = OpenAiStreamAssembler::new();
+        read_sse_events(BufReader::new(response.into_reader()), |event| {
+            for delta in assembler.push_sse(&event)? {
+                on_event(delta)?;
+            }
+            Ok(())
+        })?;
+        let mut response = assembler.finish(&request.tools)?;
         attach_context_receipt(&mut response, request);
         Ok(response)
     }
@@ -257,7 +316,20 @@ fn parse_response(body: &str, tools: &[ToolSpec]) -> Result<ProviderResponse, Ag
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("message"))
         .ok_or_else(|| AgentError::Provider("missing choices[0].message".into()))?;
-    let usage = parse_usage(value.get("usage"));
+    let (tool_calls, completion) = parse_message(message, tools)?;
+    Ok(ProviderResponse {
+        tool_calls,
+        completion,
+        usage: parse_usage(value.get("usage")),
+        prefix: parse_prefix(&value),
+        context: None,
+    })
+}
+
+pub(crate) fn parse_message(
+    message: &Value,
+    tools: &[ToolSpec],
+) -> Result<(Vec<ToolRequest>, Option<ClaimRequest>), AgentError> {
     let mut tool_calls = Vec::new();
     let mut completion = None;
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
@@ -355,13 +427,7 @@ fn parse_response(body: &str, tools: &[ToolSpec]) -> Result<ProviderResponse, Ag
             }
         }
     }
-    Ok(ProviderResponse {
-        tool_calls,
-        completion,
-        usage,
-        prefix: parse_prefix(&value),
-        context: None,
-    })
+    Ok((tool_calls, completion))
 }
 
 fn attach_context_receipt(response: &mut ProviderResponse, request: &ProviderRequest) {
@@ -391,7 +457,7 @@ fn now_ms() -> Option<u64> {
         .map(|duration| duration.as_millis() as u64)
 }
 
-fn parse_prefix(value: &Value) -> Option<PrefixSignal> {
+pub(crate) fn parse_prefix(value: &Value) -> Option<PrefixSignal> {
     let diagnostics = value.get("cache_diagnostics")?;
     let changed = diagnostics
         .get("prefix_changed")
@@ -476,7 +542,7 @@ fn parse_claim(arguments: &Value, call_id: &str) -> Result<ClaimRequest, AgentEr
     Ok(ClaimRequest { criteria })
 }
 
-fn parse_usage(usage: Option<&Value>) -> HostUsage {
+pub(crate) fn parse_usage(usage: Option<&Value>) -> HostUsage {
     let Some(usage) = usage else {
         return HostUsage {
             estimated: true,
@@ -492,14 +558,20 @@ fn parse_usage(usage: Option<&Value>) -> HostUsage {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let cached = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
+        .get("prompt_cache_hit_tokens")
         .and_then(Value::as_u64)
         .or_else(|| usage.get("cache_hit_tokens").and_then(Value::as_u64))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
         .unwrap_or(0);
     let miss = usage
-        .get("cache_miss_tokens")
+        .get("prompt_cache_miss_tokens")
         .and_then(Value::as_u64)
+        .or_else(|| usage.get("cache_miss_tokens").and_then(Value::as_u64))
         .unwrap_or_else(|| prompt_tokens.saturating_sub(cached));
     HostUsage {
         prompt_tokens,
@@ -751,6 +823,23 @@ mod tests {
         assert_eq!(response.usage.cache_hit_tokens, 80);
         assert_eq!(response.usage.cache_miss_tokens, 20);
         assert_eq!(response.usage.completion_tokens, 5);
+        assert!(!response.usage.estimated);
+    }
+
+    #[test]
+    fn parses_deepseek_prompt_cache_usage_fields() {
+        let body = r#"{
+            "choices": [{"message": {}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "prompt_cache_hit_tokens": 70,
+                "prompt_cache_miss_tokens": 30
+            }
+        }"#;
+        let response = parse_response(body, &[]).unwrap();
+        assert_eq!(response.usage.cache_hit_tokens, 70);
+        assert_eq!(response.usage.cache_miss_tokens, 30);
         assert!(!response.usage.estimated);
     }
 

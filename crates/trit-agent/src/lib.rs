@@ -795,6 +795,8 @@ pub mod mcp_tools;
 pub mod openai;
 pub mod port_bridge;
 pub mod provider;
+pub mod provider_health;
+pub mod provider_stream;
 pub mod reasonix_wire;
 pub mod sampling;
 pub mod session;
@@ -836,6 +838,13 @@ pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
     ToolCatalog, ToolSpec, default_tools,
+};
+pub use provider_health::{
+    ConnectionFailure, ConnectionFailureKind, ConnectionHealth, ConnectionHealthPolicy,
+    ConnectionState,
+};
+pub use provider_stream::{
+    OpenAiStreamAssembler, ProviderStreamEvent, SseEvent, StreamingProvider, read_sse_events,
 };
 pub use reasonix_wire::{
     REASONIX_EVENT_KINDS, REASONIX_WIRE_VERSION, WireCacheDiagnostics, WireContractError,

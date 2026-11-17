@@ -37,8 +37,8 @@
 | # | 能力 | Reasonix 证据 | 当前状态 | 缺口 / 目标 | 批次 |
 | --- | --- | --- | --- | --- | --- |
 | 1 | 事件 / 用量 wire 契约 | `contract/eventwire`、`BUDGET_USAGE_COMPLETENESS.md` | 部分 | 版本化 event/wire、usage/cost/cache 完整性、golden fixtures | B7.1 |
-| 2 | Provider 流式输出与工具增量 | `SPEC §3.1`、`provider.Stream` | 缺口 | 当前 `Provider::complete` 是整包；需 SSE / delta / tool-call 累积 | B7.2 |
-| 3 | 模型连接健康 / 别名 / 重试 | `MODEL_CONNECTION_HEALTH.md`、`MODEL_DISPLAY_ALIASES.md` | 部分 | 健康检查、超时分级、别名解析、错误分类 | B7.2 |
+| 2 | Provider 流式输出与工具增量 | `SPEC §3.1`、`provider.Stream` | 部分（首版） | SSE / tool delta 已有；缺多 provider、中断恢复、默认路径接入 | B7.2 |
+| 3 | 模型连接健康 / 别名 / 重试 | `MODEL_CONNECTION_HEALTH.md`、`MODEL_DISPLAY_ALIASES.md` | 部分（首版） | 纯健康状态机已有；缺自动探测、别名、超时分级 | B7.2 |
 | 4 | 工具契约 / 注册表 / schema 规范化 | `TOOL_CONTRACT.md`、`SPEC §3.2` | 部分 | `ToolSpec` 已有，缺 schema 规范化、契约对照测试、工具家族 | B7.1/B7.2 |
 | 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分 | `ContextPlan` + `CacheLedger` 已有；缺完整 append-only / checkpoint 投影 | B7.3 |
 | 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分 | `PrefixSignal` 已产生义务；需把压缩点与 epoch/freshness 全链路绑定 | B7.3 |
@@ -210,18 +210,27 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
 
 ## 7. 当前进度与下一步
 
-B7.1 首版已落地：
+B7.1 已落地：
 
 - `reasonix_wire`：`WireUsage` / `WireEvent` / `WireTool` 版本化兼容子集；
 - usage → `HostUsage` / `TokenUsage` 映射，`estimated` 保留，负 token / 负 seq fail-closed；
 - `cacheDiagnostics` → `PrefixSignal` 映射；
-- tool args JSON 解析与 `ToolRequest` 映射（本地 command/paths 留给 B7.2 适配）；
+- tool args JSON 解析与 `ToolRequest` 映射；
 - fixture harness：版本校验、未知字段保留、三类手写契约 fixture 与回放测试；
 - 未接入 provider / MCP / 工具执行路径，现有行为不变。
 
+B7.2 首版已落地：
+
+- `StreamingProvider` 与 `OpenAiProvider::complete_stream`，默认同步 `Provider::complete` 路径不变；
+- SSE 解码：注释、多行 data、`[DONE]`、EOF；Text / Reasoning / ToolCall delta；
+- tool-call 按 index 累积，参数分片拼接，id/name 冲突与缺失 name fail-closed；
+- finish_reason / usage 校验；没有 finish 或 `[DONE]` 的截断流拒绝；
+- `ConnectionHealth` 纯状态机：retryable 失败降级、连续失败不可用、auth/quota 立即不可用、成功恢复；
+- 真实录制 DeepSeek SSE fixture（stop / length）与本地 HTTP `complete_stream` 回放测试。
+
 剩余与下一步：
 
-1. 用真实 provider/MCP 录制替换或扩充手写 fixture，保留当前字段级回归。
-2. 生成并校验 wire manifest，覆盖更多 `event.kind` 与拒绝路径。
-3. 开 B7.2：流式 provider / tool delta / 连接健康；仍不改动现有同步 provider 的默认行为。
+1. 录制真实 tool-call 流 fixture；当前真实 fixture 只有文本流，tool delta 用内联 chunk。
+2. 补模型别名、超时分级、可重试错误分类，以及可选的 provider 健康接线。
+3. 开 B7.3：缓存优先上下文与 Rebasis；仍不改动现有默认同步路径。
 4. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。
