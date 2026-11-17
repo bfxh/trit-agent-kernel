@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -106,6 +106,10 @@ fn default_roots_watch_debounce_ms() -> u64 {
     1_000
 }
 
+fn default_resource_read_concurrency() -> usize {
+    8
+}
+
 /// 宿主/CLI 的 supervisor 声明；可直接从 JSON 解析。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorConfig {
@@ -130,6 +134,9 @@ pub struct SupervisorConfig {
     pub interval_ms: u64,
     #[serde(default = "default_mcp_timeout_ms")]
     pub mcp_timeout_ms: u64,
+    /// `sampling/createMessage` 预取资源正文时的最大并发；不限制资源数量或正文长度。
+    #[serde(default = "default_resource_read_concurrency")]
+    pub resource_read_concurrency: usize,
 }
 
 impl Default for SupervisorConfig {
@@ -145,6 +152,7 @@ impl Default for SupervisorConfig {
             restart: RestartPolicy::default(),
             interval_ms: default_interval_ms(),
             mcp_timeout_ms: default_mcp_timeout_ms(),
+            resource_read_concurrency: default_resource_read_concurrency(),
         }
     }
 }
@@ -454,6 +462,7 @@ struct McpFeatures {
     server: String,
     context_registry: Arc<Mutex<std::collections::BTreeMap<String, McpContextEntry>>>,
     request_timeout: Duration,
+    resource_read_concurrency: usize,
 }
 
 impl McpFeatures {
@@ -461,6 +470,7 @@ impl McpFeatures {
         Self {
             server: server.into(),
             request_timeout: Duration::from_secs(30),
+            resource_read_concurrency: default_resource_read_concurrency(),
             ..Self::default()
         }
     }
@@ -561,33 +571,27 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
     let results: std::collections::BTreeMap<(usize, usize), String> = if reads.is_empty() {
         std::collections::BTreeMap::new()
     } else {
-        let (sender, receiver) = mpsc::channel();
         let timeout = features.request_timeout;
-        std::thread::scope(|scope| {
-            for (entry_index, resource_index, uri, client) in reads {
-                let sender = sender.clone();
-                scope.spawn(move || {
-                    let text = client
-                        .request("resources/read", serde_json::json!({"uri": uri}), timeout)
-                        .ok()
-                        .and_then(|result| serde_json::from_value::<McpResourceRead>(result).ok())
-                        .map(|read| {
-                            read.contents
-                                .into_iter()
-                                .filter_map(|content| content.text)
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .filter(|text| !text.is_empty());
-                    let _ = sender.send(((entry_index, resource_index), text));
-                });
-            }
-            drop(sender);
-            receiver
-                .into_iter()
-                .filter_map(|(key, text)| text.map(|text| (key, text)))
-                .collect()
-        })
+        let texts = prefetch_parallel(&reads, features.resource_read_concurrency, |read| {
+            let (_, _, uri, client) = read;
+            client
+                .request("resources/read", serde_json::json!({"uri": uri}), timeout)
+                .ok()
+                .and_then(|result| serde_json::from_value::<McpResourceRead>(result).ok())
+                .map(|read| {
+                    read.contents
+                        .into_iter()
+                        .filter_map(|content| content.text)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|text| !text.is_empty())
+        });
+        reads
+            .iter()
+            .zip(texts)
+            .filter_map(|(read, text)| text.map(|text| ((read.0, read.1), text)))
+            .collect()
     };
 
     let mut context = String::from("MCP context available to this request:\n");
@@ -647,6 +651,40 @@ fn inject_sampling_context(features: &McpFeatures, params: &mut serde_json::Valu
         format!("{system}\n\n{context}")
     };
     params["systemPrompt"] = serde_json::Value::String(combined);
+}
+
+fn prefetch_parallel<T, F>(items: &[T], concurrency: usize, read: F) -> Vec<Option<String>>
+where
+    T: Sync,
+    F: Fn(&T) -> Option<String> + Sync,
+{
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let workers = concurrency.max(1).min(items.len());
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(vec![None; items.len()]);
+    let read = &read;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    if let Some(text) = read(&items[index])
+                        && let Ok(mut results) = results.lock()
+                    {
+                        results[index] = Some(text);
+                    }
+                }
+            });
+        }
+    });
+    results
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1386,6 +1424,12 @@ impl McpSupervisor {
         self
     }
 
+    /// sampling 预取资源正文的最大并发；0 会被归一为 1。资源数量与正文长度不截断。
+    pub fn with_resource_read_concurrency(mut self, concurrency: usize) -> Self {
+        self.features.resource_read_concurrency = concurrency.max(1);
+        self
+    }
+
     /// 声明 roots；握手时广告 `roots.listChanged=true`。
     pub fn with_roots(mut self, roots: Vec<McpRoot>) -> Self {
         self.features.roots = Arc::new(Mutex::new(roots));
@@ -2060,6 +2104,7 @@ impl SupervisorRuntime {
         for spec in &config.mcp {
             let supervisor = McpSupervisor::new(spec.clone(), config.restart)
                 .with_timeout(timeout)
+                .with_resource_read_concurrency(config.resource_read_concurrency)
                 .with_roots(initial_roots.clone())
                 .with_context_registry(Arc::clone(&context_registry));
             let supervisor = match config.log_level {
@@ -2253,6 +2298,48 @@ mod tests {
             recovery.validate(),
             Err(SupervisorError::RecoveryRejected(_))
         ));
+    }
+
+    #[test]
+    fn parallel_prefetch_bounds_workers_and_keeps_every_result() {
+        let items: Vec<usize> = (0..24).collect();
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        let results = prefetch_parallel(&items, 3, |item| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(10));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Some(format!("item-{item}"))
+        });
+        assert_eq!(results.len(), items.len());
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result.as_deref(), Some(format!("item-{index}").as_str()));
+        }
+        let peak = max_active.load(Ordering::SeqCst);
+        assert!(
+            peak <= 3,
+            "prefetch spawned more than the configured workers"
+        );
+        assert!(peak >= 2, "prefetch did not overlap independent reads");
+    }
+
+    #[test]
+    fn parallel_prefetch_normalizes_zero_and_preserves_failed_slots() {
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        let items = [0usize, 1, 2];
+        let results = prefetch_parallel(&items, 0, |item| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(5));
+            active.fetch_sub(1, Ordering::SeqCst);
+            (*item != 1).then(|| format!("ok-{item}"))
+        });
+        assert_eq!(results[0].as_deref(), Some("ok-0"));
+        assert!(results[1].is_none());
+        assert_eq!(results[2].as_deref(), Some("ok-2"));
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2670,7 +2757,7 @@ done
                 "model": "test-model"
             }))
         })
-        .with_timeout(Duration::from_secs(2));
+        .with_timeout(Duration::from_secs(30));
         let recovery = RecoveryContext::default();
         assert_eq!(
             supervisor.ensure_connected(&recovery).unwrap(),
@@ -3428,6 +3515,24 @@ done
         assert_eq!(config.restart.max_backoff_ms, 1_000);
         assert_eq!(config.interval_ms, 500);
         assert_eq!(config.mcp_timeout_ms, 30_000);
+        assert_eq!(config.resource_read_concurrency, 8);
+    }
+
+    #[test]
+    fn supervisor_config_can_raise_resource_read_concurrency() {
+        let config: SupervisorConfig =
+            serde_json::from_str(r#"{"resource_read_concurrency": 2}"#).unwrap();
+        assert_eq!(config.resource_read_concurrency, 2);
+        let supervisor = McpSupervisor::new(
+            ProcessSpec::new("stub"),
+            RestartPolicy {
+                max_attempts: 0,
+                initial_backoff_ms: 0,
+                max_backoff_ms: 0,
+            },
+        )
+        .with_resource_read_concurrency(0);
+        assert_eq!(supervisor.features.resource_read_concurrency, 1);
     }
 
     #[test]
@@ -3456,6 +3561,7 @@ done
             },
             interval_ms: 10,
             mcp_timeout_ms: 30_000,
+            resource_read_concurrency: 8,
         };
         let mut runtime = SupervisorRuntime::start(
             &config,

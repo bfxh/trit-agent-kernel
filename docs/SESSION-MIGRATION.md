@@ -142,9 +142,13 @@ CLI 通过 `--supervisor-config <json>` 接入：
   "log_level": "info",
   "restart": {"max_attempts": 3, "initial_backoff_ms": 50, "max_backoff_ms": 1000},
   "interval_ms": 500,
-  "mcp_timeout_ms": 30000
+  "mcp_timeout_ms": 30000,
+  "resource_read_concurrency": 8
 }
 ```
+
+`resource_read_concurrency` 只限制 `sampling/createMessage` 预取资源正文时的并发线程数，
+不限制资源数量或正文长度；单个读取仍受 `mcp_timeout_ms` 约束。
 
 CLI 在运行前用已有 session log + cache ledger 构造恢复包，运行结束后从新日志重建并
 `refresh_recovery`。运行中崩溃会使用最近一次快照，宿主可自行在关键点刷新。
