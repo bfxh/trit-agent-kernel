@@ -28,7 +28,7 @@
 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | 现行规范 | 工作区依赖与公开 API |
 | [RIGHTS.md](RIGHTS.md) | 政策草案，非法律意见 | 各仓库 LICENSE / NOTICE |
 | [MERGE-POLICY.md](MERGE-POLICY.md) | 现行流程 | CI 与 PR 模板 |
-| [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7.1–B7.3 首版已落地 | `reasonix_wire` / `provider_stream` / 本地 rebasis |
+| [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7.1–B7.3 首版已落地，B7.4 待开工 | `reasonix_wire` / `provider_stream` / `context_projection` |
 
 ## 维护规则
 

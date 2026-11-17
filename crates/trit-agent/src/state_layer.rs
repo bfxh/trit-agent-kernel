@@ -42,9 +42,17 @@ pub struct CompactionState {
     pub dropped: usize,
     pub truncated: usize,
     #[serde(default)]
+    pub retained: Option<usize>,
+    #[serde(default)]
     pub dropped_chars: usize,
     #[serde(default)]
     pub truncated_chars: usize,
+    #[serde(default)]
+    pub epoch_before: Option<u64>,
+    #[serde(default)]
+    pub epoch_after: Option<u64>,
+    #[serde(default)]
+    pub freshness: Option<Ternary>,
     pub digest: Option<String>,
     pub state_before: AgentState,
     /// 压缩完成、回到可继续执行的状态。
@@ -242,8 +250,12 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                 step,
                 dropped,
                 truncated,
+                retained,
                 dropped_chars,
                 truncated_chars,
+                epoch_before,
+                epoch_after,
+                freshness,
                 digest,
             } => {
                 let Some(progress) = current.as_mut() else {
@@ -280,8 +292,12 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                     step: *step,
                     dropped: *dropped,
                     truncated: *truncated,
+                    retained: *retained,
                     dropped_chars: *dropped_chars,
                     truncated_chars: *truncated_chars,
+                    epoch_before: *epoch_before,
+                    epoch_after: *epoch_after,
+                    freshness: *freshness,
                     digest: digest.clone(),
                     state_before,
                     state_after: AgentState::Planning,
@@ -492,6 +508,10 @@ mod tests {
                     truncated: 1,
                     dropped_chars: 200,
                     truncated_chars: 50,
+                    retained: Some(1),
+                    epoch_before: Some(0),
+                    epoch_after: Some(1),
+                    freshness: Some(Ternary::Unknown),
                     digest: Some("digest".into()),
                 },
             ),
@@ -504,6 +524,13 @@ mod tests {
             AgentState::Planning
         );
         assert_eq!(state.last_compaction().unwrap().dropped, 2);
+        assert_eq!(state.last_compaction().unwrap().retained, Some(1));
+        assert_eq!(state.last_compaction().unwrap().epoch_before, Some(0));
+        assert_eq!(state.last_compaction().unwrap().epoch_after, Some(1));
+        assert_eq!(
+            state.last_compaction().unwrap().freshness,
+            Some(Ternary::Unknown)
+        );
         assert_eq!(state.last_compaction().unwrap().dropped_chars, 200);
         assert_eq!(state.last_compaction().unwrap().truncated_chars, 50);
         assert_eq!(
@@ -541,6 +568,10 @@ mod tests {
                     truncated: 0,
                     dropped_chars: 100,
                     truncated_chars: 0,
+                    retained: None,
+                    epoch_before: None,
+                    epoch_after: None,
+                    freshness: None,
                     digest: None,
                 },
             ),
@@ -598,6 +629,10 @@ mod tests {
                     truncated: 0,
                     dropped_chars: 0,
                     truncated_chars: 0,
+                    retained: None,
+                    epoch_before: None,
+                    epoch_after: None,
+                    freshness: None,
                     digest: Some("digest".into()),
                 },
             ),
@@ -624,6 +659,10 @@ mod tests {
                     truncated: 0,
                     dropped_chars: 100,
                     truncated_chars: 0,
+                    retained: None,
+                    epoch_before: None,
+                    epoch_after: None,
+                    freshness: None,
                     digest: Some("d1".into()),
                 },
             ),
@@ -643,6 +682,10 @@ mod tests {
                     truncated: 0,
                     dropped_chars: 200,
                     truncated_chars: 0,
+                    retained: None,
+                    epoch_before: None,
+                    epoch_after: None,
+                    freshness: None,
                     digest: Some("d2".into()),
                 },
             ),

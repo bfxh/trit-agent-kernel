@@ -1,0 +1,380 @@
+//! Append-only 上下文投影（B7.3）。
+//!
+//! 规范事实是 append-only 的 `canonical` 入口；模型可见投影只是
+//! `canonical[visible_start..]`。压缩不会删除历史，只会移动可见起点、
+//! 创建新的 epoch/generation，并把 freshness 降为 Unknown。
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use trit_orch::Ternary;
+
+use crate::ToolOutcome;
+use crate::session::{SessionEvent, SessionRecord};
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProjectionError {
+    #[error("cannot retain {retained} entries from {visible} visible entries")]
+    RetainedExceedsVisible { retained: usize, visible: usize },
+    #[error("cannot drop {dropped} entries from {visible} visible entries")]
+    DroppedExceedsVisible { dropped: usize, visible: usize },
+    #[error("projection {field} mismatch: expected {expected:?}, got {actual:?}")]
+    EpochMismatch {
+        field: &'static str,
+        expected: Option<u64>,
+        actual: u64,
+    },
+    #[error("projection freshness mismatch: expected {expected:?}, got {actual:?}")]
+    FreshnessMismatch {
+        expected: Option<Ternary>,
+        actual: Ternary,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionEntry {
+    pub call_id: String,
+    pub tool: String,
+    pub step: usize,
+    /// 追加时的上下文 epoch。
+    pub epoch: u64,
+    pub passed: bool,
+    pub in_doubt: bool,
+    #[serde(default)]
+    pub written_paths: Vec<String>,
+    pub chars: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionInput {
+    pub step: usize,
+    pub retained: usize,
+    pub dropped: usize,
+    pub truncated: usize,
+    pub dropped_chars: usize,
+    pub truncated_chars: usize,
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionBoundary {
+    pub step: usize,
+    pub epoch_before: u64,
+    pub epoch_after: u64,
+    pub generation: u64,
+    pub visible_before: usize,
+    pub visible_after: usize,
+    pub canonical_len: usize,
+    pub retained: usize,
+    pub dropped: usize,
+    pub truncated: usize,
+    pub dropped_chars: usize,
+    pub truncated_chars: usize,
+    pub freshness: Ternary,
+    pub digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextProjection {
+    /// 规范日志：只追加，压缩不删除。
+    canonical: Vec<ProjectionEntry>,
+    /// 当前模型可见投影的起点；`begin_turn` 会把它推到当前末尾。
+    visible_start: usize,
+    epoch: u64,
+    generation: u64,
+    freshness: Ternary,
+    boundaries: Vec<CompactionBoundary>,
+}
+
+impl Default for ContextProjection {
+    fn default() -> Self {
+        Self {
+            canonical: Vec::new(),
+            visible_start: 0,
+            epoch: 0,
+            generation: 0,
+            freshness: Ternary::True,
+            boundaries: Vec::new(),
+        }
+    }
+}
+
+impl ContextProjection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 新 turn 只让本 turn 新追加的 entry 进入可见投影；canonical 仍保留历史。
+    pub fn begin_turn(&mut self) {
+        self.visible_start = self.canonical.len();
+    }
+
+    pub fn append(&mut self, step: usize, outcome: &ToolOutcome) -> usize {
+        let index = self.canonical.len();
+        self.canonical.push(ProjectionEntry {
+            call_id: outcome.call_id.clone(),
+            tool: outcome.tool.clone(),
+            step,
+            epoch: self.epoch,
+            passed: outcome.passed,
+            in_doubt: outcome.in_doubt,
+            written_paths: outcome.written_paths.clone(),
+            chars: outcome.output.chars().count(),
+        });
+        index
+    }
+
+    /// 压缩当前可见投影；返回新的边界，旧 canonical 条目不删除。
+    pub fn compact(
+        &mut self,
+        input: CompactionInput,
+    ) -> Result<CompactionBoundary, ProjectionError> {
+        let visible_before = self.canonical.len().saturating_sub(self.visible_start);
+        if input.retained > visible_before {
+            return Err(ProjectionError::RetainedExceedsVisible {
+                retained: input.retained,
+                visible: visible_before,
+            });
+        }
+        if input.dropped > visible_before {
+            return Err(ProjectionError::DroppedExceedsVisible {
+                dropped: input.dropped,
+                visible: visible_before,
+            });
+        }
+        let epoch_before = self.epoch;
+        self.epoch = self.epoch.saturating_add(1);
+        self.generation = self.generation.saturating_add(1);
+        self.visible_start = self.canonical.len().saturating_sub(input.retained);
+        self.freshness = Ternary::Unknown;
+        let boundary = CompactionBoundary {
+            step: input.step,
+            epoch_before,
+            epoch_after: self.epoch,
+            generation: self.generation,
+            visible_before,
+            visible_after: input.retained,
+            canonical_len: self.canonical.len(),
+            retained: input.retained,
+            dropped: input.dropped,
+            truncated: input.truncated,
+            dropped_chars: input.dropped_chars,
+            truncated_chars: input.truncated_chars,
+            freshness: self.freshness,
+            digest: input.digest,
+        };
+        self.boundaries.push(boundary.clone());
+        Ok(boundary)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn freshness(&self) -> Ternary {
+        self.freshness
+    }
+
+    pub fn mark_freshness(&mut self, freshness: Ternary) {
+        self.freshness = freshness;
+    }
+
+    pub fn canonical(&self) -> &[ProjectionEntry] {
+        &self.canonical
+    }
+
+    pub fn visible(&self) -> &[ProjectionEntry] {
+        &self.canonical[self.visible_start..]
+    }
+
+    pub fn boundaries(&self) -> &[CompactionBoundary] {
+        &self.boundaries
+    }
+
+    pub fn last_compaction(&self) -> Option<&CompactionBoundary> {
+        self.boundaries.last()
+    }
+}
+
+/// 从 session 事件重建投影；用于回放一致性测试与迁移校验。
+pub fn replay(records: &[SessionRecord]) -> Result<ContextProjection, ProjectionError> {
+    let mut projection = ContextProjection::new();
+    for record in records {
+        match &record.event {
+            SessionEvent::TurnStarted { .. } => projection.begin_turn(),
+            SessionEvent::ToolCompleted { step, outcome } => {
+                projection.append(*step, outcome);
+            }
+            SessionEvent::ContextCompacted {
+                step,
+                retained,
+                dropped,
+                truncated,
+                dropped_chars,
+                truncated_chars,
+                epoch_before,
+                epoch_after,
+                freshness,
+                digest,
+            } => {
+                // 仅截断、没有丢弃且没有 epoch 的旧事件不构成投影边界。
+                if *dropped == 0 && epoch_before.is_none() && epoch_after.is_none() {
+                    continue;
+                }
+                let visible = projection.visible().len();
+                let retained = retained.unwrap_or_else(|| visible.saturating_sub(*dropped));
+                let boundary = projection.compact(CompactionInput {
+                    step: *step,
+                    retained,
+                    dropped: *dropped,
+                    truncated: *truncated,
+                    dropped_chars: *dropped_chars,
+                    truncated_chars: *truncated_chars,
+                    digest: digest.clone(),
+                })?;
+                if let Some(expected) = epoch_before
+                    && boundary.epoch_before != *expected
+                {
+                    return Err(ProjectionError::EpochMismatch {
+                        field: "epoch_before",
+                        expected: Some(*expected),
+                        actual: boundary.epoch_before,
+                    });
+                }
+                if let Some(expected) = epoch_after
+                    && boundary.epoch_after != *expected
+                {
+                    return Err(ProjectionError::EpochMismatch {
+                        field: "epoch_after",
+                        expected: Some(*expected),
+                        actual: boundary.epoch_after,
+                    });
+                }
+                if let Some(expected) = freshness
+                    && boundary.freshness != *expected
+                {
+                    return Err(ProjectionError::FreshnessMismatch {
+                        expected: Some(*expected),
+                        actual: boundary.freshness,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(projection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(call_id: &str, chars: usize) -> ToolOutcome {
+        ToolOutcome {
+            call_id: call_id.into(),
+            tool: "bash".into(),
+            command: None,
+            passed: true,
+            assertions: 0,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: "x".repeat(chars),
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_canonical_history_and_moves_visible_start() {
+        let mut projection = ContextProjection::new();
+        projection.begin_turn();
+        projection.append(0, &outcome("a", 10));
+        projection.append(0, &outcome("b", 20));
+        projection.append(1, &outcome("c", 30));
+        let boundary = projection
+            .compact(CompactionInput {
+                step: 1,
+                retained: 1,
+                dropped: 2,
+                truncated: 0,
+                dropped_chars: 30,
+                truncated_chars: 0,
+                digest: Some("digest".into()),
+            })
+            .unwrap();
+        assert_eq!(boundary.visible_before, 3);
+        assert_eq!(boundary.visible_after, 1);
+        assert_eq!(boundary.epoch_before, 0);
+        assert_eq!(boundary.epoch_after, 1);
+        assert_eq!(projection.canonical().len(), 3);
+        assert_eq!(projection.visible().len(), 1);
+        assert_eq!(projection.visible()[0].call_id, "c");
+        assert_eq!(projection.freshness(), Ternary::Unknown);
+
+        projection.begin_turn();
+        assert_eq!(projection.canonical().len(), 3);
+        assert_eq!(projection.visible().len(), 0);
+    }
+
+    #[test]
+    fn compaction_rejects_retaining_more_than_visible() {
+        let mut projection = ContextProjection::new();
+        projection.append(0, &outcome("a", 1));
+        assert!(matches!(
+            projection.compact(CompactionInput {
+                step: 0,
+                retained: 2,
+                ..CompactionInput::default()
+            }),
+            Err(ProjectionError::RetainedExceedsVisible {
+                retained: 2,
+                visible: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn replay_ignores_truncation_only_legacy_events() {
+        let records = vec![
+            SessionRecord {
+                schema: crate::SESSION_SCHEMA,
+                seq: 1,
+                event: SessionEvent::TurnStarted {
+                    task: "t".into(),
+                    objective: "o".into(),
+                    max_steps: 2,
+                },
+            },
+            SessionRecord {
+                schema: crate::SESSION_SCHEMA,
+                seq: 2,
+                event: SessionEvent::ToolCompleted {
+                    step: 0,
+                    outcome: outcome("a", 10),
+                },
+            },
+            SessionRecord {
+                schema: crate::SESSION_SCHEMA,
+                seq: 3,
+                event: SessionEvent::ContextCompacted {
+                    step: 0,
+                    dropped: 0,
+                    truncated: 1,
+                    retained: Some(1),
+                    dropped_chars: 0,
+                    truncated_chars: 5,
+                    epoch_before: None,
+                    epoch_after: None,
+                    freshness: None,
+                    digest: None,
+                },
+            },
+        ];
+        let projection = replay(&records).unwrap();
+        assert_eq!(projection.epoch(), 0);
+        assert_eq!(projection.canonical().len(), 1);
+        assert_eq!(projection.visible().len(), 1);
+        assert!(projection.boundaries().is_empty());
+    }
+}

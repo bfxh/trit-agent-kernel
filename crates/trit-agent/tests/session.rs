@@ -315,11 +315,19 @@ fn legacy_compaction_event_defaults_char_counts() {
         SessionEvent::ContextCompacted {
             dropped_chars,
             truncated_chars,
+            retained,
+            epoch_before,
+            epoch_after,
+            freshness,
             digest,
             ..
         } => {
             assert_eq!(dropped_chars, 0);
             assert_eq!(truncated_chars, 0);
+            assert_eq!(retained, None);
+            assert_eq!(epoch_before, None);
+            assert_eq!(epoch_after, None);
+            assert_eq!(freshness, None);
             assert_eq!(digest.as_deref(), Some("d"));
         }
         other => panic!("unexpected event: {other:?}"),

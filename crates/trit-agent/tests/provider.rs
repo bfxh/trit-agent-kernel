@@ -3,6 +3,7 @@ use trit_agent::{
     AgentError, AgentHost, CacheObservation, ContextPlan, ContextPlanner, ContextPolicy,
     ContextReceipt, InclusionReceipt, ProviderModel, ProviderResponse, ScriptedProvider,
     ScriptedTools, SessionEvent, SessionLog, ToolOutcome, ToolRequest, TurnContext,
+    replay_projection,
 };
 use trit_orch::{EvidenceVerdict, ObligationKind, TaskBrief};
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, TurnSpec};
@@ -243,6 +244,74 @@ fn compacts_old_receipts_before_the_next_provider_call() {
             .unwrap()
             .contains("compacted 1")
     );
+}
+
+#[test]
+fn context_projection_replays_from_session_log() {
+    let provider = ScriptedProvider::new(vec![
+        ProviderResponse {
+            tool_calls: vec![
+                ToolRequest::verification("call-1", "test1"),
+                ToolRequest::verification("call-2", "test2"),
+            ],
+            completion: None,
+            usage: HostUsage::default(),
+            prefix: None,
+            context: None,
+        },
+        ProviderResponse {
+            tool_calls: vec![ToolRequest::verification("call-3", "test3")],
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "c3".into(),
+                    kind: CriterionKind::Verification {
+                        command: "test3".into(),
+                    },
+                }],
+            }),
+            usage: HostUsage::default(),
+            prefix: None,
+            context: None,
+        },
+    ]);
+    let tools = ScriptedTools::new(vec![
+        verification_outcome("call-1", "test1"),
+        verification_outcome("call-2", "test2"),
+        verification_outcome("call-3", "test3"),
+    ]);
+    let mut host =
+        AgentHost::new(ProviderModel::new(provider), tools).with_context(ContextPolicy {
+            max_receipts: 1,
+            max_chars: 100_000,
+            max_output_chars: 1_000,
+        });
+    let path = std::env::temp_dir().join(format!(
+        "trit-projection-{}-{:?}.jsonl",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut log = SessionLog::open(&path).unwrap();
+    host.run_turn_with_session(&turn(), &mut log).unwrap();
+
+    let live = host.context_projection().clone();
+    let records = log.load().unwrap();
+    let replayed = replay_projection(&records).unwrap();
+    assert_eq!(replayed, live);
+    let state = trit_agent::state_layer(&records);
+    let compaction = state.last_compaction().unwrap();
+    assert_eq!(compaction.retained, Some(1));
+    assert_eq!(compaction.epoch_before, Some(0));
+    assert_eq!(compaction.epoch_after, Some(1));
+    assert_eq!(compaction.freshness, Some(trit_orch::Ternary::Unknown));
+    assert_eq!(live.epoch(), 1);
+    assert_eq!(live.generation(), 1);
+    assert_eq!(live.freshness(), trit_orch::Ternary::Unknown);
+    assert_eq!(live.canonical().len(), 3);
+    assert_eq!(live.visible().len(), 2);
+    assert_eq!(live.boundaries().len(), 1);
+    assert!(live.boundaries()[0].digest.is_some());
+    let _ = std::fs::remove_file(&path);
 }
 
 struct FixedPlanner(ContextPlan);

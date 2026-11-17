@@ -60,9 +60,17 @@ pub enum SessionEvent {
         dropped: usize,
         truncated: usize,
         #[serde(default)]
+        retained: Option<usize>,
+        #[serde(default)]
         dropped_chars: usize,
         #[serde(default)]
         truncated_chars: usize,
+        #[serde(default)]
+        epoch_before: Option<u64>,
+        #[serde(default)]
+        epoch_after: Option<u64>,
+        #[serde(default)]
+        freshness: Option<Ternary>,
         digest: Option<String>,
     },
     CompletionClaimed {

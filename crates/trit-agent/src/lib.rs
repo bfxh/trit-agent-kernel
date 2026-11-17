@@ -351,6 +351,7 @@ pub struct AgentHost<M, T> {
     context: ContextPolicy,
     cache_ledger: Arc<Mutex<crate::context_layers::CacheLedger>>,
     last_prefix_fingerprint: Option<String>,
+    context_projection: crate::context_projection::ContextProjection,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -362,6 +363,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             context: ContextPolicy::default(),
             cache_ledger: Arc::new(Mutex::new(crate::context_layers::CacheLedger::default())),
             last_prefix_fingerprint: None,
+            context_projection: crate::context_projection::ContextProjection::new(),
         }
     }
 
@@ -381,6 +383,10 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
 
     pub fn cache_ledger(&self) -> Arc<Mutex<crate::context_layers::CacheLedger>> {
         Arc::clone(&self.cache_ledger)
+    }
+
+    pub fn context_projection(&self) -> &crate::context_projection::ContextProjection {
+        &self.context_projection
     }
 
     pub fn with_cache_ledger(
@@ -462,6 +468,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 max_steps: self.max_steps,
             },
         )?;
+        self.context_projection.begin_turn();
         let mut ledger = Ledger::new();
         let mut receipts = Vec::new();
         let mut usage = TokenUsage::default();
@@ -479,17 +486,57 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             context.usage = usage;
             let compacted = compact_receipts(&receipts, &self.context);
             if compacted.dropped > 0 || compacted.truncated > 0 {
+                let boundary = if compacted.dropped > 0 {
+                    Some(
+                        self.context_projection
+                            .compact(crate::context_projection::CompactionInput {
+                                step,
+                                retained: compacted.receipts.len(),
+                                dropped: compacted.dropped,
+                                truncated: compacted.truncated,
+                                dropped_chars: compacted.dropped_chars,
+                                truncated_chars: compacted.truncated_chars,
+                                digest: compacted.digest.clone(),
+                            })
+                            .map_err(|error| {
+                                AgentError::SessionState(format!("context projection: {error}"))
+                            })?,
+                    )
+                } else {
+                    None
+                };
                 log_session(
                     &mut session,
                     SessionEvent::ContextCompacted {
                         step,
                         dropped: compacted.dropped,
                         truncated: compacted.truncated,
+                        retained: Some(compacted.receipts.len()),
                         dropped_chars: compacted.dropped_chars,
                         truncated_chars: compacted.truncated_chars,
+                        epoch_before: boundary.as_ref().map(|boundary| boundary.epoch_before),
+                        epoch_after: boundary.as_ref().map(|boundary| boundary.epoch_after),
+                        freshness: boundary.as_ref().map(|boundary| boundary.freshness),
                         digest: compacted.digest.clone(),
                     },
                 )?;
+                if let Some(boundary) = boundary {
+                    let needs_obligation = !rebasis.iter().any(|existing| {
+                        existing.kind == ObligationKind::Rebasis && existing.subject == "context"
+                    });
+                    if needs_obligation {
+                        let detail = format!(
+                            "context compaction epoch {} -> {}; generation {}; freshness Unknown",
+                            boundary.epoch_before, boundary.epoch_after, boundary.generation
+                        );
+                        rebasis.push(AdmissionObligation::new(
+                            ObligationKind::Rebasis,
+                            &turn.task,
+                            "context",
+                            &detail,
+                        ));
+                    }
+                }
             }
             context.receipts = compacted.receipts;
             context.digest = compacted.digest;
@@ -626,6 +673,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                         outcome: outcome.clone(),
                     },
                 )?;
+                self.context_projection.append(step, &outcome);
                 receipts.push(outcome);
             }
 
@@ -821,6 +869,7 @@ pub fn run_headless<M: Model>(
 pub mod checkpoint;
 pub mod context;
 pub mod context_layers;
+pub mod context_projection;
 pub mod context_tools;
 pub mod frontend_compat;
 pub mod git_checkpoint;
@@ -853,6 +902,10 @@ pub use context_layers::{
     ContextSpan, DroppedContext, ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile,
     PriorImpression, ReasoningEffort, ResolvedContext, SearchOrder, Sensitivity, UsageCalibration,
     assemble_context, estimate_tokens,
+};
+pub use context_projection::{
+    CompactionBoundary, CompactionInput, ContextProjection, ProjectionEntry, ProjectionError,
+    replay as replay_projection,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
