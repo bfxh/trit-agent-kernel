@@ -41,6 +41,10 @@ pub struct CompactionState {
     pub step: usize,
     pub dropped: usize,
     pub truncated: usize,
+    #[serde(default)]
+    pub dropped_chars: usize,
+    #[serde(default)]
+    pub truncated_chars: usize,
     pub digest: Option<String>,
     pub state_before: AgentState,
     /// 压缩完成、回到可继续执行的状态。
@@ -238,6 +242,8 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                 step,
                 dropped,
                 truncated,
+                dropped_chars,
+                truncated_chars,
                 digest,
             } => {
                 let Some(progress) = current.as_mut() else {
@@ -274,6 +280,8 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                     step: *step,
                     dropped: *dropped,
                     truncated: *truncated,
+                    dropped_chars: *dropped_chars,
+                    truncated_chars: *truncated_chars,
                     digest: digest.clone(),
                     state_before,
                     state_after: AgentState::Planning,
@@ -482,6 +490,8 @@ mod tests {
                     step: 0,
                     dropped: 2,
                     truncated: 1,
+                    dropped_chars: 200,
+                    truncated_chars: 50,
                     digest: Some("digest".into()),
                 },
             ),
@@ -494,6 +504,8 @@ mod tests {
             AgentState::Planning
         );
         assert_eq!(state.last_compaction().unwrap().dropped, 2);
+        assert_eq!(state.last_compaction().unwrap().dropped_chars, 200);
+        assert_eq!(state.last_compaction().unwrap().truncated_chars, 50);
         assert_eq!(
             state.last_compaction().unwrap().digest.as_deref(),
             Some("digest")
@@ -527,6 +539,8 @@ mod tests {
                     step: 0,
                     dropped: 1,
                     truncated: 0,
+                    dropped_chars: 100,
+                    truncated_chars: 0,
                     digest: None,
                 },
             ),
@@ -582,6 +596,8 @@ mod tests {
                     step: 0,
                     dropped: 0,
                     truncated: 0,
+                    dropped_chars: 0,
+                    truncated_chars: 0,
                     digest: Some("digest".into()),
                 },
             ),
@@ -606,6 +622,8 @@ mod tests {
                     step: 0,
                     dropped: 1,
                     truncated: 0,
+                    dropped_chars: 100,
+                    truncated_chars: 0,
                     digest: Some("d1".into()),
                 },
             ),
@@ -623,6 +641,8 @@ mod tests {
                     step: 1,
                     dropped: 2,
                     truncated: 0,
+                    dropped_chars: 200,
+                    truncated_chars: 0,
                     digest: Some("d2".into()),
                 },
             ),

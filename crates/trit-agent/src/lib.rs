@@ -483,6 +483,8 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                         step,
                         dropped: compacted.dropped,
                         truncated: compacted.truncated,
+                        dropped_chars: compacted.dropped_chars,
+                        truncated_chars: compacted.truncated_chars,
                         digest: compacted.digest.clone(),
                     },
                 )?;

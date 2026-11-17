@@ -306,6 +306,27 @@ fn reopening_a_session_rebuilds_the_cache_ledger() {
 }
 
 #[test]
+fn legacy_compaction_event_defaults_char_counts() {
+    let record: trit_agent::SessionRecord = serde_json::from_str(
+        r#"{"schema":1,"seq":1,"event":{"type":"context_compacted","step":0,"dropped":1,"truncated":0,"digest":"d"}}"#,
+    )
+    .unwrap();
+    match record.event {
+        SessionEvent::ContextCompacted {
+            dropped_chars,
+            truncated_chars,
+            digest,
+            ..
+        } => {
+            assert_eq!(dropped_chars, 0);
+            assert_eq!(truncated_chars, 0);
+            assert_eq!(digest.as_deref(), Some("d"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
 fn recovery_context_rebuilds_from_session_log() {
     let root = temp_workspace("recovery-context");
     let path = temp_file("recovery-context");

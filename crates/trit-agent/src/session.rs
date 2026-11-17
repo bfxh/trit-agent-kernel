@@ -59,6 +59,10 @@ pub enum SessionEvent {
         step: usize,
         dropped: usize,
         truncated: usize,
+        #[serde(default)]
+        dropped_chars: usize,
+        #[serde(default)]
+        truncated_chars: usize,
         digest: Option<String>,
     },
     CompletionClaimed {
