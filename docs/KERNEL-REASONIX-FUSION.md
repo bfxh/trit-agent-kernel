@@ -1,5 +1,7 @@
 # 与 DeepSeek-Reasonix-rs 的融合设计
 
+> 基线（2026-11-17）：上游 [`esengine/DeepSeek-Reasonix`](https://github.com/esengine/DeepSeek-Reasonix) 已归档（v2.61.0，`studio@cd20bb5`），Rust 重写参考为 [`1012905/DeepSeek-Reasonix-rs`](https://github.com/1012905/DeepSeek-Reasonix-rs)（`studio@5edbda1`）。逐能力状态与移植批次见 [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md)。
+
 > 结论：**不合并代码库，做“认证平面”。**
 > Reasonix 管执行、上下文、权限、UI 与分发；`trit-orch` 管判定、义务、证据、效果与回放。
 > 两者通过一个薄适配层组合，先影子、后强制，每一步都有指标与回放证据。

@@ -95,6 +95,7 @@ cargo run -p trit-agent -- rewind \
 - [LIBRARY-STACK.md](docs/LIBRARY-STACK.md)：依赖方向、三进制原生库使用规则、新库准入与第三方库政策。
 - [RIGHTS.md](docs/RIGHTS.md)：分层许可、商业使用、贡献授权、Reasonix 移植与全仓权益清单。
 - [MERGE-POLICY.md](docs/MERGE-POLICY.md)：合并批次、顺序、门禁、停止条件、回退与当前队列。
+- [REASONIX-PORT-MATRIX.md](docs/REASONIX-PORT-MATRIX.md)：Reasonix 能力基线、当前落点、差距与 B7.1–B7.9 Rust 移植批次。
 - [crates/trit-orch/docs/COORDINATION.md](crates/trit-orch/docs/COORDINATION.md)：协调/派发设计。
 
 ## 平台支持

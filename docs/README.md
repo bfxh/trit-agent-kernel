@@ -10,7 +10,7 @@
 | 前端 / 桌面开发者 | [FRONTEND-CONTRACT.md](FRONTEND-CONTRACT.md) | [STARTUP-AND-GAME-MODE.md](STARTUP-AND-GAME-MODE.md)、[RESPONSIBILITY.md](RESPONSIBILITY.md) | 内核更新而前端没跟上时，功能怎么锁？锁住后通知谁？ |
 | 上层组件开发者 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | [RIGHTS.md](RIGHTS.md) | 引入哪些库？三进制原生库怎么用？哪些 API 不能碰？ |
 | 维护者 / 仓库所有者 | [RESPONSIBILITY.md](RESPONSIBILITY.md) | [RIGHTS.md](RIGHTS.md)、[MERGE-POLICY.md](MERGE-POLICY.md) | 五类问题谁负责？批次怎么合？权益怎么分层？ |
-| 参与移植 / 合并的人 | [MERGE-POLICY.md](MERGE-POLICY.md) | [LIBRARY-STACK.md](LIBRARY-STACK.md)、[RIGHTS.md](RIGHTS.md) | 一批改多少？先合哪层？怎样算可回退？ |
+| 参与移植 / 合并的人 | [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | [MERGE-POLICY.md](MERGE-POLICY.md)、[LIBRARY-STACK.md](LIBRARY-STACK.md)、[RIGHTS.md](RIGHTS.md) | Reasonix 哪些能力先移？每批验收什么？ |
 
 ## 最小引入集
 
@@ -28,6 +28,7 @@
 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | 现行规范 | 工作区依赖与公开 API |
 | [RIGHTS.md](RIGHTS.md) | 政策草案，非法律意见 | 各仓库 LICENSE / NOTICE |
 | [MERGE-POLICY.md](MERGE-POLICY.md) | 现行流程 | CI 与 PR 模板 |
+| [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7 规划基线 | 尚未开始 B7.1 代码 |
 
 ## 维护规则
 
