@@ -368,6 +368,36 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_tool_deltas_stay_separate() {
+        let mut assembler = OpenAiStreamAssembler::new();
+        for chunk in [
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call-0", "function": {"name": "bash", "arguments": "{\"command\":\"ca"}}
+            ]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 1, "id": "call-1", "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}}
+            ]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "rgo test\"}"}}
+            ]}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}),
+        ] {
+            assembler.push_chunk(&chunk).unwrap();
+        }
+        let response = assembler.finish(&crate::default_tools()).unwrap();
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].call_id, "call-0");
+        assert_eq!(response.tool_calls[0].tool, "bash");
+        assert_eq!(
+            response.tool_calls[0].command.as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(response.tool_calls[1].call_id, "call-1");
+        assert_eq!(response.tool_calls[1].tool, "read_file");
+        assert_eq!(response.tool_calls[1].paths, ["a.rs"]);
+    }
+
+    #[test]
     fn empty_stream_fails_closed() {
         assert!(OpenAiStreamAssembler::new().finish(&[]).is_err());
     }
