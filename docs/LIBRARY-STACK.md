@@ -140,7 +140,31 @@ trit-core = { git = "https://github.com/bfxh/trit-agent-kernel", tag = "v0.1.0" 
 
 Reasonix 是 MIT 许可的参考实现。移植其架构或代码时保留版权与许可声明，具体见 [RIGHTS.md](RIGHTS.md)。
 
-## 7. 上层组件检查清单
+## 7. 当前第三方依赖清单
+
+直接依赖（以 `Cargo.lock` 为准；升级时同步本表）：
+
+| Crate | 当前版本 | 用途 | 许可 | 备注 |
+| --- | --- | --- | --- | --- |
+| `serde` / `serde_json` | 1.0.x / 1.0.x | 序列化 / JSON | MIT OR Apache-2.0 | 全栈基础 |
+| `thiserror` | 2.0.x | 错误类型 | MIT OR Apache-2.0 | 不引入运行时 |
+| `ureq` | 2.12.x | OpenAI-compatible HTTP | MIT OR Apache-2.0 | TLS 传递依赖是 LoongArch 构建阻塞点 |
+| `cap-std` / `cap-fs-ext` | 3.4.x | 能力式文件系统 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 工具边界 |
+| `notify` | 8.2.x | roots 文件事件 | CC0-1.0 | 平台后端不同 |
+| `ignore` | 0.4.x | `.gitignore` 语义 | Unlicense OR MIT | 搜索 / glob |
+| `regex` | 1.13.x | 正则 | MIT OR Apache-2.0 | 搜索 |
+| `globset` | 0.4.x | glob 匹配 | Unlicense OR MIT | 搜索 / glob |
+| `libc` | 0.2.x | Unix 系统调用 | MIT OR Apache-2.0 | 仅 Unix |
+| `windows-sys` | 0.61.x | Windows API | MIT OR Apache-2.0 | 仅 Windows |
+| `proptest` | 1.12.x | 属性测试 | MIT OR Apache-2.0 | 仅 dev |
+
+说明：
+
+- `notify` 是 CC0-1.0（公共领域奉献），仍需在 NOTICE / 第三方清单中保留来源与版本。
+- `ureq` 的 TLS 传递依赖（`ring` / `rustls` 等）未列入本表；CI 的 LoongArch 检查因此只覆盖不含 `trit-agent` 的核心 crates。要宣称全栈 LoongArch 支持，必须先解决或替换该 TLS 栈。
+- 这张表只列直接依赖。发布前必须用工具生成完整传递依赖清单，不能用手写表代替许可证扫描。
+
+## 8. 上层组件检查清单
 
 - [ ] 显式依赖 `trit-core`，没有自造三值枚举。
 - [ ] 只使用公开 API，没有 `pub(crate)` / 私有路径穿透。
