@@ -877,3 +877,120 @@ fn cache_ledger_roundtrips_through_json() {
     assert_eq!(stat.cache_hit_tokens, 80);
     assert_eq!(stat.recent.len(), 1);
 }
+
+fn record_cache(
+    ledger: &mut trit_agent::CacheLedger,
+    prefix: &str,
+    hit: u64,
+    miss: u64,
+    estimated: bool,
+) {
+    ledger.observe(&trit_agent::CacheObservation {
+        provider: "p".into(),
+        model: "m".into(),
+        prefix_fingerprint: prefix.into(),
+        prompt_tokens: hit + miss,
+        cache_hit_tokens: hit,
+        cache_miss_tokens: miss,
+        estimated,
+        observed_at_ms: None,
+    });
+}
+
+#[test]
+fn cache_ledger_lru_evicts_least_recently_used_entry() {
+    let mut ledger = trit_agent::CacheLedger::new(0, 2);
+    record_cache(&mut ledger, "a", 10, 0, false);
+    record_cache(&mut ledger, "b", 20, 0, false);
+    record_cache(&mut ledger, "a", 10, 0, false);
+    record_cache(&mut ledger, "c", 30, 0, false);
+
+    assert_eq!(ledger.len(), 2);
+    assert!(ledger.stat_for("p", "m", "a").is_some());
+    assert!(ledger.stat_for("p", "m", "c").is_some());
+    assert!(ledger.stat_for("p", "m", "b").is_none());
+    assert_eq!(
+        ledger.hot_entries(2).first().map(|(key, _)| key.as_str()),
+        Some("p|m|c")
+    );
+}
+
+#[test]
+fn cache_ledger_ttl_drops_expired_entries_but_keeps_legacy_untimestamped() {
+    let mut ledger = trit_agent::CacheLedger::new(1, 0);
+    record_cache(&mut ledger, "old", 10, 0, false);
+    record_cache(&mut ledger, "legacy", 20, 0, false);
+
+    let mut value = serde_json::to_value(&ledger).unwrap();
+    value["ttl_secs"] = serde_json::json!(1);
+    value["entries"]["p|m|old"]["last_accessed"] = serde_json::json!(1);
+    value["entries"]["p|m|legacy"]["last_accessed"] = serde_json::json!(0);
+    let mut restored: trit_agent::CacheLedger = serde_json::from_value(value).unwrap();
+
+    record_cache(&mut restored, "fresh", 30, 0, false);
+    assert!(restored.stat_for("p", "m", "old").is_none());
+    assert!(restored.stat_for("p", "m", "legacy").is_some());
+    assert!(restored.stat_for("p", "m", "fresh").is_some());
+}
+
+#[test]
+fn cache_ledger_capacity_repairs_missing_lru_order_after_load() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    record_cache(&mut ledger, "a", 10, 0, false);
+    record_cache(&mut ledger, "b", 20, 0, false);
+    record_cache(&mut ledger, "c", 30, 0, false);
+
+    let mut value = serde_json::to_value(&ledger).unwrap();
+    value.as_object_mut().unwrap().remove("lru_order");
+    value["max_entries"] = serde_json::json!(2);
+    let mut restored: trit_agent::CacheLedger = serde_json::from_value(value).unwrap();
+
+    record_cache(&mut restored, "d", 40, 0, false);
+    assert_eq!(restored.len(), 2);
+    assert!(restored.stat_for("p", "m", "d").is_some());
+    assert!(
+        restored.stat_for("p", "m", "a").is_none(),
+        "same-second entries must fall back to deterministic key order"
+    );
+}
+
+#[test]
+fn cache_ledger_merge_keeps_limits_and_combines_counts() {
+    let mut left = trit_agent::CacheLedger::new(0, 2);
+    record_cache(&mut left, "a", 10, 5, false);
+    record_cache(&mut left, "b", 20, 5, false);
+    let mut right = trit_agent::CacheLedger::new(0, 2);
+    record_cache(&mut right, "a", 30, 5, false);
+    record_cache(&mut right, "c", 40, 5, false);
+
+    left.merge(&right);
+    assert_eq!(left.len(), 2);
+    let stat = left.stat_for("p", "m", "a").unwrap();
+    assert_eq!(stat.cache_hit_tokens, 40);
+    assert_eq!(stat.cache_miss_tokens, 10);
+    assert!(left.stat_for("p", "m", "c").is_some());
+}
+
+#[test]
+fn cache_ledger_compress_retains_confidence_and_respects_budget() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    for _ in 0..3 {
+        record_cache(&mut ledger, "high", 80, 20, false);
+    }
+    record_cache(&mut ledger, "medium", 20, 80, false);
+    record_cache(&mut ledger, "none", 100, 0, true);
+
+    let all = ledger.compress(Ternary::Unknown, 0);
+    assert_eq!(all.original_token_count, 500);
+    assert_eq!(all.retained_keys.len(), 2);
+    assert_eq!(all.dropped_keys, vec!["p|m|none".to_owned()]);
+    assert!(all.summary.contains("p|m|none"));
+    assert_eq!(all.compressed_token_count, 400);
+
+    let budgeted = ledger.compress(Ternary::False, 150);
+    assert_eq!(budgeted.original_token_count, 500);
+    assert_eq!(budgeted.compressed_token_count, 100);
+    assert_eq!(budgeted.retained_keys, vec!["p|m|medium".to_owned()]);
+    assert!(budgeted.summary.contains("p|m|high"));
+    assert!(budgeted.summary.contains("p|m|none"));
+}

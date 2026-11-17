@@ -717,71 +717,140 @@ impl CacheStat {
 
 const MAX_RECENT_CACHE_SAMPLES: usize = 256;
 
+/// 缓存条目的压缩结果：保留键、丢弃键以及可注入下一轮的摘要。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompressedContext {
+    pub retained_keys: Vec<String>,
+    pub dropped_keys: Vec<String>,
+    pub summary: String,
+    pub original_token_count: u64,
+    pub compressed_token_count: u64,
+}
+
 /// 按 prefix fingerprint 聚合实际 cache 观测；用于把计划层 hit_potential
 /// 校准成可验证的命中率。
+///
+/// `ttl_secs` / `max_entries` 为 0 表示不限制。旧版持久化 ledger 没有
+/// `last_accessed` 与 LRU 顺序，加载后按 0 处理：不参与 TTL 淘汰，直到
+/// 下一次观测刷新；容量淘汰前会先补齐 LRU 顺序。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheLedger {
     entries: BTreeMap<String, CacheStat>,
-    // LRU 追踪：键按最近访问时间排序
+    #[serde(default)]
     lru_order: Vec<String>,
-    // TTL 配置：条目最大存活时间（秒），0 表示不过期
+    #[serde(default)]
     ttl_secs: u64,
-    // 最大条目数，0 表示不限制
+    #[serde(default)]
     max_entries: usize,
 }
 
 impl CacheLedger {
-    fn make_key(&self, provider: &str, model: &str, prefix_fingerprint: &str) -> String {
-        format!("{}|{}|{}", provider, model, prefix_fingerprint)
+    pub fn new(ttl_secs: u64, max_entries: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            lru_order: Vec::new(),
+            ttl_secs,
+            max_entries,
+        }
+    }
+
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(position) = self.lru_order.iter().position(|candidate| candidate == key) {
+            self.lru_order.remove(position);
+        }
+        self.lru_order.push(key.to_owned());
+    }
+
+    /// 旧 ledger 或外部 merge 可能缺少 LRU 记录；按最后访问时间补齐。
+    fn ensure_lru_order(&mut self) {
+        self.lru_order.retain(|key| self.entries.contains_key(key));
+        let mut seen: BTreeSet<String> = self.lru_order.iter().cloned().collect();
+        let mut missing: Vec<(u64, &str)> = self
+            .entries
+            .iter()
+            .filter(|(key, _)| !seen.contains(*key))
+            .map(|(key, stat)| (stat.last_accessed, key.as_str()))
+            .collect();
+        missing.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
+        let missing: Vec<String> = missing.into_iter().map(|(_, key)| key.to_owned()).collect();
+        // 缺失顺序的条目视为更旧，必须排在新近访问的键之前。
+        self.lru_order.splice(0..0, missing);
+        seen.clear();
+        self.lru_order.retain(|key| seen.insert(key.clone()));
+    }
+
+    fn evict_expired(&mut self, now: u64) {
+        if self.ttl_secs == 0 {
+            return;
+        }
+        self.entries.retain(|_, stat| {
+            stat.last_accessed == 0 || now.saturating_sub(stat.last_accessed) <= self.ttl_secs
+        });
+        self.lru_order.retain(|key| self.entries.contains_key(key));
+    }
+
+    fn enforce_capacity(&mut self) {
+        if self.max_entries == 0 || self.entries.len() <= self.max_entries {
+            return;
+        }
+        self.ensure_lru_order();
+        let excess = self.entries.len() - self.max_entries;
+        let evicted: Vec<String> = self.lru_order.drain(..excess).collect();
+        for key in evicted {
+            self.entries.remove(&key);
+        }
     }
 
     pub fn observe(&mut self, observation: &CacheObservation) {
-        let key = self.make_key(&observation.provider, &observation.model, &observation.prefix_fingerprint);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-
-        // 更新 LRU 顺序
-        let full_key = self.make_key(&observation.provider, &observation.model, &observation.prefix_fingerprint);
-        if let Some(pos) = self.lru_order.iter().position(|k| k == &full_key) {
-            self.lru_order.remove(pos);
-        }
-        self.lru_order.push(full_key.clone());
-
-        // 更新/插入条目
-        self.entries
-            .entry(key)
-            .or_default()
-            .observe(observation);
-
-        // 清理过期条目
-        if self.ttl_secs > 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            self.entries.retain(|_, stat| {
-                now.saturating_sub(stat.last_accessed) <= self.ttl_secs
-            });
-            // 同步 LRU 顺序
-            self.lru_order.retain(|k| self.entries.contains_key(k));
-        }
-
-        // 限制最大条目数
-        if self.max_entries > 0 && self.entries.len() > self.max_entries {
-            let excess = self.entries.len() - self.max_entries;
-            let to_remove: Vec<String> = self.lru_order.drain(..excess).collect();
-            for key in to_remove {
-                self.entries.remove(&key);
-            }
-        }
+        let key = cache_key(
+            &observation.provider,
+            &observation.model,
+            &observation.prefix_fingerprint,
+        );
+        let stat = self.entries.entry(key.clone()).or_default();
+        stat.observe(observation);
+        stat.last_accessed = now;
+        self.touch(&key);
+        self.evict_expired(now);
+        self.enforce_capacity();
     }
 
     pub fn merge(&mut self, other: &CacheLedger) {
         for (key, stat) in &other.entries {
-            self.entries.entry(key.clone()).or_default().merge(stat);
+            let entry = self.entries.entry(key.clone()).or_default();
+            entry.merge(stat);
+            entry.last_accessed = entry.last_accessed.max(stat.last_accessed);
+            self.touch(key);
         }
+        if !other.entries.is_empty() {
+            self.evict_expired(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+        }
+        self.enforce_capacity();
     }
 
     pub fn stat_for(
@@ -796,6 +865,82 @@ impl CacheLedger {
 
     pub fn entries(&self) -> impl Iterator<Item = (&String, &CacheStat)> {
         self.entries.iter()
+    }
+
+    /// 在预算内保留高置信度条目，其余折叠成摘要。
+    ///
+    /// `min_confidence` 是保留门槛；`budget_tokens == 0` 表示不限制预算。
+    /// token 数使用观测到的 hit + miss token 总量，而不是条目数。
+    pub fn compress(&self, min_confidence: Ternary, budget_tokens: u64) -> CompressedContext {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_by(|left, right| {
+            right
+                .1
+                .confidence()
+                .index()
+                .cmp(&left.1.confidence().index())
+                .then_with(|| cache_entry_tokens(right.1).cmp(&cache_entry_tokens(left.1)))
+                .then_with(|| left.0.cmp(right.0))
+        });
+
+        let original_token_count = self
+            .entries
+            .values()
+            .map(cache_entry_tokens)
+            .fold(0u64, u64::saturating_add);
+        let mut retained = Vec::new();
+        let mut dropped = Vec::new();
+        let mut retained_tokens = 0u64;
+        for (key, stat) in entries {
+            let tokens = cache_entry_tokens(stat);
+            let within_budget =
+                budget_tokens == 0 || retained_tokens.saturating_add(tokens) <= budget_tokens;
+            if stat.confidence() >= min_confidence && within_budget {
+                retained.push(key.clone());
+                retained_tokens = retained_tokens.saturating_add(tokens);
+            } else {
+                dropped.push(key.clone());
+            }
+        }
+
+        let mut summary = String::new();
+        for key in &dropped {
+            if let Some(stat) = self.entries.get(key) {
+                summary.push_str(&format!(
+                    "[{key}] hits={} miss={} rate={}bp confidence={}\n",
+                    stat.cache_hit_tokens,
+                    stat.cache_miss_tokens,
+                    stat.hit_rate_bp(),
+                    stat.confidence()
+                ));
+            }
+        }
+
+        CompressedContext {
+            retained_keys: retained,
+            dropped_keys: dropped,
+            summary,
+            original_token_count,
+            compressed_token_count: retained_tokens,
+        }
+    }
+
+    /// 获取热点条目：先按访问 token 量，再按置信度排序。
+    pub fn hot_entries(&self, limit: usize) -> Vec<(&String, &CacheStat)> {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_by(|left, right| {
+            cache_entry_tokens(right.1)
+                .cmp(&cache_entry_tokens(left.1))
+                .then_with(|| {
+                    right
+                        .1
+                        .confidence()
+                        .index()
+                        .cmp(&left.1.confidence().index())
+                })
+                .then_with(|| left.0.cmp(right.0))
+        });
+        entries.into_iter().take(limit).collect()
     }
 
     pub fn total_hit_rate_bp(&self) -> u32 {
@@ -836,6 +981,10 @@ impl CacheLedger {
 
 fn cache_key(provider: &str, model: &str, prefix_fingerprint: &str) -> String {
     format!("{provider}|{model}|{prefix_fingerprint}")
+}
+
+fn cache_entry_tokens(stat: &CacheStat) -> u64 {
+    stat.cache_hit_tokens.saturating_add(stat.cache_miss_tokens)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
