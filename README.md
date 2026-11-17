@@ -31,7 +31,8 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 会话迁移：`SessionMigrationBundle` 携带上下文版本、钩子契约、状态层和 cache ledger；缓存只在 provider/model/prefix 兼容时复用，旧上下文只保留已有摘要。
 - Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息；`context_search` / `context_add` / `context_read` 让 agent 自主搜索、加入动态上下文并读取句柄；inclusion receipt、实际 cache hit/miss 与按 prefix 聚合的 cache ledger 会被记录。
 - CLI：`--context-catalog <json>` 启用 agent 自主上下文；`--context-read-budget` / `--context-read-max` 限制单轮/单次读取；`--cache-hit-threshold`、`--cache-low-hit-policy`、`--cache-window-samples`/`--cache-window-ms`、`--cache-pressure-scale-bp`、`--cache-search-scale-bp`、`--cache-search-order`、`--cache-task-selection`、`--cache-ledger <json>` 控制校准窗口、低命中策略、搜索排序/候选、动态预算、任务选批压力与可选 ledger 持久化；运行结束向 stderr 输出 cache ledger；`--supervisor-config <json>` 启动受监督的 gateway/MCP sidecar，并自动把发现的 MCP 工具接入模型工具循环。
-- Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 provider + model + prefix 聚合、只用窗口内精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一桶至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`。
+- Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 provider + model + prefix 聚合、只用窗口内精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一桶至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`；`CacheLedger` 支持 TTL / LRU / 最大条目数回收，并可把低优先级条目压缩成摘要。
+- 内核-前端能力门禁：`FeatureGate` 按 `api_level`、前端能力表、依赖和显式开关决定启用 / 关闭 / 锁住；锁住的能力对前端隐藏并产生带 owner 的通知，扩展坞按组 fail-closed。实现见 `frontend_compat.rs`，契约见 `docs/FRONTEND-CONTRACT.md`。
 - 无头 agent：OpenAI-compatible provider、scripted replay、session JSONL、`--resume`。
 - 文件级 checkpoint/rewind：预检、symlink/类型拒绝、应用失败逆序回滚。
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。
@@ -81,18 +82,26 @@ cargo run -p trit-agent -- rewind \
 
 ## 文档
 
+- [docs/README.md](docs/README.md)：按用户 / 前端 / 上层组件 / 维护者划分的文档地图。
 - [CONTEXT-ORCHESTRATION.md](docs/CONTEXT-ORCHESTRATION.md)：上下文引用/复用、会话地址、推理记录、语义判断、调用缝合与交互式 UI 提案。
 - [SESSION-MIGRATION.md](docs/SESSION-MIGRATION.md)：会话/缓存/上下文版本/钩子迁移契约，以及网关/MCP 自动重启与恢复的 supervisor 实现。
 - [KERNEL-REASONIX-FUSION.md](docs/KERNEL-REASONIX-FUSION.md)：与 Reasonix 的组合边界、认证平面与 Rust 迁移策略。
 - [TERNARY-ORCHESTRATION.md](docs/TERNARY-ORCHESTRATION.md)：三值编排模型。
 - [TRACE-AND-TIME.md](docs/TRACE-AND-TIME.md)：轨迹、重放与时间语义。
+- [STARTUP-AND-GAME-MODE.md](docs/STARTUP-AND-GAME-MODE.md)：开机调度、桌面清理、游戏模式与外部关闭方式。
+- [FRONTEND-CONTRACT.md](docs/FRONTEND-CONTRACT.md)：内核 / 前端能力协商、锁住 / 隐藏规则、扩展坞 fail-closed 与通知。
+- [RESPONSIBILITY.md](docs/RESPONSIBILITY.md)：五类问题的责任分层、通知渠道、升级时限与原始库移交。
+- [LIBRARY-STACK.md](docs/LIBRARY-STACK.md)：依赖方向、三进制原生库使用规则、新库准入与第三方库政策。
+- [RIGHTS.md](docs/RIGHTS.md)：分层许可、商业使用、贡献授权、Reasonix 移植与全仓权益清单。
+- [MERGE-POLICY.md](docs/MERGE-POLICY.md)：合并批次、顺序、门禁、停止条件、回退与当前队列。
 - [crates/trit-orch/docs/COORDINATION.md](crates/trit-orch/docs/COORDINATION.md)：协调/派发设计。
 
 ## 平台支持
 
-- CI 覆盖 Ubuntu、Windows、macOS：fmt / clippy / 全量测试三套矩阵。
+- CI 在 Ubuntu、Windows、macOS 跑 fmt / clippy / 全量测试。
+- CI 额外做 ARM64 整工作区 `cargo check`，以及 LoongArch64 核心 crates（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix`）的 `cargo check`；`trit-agent` 的 LoongArch 构建仍受 TLS 依赖限制，未宣称支持。
 - Linux 使用 inotify、macOS 使用 FSEvents、Windows 使用 ReadDirectoryChangesW 做 roots 监听；持久 shell 优先 bash，Windows 显式走 Git Bash。
-- 国产系统（麒麟 / 统信 UOS、ARM64 / LoongArch 等）尚未验证。后续适配重点是 bash 路径探测、文件通知后端、OS 沙箱封装和 Git/其他 VCS 的可用性；在完成前不宣称支持。
+- 国产系统（麒麟 / 统信 UOS、ARM64 / LoongArch 等）尚未完成运行时验证。后续适配重点是 bash 路径探测、文件通知后端、OS 沙箱封装、TLS 依赖和 Git/其他 VCS 的可用性；在完成前不宣称支持。
 
 ## 来源与状态
 

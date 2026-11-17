@@ -787,6 +787,7 @@ pub mod checkpoint;
 pub mod context;
 pub mod context_layers;
 pub mod context_tools;
+pub mod frontend_compat;
 pub mod git_checkpoint;
 pub mod mcp_tools;
 pub mod openai;
@@ -807,16 +808,21 @@ pub use checkpoint::{
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
 pub use context_layers::{
     AgentContext, AutonomyPolicy, CacheClass, CacheLedger, CacheObservation, CacheReport,
-    CacheSample, CacheStat, CacheWindow, CacheWindowStats, CalibrationReport, ContextCatalog,
-    ContextDegradation, ContextDetail, ContextDocument, ContextDropReason, ContextError,
-    ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef, ContextRequest,
-    ContextResolver, ContextScope, ContextSelection, ContextSpan, DroppedContext, ImpressionDelta,
-    InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression, ReasoningEffort,
-    ResolvedContext, SearchOrder, Sensitivity, UsageCalibration, assemble_context, estimate_tokens,
+    CacheSample, CacheStat, CacheWindow, CacheWindowStats, CalibrationReport, CompressedContext,
+    ContextCatalog, ContextDegradation, ContextDetail, ContextDocument, ContextDropReason,
+    ContextError, ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef,
+    ContextRequest, ContextResolver, ContextScope, ContextSelection, ContextSpan, DroppedContext,
+    ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression,
+    ReasoningEffort, ResolvedContext, SearchOrder, Sensitivity, UsageCalibration, assemble_context,
+    estimate_tokens,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
+};
+pub use frontend_compat::{
+    FeatureDecision, FeatureGate, FeatureGroupDecision, FeatureGroupSpec, FeatureNotice,
+    FeatureSpec, FeatureState, FrontendCapabilities, GateReport, GateRequest, LockReason,
 };
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
