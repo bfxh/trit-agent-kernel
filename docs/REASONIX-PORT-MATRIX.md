@@ -41,7 +41,7 @@
 | 3 | 模型连接健康 / 别名 / 重试 | `MODEL_CONNECTION_HEALTH.md`、`MODEL_DISPLAY_ALIASES.md` | 部分（首版） | 纯健康状态机已有；缺自动探测、别名、超时分级 | B7.2 |
 | 4 | 工具契约 / 注册表 / schema 规范化 | `TOOL_CONTRACT.md`、`SPEC §3.2` | 部分 | `ToolSpec` 已有，缺 schema 规范化、契约对照测试、工具家族 | B7.1/B7.2 |
 | 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（投影+prompt+迁移） | `ContextProjection` 进入 prompt、迁移 bundle 携带投影；缺跨设备/跨存储实际落盘 | B7.3 |
-| 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+证据过滤） | 压缩事件 / 状态层 / Rebasis / replay 已绑定；完成裁决按 epoch 过滤旧回执；缺 freshness 恢复与 Plan/Observation 联动 | B7.3 |
+| 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+恢复+Plan 联动） | 完成裁决要求当前 epoch + freshness True；新证据恢复、Manual 策略、Plan/Observation epoch 已联动；缺跨设备落盘与多任务图迁移 | B7.3 |
 | 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；缺 sidecar 布局、byte parity、重建投影 | B7.7 |
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 已实现；缺持久 journal、operation lease、崩溃恢复 | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分 | 当前是工具开关/沙箱边界；缺逐调用决策、deny 优先、非交互 fail-closed | B7.4 |
@@ -237,11 +237,14 @@ B7.3 首版已落地：
 - `replay_projection` 从 JSONL 重建投影并校验 epoch / freshness；真实 AgentHost + SessionLog 回放测试通过；
 - `ProjectionView` 进入 `ProviderRequest` 与 OpenAI user prompt；
 - 完成裁决只接受当前 epoch 的回执，压缩前旧证据不能为压缩后完成声明背书；
-- `SessionMigrationBundle` 携带 canonical 投影、epoch 与边界；目标 prefix 不匹配时 freshness 降为 Unknown；迁移测试覆盖开关与跨 prefix 场景。
+- `SessionMigrationBundle` 携带 canonical 投影、epoch 与边界；目标 prefix 不匹配时 freshness 降为 Unknown；迁移测试覆盖开关与跨 prefix 场景；
+- `FreshnessRecovery::OnVerifiedEvidence` 默认在新 epoch 的成功且带断言证据后恢复 True，`Manual` 保持 Unknown；完成裁决要求 freshness True；
+- 压缩时 `Plan::rebase_epoch` 推进任务 epoch，Observation epoch / freshness 同步更新，brief 重新生成；
+- `ContextFreshnessRecovered` session 事件进入状态层与 replay，保证 live / replay 一致。
 
 剩余与下一步：
 
 1. 录制真实 tool-call 流 fixture；当前真实 fixture 只有文本流，tool delta 用内联 chunk。
 2. 补模型别名、超时分级、可重试错误分类，以及可选的 provider 健康接线。
-3. B7.3 继续：freshness 恢复策略、Plan/Observation 与 epoch 联动、跨设备实际落盘。
+3. B7.3 剩余：跨设备/跨存储实际落盘、多任务 Plan 的批量 rebase。
 4. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。

@@ -355,6 +355,7 @@ pub struct AgentHost<M, T> {
     last_prefix_fingerprint: Option<String>,
     context_projection: crate::context_projection::ContextProjection,
     receipt_epochs: BTreeMap<String, u64>,
+    freshness_recovery: crate::context_projection::FreshnessRecovery,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -368,6 +369,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             last_prefix_fingerprint: None,
             context_projection: crate::context_projection::ContextProjection::new(),
             receipt_epochs: BTreeMap::new(),
+            freshness_recovery: crate::context_projection::FreshnessRecovery::default(),
         }
     }
 
@@ -381,6 +383,14 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         self
     }
 
+    pub fn with_freshness_recovery(
+        mut self,
+        freshness_recovery: crate::context_projection::FreshnessRecovery,
+    ) -> Self {
+        self.freshness_recovery = freshness_recovery;
+        self
+    }
+
     pub fn model(&self) -> &M {
         &self.model
     }
@@ -391,6 +401,11 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
 
     pub fn context_projection(&self) -> &crate::context_projection::ContextProjection {
         &self.context_projection
+    }
+
+    /// 手动恢复投影 freshness；下一条 proposal / 下一个 turn 会看到新值。
+    pub fn mark_context_freshness(&mut self, freshness: Ternary) {
+        self.context_projection.mark_freshness(freshness);
     }
 
     pub fn with_cache_ledger(
@@ -426,15 +441,18 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         turn: &TurnSpec,
         mut session: Option<&mut SessionLog>,
     ) -> Result<TurnOutcome, AgentError> {
-        let spec = turn.task_spec();
+        let mut spec = turn.task_spec();
+        spec.epoch = self.context_projection.epoch();
+        let task_epoch = spec.epoch;
         let mut plan = Plan::new(1, vec![spec])?;
         let mut snapshot = Snapshot {
             revision: 1,
             observations: BTreeMap::from([(
                 turn.task.clone(),
                 Observation {
+                    epoch: task_epoch,
                     authorization: Ternary::True,
-                    freshness: Ternary::True,
+                    freshness: self.context_projection.freshness(),
                     ..Observation::default()
                 },
             )]),
@@ -527,6 +545,16 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     },
                 )?;
                 if let Some(boundary) = boundary {
+                    plan = plan.rebase_epoch()?;
+                    snapshot.revision = plan.revision();
+                    if let Some(observation) = snapshot.observations.get_mut(&turn.task) {
+                        observation.epoch = plan
+                            .task(&turn.task)
+                            .map(|task| task.epoch)
+                            .unwrap_or(observation.epoch);
+                        observation.freshness = Ternary::Unknown;
+                    }
+                    brief = brief_for(&plan, &snapshot, &limits, &turn.task)?;
                     let needs_obligation = !rebasis.iter().any(|existing| {
                         existing.kind == ObligationKind::Rebasis && existing.subject == "context"
                     });
@@ -640,6 +668,12 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 {
                     plan = next_plan;
                     snapshot = next_snapshot;
+                    if let Some(observation) = snapshot.observations.get_mut(&turn.task) {
+                        observation.epoch = plan
+                            .task(&turn.task)
+                            .map(|task| task.epoch)
+                            .unwrap_or(observation.epoch);
+                    }
                     log_session(
                         &mut session,
                         SessionEvent::PlanPatched {
@@ -684,6 +718,28 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 self.receipt_epochs
                     .insert(outcome.call_id.clone(), self.context_projection.epoch());
                 receipts.push(outcome);
+                if matches!(
+                    self.freshness_recovery,
+                    crate::context_projection::FreshnessRecovery::OnVerifiedEvidence
+                ) && self.context_projection.freshness() == Ternary::Unknown
+                    && receipts.last().is_some_and(|outcome| {
+                        outcome.passed && !outcome.in_doubt && outcome.assertions > 0
+                    })
+                {
+                    self.context_projection.mark_freshness(Ternary::True);
+                    log_session(
+                        &mut session,
+                        SessionEvent::ContextFreshnessRecovered {
+                            step,
+                            epoch: self.context_projection.epoch(),
+                            freshness: Ternary::True,
+                        },
+                    )?;
+                    if let Some(observation) = snapshot.observations.get_mut(&turn.task) {
+                        observation.freshness = Ternary::True;
+                    }
+                    brief = brief_for(&plan, &snapshot, &limits, &turn.task)?;
+                }
             }
 
             if let Some(claim) = &proposal.completion {
@@ -695,17 +751,20 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     },
                 )?;
                 let active_epoch = self.context_projection.epoch();
-                let evidence: Vec<ToolOutcome> = if active_epoch == 0 {
-                    receipts.clone()
-                } else {
-                    receipts
-                        .iter()
-                        .filter(|outcome| {
-                            self.receipt_epochs.get(&outcome.call_id) == Some(&active_epoch)
-                        })
-                        .cloned()
-                        .collect()
-                };
+                let evidence: Vec<ToolOutcome> =
+                    if self.context_projection.freshness() != Ternary::True {
+                        Vec::new()
+                    } else if active_epoch == 0 {
+                        receipts.clone()
+                    } else {
+                        receipts
+                            .iter()
+                            .filter(|outcome| {
+                                self.receipt_epochs.get(&outcome.call_id) == Some(&active_epoch)
+                            })
+                            .cloned()
+                            .collect()
+                    };
                 let backed = back_claim(claim, &turn.task, &evidence);
                 let judgment = judge_completion(&brief, &backed)?;
                 let complete = judgment.is_complete();
@@ -925,8 +984,8 @@ pub use context_layers::{
     assemble_context, estimate_tokens,
 };
 pub use context_projection::{
-    CompactionBoundary, CompactionInput, ContextProjection, ProjectionEntry, ProjectionError,
-    ProjectionView, replay as replay_projection,
+    CompactionBoundary, CompactionInput, ContextProjection, FreshnessRecovery, ProjectionEntry,
+    ProjectionError, ProjectionView, replay as replay_projection,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,

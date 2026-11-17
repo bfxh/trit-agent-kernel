@@ -64,6 +64,24 @@ impl Plan {
             .map(|position| &self.tasks[position])
     }
 
+    /// 上下文 basis 变化时整体推进任务 epoch；旧观察与旧效果随之作废。
+    pub fn rebase_epoch(&self) -> Result<Self, Error> {
+        let mut tasks = self.tasks.clone();
+        for spec in &mut tasks {
+            spec.epoch = spec
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| Error::EpochOverflow {
+                    id: spec.task.id.clone(),
+                })?;
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(Error::RevisionOverflow)?;
+        Self::new(revision, tasks)
+    }
+
     /// 找出声明为 `task` 生产证据的全部任务（原生 `resolves` 绑定）。
     pub fn resolvers_of(&self, task: &str) -> Vec<&TaskSpec> {
         self.tasks

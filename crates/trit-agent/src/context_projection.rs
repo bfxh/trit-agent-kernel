@@ -11,6 +11,16 @@ use trit_orch::Ternary;
 use crate::ToolOutcome;
 use crate::session::{SessionEvent, SessionRecord};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessRecovery {
+    /// 新 epoch 内出现一条成功且有断言的证据后恢复 True。
+    #[default]
+    OnVerifiedEvidence,
+    /// 宿主手动恢复；AgentHost 不自动改 freshness。
+    Manual,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProjectionError {
     #[error("cannot retain {retained} entries from {visible} visible entries")]
@@ -282,6 +292,18 @@ pub fn replay(records: &[SessionRecord]) -> Result<ContextProjection, Projection
                         actual: boundary.freshness,
                     });
                 }
+            }
+            SessionEvent::ContextFreshnessRecovered {
+                epoch, freshness, ..
+            } => {
+                if projection.epoch() != *epoch {
+                    return Err(ProjectionError::EpochMismatch {
+                        field: "freshness_epoch",
+                        expected: Some(*epoch),
+                        actual: projection.epoch(),
+                    });
+                }
+                projection.mark_freshness(*freshness);
             }
             _ => {}
         }

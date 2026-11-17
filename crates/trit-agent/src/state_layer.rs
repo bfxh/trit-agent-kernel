@@ -132,6 +132,11 @@ pub struct StateLayer {
     pub in_progress: Option<InProgressState>,
     /// 每次压缩的状态快照，按事件顺序保留。
     pub compactions: Vec<CompactionState>,
+    /// 最近一次投影快照播报的 epoch / freshness；旧日志为 None。
+    #[serde(default)]
+    pub projection_epoch: Option<u64>,
+    #[serde(default)]
+    pub projection_freshness: Option<Ternary>,
     pub usage: TokenUsage,
     pub validation: StateValidation,
 }
@@ -302,6 +307,12 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                     state_before,
                     state_after: AgentState::Planning,
                 });
+                if let Some(epoch) = epoch_after {
+                    layer.projection_epoch = Some(*epoch);
+                }
+                if let Some(freshness) = freshness {
+                    layer.projection_freshness = Some(*freshness);
+                }
             }
             SessionEvent::CompletionClaimed { step, .. } => {
                 if let Some(progress) = current.as_mut() {
@@ -343,6 +354,12 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                 current = None;
             }
             SessionEvent::PrefixChanged { .. } => {}
+            SessionEvent::ContextFreshnessRecovered {
+                epoch, freshness, ..
+            } => {
+                layer.projection_epoch = Some(*epoch);
+                layer.projection_freshness = Some(*freshness);
+            }
         }
     }
 
@@ -531,6 +548,8 @@ mod tests {
             state.last_compaction().unwrap().freshness,
             Some(Ternary::Unknown)
         );
+        assert_eq!(state.projection_epoch, Some(1));
+        assert_eq!(state.projection_freshness, Some(Ternary::Unknown));
         assert_eq!(state.last_compaction().unwrap().dropped_chars, 200);
         assert_eq!(state.last_compaction().unwrap().truncated_chars, 50);
         assert_eq!(

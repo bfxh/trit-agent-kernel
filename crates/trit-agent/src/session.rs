@@ -73,6 +73,11 @@ pub enum SessionEvent {
         freshness: Option<Ternary>,
         digest: Option<String>,
     },
+    ContextFreshnessRecovered {
+        step: usize,
+        epoch: u64,
+        freshness: Ternary,
+    },
     CompletionClaimed {
         step: usize,
         criteria: Vec<CriterionRequest>,

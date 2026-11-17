@@ -48,6 +48,8 @@ SessionMigrationBundle {
 - `compactions[]`：每次压缩的 step、dropped/truncated、retained、字符数、epoch before/after、
   freshness、digest、`state_before`、`state_after`；旧日志缺新字段时按 `None` / 0 兼容，`state_after` 是压缩完成后的可继续状态（当前为 Planning），
   当前 `state` 在压缩事件后仍可显示 `Compacting`；
+- `projection_epoch` / `projection_freshness`：最近一次投影快照的 epoch 与 freshness；
+  `ContextFreshnessRecovered` 事件会更新这两个字段，replay 也会消费该事件。
 - `usage`：Proposal 事件的聚合用量；
 - `validation`：`True / Unknown / False`，附 issue code 与 seq。
 

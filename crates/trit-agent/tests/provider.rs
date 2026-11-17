@@ -5,7 +5,7 @@ use trit_agent::{
     ScriptedTools, SessionEvent, SessionLog, ToolOutcome, ToolRequest, TurnContext,
     replay_projection,
 };
-use trit_orch::{EvidenceVerdict, ObligationKind, TaskBrief};
+use trit_orch::{EvidenceVerdict, ObligationKind, TaskBrief, Ternary};
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, TurnSpec};
 
 fn turn() -> TurnSpec {
@@ -233,6 +233,13 @@ fn compacts_old_receipts_before_the_next_provider_call() {
     let outcome = host.run_turn(&turn()).unwrap();
     assert_eq!(outcome.judgment.verdict, EvidenceVerdict::Proved);
     assert_eq!(outcome.receipts.len(), 3, "audit keeps all receipts");
+    assert_eq!(outcome.brief.epoch, 1, "compaction rebases the task epoch");
+    assert_eq!(host.context_projection().epoch(), 1);
+    assert_eq!(
+        host.context_projection().freshness(),
+        Ternary::True,
+        "verified evidence recovers freshness"
+    );
 
     let requests = host.model().provider().requests();
     assert_eq!(requests[1].receipts.len(), 1, "ORCH_AGENT_CONTEXT_COMPACT");
@@ -292,6 +299,58 @@ fn compaction_epoch_invalidates_old_evidence() {
         "old epoch evidence must not back a post-compaction claim"
     );
     assert_eq!(host.context_projection().epoch(), 1);
+    assert_eq!(
+        host.context_projection().freshness(),
+        Ternary::Unknown,
+        "freshness stays unknown without new verified evidence"
+    );
+    assert_eq!(outcome.brief.epoch, 1);
+}
+
+#[test]
+fn manual_freshness_recovery_keeps_completion_blocked() {
+    let provider = ScriptedProvider::new(vec![
+        ProviderResponse {
+            tool_calls: vec![
+                ToolRequest::verification("call-1", "test1"),
+                ToolRequest::verification("call-2", "test2"),
+            ],
+            completion: None,
+            usage: HostUsage::default(),
+            prefix: None,
+            context: None,
+        },
+        ProviderResponse {
+            tool_calls: vec![ToolRequest::verification("call-3", "test3")],
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "c3".into(),
+                    kind: CriterionKind::Verification {
+                        command: "test3".into(),
+                    },
+                }],
+            }),
+            usage: HostUsage::default(),
+            prefix: None,
+            context: None,
+        },
+    ]);
+    let tools = ScriptedTools::new(vec![
+        verification_outcome("call-1", "test1"),
+        verification_outcome("call-2", "test2"),
+        verification_outcome("call-3", "test3"),
+    ]);
+    let mut host = AgentHost::new(ProviderModel::new(provider), tools)
+        .with_context(ContextPolicy {
+            max_receipts: 1,
+            max_chars: 100_000,
+            max_output_chars: 1_000,
+        })
+        .with_freshness_recovery(trit_agent::FreshnessRecovery::Manual);
+    let outcome = host.run_turn(&turn()).unwrap();
+    assert_eq!(host.context_projection().freshness(), Ternary::Unknown);
+    assert_ne!(outcome.judgment.verdict, EvidenceVerdict::Proved);
+    assert_eq!(outcome.brief.epoch, 1);
 }
 
 #[test]
@@ -352,9 +411,11 @@ fn context_projection_replays_from_session_log() {
     assert_eq!(compaction.epoch_before, Some(0));
     assert_eq!(compaction.epoch_after, Some(1));
     assert_eq!(compaction.freshness, Some(trit_orch::Ternary::Unknown));
+    assert_eq!(state.projection_epoch, Some(1));
+    assert_eq!(state.projection_freshness, Some(trit_orch::Ternary::True));
     assert_eq!(live.epoch(), 1);
     assert_eq!(live.generation(), 1);
-    assert_eq!(live.freshness(), trit_orch::Ternary::Unknown);
+    assert_eq!(live.freshness(), trit_orch::Ternary::True);
     assert_eq!(live.canonical().len(), 3);
     assert_eq!(live.visible().len(), 2);
     assert_eq!(live.boundaries().len(), 1);
