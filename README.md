@@ -31,7 +31,7 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 会话迁移：`SessionMigrationBundle` 携带上下文版本、钩子契约、状态层和 cache ledger；缓存只在 provider/model/prefix 兼容时复用，旧上下文只保留已有摘要。
 - Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息；`context_search` / `context_add` / `context_read` 让 agent 自主搜索、加入动态上下文并读取句柄；inclusion receipt、实际 cache hit/miss 与按 prefix 聚合的 cache ledger 会被记录。
 - CLI：`--context-catalog <json>` 启用 agent 自主上下文；`--context-read-budget` / `--context-read-max` 限制单轮/单次读取；`--cache-hit-threshold`、`--cache-low-hit-policy`、`--cache-window-samples`/`--cache-window-ms`、`--cache-pressure-scale-bp`、`--cache-search-scale-bp`、`--cache-search-order`、`--cache-task-selection`、`--cache-ledger <json>` 控制校准窗口、低命中策略、搜索排序/候选、动态预算、任务选批压力与可选 ledger 持久化；运行结束向 stderr 输出 cache ledger；`--supervisor-config <json>` 启动受监督的 gateway/MCP sidecar，并自动把发现的 MCP 工具接入模型工具循环。
-- Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 provider + model + prefix 聚合、只用窗口内精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一桶至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`；`CacheLedger` 支持 TTL / LRU / 最大条目数回收，并可把低优先级条目压缩成摘要。
+- Cache 校准：`AgentContextPlanner` 与 AgentHost 共享 `CacheLedger`；ledger 按 provider + model + prefix 聚合、只用窗口内精确样本计算校准率；`--resume` 会从历史 `Proposal.context` 重建 ledger；同一桶至少有 3 次精确观测后，实际命中率覆盖下一轮 `hit_potential` 并写入 `observed_hit_rate_bp` / `calibration`；`CacheLedger` 支持 TTL / LRU / 最大条目数回收，按命中质量分为 hot / warm / cold 三层（容量回收先淘汰 cold），并可把低优先级条目压缩成摘要。
 - 内核-前端能力门禁：`FeatureGate` 按 `api_level`、前端能力表、依赖和显式开关决定启用 / 关闭 / 锁住；锁住的能力对前端隐藏并产生带 owner 的通知，扩展坞按组 fail-closed。实现见 `frontend_compat.rs`，契约见 `docs/FRONTEND-CONTRACT.md`。
 - 无头 agent：OpenAI-compatible provider、scripted replay、session JSONL、`--resume`。
 - 文件级 checkpoint/rewind：预检、symlink/类型拒绝、应用失败逆序回滚。

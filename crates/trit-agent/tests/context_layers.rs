@@ -972,6 +972,49 @@ fn cache_ledger_merge_keeps_limits_and_combines_counts() {
 }
 
 #[test]
+fn cache_ledger_tiers_by_hit_quality_and_confidence() {
+    let mut ledger = trit_agent::CacheLedger::default();
+    for _ in 0..3 {
+        record_cache(&mut ledger, "hot", 90, 10, false);
+    }
+    for _ in 0..2 {
+        record_cache(&mut ledger, "warm", 50, 50, false);
+    }
+    for _ in 0..3 {
+        record_cache(&mut ledger, "cold", 10, 90, false);
+    }
+    record_cache(&mut ledger, "estimated", 100, 0, true);
+
+    let tiers = ledger.tiers();
+    assert_eq!(tiers.hot, vec!["p|m|hot".to_owned()]);
+    assert_eq!(tiers.warm, vec!["p|m|warm".to_owned()]);
+    assert_eq!(tiers.cold.len(), 2);
+    assert!(tiers.cold.contains(&"p|m|cold".to_owned()));
+    assert!(tiers.cold.contains(&"p|m|estimated".to_owned()));
+    assert_eq!(tiers.len(), 4);
+}
+
+#[test]
+fn cache_ledger_capacity_evicts_cold_before_newer_hot() {
+    let mut ledger = trit_agent::CacheLedger::new(0, 2);
+    for _ in 0..3 {
+        record_cache(&mut ledger, "hot", 90, 10, false);
+    }
+    record_cache(&mut ledger, "cold", 0, 100, true);
+    record_cache(&mut ledger, "warm", 50, 50, false);
+
+    assert_eq!(ledger.len(), 2);
+    assert!(ledger.stat_for("p", "m", "hot").is_some());
+    assert!(ledger.stat_for("p", "m", "warm").is_some());
+    assert!(ledger.stat_for("p", "m", "cold").is_none());
+    assert_eq!(
+        ledger.tiers().hot,
+        vec!["p|m|hot".to_owned()],
+        "hot entry must survive a newer cold entry"
+    );
+}
+
+#[test]
 fn cache_ledger_compress_retains_confidence_and_respects_budget() {
     let mut ledger = trit_agent::CacheLedger::default();
     for _ in 0..3 {

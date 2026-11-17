@@ -808,13 +808,13 @@ pub use checkpoint::{
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};
 pub use context_layers::{
     AgentContext, AutonomyPolicy, CacheClass, CacheLedger, CacheObservation, CacheReport,
-    CacheSample, CacheStat, CacheWindow, CacheWindowStats, CalibrationReport, CompressedContext,
-    ContextCatalog, ContextDegradation, ContextDetail, ContextDocument, ContextDropReason,
-    ContextError, ContextItem, ContextKind, ContextPlan, ContextReceipt, ContextRef,
-    ContextRequest, ContextResolver, ContextScope, ContextSelection, ContextSpan, DroppedContext,
-    ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile, PriorImpression,
-    ReasoningEffort, ResolvedContext, SearchOrder, Sensitivity, UsageCalibration, assemble_context,
-    estimate_tokens,
+    CacheSample, CacheStat, CacheTier, CacheTiers, CacheWindow, CacheWindowStats,
+    CalibrationReport, CompressedContext, ContextCatalog, ContextDegradation, ContextDetail,
+    ContextDocument, ContextDropReason, ContextError, ContextItem, ContextKind, ContextPlan,
+    ContextReceipt, ContextRef, ContextRequest, ContextResolver, ContextScope, ContextSelection,
+    ContextSpan, DroppedContext, ImpressionDelta, InMemoryContext, InclusionReceipt, ModelProfile,
+    PriorImpression, ReasoningEffort, ResolvedContext, SearchOrder, Sensitivity, UsageCalibration,
+    assemble_context, estimate_tokens,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,

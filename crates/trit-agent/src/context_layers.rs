@@ -5,6 +5,7 @@
 //! 它不调用模型，也不把语义判断硬编码成词表。
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -727,6 +728,50 @@ pub struct CompressedContext {
     pub compressed_token_count: u64,
 }
 
+/// 按命中质量与样本置信度划分的缓存温度。
+///
+/// 温度只决定回收顺序；实际新近程度仍由 LRU 顺序细化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTier {
+    Hot,
+    Warm,
+    Cold,
+}
+
+impl CacheTier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hot => "hot",
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+        }
+    }
+}
+
+impl fmt::Display for CacheTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheTiers {
+    pub hot: Vec<String>,
+    pub warm: Vec<String>,
+    pub cold: Vec<String>,
+}
+
+impl CacheTiers {
+    pub fn len(&self) -> usize {
+        self.hot.len() + self.warm.len() + self.cold.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// 按 prefix fingerprint 聚合实际 cache 观测；用于把计划层 hit_potential
 /// 校准成可验证的命中率。
 ///
@@ -805,16 +850,62 @@ impl CacheLedger {
         self.lru_order.retain(|key| self.entries.contains_key(key));
     }
 
+    /// 命中率与样本置信度决定温度；LRU 只在同一温度内决定先后。
+    pub fn tier_for(stat: &CacheStat) -> CacheTier {
+        const HOT_HIT_RATE_BP: u32 = 8_000;
+        const COLD_HIT_RATE_BP: u32 = 2_000;
+        match stat.confidence() {
+            Ternary::True => {
+                let rate = stat.calibrated_hit_rate_bp();
+                if rate >= HOT_HIT_RATE_BP {
+                    CacheTier::Hot
+                } else if rate < COLD_HIT_RATE_BP {
+                    CacheTier::Cold
+                } else {
+                    CacheTier::Warm
+                }
+            }
+            Ternary::Unknown => {
+                if stat.hit_rate_bp() < COLD_HIT_RATE_BP {
+                    CacheTier::Cold
+                } else {
+                    CacheTier::Warm
+                }
+            }
+            Ternary::False => CacheTier::Cold,
+        }
+    }
+
+    pub fn tiers(&self) -> CacheTiers {
+        let mut tiers = CacheTiers::default();
+        for (key, stat) in &self.entries {
+            match Self::tier_for(stat) {
+                CacheTier::Hot => tiers.hot.push(key.clone()),
+                CacheTier::Warm => tiers.warm.push(key.clone()),
+                CacheTier::Cold => tiers.cold.push(key.clone()),
+            }
+        }
+        tiers
+    }
+
     fn enforce_capacity(&mut self) {
         if self.max_entries == 0 || self.entries.len() <= self.max_entries {
             return;
         }
         self.ensure_lru_order();
         let excess = self.entries.len() - self.max_entries;
-        let evicted: Vec<String> = self.lru_order.drain(..excess).collect();
-        for key in evicted {
-            self.entries.remove(&key);
+        let mut eviction_order = Vec::with_capacity(self.lru_order.len());
+        for tier in [CacheTier::Cold, CacheTier::Warm, CacheTier::Hot] {
+            eviction_order.extend(self.lru_order.iter().filter_map(|key| {
+                self.entries
+                    .get(key)
+                    .filter(|stat| Self::tier_for(stat) == tier)
+                    .map(|_| key.clone())
+            }));
         }
+        let evicted: BTreeSet<String> = eviction_order.into_iter().take(excess).collect();
+        self.entries.retain(|key, _| !evicted.contains(key));
+        self.lru_order.retain(|key| !evicted.contains(key));
     }
 
     pub fn observe(&mut self, observation: &CacheObservation) {
@@ -874,11 +965,15 @@ impl CacheLedger {
     pub fn compress(&self, min_confidence: Ternary, budget_tokens: u64) -> CompressedContext {
         let mut entries: Vec<_> = self.entries.iter().collect();
         entries.sort_by(|left, right| {
-            right
-                .1
-                .confidence()
-                .index()
-                .cmp(&left.1.confidence().index())
+            Self::tier_for(left.1)
+                .cmp(&Self::tier_for(right.1))
+                .then_with(|| {
+                    right
+                        .1
+                        .confidence()
+                        .index()
+                        .cmp(&left.1.confidence().index())
+                })
                 .then_with(|| cache_entry_tokens(right.1).cmp(&cache_entry_tokens(left.1)))
                 .then_with(|| left.0.cmp(right.0))
         });
@@ -907,7 +1002,8 @@ impl CacheLedger {
         for key in &dropped {
             if let Some(stat) = self.entries.get(key) {
                 summary.push_str(&format!(
-                    "[{key}] hits={} miss={} rate={}bp confidence={}\n",
+                    "[{key}] tier={} hits={} miss={} rate={}bp confidence={}\n",
+                    Self::tier_for(stat),
                     stat.cache_hit_tokens,
                     stat.cache_miss_tokens,
                     stat.hit_rate_bp(),
