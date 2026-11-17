@@ -27,6 +27,7 @@ Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
 - 分层上下文组装初版：`Session/Project/Shared` scope、引用句柄、稳定前缀/动态尾段、印象对比、三值 autonomy、模型/推理 profile 与真实 usage 校准。
 - 状态层：从 session 事件重建当前/进行中/压缩后的 AI 状态、压缩历史和校验结论；迁移 bundle 可携带该状态层。
+- 上下文压缩：`compact_receipts` 保留最近回执，旧回执折叠为有界摘要（工具、失败 / 不确定、写入路径、输出首行摘录）；摘要预算计入 `max_chars`，截断标记也受单条预算约束。
 - Supervisor：`ProcessSupervisor` 用 OS wait 线程检测退出并自动重启网关；`McpSupervisor` 做 stdio 握手、capability 协商、tools/resources/prompts 分页发现与调用、`McpToolExecutor` 把工具以 `mcp__server__tool` 暴露给模型工具循环（list_changed 动态增删、失败/超时回执）、内置 `OpenAiSamplingHandler`（text/image/audio、includeContext 并发实时读取资源正文）、roots/list_changed、`roots_watch` OS 文件事件监听、logging/setLevel、list_changed 自动刷新、断线重连，并发送含状态层/钩子/cache 的恢复包；采样上下文预取使用有界工作池（`resource_read_concurrency`，默认 8，不截断资源数量或正文长度）；`PortBridge` 保持前端端口常驻；`SupervisorRuntime` + CLI `--supervisor-config <json>` / `--mcp-sampling` 启动并守护 sidecar，运行结束刷新恢复包。
 - 会话迁移：`SessionMigrationBundle` 携带上下文版本、钩子契约、状态层和 cache ledger；缓存只在 provider/model/prefix 兼容时复用，旧上下文只保留已有摘要。
 - Provider 对接：`ContextPlan` 进入 `ProviderRequest`/OpenAI 消息；`context_search` / `context_add` / `context_read` 让 agent 自主搜索、加入动态上下文并读取句柄；inclusion receipt、实际 cache hit/miss 与按 prefix 聚合的 cache ledger 会被记录。
