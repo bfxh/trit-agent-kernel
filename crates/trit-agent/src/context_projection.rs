@@ -73,6 +73,17 @@ pub struct CompactionBoundary {
     pub digest: Option<String>,
 }
 
+/// 送进 prompt 的轻量投影视图；不包含 canonical 历史。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionView {
+    pub epoch: u64,
+    pub generation: u64,
+    pub freshness: Ternary,
+    pub visible: Vec<ProjectionEntry>,
+    #[serde(default)]
+    pub last_compaction: Option<CompactionBoundary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextProjection {
     /// 规范日志：只追加，压缩不删除。
@@ -196,6 +207,16 @@ impl ContextProjection {
 
     pub fn last_compaction(&self) -> Option<&CompactionBoundary> {
         self.boundaries.last()
+    }
+
+    pub fn view(&self) -> ProjectionView {
+        ProjectionView {
+            epoch: self.epoch,
+            generation: self.generation,
+            freshness: self.freshness,
+            visible: self.visible().to_vec(),
+            last_compaction: self.last_compaction().cloned(),
+        }
     }
 }
 

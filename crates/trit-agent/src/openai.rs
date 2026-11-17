@@ -190,7 +190,7 @@ fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value
         context_tail = plan.render_tail();
         context_fingerprint = plan.cache.prefix_fingerprint.clone();
     }
-    let user = json!({
+    let mut user = json!({
         "step": request.step,
         "usage": request.usage,
         "receipts": request.receipts,
@@ -199,6 +199,9 @@ fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value
         "context_fingerprint": context_fingerprint,
         "instruction": "Continue the task. Call tools as needed. When finished, call complete_subtask."
     });
+    if let Some(projection) = &request.projection {
+        user["projection"] = serde_json::to_value(projection).unwrap_or(serde_json::Value::Null);
+    }
     let mut body = json!({
         "model": config.model,
         "messages": [
@@ -714,6 +717,7 @@ mod tests {
             },
             context_digest: None,
             context: None,
+            projection: None,
         }
     }
 
@@ -782,6 +786,36 @@ mod tests {
         assert_eq!(cache.cache_hit_tokens, 80);
         assert_eq!(cache.cache_miss_tokens, 20);
         assert_eq!(cache.cache_hit_rate_bp(), 8_000);
+    }
+
+    #[test]
+    fn builds_projection_view_into_user_prompt() {
+        let mut request = provider_request();
+        request.projection = Some(crate::context_projection::ProjectionView {
+            epoch: 1,
+            generation: 2,
+            freshness: trit_orch::Ternary::Unknown,
+            visible: vec![crate::context_projection::ProjectionEntry {
+                call_id: "call-1".into(),
+                tool: "bash".into(),
+                step: 1,
+                epoch: 1,
+                passed: true,
+                in_doubt: false,
+                written_paths: vec!["a.txt".into()],
+                chars: 5,
+            }],
+            last_compaction: None,
+        });
+        let body = build_request_body(
+            &OpenAiConfig::new("https://example.test/v1", "sk-test", "model-x"),
+            &request,
+        );
+        let user = body["messages"][1]["content"].as_str().unwrap();
+        assert!(user.contains("\"epoch\":1"));
+        assert!(user.contains("\"generation\":2"));
+        assert!(user.contains("call-1"));
+        assert!(user.contains("Unknown"));
     }
 
     #[test]

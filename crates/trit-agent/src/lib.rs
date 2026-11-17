@@ -240,6 +240,8 @@ pub struct TurnContext {
     pub receipts: Vec<ToolOutcome>,
     /// 被压缩掉的旧回执的确定性摘要。
     pub digest: Option<String>,
+    /// 当前 append-only 投影的模型可见视图。
+    pub projection: Option<crate::context_projection::ProjectionView>,
 }
 
 pub trait Model {
@@ -352,6 +354,7 @@ pub struct AgentHost<M, T> {
     cache_ledger: Arc<Mutex<crate::context_layers::CacheLedger>>,
     last_prefix_fingerprint: Option<String>,
     context_projection: crate::context_projection::ContextProjection,
+    receipt_epochs: BTreeMap<String, u64>,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -364,6 +367,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             cache_ledger: Arc::new(Mutex::new(crate::context_layers::CacheLedger::default())),
             last_prefix_fingerprint: None,
             context_projection: crate::context_projection::ContextProjection::new(),
+            receipt_epochs: BTreeMap::new(),
         }
     }
 
@@ -469,6 +473,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             },
         )?;
         self.context_projection.begin_turn();
+        self.receipt_epochs.clear();
         let mut ledger = Ledger::new();
         let mut receipts = Vec::new();
         let mut usage = TokenUsage::default();
@@ -479,6 +484,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             usage,
             receipts: Vec::new(),
             digest: None,
+            projection: None,
         };
 
         for step in 0..self.max_steps {
@@ -540,6 +546,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             }
             context.receipts = compacted.receipts;
             context.digest = compacted.digest;
+            context.projection = Some(self.context_projection.view());
             let proposal = self.model.proposal(&brief, &context)?;
             log_session(
                 &mut session,
@@ -674,6 +681,8 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     },
                 )?;
                 self.context_projection.append(step, &outcome);
+                self.receipt_epochs
+                    .insert(outcome.call_id.clone(), self.context_projection.epoch());
                 receipts.push(outcome);
             }
 
@@ -685,7 +694,19 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                         criteria: claim.criteria.clone(),
                     },
                 )?;
-                let backed = back_claim(claim, &turn.task, &receipts);
+                let active_epoch = self.context_projection.epoch();
+                let evidence: Vec<ToolOutcome> = if active_epoch == 0 {
+                    receipts.clone()
+                } else {
+                    receipts
+                        .iter()
+                        .filter(|outcome| {
+                            self.receipt_epochs.get(&outcome.call_id) == Some(&active_epoch)
+                        })
+                        .cloned()
+                        .collect()
+                };
+                let backed = back_claim(claim, &turn.task, &evidence);
                 let judgment = judge_completion(&brief, &backed)?;
                 let complete = judgment.is_complete();
                 log_session(
@@ -905,7 +926,7 @@ pub use context_layers::{
 };
 pub use context_projection::{
     CompactionBoundary, CompactionInput, ContextProjection, ProjectionEntry, ProjectionError,
-    replay as replay_projection,
+    ProjectionView, replay as replay_projection,
 };
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,

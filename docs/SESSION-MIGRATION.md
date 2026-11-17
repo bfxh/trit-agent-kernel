@@ -5,7 +5,7 @@
 
 ## 1. 迁移什么
 
-一次迁移把下面四类东西作为一个 bundle 处理：
+一次迁移把下面五类东西作为一个 bundle 处理：
 
 ```text
 SessionMigrationBundle {
@@ -14,7 +14,8 @@ SessionMigrationBundle {
   contexts: [ContextVersion],
   hooks: [HookDescriptor],
   cache: CacheLedger,
-  state: Option<StateLayer>
+  state: Option<StateLayer>,
+  projection: Option<ContextProjection>
 }
 ```
 
@@ -23,6 +24,9 @@ SessionMigrationBundle {
 - **钩子**：`id + event + contract_hash + enabled`；没有 contract 的钩子不迁移。
 - **缓存**：按 `provider + model + prefix_fingerprint` 复用的实际 cache ledger。
 - **状态层**：当前状态、进行中的 turn/step/tool、每次压缩后的状态与摘要、校验结论。
+- **投影**：append-only canonical、epoch/generation/freshness 与压缩边界；目标 prefix
+  不一致时 freshness 降为 `Unknown`，旧证据不能继续背书。`migrate_projection=false`
+  时投影不迁移。
 
 ## 2. 缓存迁移契约
 
@@ -89,6 +93,8 @@ SessionMigrationBundle {
 enabled              // 总开关
 migrate_cache        // 是否尝试复用缓存
 migrate_hooks        // 是否迁移钩子
+migrate_state        // 是否迁移状态层
+migrate_projection   // 是否迁移 append-only 投影
 conflict             // PreferIncoming | PreferTarget | Reject
 preserve_superseded  // 是否保留旧摘要
 ```

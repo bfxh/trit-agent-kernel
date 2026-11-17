@@ -61,6 +61,9 @@ pub struct SessionMigrationBundle {
     /// 来源会话的状态层；迁移前可用于展示和校验。
     #[serde(default)]
     pub state: Option<crate::state_layer::StateLayer>,
+    /// 来源会话的 append-only 投影；canonical 与 epoch 一并迁移。
+    #[serde(default)]
+    pub projection: Option<crate::context_projection::ContextProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +93,7 @@ pub struct MigrationPolicy {
     pub migrate_cache: bool,
     pub migrate_hooks: bool,
     pub migrate_state: bool,
+    pub migrate_projection: bool,
     pub conflict: ContextConflictPolicy,
     pub preserve_superseded: bool,
 }
@@ -101,6 +105,7 @@ impl Default for MigrationPolicy {
             migrate_cache: true,
             migrate_hooks: true,
             migrate_state: true,
+            migrate_projection: true,
             conflict: ContextConflictPolicy::PreferIncoming,
             preserve_superseded: true,
         }
@@ -129,6 +134,9 @@ pub struct MigrationReport {
     /// 来源状态层的校验结论；没有迁移状态时为 None。
     #[serde(default)]
     pub state_verdict: Option<trit_orch::Ternary>,
+    /// 迁入投影的当前 epoch；未迁移时为 None。
+    #[serde(default)]
+    pub projection_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +147,7 @@ pub struct MigrationPlan {
     pub hooks: Vec<HookDescriptor>,
     pub cache: Option<CacheLedger>,
     pub state: Option<crate::state_layer::StateLayer>,
+    pub projection: Option<crate::context_projection::ContextProjection>,
     pub report: MigrationReport,
 }
 
@@ -158,6 +167,7 @@ pub fn plan_migration(
             hooks: Vec::new(),
             cache: None,
             state: None,
+            projection: None,
             report,
         };
     }
@@ -246,12 +256,27 @@ pub fn plan_migration(
         report.state_verdict = Some(state.validation.verdict);
     }
 
+    let projection = if policy.migrate_projection {
+        source.projection.clone().map(|mut projection| {
+            if source.prefix_fingerprint != target.prefix_fingerprint {
+                projection.mark_freshness(trit_orch::Ternary::Unknown);
+            }
+            projection
+        })
+    } else {
+        None
+    };
+    if let Some(projection) = &projection {
+        report.projection_epoch = Some(projection.epoch());
+    }
+
     MigrationPlan {
         contexts,
         superseded,
         hooks,
         cache,
         state,
+        projection,
         report,
     }
 }
@@ -289,6 +314,7 @@ mod tests {
             }],
             cache: CacheLedger::default(),
             state: None,
+            projection: None,
         }
     }
 
@@ -389,6 +415,67 @@ mod tests {
         );
         assert!(plan.state.is_none());
         assert!(plan.report.state_verdict.is_none());
+    }
+
+    #[test]
+    fn projection_moves_with_bundle_and_invalidates_on_prefix_change() {
+        let mut source = bundle();
+        let mut projection = crate::context_projection::ContextProjection::new();
+        for call_id in ["call-1", "call-2"] {
+            projection.append(
+                0,
+                &crate::ToolOutcome {
+                    call_id: call_id.into(),
+                    tool: "bash".into(),
+                    command: Some("cargo test".into()),
+                    passed: true,
+                    assertions: 1,
+                    written_paths: Vec::new(),
+                    in_doubt: false,
+                    output: "ok".into(),
+                },
+            );
+        }
+        projection
+            .compact(crate::context_projection::CompactionInput {
+                step: 0,
+                retained: 1,
+                dropped: 1,
+                truncated: 0,
+                dropped_chars: 2,
+                truncated_chars: 0,
+                digest: Some("digest".into()),
+            })
+            .unwrap();
+        projection.mark_freshness(trit_orch::Ternary::True);
+        source.projection = Some(projection);
+
+        let plan = plan_migration(&source, &target(), &MigrationPolicy::default());
+        let migrated = plan.projection.unwrap();
+        assert_eq!(migrated.epoch(), 1);
+        assert_eq!(migrated.freshness(), trit_orch::Ternary::True);
+        assert_eq!(migrated.canonical().len(), 2);
+        assert_eq!(migrated.boundaries().len(), 1);
+        assert_eq!(plan.report.projection_epoch, Some(1));
+
+        let mut other = target();
+        other.prefix_fingerprint = "fnv1a64:other".into();
+        let plan = plan_migration(&source, &other, &MigrationPolicy::default());
+        assert_eq!(
+            plan.projection.unwrap().freshness(),
+            trit_orch::Ternary::Unknown
+        );
+
+        let plan = plan_migration(
+            &source,
+            &target(),
+            &MigrationPolicy {
+                migrate_projection: false,
+                ..MigrationPolicy::default()
+            },
+        );
+        assert!(plan.projection.is_none());
+        assert!(plan.report.projection_epoch.is_none());
     }
 
     #[test]

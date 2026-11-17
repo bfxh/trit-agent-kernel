@@ -40,8 +40,8 @@
 | 2 | Provider 流式输出与工具增量 | `SPEC §3.1`、`provider.Stream` | 部分（首版） | SSE / tool delta 已有；缺多 provider、中断恢复、默认路径接入 | B7.2 |
 | 3 | 模型连接健康 / 别名 / 重试 | `MODEL_CONNECTION_HEALTH.md`、`MODEL_DISPLAY_ALIASES.md` | 部分（首版） | 纯健康状态机已有；缺自动探测、别名、超时分级 | B7.2 |
 | 4 | 工具契约 / 注册表 / schema 规范化 | `TOOL_CONTRACT.md`、`SPEC §3.2` | 部分 | `ToolSpec` 已有，缺 schema 规范化、契约对照测试、工具家族 | B7.1/B7.2 |
-| 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（首版+投影） | `ContextProjection` canonical 只追加；缺把投影直接接入 prompt 组装与跨会话迁移 | B7.3 |
-| 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（首版+epoch） | 压缩事件 / 状态层 / Rebasis / replay 已绑定 epoch 与 freshness；缺按 epoch 失效旧证据的调用侧策略 | B7.3 |
+| 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（投影+prompt+迁移） | `ContextProjection` 进入 prompt、迁移 bundle 携带投影；缺跨设备/跨存储实际落盘 | B7.3 |
+| 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+证据过滤） | 压缩事件 / 状态层 / Rebasis / replay 已绑定；完成裁决按 epoch 过滤旧回执；缺 freshness 恢复与 Plan/Observation 联动 | B7.3 |
 | 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；缺 sidecar 布局、byte parity、重建投影 | B7.7 |
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 已实现；缺持久 journal、operation lease、崩溃恢复 | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分 | 当前是工具开关/沙箱边界；缺逐调用决策、deny 优先、非交互 fail-closed | B7.4 |
@@ -234,11 +234,14 @@ B7.3 首版已落地：
 - provider 未上报 `prefix_changed` 时，指纹变化 / 稳定前缀消失也会产生 `PrefixChanged` 与 Rebasis；
 - provider signal 与本地变化合并原因并去重；仍不改写 provider 的同步调用路径；
 - `ContextProjection`：canonical 回执只追加，压缩移动 visible start，epoch / generation / freshness 进入 session、状态层与 context Rebasis；
-- `replay_projection` 从 JSONL 重建投影并校验 epoch / freshness；真实 AgentHost + SessionLog 回放测试通过。
+- `replay_projection` 从 JSONL 重建投影并校验 epoch / freshness；真实 AgentHost + SessionLog 回放测试通过；
+- `ProjectionView` 进入 `ProviderRequest` 与 OpenAI user prompt；
+- 完成裁决只接受当前 epoch 的回执，压缩前旧证据不能为压缩后完成声明背书；
+- `SessionMigrationBundle` 携带 canonical 投影、epoch 与边界；目标 prefix 不匹配时 freshness 降为 Unknown；迁移测试覆盖开关与跨 prefix 场景。
 
 剩余与下一步：
 
 1. 录制真实 tool-call 流 fixture；当前真实 fixture 只有文本流，tool delta 用内联 chunk。
 2. 补模型别名、超时分级、可重试错误分类，以及可选的 provider 健康接线。
-3. B7.3 继续：把投影直接接入 prompt 组装、按 epoch 失效旧证据、跨会话迁移。
+3. B7.3 继续：freshness 恢复策略、Plan/Observation 与 epoch 联动、跨设备实际落盘。
 4. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。

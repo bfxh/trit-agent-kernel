@@ -247,6 +247,54 @@ fn compacts_old_receipts_before_the_next_provider_call() {
 }
 
 #[test]
+fn compaction_epoch_invalidates_old_evidence() {
+    let provider = ScriptedProvider::new(vec![
+        ProviderResponse {
+            tool_calls: vec![
+                ToolRequest::verification("old-1", "test-old-1"),
+                ToolRequest::verification("old-2", "test-old-2"),
+            ],
+            completion: None,
+            usage: HostUsage::default(),
+            prefix: None,
+            context: None,
+        },
+        ProviderResponse {
+            tool_calls: vec![],
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "c-old".into(),
+                    kind: CriterionKind::Verification {
+                        command: "test-old-1".into(),
+                    },
+                }],
+            }),
+            usage: HostUsage::default(),
+            prefix: None,
+            context: None,
+        },
+    ]);
+    let tools = ScriptedTools::new(vec![
+        verification_outcome("old-1", "test-old-1"),
+        verification_outcome("old-2", "test-old-2"),
+    ]);
+    let mut host =
+        AgentHost::new(ProviderModel::new(provider), tools).with_context(ContextPolicy {
+            max_receipts: 1,
+            max_chars: 100_000,
+            max_output_chars: 1_000,
+        });
+    let outcome = host.run_turn(&turn()).unwrap();
+    assert_eq!(outcome.receipts.len(), 2, "audit keeps old receipts");
+    assert_ne!(
+        outcome.judgment.verdict,
+        EvidenceVerdict::Proved,
+        "old epoch evidence must not back a post-compaction claim"
+    );
+    assert_eq!(host.context_projection().epoch(), 1);
+}
+
+#[test]
 fn context_projection_replays_from_session_log() {
     let provider = ScriptedProvider::new(vec![
         ProviderResponse {

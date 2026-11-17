@@ -49,6 +49,7 @@ pub struct ProviderRequest {
     pub usage: TokenUsage,
     pub context_digest: Option<String>,
     pub context: Option<ContextPlan>,
+    pub projection: Option<crate::context_projection::ProjectionView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +139,7 @@ impl<P: Provider> Model for ProviderModel<P> {
             usage: context.usage,
             context_digest: context.digest.clone(),
             context: plan,
+            projection: context.projection.clone(),
         })?;
         Ok(Proposal {
             tool_calls: response.tool_calls,
@@ -350,6 +352,7 @@ mod tests {
             usage: TokenUsage::default(),
             receipts: Vec::new(),
             digest: None,
+            projection: None,
         };
         model.proposal(&brief, &context).unwrap();
         *catalog_tools.lock().unwrap() = vec![spec("mcp__stub__echo"), spec("mcp__stub__echo2")];

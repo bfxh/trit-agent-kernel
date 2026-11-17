@@ -229,6 +229,7 @@ fn turn_context() -> TurnContext {
         usage: TokenUsage::default(),
         receipts: Vec::new(),
         digest: None,
+        projection: None,
     }
 }
 

@@ -67,6 +67,7 @@ fn provider_request() -> ProviderRequest {
         usage: TokenUsage::default(),
         context_digest: None,
         context: None,
+        projection: None,
     }
 }
 
