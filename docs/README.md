@@ -28,7 +28,7 @@
 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | 现行规范 | 工作区依赖与公开 API |
 | [RIGHTS.md](RIGHTS.md) | 政策草案，非法律意见 | 各仓库 LICENSE / NOTICE |
 | [MERGE-POLICY.md](MERGE-POLICY.md) | 现行流程 | CI 与 PR 模板 |
-| [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7 规划基线 | 尚未开始 B7.1 代码 |
+| [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7.1 契约骨架已落地，待真实 fixture | `reasonix_wire` + fixture harness |
 
 ## 维护规则
 

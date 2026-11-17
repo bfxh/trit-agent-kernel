@@ -208,11 +208,20 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
 - 不为了“对齐上游”而绕过现有 fail-closed 边界。
 - 不把桌面主题、市场、远程 SSH 当作内核能力。
 
-## 7. 下一步
+## 7. 当前进度与下一步
 
-本文件落地后，B7.1 是第一可执行批次：
+B7.1 首版已落地：
 
-1. 锁定基线提交（本文表格）并在测试中记录来源。
-2. 建 `reasonix_wire` 类型与 golden fixture harness，不改变现有运行路径。
-3. 先把 usage / event / tool call 三类 fixture 跑通，再开 B7.2 的流式实现。
+- `reasonix_wire`：`WireUsage` / `WireEvent` / `WireTool` 版本化兼容子集；
+- usage → `HostUsage` / `TokenUsage` 映射，`estimated` 保留，负 token / 负 seq fail-closed；
+- `cacheDiagnostics` → `PrefixSignal` 映射；
+- tool args JSON 解析与 `ToolRequest` 映射（本地 command/paths 留给 B7.2 适配）；
+- fixture harness：版本校验、未知字段保留、三类手写契约 fixture 与回放测试；
+- 未接入 provider / MCP / 工具执行路径，现有行为不变。
+
+剩余与下一步：
+
+1. 用真实 provider/MCP 录制替换或扩充手写 fixture，保留当前字段级回归。
+2. 生成并校验 wire manifest，覆盖更多 `event.kind` 与拒绝路径。
+3. 开 B7.2：流式 provider / tool delta / 连接健康；仍不改动现有同步 provider 的默认行为。
 4. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。

@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "source": "1012905/DeepSeek-Reasonix-rs@5edbda1a71e2cd8acd5cfdf2d7f1f2c5462f4dd9",
+  "name": "event-tool-result-with-usage",
+  "payload": {
+    "kind": "tool_result",
+    "seq": 42,
+    "text": "read src/lib.rs",
+    "detail": "read_file",
+    "code": "ok",
+    "reasoning": "the file exists",
+    "tool": {
+      "id": "call-1",
+      "name": "read_file",
+      "args": "{\"path\":\"src/lib.rs\"}",
+      "resolvedName": "read_file",
+      "capabilityId": "fs.read",
+      "output": "pub fn main() {}",
+      "readOnly": true,
+      "durationMs": 12
+    },
+    "usage": {
+      "promptTokens": 1200,
+      "completionTokens": 300,
+      "totalTokens": 1500,
+      "cacheHitTokens": 900,
+      "cacheMissTokens": 300,
+      "estimated": false
+    },
+    "err": "",
+    "cancelled": false,
+    "outcome": "success",
+    "nonPersistable": true,
+    "retryAttempt": 1
+  }
+}

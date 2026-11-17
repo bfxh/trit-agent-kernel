@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "source": "1012905/DeepSeek-Reasonix-rs@5edbda1a71e2cd8acd5cfdf2d7f1f2c5462f4dd9",
+  "name": "usage-cache-diagnostics",
+  "payload": {
+    "promptTokens": 1200,
+    "completionTokens": 300,
+    "totalTokens": 1500,
+    "cacheHitTokens": 900,
+    "cacheMissTokens": 300,
+    "reasoningTokens": 64,
+    "estimated": false,
+    "source": "provider",
+    "attemptId": "attempt-1",
+    "cacheDiagnostics": {
+      "prefixHash": "sha256:prefix",
+      "prefixChanged": true,
+      "prefixChangeReasons": ["compaction"],
+      "systemHash": "sha256:system",
+      "toolsHash": "sha256:tools",
+      "logRewriteVersion": 3,
+      "toolSchemaTokens": 128,
+      "cacheMissTokens": 300,
+      "cacheHitTokens": 900,
+      "carriedMessages": 12,
+      "bodyChanged": false,
+      "bodyHash": "sha256:body"
+    },
+    "sessionCacheHitTokens": 5000,
+    "sessionCacheMissTokens": 1000,
+    "cost": 0.0042,
+    "currency": "USD",
+    "currencyCode": "USD",
+    "costUsd": 0.0042,
+    "costComplete": true,
+    "displayComplete": true,
+    "displayStatus": "complete",
+    "aggregateMode": "provider"
+  }
+}

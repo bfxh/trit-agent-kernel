@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "source": "1012905/DeepSeek-Reasonix-rs@5edbda1a71e2cd8acd5cfdf2d7f1f2c5462f4dd9",
+  "name": "tool-shell-call",
+  "payload": {
+    "id": "call-2",
+    "name": "shell",
+    "args": "{\"command\":\"cargo test\"}",
+    "resolvedName": "bash",
+    "capabilityId": "shell.exec",
+    "output": "",
+    "readOnly": false,
+    "truncated": false,
+    "durationMs": 1200,
+    "parentId": "turn-1",
+    "issuer": "model",
+    "attemptId": "attempt-2",
+    "partial": false
+  }
+}
