@@ -1,4 +1,4 @@
-# 交接：构建 + 安全措施（给接手本仓库的智能体）
+# 交接：构建 + 安全措施（给接手方）
 
 > 两条硬要求：**构建必须能一键判定红/绿**，**安全门必须默认开、可审计**。
 > 这里写清现状、缺口和逐条可执行的做法；不要把「本机能编过」当成保障。
@@ -52,7 +52,7 @@ git remote -v
 - `scripts/secret_scan.py`、`scripts/ai_vendor_scan.py`（身份/密钥）
 - `scripts/repo_admission.py` + `docs/ADMISSION.md`（什么能进版本库）
 - `scripts/hazard_gate.py`（unsafe / Relaxed / 裸分配）
-- `docs/COLLAB.md §10`（多智能体防丢失：阶段完成即 push、不留 stash、删目录前归档）
+- `docs/COLLAB.md §10`（多接手方防丢失：阶段完成即 push、不留 stash、删目录前归档）
 
 ## 4. 两个同名 `trit-agent` 的区分（别改错仓库）
 

@@ -2,11 +2,15 @@
 
 [![CI](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml)
 
-Rust 三值（ternary）智能体内核。**实验阶段，WIP，不承诺稳定 API。**
+Rust 三值（ternary）**决策状态机内核（含编排）**。**实验阶段，WIP，不承诺稳定 API。**
 
-本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出智能体相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与无头宿主能力。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
+本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出决策状态机相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与编排（`trit-orch`）。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
 
-> 注意：本仓库与 [`bfxh/trit-agent`](https://github.com/bfxh/trit-agent)（Minecraft 角色托管项目）不是同一个项目。
+> **与 [`bfxh/trit-agent`](https://github.com/bfxh/trit-agent) 的关系**：同一套三值决策状态机的两个切片。
+> 本仓库是**内核 + 编排**（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix` / 无头 `trit-agent` 宿主）；
+> `trit-agent` 仓库是**面向 Minecraft 的具体宿主**（零依赖纯 std 的守护进程 + 游戏侧交互）。
+> 两者共用 `trit-agent` 这个名字，但**内核以本仓库为准**，宿主仓库只实现 I/O 与游戏交互。
+> 它是决策状态机，不是「智能体」：每步输出 `True / Unknown / False`，`Unknown` 一律弃权。
 
 ## Crates
 
