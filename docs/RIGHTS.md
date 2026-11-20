@@ -9,7 +9,7 @@
 | 层 | 代码 | 许可 / 条款 | 商业使用 | 修改 / 分发 | 品牌 |
 | --- | --- | --- | --- | --- | --- |
 | L0 原生三进制 | `trit-core` | MIT OR Apache-2.0 | 允许 | 允许，保留版权 / 许可 / NOTICE；Apache 含专利授权 | 不自动获得项目商标 |
-| L1 内核 | `trit-schedule` / `trit-orch` / `trit-reasonix` / `trit-agent` | MIT OR Apache-2.0 + NOTICE | 允许 | 允许，保留声明；不得移除 NOTICE | 不自动获得“官方”标识 |
+| L1 内核 | `trit-schedule` / `trit-orch` / `trit-reasonix` / `trit-host` | MIT OR Apache-2.0 + NOTICE | 允许 | 允许，保留声明；不得移除 NOTICE | 不自动获得“官方”标识 |
 | L2 官方桌面 / 云 | 桌面、托管服务、企业版 | 单独商业条款 / EULA（如启用） | 按合同 | 按合同 | 可授权使用官方标识 |
 | L3 插件 / 集成 | 第三方扩展、MCP server | 各自许可，必须声明 | 由作者决定 | 由作者决定 | 不得冒充官方 |
 | 数据 | 用户会话、日志、模型输入输出 | 不随代码许可授予 | 用户保留权利 | 不适用 | 不适用 |

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use trit_agent::tools::WorkspaceConfig;
-use trit_agent::{
+use trit_host::tools::WorkspaceConfig;
+use trit_host::{
     AgentError, CacheObservation, ContextReceipt, HeadlessConfig, Proposal, SESSION_SCHEMA,
     ScriptedModel, ScriptedTools, Session, SessionEvent, SessionLog, ToolOutcome, ToolRequest,
     recovery_context_for_session, run_headless,
@@ -12,7 +12,7 @@ use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, Tu
 fn temp_workspace(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-session-{tag}-{}-{:?}",
+        "trit-host-session-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -24,7 +24,7 @@ fn temp_workspace(tag: &str) -> PathBuf {
 fn temp_file(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-session-{tag}-{}-{:?}.jsonl",
+        "trit-host-session-{tag}-{}-{:?}.jsonl",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -85,7 +85,7 @@ fn config(root: &std::path::Path, session: Option<PathBuf>) -> HeadlessConfig {
         workspace,
         max_steps: 2,
         session,
-        context: trit_agent::ContextPolicy::default(),
+        context: trit_host::ContextPolicy::default(),
     }
 }
 
@@ -307,7 +307,7 @@ fn reopening_a_session_rebuilds_the_cache_ledger() {
 
 #[test]
 fn legacy_compaction_event_defaults_char_counts() {
-    let record: trit_agent::SessionRecord = serde_json::from_str(
+    let record: trit_host::SessionRecord = serde_json::from_str(
         r#"{"schema":1,"seq":1,"event":{"type":"context_compacted","step":0,"dropped":1,"truncated":0,"digest":"d"}}"#,
     )
     .unwrap();
@@ -349,7 +349,7 @@ fn recovery_context_rebuilds_from_session_log() {
     let recovery = recovery_context_for_session(&path).unwrap();
     assert_eq!(recovery.session_id.as_deref(), path.to_str());
     let state = recovery.state.expect("state layer");
-    assert_eq!(state.state, trit_agent::AgentState::Finished);
+    assert_eq!(state.state, trit_host::AgentState::Finished);
     assert_eq!(state.turns, 1);
     assert_eq!(state.validation.verdict, trit_orch::Ternary::True);
     assert!(recovery.cache.is_some());
@@ -373,7 +373,7 @@ fn session_exposes_state_layer_and_validation() {
     .unwrap();
     session.run_turn(&turn()).unwrap();
     let state = session.state_layer().unwrap();
-    assert_eq!(state.state, trit_agent::AgentState::Finished);
+    assert_eq!(state.state, trit_host::AgentState::Finished);
     assert_eq!(state.turns, 1);
     assert_eq!(state.completed_turns, 1);
     assert!(state.in_progress.is_none());

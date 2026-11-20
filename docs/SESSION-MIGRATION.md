@@ -1,6 +1,6 @@
 # 会话迁移与网关/MCP 重启
 
-> 状态：迁移计划已实现为 `crates/trit-agent/src/session_migration.rs`；
+> 状态：迁移计划已实现为 `crates/trit-host/src/session_migration.rs`；
 > 网关/MCP supervisor 是**契约提案**，当前仓库还没有网关或 MCP 运行时。
 
 ## 1. 迁移什么
@@ -105,7 +105,7 @@ preserve_superseded  // 是否保留旧摘要
 
 ## 7. 网关与 MCP 自动重启（实现）
 
-`crates/trit-agent/src/supervisor.rs` 已实现：
+`crates/trit-host/src/supervisor.rs` 已实现：
 
 - `ProcessSupervisor`：启动/监控/退避重启子进程，`max_attempts=0` 表示只启动不重启；
   子进程退出由阻塞在 OS wait 上的监视线程发事件，不再用 `try_wait` 轮询；

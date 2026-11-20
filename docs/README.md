@@ -23,7 +23,7 @@
 | 文档 | 状态 | 对应实现 |
 | --- | --- | --- |
 | [STARTUP-AND-GAME-MODE.md](STARTUP-AND-GAME-MODE.md) | 设计契约，桌面宿主待接入 | 内核不直接管理桌面进程 |
-| [FRONTEND-CONTRACT.md](FRONTEND-CONTRACT.md) | 门禁库已实现，桌面适配待接入 | `crates/trit-agent/src/frontend_compat.rs` |
+| [FRONTEND-CONTRACT.md](FRONTEND-CONTRACT.md) | 门禁库已实现，桌面适配待接入 | `crates/trit-host/src/frontend_compat.rs` |
 | [RESPONSIBILITY.md](RESPONSIBILITY.md) | 现行流程 | GitHub 标签 / CODEOWNERS 待逐仓配置 |
 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | 现行规范 | 工作区依赖与公开 API |
 | [RIGHTS.md](RIGHTS.md) | 政策草案，非法律意见 | 各仓库 LICENSE / NOTICE |

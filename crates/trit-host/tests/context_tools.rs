@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use trit_agent::{
+use trit_host::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentError, CacheClass, CacheLedger,
     CacheObservation, CachePressurePolicy, ContextDocument, ContextKind, ContextPlan,
     ContextPlanner, ContextReadTools, ContextRef, ContextRequest, ContextScope, ContextSelection,
@@ -164,7 +164,7 @@ fn agent_can_search_add_and_read_dynamic_context() {
     assert_eq!(plan.cache.dynamic_items, 2);
     assert!(
         plan.degradations
-            .contains(&trit_agent::ContextDegradation::DynamicPrefixOverride)
+            .contains(&trit_host::ContextDegradation::DynamicPrefixOverride)
     );
     let receipt = plan.inclusion_receipt();
     assert!(receipt.handles.contains(&handle));
@@ -178,10 +178,10 @@ fn agent_context_denies_add_when_autonomy_is_not_allowed() {
     let error = context.add("doc").unwrap_err();
     assert!(matches!(
         error,
-        trit_agent::ContextError::AlreadyIncluded(_)
+        trit_host::ContextError::AlreadyIncluded(_)
     ));
     let error = context.add("missing").unwrap_err();
-    assert!(matches!(error, trit_agent::ContextError::AutonomyDenied(_)));
+    assert!(matches!(error, trit_host::ContextError::AutonomyDenied(_)));
 }
 
 #[test]
@@ -309,7 +309,7 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
         .with_cache_pressure_policy(CachePressurePolicy {
             dynamic_budget_scale_bp: 5_000,
             search_limit_scale_bp: 5_000,
-            search_order: trit_agent::SearchOrder::PreferDynamic,
+            search_order: trit_host::SearchOrder::PreferDynamic,
             task_selection: trit_orch::SelectionPressure::LowCacheHit,
         });
     let plan = planner.plan(&brief(), &turn_context()).unwrap().unwrap();
@@ -317,7 +317,7 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
     assert_eq!(shared.lock().unwrap().search_limit_scale_bp(), 5_000);
     assert_eq!(
         shared.lock().unwrap().search_order(),
-        trit_agent::SearchOrder::PreferDynamic
+        trit_host::SearchOrder::PreferDynamic
     );
     assert_eq!(
         plan.cache.task_selection,
@@ -331,7 +331,7 @@ fn planner_calibrates_hit_potential_from_actual_cache_ledger() {
     assert_eq!(shared.lock().unwrap().search_limit_scale_bp(), 10_000);
     assert_eq!(
         shared.lock().unwrap().search_order(),
-        trit_agent::SearchOrder::Resolver
+        trit_host::SearchOrder::Resolver
     );
     assert_eq!(
         plan.cache.task_selection,
@@ -372,7 +372,7 @@ fn cache_pressure_scales_search_candidates() {
     assert_eq!(agent.search("doc", 10).len(), 5);
     agent.set_search_limit_scale_bp(10_000);
     assert_eq!(agent.search("doc", 10).len(), 10);
-    agent.set_search_order(trit_agent::SearchOrder::PreferDynamic);
+    agent.set_search_order(trit_host::SearchOrder::PreferDynamic);
     let ordered = agent.search("doc", 10);
     assert_eq!(
         ordered.last().map(|reference| reference.id.as_str()),

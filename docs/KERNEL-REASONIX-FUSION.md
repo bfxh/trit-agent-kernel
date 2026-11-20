@@ -190,7 +190,7 @@ Reasonix 的测量纪律值得照抄：固定模型、读宿主事实、报告 c
 Reasonix 的四种表面（TUI / Studio / Web / ACP）都不是 Rust 内核的前置条件。
 先把“无头宿主”做出来，UI 以后接：
 
-- `trit-agent run`：读一个 JSON proposal 脚本，执行工具、效果台账、完成裁决，
+- `trit-host run`：读一个 JSON proposal 脚本，执行工具、效果台账、完成裁决，
   输出结构化 JSON；退出码 0 表示 `Proved`，1 表示未完成，2 表示运行错误。
 - 本地工具：`read_file` / `write_file` / `bash`；
   - 所有路径先做词法归一化，再检查是否仍在 workspace root 内；
@@ -242,7 +242,7 @@ Reasonix 的四种表面（TUI / Studio / Web / ACP）都不是 Rust 内核的�
     git 后端删除旧 ref 后执行 `gc --prune=now`。
   - `rewind_session` / `rewind_session_git` 可恢复 code、截断 conversation，或两者都做。
     CLI：`--checkpoint-dir <dir> --checkpoint-backend files|git` 记录，
-    `trit-agent rewind` 用相同后端参数回退。
+    `trit-host rewind` 用相同后端参数回退。
 - **context 压缩**：`ContextPolicy` 保留最近 receipts + 字符预算，旧回执折叠成确定性摘要
   （工具名、失败/in-doubt 计数、写入路径数）；全量回执仍在 `TurnOutcome` / session，
   压缩只影响模型上下文；session 记 `ContextCompacted`。CLI 可调
@@ -509,7 +509,7 @@ Reasonix 的 `Usage` 明确区分 provider-reported 与 `estimated`，且“未�
 5. **写权威矩阵测试**：模拟“Reasonix 说写了 / 内核说没写”的分歧，确保适配层不会制造第二个真相。
 6. **等 Rust parity 后接进程内形态**：在 Reasonix `crates/` 新增薄 `orch` crate 依赖 `trit-orch`，
    复用其 golden fixtures；Go 宿主继续用 sidecar，两边跑同一套契约测试。
-   `crates/trit-agent` 是这一步之前的独立 Rust 宿主骨架，可整体或按模块移植。
+   `crates/trit-host` 是这一步之前的独立 Rust 宿主骨架，可整体或按模块移植。
 
 ---
 
@@ -523,14 +523,14 @@ Reasonix 的 `Usage` 明确区分 provider-reported 与 `estimated`，且“未�
   - `judge_completion()`：三值 / Belnap 判定 + 遵循度检查；
   - `TurnSpec::task_spec()`：objective/constraints/stop_when/produces；
   - `HostToolCall::effect_spec()/claim_paths()`：写工具效果与路径。
-- 新 crate `crates/trit-agent`：Rust 无头宿主。
+- 新 crate `crates/trit-host`：Rust 无头宿主。
   - `Model` / `ToolExecutor` trait，不绑定 provider、异步运行时或 UI；
   - `AgentHost::run_turn`：选批 → brief → 模型提议 → 工具执行 → 效果台账 →
     宿主逐条背书 criterion → `judge_completion`；
   - `LocalTools`：`read_file` / `write_file` / `bash`；workspace 边界，symlink / 硬链接拒绝，
     shell 默认拒绝并要求外部 OS 沙箱（或显式无沙箱降级）；
   - `PlanPatch` 效果声明、`PrefixSignal` → Rebasis、session JSONL；
-  - `trit-agent run` CLI：scripted / openai、效果与 shell 权限、session；
+  - `trit-host run` CLI：scripted / openai、效果与 shell 权限、session；
   - 写工具在真正执行前 `prepare` + `mark_sending`，结果不明进 `Unknown`；
   - 步数上限、工具结果错配、空提议、task 不匹配都 fail-closed。
 - 测试：适配层 9 条 + 宿主 46 条；全 workspace 333 个 test target、3080 项通过、0 失败、1 ignored。

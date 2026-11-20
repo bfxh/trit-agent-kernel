@@ -383,7 +383,7 @@ TokUI（JBoltAI，MIT）提供了“后端 DSL → SSE/WebSocket → 前端增�
 
 ## 10. 与现有代码的映射
 
-> **实现状态（2026-11-15）**：第一刀已落在 `crates/trit-agent/src/context_layers.rs`：
+> **实现状态（2026-11-15）**：第一刀已落在 `crates/trit-host/src/context_layers.rs`：
 > `ContextRef` / `ContextDocument` / `InMemoryContext` / `ModelProfile` / `ReasoningEffort` /
 > `assemble_context`，覆盖 scope 校验、句柄/摘要/全文预算、工具/`context_read` 能力降级、
 > 稳定前缀/动态尾段、`PriorImpression` 对比、三值 autonomy 闸门与真实 usage 校准。

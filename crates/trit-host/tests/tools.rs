@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
-use trit_agent::{
+use trit_host::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
+use trit_host::{
     AgentError, HeadlessConfig, Proposal, ScriptedModel, ToolExecutor, ToolRequest,
     effect_confirmed, run_headless,
 };
@@ -11,7 +11,7 @@ use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, Tu
 fn temp_workspace(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-{tag}-{}-{:?}",
+        "trit-host-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -280,7 +280,7 @@ fn headless_run_writes_and_proves_from_local_receipts() {
             workspace,
             max_steps: 2,
             session: None,
-            context: trit_agent::ContextPolicy::default(),
+            context: trit_host::ContextPolicy::default(),
         },
     )
     .unwrap();
@@ -315,7 +315,7 @@ fn headless_run_rejects_escape_before_writing() {
             workspace,
             max_steps: 2,
             session: None,
-            context: trit_agent::ContextPolicy::default(),
+            context: trit_host::ContextPolicy::default(),
         },
     )
     .unwrap_err();
@@ -331,7 +331,7 @@ fn headless_run_rejects_escape_before_writing() {
 fn hardlinked_files_are_rejected() {
     let root = temp_workspace("hardlink");
     let outside = root.parent().unwrap().join(format!(
-        "trit-agent-outside-{}-{:?}.txt",
+        "trit-host-outside-{}-{:?}.txt",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -357,7 +357,7 @@ fn symlinks_are_rejected() {
 
     let root = temp_workspace("symlink");
     let outside = root.parent().unwrap().join(format!(
-        "trit-agent-symlink-outside-{}-{:?}.txt",
+        "trit-host-symlink-outside-{}-{:?}.txt",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -408,7 +408,7 @@ fn shell_requires_a_sandbox_or_explicit_unsandboxed_opt_in() {
 fn writes_through_hardlinks_are_rejected() {
     let root = temp_workspace("hardlink-write");
     let outside = root.parent().unwrap().join(format!(
-        "trit-agent-hardlink-write-{}-{:?}.txt",
+        "trit-host-hardlink-write-{}-{:?}.txt",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -440,7 +440,7 @@ fn writes_through_symlinks_and_symlinked_dirs_are_rejected() {
 
     let root = temp_workspace("symlink-write");
     let outside_dir = root.parent().unwrap().join(format!(
-        "trit-agent-symlink-dir-{}-{:?}",
+        "trit-host-symlink-dir-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));

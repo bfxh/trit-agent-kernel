@@ -9,7 +9,7 @@
 ```text
 L3  前端 / 桌面 / CLI 展示 / 编辑器插件
         │
-L2  trit-agent（无头宿主：模型循环、工具、MCP、会话、检查点、缓存）
+L2  trit-host（无头宿主：模型循环、工具、MCP、会话、检查点、缓存）
         │
 L1  trit-schedule   trit-orch   trit-reasonix
         │
@@ -30,7 +30,7 @@ L4  第三方 crate / 模型 API / OS / MCP server
 | L1 | `trit-schedule` | 三值依赖 DAG 的静态调度 | L0 | 内核维护者 | MIT OR Apache-2.0 |
 | L1 | `trit-orch` | 准入、快照、义务 / 证据、预算、影子学习、`tick` | L0/L1 | 内核维护者 | MIT OR Apache-2.0 |
 | L1 | `trit-reasonix` | 完成声明、证据裁决、用量适配 | L0/L1 | 内核维护者 | MIT OR Apache-2.0 |
-| L2 | `trit-agent` | 模型 / 工具循环、MCP、工具边界、会话、检查点、上下文 / 缓存 | L0/L1 | 内核维护者 | MIT OR Apache-2.0 |
+| L2 | `trit-host` | 模型 / 工具循环、MCP、工具边界、会话、检查点、上下文 / 缓存 | L0/L1 | 内核维护者 | MIT OR Apache-2.0 |
 | L3 | 前端 / 桌面 | 展示、启动调度、游戏模式、扩展坞 | L2 + 前端契约 | 前端维护者 | 按仓库 |
 | L4 | 第三方 | crate、模型、MCP server、OS 工具 | 不适用 | 引入方 | 逐个审计 |
 
@@ -116,7 +116,7 @@ trit-core.workspace = true
 
 ```toml
 [dependencies]
-trit-core = { git = "https://github.com/bfxh/trit-agent-kernel", tag = "v0.1.0" }
+trit-core = { git = "https://github.com/bfxh/trit-kernel", tag = "v0.1.0" }
 ```
 
 规则：
@@ -161,7 +161,7 @@ Reasonix 是 MIT 许可的参考实现。移植其架构或代码时保留版权
 说明：
 
 - `notify` 是 CC0-1.0（公共领域奉献），仍需在 NOTICE / 第三方清单中保留来源与版本。
-- `ureq` 的 TLS 传递依赖（`ring` / `rustls` 等）未列入本表；CI 的 LoongArch 检查因此只覆盖不含 `trit-agent` 的核心 crates。要宣称全栈 LoongArch 支持，必须先解决或替换该 TLS 栈。
+- `ureq` 的 TLS 传递依赖（`ring` / `rustls` 等）未列入本表；CI 的 LoongArch 检查因此只覆盖不含 `trit-host` 的核心 crates。要宣称全栈 LoongArch 支持，必须先解决或替换该 TLS 栈。
 - 这张表只列直接依赖。发布前必须用工具生成完整传递依赖清单，不能用手写表代替许可证扫描。
 
 ## 8. 上层组件检查清单

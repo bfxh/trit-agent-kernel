@@ -1124,7 +1124,7 @@ P5.5 已完成长期窗口：`windowed(n)` 显式 opt-in、整批丢弃、安全
 语义抽取、干预效果度量与学习型策略未接。
 指标层已落地：`OrchestrationMetrics::capture` 汇总并发、token、缓存命中、选批压力、
 引导与义务计数，并支持 `trit_orch_*` Prometheus 导出；墙钟耗时仍由宿主测量。
-Rust 宿主骨架 `trit-agent` 已落地：模型/工具 trait、turn 循环、效果台账与完成裁决；
+Rust 宿主骨架 `trit-host` 已落地：模型/工具 trait、turn 循环、效果台账与完成裁决；
 Reasonix 适配层 `trit-reasonix` 已落地 usage/完成声明映射。
 
 结构性缺口已闭合：义务 → PlanPatch 覆盖全部八种 kind + Pending 目标 + 自动证据回写 +
@@ -1211,7 +1211,7 @@ Reasonix 适配层 `trit-reasonix` 已落地 usage/完成声明映射。
 | 轨迹与时序 | `shadow.rs` / `trace.rs` / `trace_store.rs` / `trace_merge.rs` / `trace_invariants.rs` | T1–T5 已完成：事件流、双时间、因果、回放、指标、脱敏、HLC 归并、不变量；详见 [TRACE-AND-TIME.md](TRACE-AND-TIME.md) |
 | 编排指标 | `orch_metrics.rs`（`OrchestrationMetrics`） | 已落地：并发、token、缓存命中、选批压力、阻塞原因、引导 / 义务计数；Prometheus gauge 导出；墙钟耗时由宿主测量 |
 | Reasonix 适配 | `crates/trit-reasonix`（`HostUsage` / `CompletionClaim` / `claim_rails` / `judge_completion` / `TurnSpec`） | 已落地：host usage（含 estimated）、完成声明 → 双轨证据 → 三值/Belnap 判定 + 遵循度；宿主事件循环与 PlanPatch 接线待补 |
-| Rust 宿主骨架 | `crates/trit-agent`（`Model` / `ToolExecutor` / `AgentHost` / `LocalTools` / `Provider` / `OpenAiProvider` / `SessionLog` / CLI） | 已落地：无头 turn 循环、workspace 边界、cap-std 目录能力 + no-follow、句柄级硬链接计数、shell 外部沙箱策略、多轮 session 恢复、context 压缩、checkpoint/rewind、PlanPatch 效果声明、效果台账、宿主背书、完成裁决、HTTP provider、prefix→Rebasis、session JSONL；内置 OS 沙箱 / 多轮恢复 / 压缩待补 |
+| Rust 宿主骨架 | `crates/trit-host`（`Model` / `ToolExecutor` / `AgentHost` / `LocalTools` / `Provider` / `OpenAiProvider` / `SessionLog` / CLI） | 已落地：无头 turn 循环、workspace 边界、cap-std 目录能力 + no-follow、句柄级硬链接计数、shell 外部沙箱策略、多轮 session 恢复、context 压缩、checkpoint/rewind、PlanPatch 效果声明、效果台账、宿主背书、完成裁决、HTTP provider、prefix→Rebasis、session JSONL；内置 OS 沙箱 / 多轮恢复 / 压缩待补 |
 | 多智能体总线仲裁 | `src/lanes.rs`（`resolve_lanes`、`LaneState`、`LaneDispute`） | P3 已完成：HighZ 弃权、同值一致、冲突列出全部 active 驱动方 |
 | 三种预算 | `budget_book.rs`（`BudgetBook` / `BudgetSplit` / `BudgetReport`、`schedule_obligations_with_budget`、`dispatch_with_execution_budget`） | 已落地：三池 + 人的预算；执行预留/结算/释放 + 义务扣费；评分版调度已接入 |
 | 未定质量 | `mass.rs`（`UndecidedMass` / `undecided_mass`） | 已落地：U 计 1、Conflict 计 2；缺证据/过期/epoch 不匹配按 U；`decreased_from` 验收 |

@@ -1,4 +1,4 @@
-use trit_agent::{
+use trit_host::{
     AgentError, AgentHost, Proposal, ScriptedModel, ScriptedTools, ToolOutcome, ToolRequest,
     effect_confirmed,
 };

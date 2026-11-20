@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use trit_agent::{
+use trit_host::{
     AutonomyPolicy, CacheClass, ContextDegradation, ContextDetail, ContextDocument,
     ContextDropReason, ContextError, ContextKind, ContextRef, ContextRequest, ContextScope,
     ContextSelection, ImpressionDelta, InMemoryContext, ModelProfile, PriorImpression,
@@ -686,8 +686,8 @@ fn estimated_or_mismatched_calibration_is_not_trusted() {
 
 struct NoSuchResolver;
 
-impl trit_agent::ContextResolver for NoSuchResolver {
-    fn resolve(&self, _id: &str) -> Result<Option<trit_agent::ResolvedContext>, ContextError> {
+impl trit_host::ContextResolver for NoSuchResolver {
+    fn resolve(&self, _id: &str) -> Result<Option<trit_host::ResolvedContext>, ContextError> {
         Ok(None)
     }
 }
@@ -702,9 +702,9 @@ fn prior(reference: &ContextRef) -> PriorImpression {
 
 #[test]
 fn cache_ledger_calibrates_prefix_hit_potential_from_real_observations() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     for _ in 0..3 {
-        ledger.observe(&trit_agent::CacheObservation {
+        ledger.observe(&trit_host::CacheObservation {
             provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:ok".into(),
@@ -731,9 +731,9 @@ fn cache_ledger_calibrates_prefix_hit_potential_from_real_observations() {
 
 #[test]
 fn estimated_cache_samples_do_not_move_calibrated_rate() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     for _ in 0..3 {
-        ledger.observe(&trit_agent::CacheObservation {
+        ledger.observe(&trit_host::CacheObservation {
             provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:mixed".into(),
@@ -745,7 +745,7 @@ fn estimated_cache_samples_do_not_move_calibrated_rate() {
         });
     }
     for _ in 0..10 {
-        ledger.observe(&trit_agent::CacheObservation {
+        ledger.observe(&trit_host::CacheObservation {
             provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:mixed".into(),
@@ -767,7 +767,7 @@ fn estimated_cache_samples_do_not_move_calibrated_rate() {
 
 #[test]
 fn cache_window_excludes_old_samples() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     for (at, hit, miss) in [
         (1_000, 20, 80),
         (1_000, 20, 80),
@@ -776,7 +776,7 @@ fn cache_window_excludes_old_samples() {
         (10_000, 80, 20),
         (10_000, 80, 20),
     ] {
-        ledger.observe(&trit_agent::CacheObservation {
+        ledger.observe(&trit_host::CacheObservation {
             provider: "p".into(),
             model: "m".into(),
             prefix_fingerprint: "fnv1a64:window".into(),
@@ -790,7 +790,7 @@ fn cache_window_excludes_old_samples() {
     let stat = ledger.stat_for("p", "m", "fnv1a64:window").unwrap();
     let window = stat.windowed(
         Some(10_000),
-        trit_agent::CacheWindow {
+        trit_host::CacheWindow {
             max_samples: 64,
             max_age_ms: Some(5_000),
         },
@@ -801,10 +801,10 @@ fn cache_window_excludes_old_samples() {
 
 #[test]
 fn cache_ledger_separates_provider_endpoints() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     for (provider, hit, miss) in [("https://a", 80, 20), ("https://b", 20, 80)] {
         for _ in 0..3 {
-            ledger.observe(&trit_agent::CacheObservation {
+            ledger.observe(&trit_host::CacheObservation {
                 provider: provider.into(),
                 model: "same-model".into(),
                 prefix_fingerprint: "fnv1a64:same".into(),
@@ -828,8 +828,8 @@ fn cache_ledger_separates_provider_endpoints() {
 
 #[test]
 fn time_window_excludes_untimestamped_legacy_samples() {
-    let mut ledger = trit_agent::CacheLedger::default();
-    ledger.observe(&trit_agent::CacheObservation {
+    let mut ledger = trit_host::CacheLedger::default();
+    ledger.observe(&trit_host::CacheObservation {
         provider: "p".into(),
         model: "m".into(),
         prefix_fingerprint: "fnv1a64:legacy".into(),
@@ -842,7 +842,7 @@ fn time_window_excludes_untimestamped_legacy_samples() {
     let stat = ledger.stat_for("p", "m", "fnv1a64:legacy").unwrap();
     let no_age = stat.windowed(
         Some(10_000),
-        trit_agent::CacheWindow {
+        trit_host::CacheWindow {
             max_samples: 64,
             max_age_ms: None,
         },
@@ -850,7 +850,7 @@ fn time_window_excludes_untimestamped_legacy_samples() {
     assert_eq!(no_age.samples, 1);
     let with_age = stat.windowed(
         Some(10_000),
-        trit_agent::CacheWindow {
+        trit_host::CacheWindow {
             max_samples: 64,
             max_age_ms: Some(5_000),
         },
@@ -860,8 +860,8 @@ fn time_window_excludes_untimestamped_legacy_samples() {
 
 #[test]
 fn cache_ledger_roundtrips_through_json() {
-    let mut ledger = trit_agent::CacheLedger::default();
-    ledger.observe(&trit_agent::CacheObservation {
+    let mut ledger = trit_host::CacheLedger::default();
+    ledger.observe(&trit_host::CacheObservation {
         provider: "p".into(),
         model: "m".into(),
         prefix_fingerprint: "fnv1a64:persist".into(),
@@ -872,20 +872,20 @@ fn cache_ledger_roundtrips_through_json() {
         observed_at_ms: Some(1_000),
     });
     let text = serde_json::to_string(&ledger).unwrap();
-    let restored: trit_agent::CacheLedger = serde_json::from_str(&text).unwrap();
+    let restored: trit_host::CacheLedger = serde_json::from_str(&text).unwrap();
     let stat = restored.stat_for("p", "m", "fnv1a64:persist").unwrap();
     assert_eq!(stat.cache_hit_tokens, 80);
     assert_eq!(stat.recent.len(), 1);
 }
 
 fn record_cache(
-    ledger: &mut trit_agent::CacheLedger,
+    ledger: &mut trit_host::CacheLedger,
     prefix: &str,
     hit: u64,
     miss: u64,
     estimated: bool,
 ) {
-    ledger.observe(&trit_agent::CacheObservation {
+    ledger.observe(&trit_host::CacheObservation {
         provider: "p".into(),
         model: "m".into(),
         prefix_fingerprint: prefix.into(),
@@ -899,7 +899,7 @@ fn record_cache(
 
 #[test]
 fn cache_ledger_lru_evicts_least_recently_used_entry() {
-    let mut ledger = trit_agent::CacheLedger::new(0, 2);
+    let mut ledger = trit_host::CacheLedger::new(0, 2);
     record_cache(&mut ledger, "a", 10, 0, false);
     record_cache(&mut ledger, "b", 20, 0, false);
     record_cache(&mut ledger, "a", 10, 0, false);
@@ -917,7 +917,7 @@ fn cache_ledger_lru_evicts_least_recently_used_entry() {
 
 #[test]
 fn cache_ledger_ttl_drops_expired_entries_but_keeps_legacy_untimestamped() {
-    let mut ledger = trit_agent::CacheLedger::new(1, 0);
+    let mut ledger = trit_host::CacheLedger::new(1, 0);
     record_cache(&mut ledger, "old", 10, 0, false);
     record_cache(&mut ledger, "legacy", 20, 0, false);
 
@@ -925,7 +925,7 @@ fn cache_ledger_ttl_drops_expired_entries_but_keeps_legacy_untimestamped() {
     value["ttl_secs"] = serde_json::json!(1);
     value["entries"]["p|m|old"]["last_accessed"] = serde_json::json!(1);
     value["entries"]["p|m|legacy"]["last_accessed"] = serde_json::json!(0);
-    let mut restored: trit_agent::CacheLedger = serde_json::from_value(value).unwrap();
+    let mut restored: trit_host::CacheLedger = serde_json::from_value(value).unwrap();
 
     record_cache(&mut restored, "fresh", 30, 0, false);
     assert!(restored.stat_for("p", "m", "old").is_none());
@@ -935,7 +935,7 @@ fn cache_ledger_ttl_drops_expired_entries_but_keeps_legacy_untimestamped() {
 
 #[test]
 fn cache_ledger_capacity_repairs_missing_lru_order_after_load() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     record_cache(&mut ledger, "a", 10, 0, false);
     record_cache(&mut ledger, "b", 20, 0, false);
     record_cache(&mut ledger, "c", 30, 0, false);
@@ -943,7 +943,7 @@ fn cache_ledger_capacity_repairs_missing_lru_order_after_load() {
     let mut value = serde_json::to_value(&ledger).unwrap();
     value.as_object_mut().unwrap().remove("lru_order");
     value["max_entries"] = serde_json::json!(2);
-    let mut restored: trit_agent::CacheLedger = serde_json::from_value(value).unwrap();
+    let mut restored: trit_host::CacheLedger = serde_json::from_value(value).unwrap();
 
     record_cache(&mut restored, "d", 40, 0, false);
     assert_eq!(restored.len(), 2);
@@ -956,10 +956,10 @@ fn cache_ledger_capacity_repairs_missing_lru_order_after_load() {
 
 #[test]
 fn cache_ledger_merge_keeps_limits_and_combines_counts() {
-    let mut left = trit_agent::CacheLedger::new(0, 2);
+    let mut left = trit_host::CacheLedger::new(0, 2);
     record_cache(&mut left, "a", 10, 5, false);
     record_cache(&mut left, "b", 20, 5, false);
-    let mut right = trit_agent::CacheLedger::new(0, 2);
+    let mut right = trit_host::CacheLedger::new(0, 2);
     record_cache(&mut right, "a", 30, 5, false);
     record_cache(&mut right, "c", 40, 5, false);
 
@@ -973,7 +973,7 @@ fn cache_ledger_merge_keeps_limits_and_combines_counts() {
 
 #[test]
 fn cache_ledger_tiers_by_hit_quality_and_confidence() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     for _ in 0..3 {
         record_cache(&mut ledger, "hot", 90, 10, false);
     }
@@ -996,7 +996,7 @@ fn cache_ledger_tiers_by_hit_quality_and_confidence() {
 
 #[test]
 fn cache_ledger_capacity_evicts_cold_before_newer_hot() {
-    let mut ledger = trit_agent::CacheLedger::new(0, 2);
+    let mut ledger = trit_host::CacheLedger::new(0, 2);
     for _ in 0..3 {
         record_cache(&mut ledger, "hot", 90, 10, false);
     }
@@ -1016,7 +1016,7 @@ fn cache_ledger_capacity_evicts_cold_before_newer_hot() {
 
 #[test]
 fn cache_ledger_compress_retains_confidence_and_respects_budget() {
-    let mut ledger = trit_agent::CacheLedger::default();
+    let mut ledger = trit_host::CacheLedger::default();
     for _ in 0..3 {
         record_cache(&mut ledger, "high", 80, 20, false);
     }

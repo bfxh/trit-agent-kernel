@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use trit_agent::tools::{LocalTools, WorkspaceConfig};
-use trit_agent::{
+use trit_host::tools::{LocalTools, WorkspaceConfig};
+use trit_host::{
     AgentError, CheckpointStore, CheckpointingTools, Proposal, RewindScope, ScriptedModel,
     ScriptedTools, Session, ToolExecutor, ToolRequest, rewind_session, rewind_session_with_policy,
 };
@@ -11,7 +11,7 @@ use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, Tu
 fn temp_dir(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-ckpt-{tag}-{}-{:?}",
+        "trit-host-ckpt-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -23,7 +23,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn temp_file(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-ckpt-{tag}-{}-{:?}.jsonl",
+        "trit-host-ckpt-{tag}-{}-{:?}.jsonl",
         std::process::id(),
         std::thread::current().id()
     ));

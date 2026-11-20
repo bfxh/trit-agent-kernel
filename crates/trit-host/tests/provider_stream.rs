@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
 use std::thread::JoinHandle;
 
-use trit_agent::{
+use trit_host::{
     OpenAiConfig, OpenAiProvider, OpenAiStreamAssembler, ProviderRequest, ProviderStreamEvent,
     StreamingProvider, read_sse_events,
 };
@@ -61,7 +61,7 @@ fn provider_request() -> ProviderRequest {
             blockers: Vec::new(),
             obligations: Vec::new(),
         },
-        tools: trit_agent::default_tools(),
+        tools: trit_host::default_tools(),
         receipts: Vec::new(),
         step: 0,
         usage: TokenUsage::default(),
@@ -71,7 +71,7 @@ fn provider_request() -> ProviderRequest {
     }
 }
 
-fn assemble(fixture: &str, tools: &[trit_agent::ToolSpec]) -> (String, Vec<ProviderStreamEvent>) {
+fn assemble(fixture: &str, tools: &[trit_host::ToolSpec]) -> (String, Vec<ProviderStreamEvent>) {
     let mut assembler = OpenAiStreamAssembler::new();
     let mut events = Vec::new();
     read_sse_events(Cursor::new(fixture), |event| {
@@ -169,7 +169,7 @@ data: [DONE]
         Ok(())
     })
     .unwrap();
-    let response = assembler.finish(&trit_agent::default_tools()).unwrap();
+    let response = assembler.finish(&trit_host::default_tools()).unwrap();
     assert_eq!(response.tool_calls.len(), 1);
     assert_eq!(response.tool_calls[0].call_id, "call_1");
     assert_eq!(response.tool_calls[0].tool, "bash");

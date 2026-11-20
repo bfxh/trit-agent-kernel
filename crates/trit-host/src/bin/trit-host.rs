@@ -3,8 +3,8 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use trit_agent::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
-use trit_agent::{
+use trit_host::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
+use trit_host::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
     ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
@@ -19,7 +19,7 @@ use trit_reasonix::TurnSpec;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("trit-agent: {error}");
+        eprintln!("trit-host: {error}");
         std::process::exit(2);
     }
 }
@@ -670,9 +670,9 @@ fn fail(message: impl Into<String>) -> Box<dyn Error> {
 
 fn usage() {
     eprintln!(
-        "trit-agent - headless Rust agent host\n\n\
+        "trit-host - headless Rust agent host\n\n\
          usage:\n  \
-         trit-agent run --task <text> --workspace <dir> \\\n    \
+         trit-host run --task <text> --workspace <dir> \\\n    \
          [--provider scripted|openai] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
@@ -709,7 +709,7 @@ fn usage() {
          recovery. --mcp-sampling serves sampling/createMessage with the OpenAI-compatible\n\
          provider (optionally --mcp-sampling-model); roots_watch directories contribute\n\
          roots automatically and changes emit roots/list_changed.\n\n\
-         rewind: trit-agent rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
+         rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
     );
@@ -785,7 +785,7 @@ fn run_rewind(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trit_agent::{
+    use trit_host::{
         CacheClass, ContextDocument, ContextKind, ContextRef, ContextScope, Sensitivity,
     };
 

@@ -1,5 +1,5 @@
-use trit_agent::PrefixSignal;
-use trit_agent::{
+use trit_host::PrefixSignal;
+use trit_host::{
     AgentError, AgentHost, CacheObservation, ContextPlan, ContextPlanner, ContextPolicy,
     ContextReceipt, InclusionReceipt, ProviderModel, ProviderResponse, ScriptedProvider,
     ScriptedTools, SessionEvent, SessionLog, ToolOutcome, ToolRequest, TurnContext,
@@ -346,7 +346,7 @@ fn manual_freshness_recovery_keeps_completion_blocked() {
             max_chars: 100_000,
             max_output_chars: 1_000,
         })
-        .with_freshness_recovery(trit_agent::FreshnessRecovery::Manual);
+        .with_freshness_recovery(trit_host::FreshnessRecovery::Manual);
     let outcome = host.run_turn(&turn()).unwrap();
     assert_eq!(host.context_projection().freshness(), Ternary::Unknown);
     assert_ne!(outcome.judgment.verdict, EvidenceVerdict::Proved);
@@ -405,7 +405,7 @@ fn context_projection_replays_from_session_log() {
     let records = log.load().unwrap();
     let replayed = replay_projection(&records).unwrap();
     assert_eq!(replayed, live);
-    let state = trit_agent::state_layer(&records);
+    let state = trit_host::state_layer(&records);
     let compaction = state.last_compaction().unwrap();
     assert_eq!(compaction.retained, Some(1));
     assert_eq!(compaction.epoch_before, Some(0));

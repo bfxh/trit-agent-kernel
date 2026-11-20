@@ -1191,7 +1191,7 @@ impl McpConnection {
             serde_json::json!({
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": features.capabilities(),
-                "clientInfo": {"name": "trit-agent", "version": "0.1.0"}
+                "clientInfo": {"name": "trit-host", "version": "0.1.0"}
             }),
             timeout,
         )?;

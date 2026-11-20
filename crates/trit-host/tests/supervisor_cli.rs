@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use trit_agent::{ProcessSpec, Proposal, RestartPolicy, SupervisorConfig, ToolRequest};
+use trit_host::{ProcessSpec, Proposal, RestartPolicy, SupervisorConfig, ToolRequest};
 use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-supervisor-cli-{tag}-{}-{:?}",
+        "trit-host-supervisor-cli-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -105,7 +105,7 @@ fn cli_exposes_and_executes_mcp_tools() {
     };
     std::fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .args([
             "run",
             "--task",
@@ -176,7 +176,7 @@ fn cli_executes_native_search_tools() {
         },
     ];
     std::fs::write(&script_path, serde_json::to_string(&proposals).unwrap()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .args([
             "run",
             "--task",
@@ -216,7 +216,7 @@ stderr: {stderr}"
 #[test]
 fn cli_rejects_sampling_without_openai_provider() {
     let root = temp_dir("sampling");
-    let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .args([
             "run",
             "--task",
@@ -283,7 +283,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
     };
     std::fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_trit-agent"))
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .args([
             "run",
             "--task",

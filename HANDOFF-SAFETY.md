@@ -54,9 +54,9 @@ git remote -v
 - `scripts/hazard_gate.py`（unsafe / Relaxed / 裸分配）
 - `docs/COLLAB.md §10`（多接手方防丢失：阶段完成即 push、不留 stash、删目录前归档）
 
-## 4. 两个同名 `trit-agent` 的区分（别改错仓库）
+## 4. 两个宿主的区分（别改错仓库）
 
-- `bfxh/trit-agent-kernel` 的 `crates/trit-agent`：无头宿主（模型/工具循环、效果台账、JSONL、检查点）。
+- `bfxh/trit-kernel` 的 `crates/trit-host`：无头宿主（模型/工具循环、效果台账、JSONL、检查点）。
 - `bfxh/trit-agent`：Minecraft 角色托管（零依赖纯 std，守护进程 + 游戏窗口控制）。
 
-两者**不是同一个项目**，但同名，搜索/替换时先确认仓库根。
+两者**不是同一个项目**；搜索/替换时先确认仓库根。

@@ -1,6 +1,6 @@
 # 内核-前端能力契约
 
-状态：内核门禁库已实现；桌面 / Web 前端适配待接入。实现见 [`frontend_compat.rs`](../crates/trit-agent/src/frontend_compat.rs)。
+状态：内核门禁库已实现；桌面 / Web 前端适配待接入。实现见 [`frontend_compat.rs`](../crates/trit-host/src/frontend_compat.rs)。
 
 适用对象：前端 / 桌面开发者、内核维护者。目标只有一个：**内核可以先更新，但前端不认识的新能力绝不能被默认打开或显示成可用。** 缺依赖时 fail-closed，锁住时通知责任方，而不是让用户点到半残按钮。
 

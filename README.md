@@ -1,15 +1,15 @@
-# trit-agent-kernel
+# trit-kernel
 
-[![CI](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml)
+[![CI](https://github.com/bfxh/trit-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-kernel/actions/workflows/ci.yml)
 
 Rust 三值（ternary）**决策状态机内核（含编排）**。**实验阶段，WIP，不承诺稳定 API。**
 
 本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出决策状态机相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与编排（`trit-orch`）。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
 
 > **与 [`bfxh/trit-agent`](https://github.com/bfxh/trit-agent) 的关系**：同一套三值决策状态机的两个切片。
-> 本仓库是**内核 + 编排**（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix` / 无头 `trit-agent` 宿主）；
-> `trit-agent` 仓库是**面向 Minecraft 的具体宿主**（零依赖纯 std 的守护进程 + 游戏侧交互）。
-> 两者共用 `trit-agent` 这个名字，但**内核以本仓库为准**，宿主仓库只实现 I/O 与游戏交互。
+> 本仓库是**内核 + 编排**（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix` / 无头 `trit-host` 宿主）；
+> `bfxh/trit-agent` 是**面向 Minecraft 的具体宿主**（零依赖纯 std 的守护进程 + 游戏侧交互）。
+> **内核以本仓库为准**，宿主仓库只实现 I/O 与游戏交互。
 > 它是决策状态机，不是「智能体」：每步输出 `True / Unknown / False`，`Unknown` 一律弃权。
 
 ## Crates
@@ -20,7 +20,7 @@ Rust 三值（ternary）**决策状态机内核（含编排）**。**实验阶�
 | `trit-schedule` | 三值依赖 DAG 的静态调度器 |
 | `trit-orch` | 准入、快照、义务、预算、证据 rail、影子学习、引导/干预与 `tick` 主循环 |
 | `trit-reasonix` | Reasonix 风格的完成声明、证据裁决与用量适配 |
-| `trit-agent` | 无头宿主：模型/工具循环、效果台账、JSONL 会话、上下文压缩、文件/Git 检查点 |
+| `trit-host` | 无头宿主：模型/工具循环、效果台账、JSONL 会话、上下文压缩、文件/Git 检查点 |
 
 ## 已实现
 
@@ -53,13 +53,13 @@ Rust 三值（ternary）**决策状态机内核（含编排）**。**实验阶�
 
 ```bash
 cargo test --workspace
-cargo run -p trit-agent -- --help
+cargo run -p trit-host -- --help
 ```
 
 脚本化回放：
 
 ```bash
-cargo run -p trit-agent -- run \
+cargo run -p trit-host -- run \
   --task "write a.txt" \
   --workspace ./workspace \
   --script proposals.json \
@@ -72,7 +72,7 @@ cargo run -p trit-agent -- run \
 回退：
 
 ```bash
-cargo run -p trit-agent -- rewind \
+cargo run -p trit-host -- rewind \
   --session ./session.jsonl \
   --checkpoint-dir ./checkpoints \
   --checkpoint-backend git \
@@ -109,7 +109,7 @@ cargo run -p trit-agent -- rewind \
 ## 平台支持
 
 - CI 在 Ubuntu、Windows、macOS 跑 fmt / clippy / 全量测试。
-- CI 额外做 ARM64 整工作区 `cargo check`，以及 LoongArch64 核心 crates（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix`）的 `cargo check`；`trit-agent` 的 LoongArch 构建仍受 TLS 依赖限制，未宣称支持。
+- CI 额外做 ARM64 整工作区 `cargo check`，以及 LoongArch64 核心 crates（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix`）的 `cargo check`；`trit-host` 的 LoongArch 构建仍受 TLS 依赖限制，未宣称支持。
 - Linux 使用 inotify、macOS 使用 FSEvents、Windows 使用 ReadDirectoryChangesW 做 roots 监听；持久 shell 优先 bash，Windows 显式走 Git Bash。
 - 国产系统（麒麟 / 统信 UOS、ARM64 / LoongArch 等）尚未完成运行时验证。后续适配重点是 bash 路径探测、文件通知后端、OS 沙箱封装、TLS 依赖和 Git/其他 VCS 的可用性；在完成前不宣称支持。
 

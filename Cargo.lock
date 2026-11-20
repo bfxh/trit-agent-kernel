@@ -1050,7 +1050,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "trit-agent"
+name = "trit-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "trit-host"
 version = "0.1.0"
 dependencies = [
  "cap-fs-ext",
@@ -1067,15 +1076,6 @@ dependencies = [
  "trit-reasonix",
  "ureq",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "trit-core"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde",
- "thiserror",
 ]
 
 [[package]]

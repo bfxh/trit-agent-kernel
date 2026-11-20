@@ -42,7 +42,7 @@ jobs:
             args: --workspace
             install_gcc: true
           - target: loongarch64-unknown-linux-gnu
-            args: --workspace --exclude trit-agent
+            args: --workspace --exclude trit-host
             install_gcc: false
     runs-on: ubuntu-latest
     timeout-minutes: 30

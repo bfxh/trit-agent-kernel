@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use trit_agent::tools::{LocalTools, WorkspaceConfig};
-use trit_agent::{AgentError, ToolExecutor, ToolRequest};
+use trit_host::tools::{LocalTools, WorkspaceConfig};
+use trit_host::{AgentError, ToolExecutor, ToolRequest};
 
 fn temp_workspace(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();

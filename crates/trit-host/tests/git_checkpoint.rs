@@ -2,8 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use trit_agent::tools::{LocalTools, WorkspaceConfig};
-use trit_agent::{
+use trit_host::tools::{LocalTools, WorkspaceConfig};
+use trit_host::{
     AgentError, GitCheckpointStore, GitCheckpointingTools, Proposal, RewindScope, ScriptedModel,
     Session, ToolExecutor, ToolRequest, rewind_session_git, rewind_session_git_with_policy,
 };
@@ -12,7 +12,7 @@ use trit_reasonix::{ClaimRequest, CriterionKind, CriterionRequest, HostUsage, Tu
 fn temp_dir(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-git-{tag}-{}-{:?}",
+        "trit-host-git-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -24,7 +24,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn temp_file(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "trit-agent-git-{tag}-{}-{:?}.jsonl",
+        "trit-host-git-{tag}-{}-{:?}.jsonl",
         std::process::id(),
         std::thread::current().id()
     ));

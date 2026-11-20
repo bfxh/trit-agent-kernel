@@ -1,4 +1,4 @@
-use trit_agent::{
+use trit_host::{
     REASONIX_WIRE_VERSION, WireContractError, WireEvent, WireFixture, WireTool, WireUsage,
     parse_fixture,
 };
