@@ -57,6 +57,6 @@ git remote -v
 ## 4. 两个宿主的区分（别改错仓库）
 
 - `bfxh/trit-kernel` 的 `crates/trit-host`：无头宿主（模型/工具循环、效果台账、JSONL、检查点）。
-- `bfxh/trit-agent`：Minecraft 角色托管（零依赖纯 std，守护进程 + 游戏窗口控制）。
+- `bfxh/trit-mc`：Minecraft 角色托管（零依赖纯 std，守护进程 + 游戏窗口控制）。
 
 两者**不是同一个项目**；搜索/替换时先确认仓库根。

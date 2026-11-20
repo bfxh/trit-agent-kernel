@@ -6,9 +6,9 @@ Rust 三值（ternary）**决策状态机内核（含编排）**。**实验阶�
 
 本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出决策状态机相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与编排（`trit-orch`）。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
 
-> **与 [`bfxh/trit-agent`](https://github.com/bfxh/trit-agent) 的关系**：同一套三值决策状态机的两个切片。
+> **与 [`bfxh/trit-mc`](https://github.com/bfxh/trit-mc) 的关系**：同一套三值决策状态机的两个切片。
 > 本仓库是**内核 + 编排**（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix` / 无头 `trit-host` 宿主）；
-> `bfxh/trit-agent` 是**面向 Minecraft 的具体宿主**（零依赖纯 std 的守护进程 + 游戏侧交互）。
+> `bfxh/trit-mc` 是**面向 Minecraft 的具体宿主**（零依赖纯 std 的守护进程 + 游戏侧交互）。
 > **内核以本仓库为准**，宿主仓库只实现 I/O 与游戏交互。
 > 它是决策状态机，不是「智能体」：每步输出 `True / Unknown / False`，`Unknown` 一律弃权。
 

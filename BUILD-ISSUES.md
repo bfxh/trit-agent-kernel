@@ -8,7 +8,7 @@
 | 仓库 | `cargo check --all-targets` | 备注 |
 |---|---|---|
 | `bfxh/trit-kernel`（本仓库） | **通过**（17.4 s，5 个 crate） | 前提：`RUSTC_WRAPPER=` 绕开 sccache，见 §2 |
-| `bfxh/trit-agent`（Minecraft 托管，独立项目） | **通过**（3.8 s） | 零依赖纯 std；**没有 CI workflow** |
+| `bfxh/trit-mc`（Minecraft 托管，独立项目） | **通过**（3.8 s） | 零依赖纯 std；**没有 CI workflow** |
 
 ## 2. 构建故障：sccache 连接被重置（本机，不是代码问题）
 
@@ -50,7 +50,7 @@ RUSTC_WRAPPER= CARGO_INCREMENTAL=0 cargo check --workspace --all-targets   # 绿
 （14:04 那次失败的具体 job 需要在 Actions 页面确认；本地全量 `cargo check` 已通过，
 说明大概率同样是环境/缓存类问题，而不是编译错误。）
 
-`bfxh/trit-agent` 仓库**没有 `.github/workflows/`**，所以「构建是否一直绿」没有任何自动证据。
+`bfxh/trit-mc` 仓库**没有 `.github/workflows/`**，所以「构建是否一直绿」没有任何自动证据。
 
 ## 4. 给接手者的最小验证顺序
 
@@ -68,4 +68,4 @@ RUSTC_WRAPPER= cargo test --workspace --quiet
 
 - 本仓库没有 `rust-toolchain.toml` 与本机 toolchain 对齐的说明（本机实测 1.99.0）。
 - 没有 `cargo fmt --check` / `cargo clippy -D warnings` 的本地门与 CI 门对照表。
-- `bfxh/trit-agent` 没有 CI，构建与测试完全靠人工。
+- `bfxh/trit-mc` 没有 CI，构建与测试完全靠人工。
