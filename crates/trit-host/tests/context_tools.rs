@@ -176,10 +176,7 @@ fn agent_context_denies_add_when_autonomy_is_not_allowed() {
     request.autonomy.may_add_optional = trit_orch::Ternary::False;
     let mut context = AgentContext::new(request, context, plan);
     let error = context.add("doc").unwrap_err();
-    assert!(matches!(
-        error,
-        trit_host::ContextError::AlreadyIncluded(_)
-    ));
+    assert!(matches!(error, trit_host::ContextError::AlreadyIncluded(_)));
     let error = context.add("missing").unwrap_err();
     assert!(matches!(error, trit_host::ContextError::AutonomyDenied(_)));
 }
