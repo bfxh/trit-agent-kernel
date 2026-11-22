@@ -9,7 +9,7 @@
 | 上游 Reasonix | [`esengine/DeepSeek-Reasonix`](https://github.com/esengine/DeepSeek-Reasonix)，`studio` 最后提交 `cd20bb5`（2026-11-12），MIT，已归档，最终版 v2.61.0 | 行为参考、文档与历史证据 |
 | Rust 重写分支 | [`1012905/DeepSeek-Reasonix-rs`](https://github.com/1012905/DeepSeek-Reasonix-rs)，`studio` 提交 `5edbda1`（2026-11-14），MIT | Rust 层映射、golden fixtures、迁移纪律 |
 | 关键规格 | `docs/SPEC.md`、`docs/RUST_MIGRATION.md`、`docs/TOOL_CONTRACT.md`、`docs/CHECKPOINTS.md`、`docs/SUBAGENT_PROFILES.md`、`docs/CAPABILITY_DIAGNOSTICS.md` | 能力与不变量 |
-| 本仓 | `trit-kernel` `main` | 移植目标；内核保持纯库，宿主面单独适配 |
+| 本仓 | `trit-agent-kernel` `main` | 移植目标；内核保持纯库，宿主面单独适配 |
 
 边界：
 

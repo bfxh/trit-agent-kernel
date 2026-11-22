@@ -7,7 +7,7 @@
 
 | 仓库 | `cargo check --all-targets` | 备注 |
 |---|---|---|
-| `bfxh/trit-kernel`（本仓库） | **通过**（17.4 s，5 个 crate） | 前提：`RUSTC_WRAPPER=` 绕开 sccache，见 §2 |
+| `bfxh/trit-agent-kernel`（本仓库） | **通过**（17.4 s，5 个 crate） | 前提：`RUSTC_WRAPPER=` 绕开 sccache，见 §2 |
 | `bfxh/trit-mc`（Minecraft 托管，独立项目） | **通过**（3.8 s） | 零依赖纯 std；**没有 CI workflow** |
 
 ## 2. 构建故障：sccache 连接被重置（本机，不是代码问题）
@@ -30,7 +30,7 @@ sccache: caused by: 远程主机强迫关闭了一个现有的连接。 (os erro
 **复现**：
 
 ```bash
-cd trit-kernel
+cd trit-agent-kernel
 cargo check --workspace --all-targets        # 红：sccache ... os error 10054
 ```
 
@@ -44,7 +44,7 @@ RUSTC_WRAPPER= CARGO_INCREMENTAL=0 cargo check --workspace --all-targets   # 绿
 - 长期修法（任选一）：重启 sccache 服务（`sccache --stop-server && sccache --start-server`），
   或在 `~/.cargo/config.toml` 里去掉 `rustc-wrapper`，或按需用上面的环境变量单次绕开。
 
-## 3. CI 现状（`bfxh/trit-kernel`）
+## 3. CI 现状（`bfxh/trit-agent-kernel`）
 
 最近 3 次 `main` 上的 CI：`2026-11-17T17:32` success、`14:29` success、`14:04` **failure**。
 （14:04 那次失败的具体 job 需要在 Actions 页面确认；本地全量 `cargo check` 已通过，

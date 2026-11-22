@@ -1,16 +1,23 @@
-# trit-kernel
+# Trit Agent Kernel
 
-[![CI](https://github.com/bfxh/trit-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-kernel/actions/workflows/ci.yml)
+[![CI](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml/badge.svg)](https://github.com/bfxh/trit-agent-kernel/actions/workflows/ci.yml)
 
-Rust 三值（ternary）**决策状态机内核（含编排）**。**实验阶段，WIP，不承诺稳定 API。**
+Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**实验阶段，WIP，不承诺稳定 API。**
 
-本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出决策状态机相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与编排（`trit-orch`）。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
+本仓库从 [`bfxh/trit`](https://github.com/bfxh/trit) 中抽出智能体决策内核相关 crate，保留三值逻辑、义务/证据裁决、影子学习、引导干预与编排（`trit-orch`）。它不包含 `trit` 的位平面、GPU、训练、语言服务器等其它工具链。
 
-> **与 [`bfxh/trit-mc`](https://github.com/bfxh/trit-mc) 的关系**：同一套三值决策状态机的两个切片。
-> 本仓库是**内核 + 编排**（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix` / 无头 `trit-host` 宿主）；
+> **与 [`bfxh/trit-mc`](https://github.com/bfxh/trit-mc) 的关系**：同一套智能体内核的两个落地切片。
+> 本仓库是**智能体内核 + 编排**（`trit-core` / `trit-schedule` / `trit-orch` / `trit-reasonix` / 无头 `trit-host` 宿主）；
 > `bfxh/trit-mc` 是**面向 Minecraft 的具体宿主**（零依赖纯 std 的守护进程 + 游戏侧交互）。
 > **内核以本仓库为准**，宿主仓库只实现 I/O 与游戏交互。
-> 它是决策状态机，不是「智能体」：每步输出 `True / Unknown / False`，`Unknown` 一律弃权。
+> 它是智能体的决策内核与编排层：每步输出 `True / Unknown / False`，`Unknown` 一律弃权；模型调用、工具执行与具体界面由宿主负责。
+
+## 先看这里
+
+- **名字**：Trit Agent Kernel（仓库 `trit-agent-kernel`）。
+- **是干嘛的**：给智能体提供三值决策、义务/证据、预算、影子学习和编排；`trit-host` 是无头宿主，不是具体桌面或游戏界面。
+- **怎么用**：先 `cargo test --workspace`；再 `cargo run -p trit-host -- --help`；上层组件从 [`docs/LIBRARY-STACK.md`](docs/LIBRARY-STACK.md) 的库引入入口开始。
+- **人类面 / 智能体面**：README、面板和论文式看板给人看；模型/插件清单在 [`docs/agent-model-manifest.json`](docs/agent-model-manifest.json)，不要拿 README 当机器契约。
 
 ## Crates
 
@@ -92,6 +99,7 @@ cargo run -p trit-host -- rewind \
 ## 文档
 
 - [docs/README.md](docs/README.md)：按用户 / 前端 / 上层组件 / 维护者划分的文档地图。
+- [AGENT-MODEL-MANIFEST.md](docs/AGENT-MODEL-MANIFEST.md)：智能体 / 模型 / 插件清单、人类面与智能体面分工、多模态准入与论文式面板契约。
 - [CONTEXT-ORCHESTRATION.md](docs/CONTEXT-ORCHESTRATION.md)：上下文引用/复用、会话地址、推理记录、语义判断、调用缝合与交互式 UI 提案。
 - [SESSION-MIGRATION.md](docs/SESSION-MIGRATION.md)：会话/缓存/上下文版本/钩子迁移契约，以及网关/MCP 自动重启与恢复的 supervisor 实现。
 - [KERNEL-REASONIX-FUSION.md](docs/KERNEL-REASONIX-FUSION.md)：与 Reasonix 的组合边界、认证平面与 Rust 迁移策略。

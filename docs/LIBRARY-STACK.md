@@ -116,7 +116,7 @@ trit-core.workspace = true
 
 ```toml
 [dependencies]
-trit-core = { git = "https://github.com/bfxh/trit-kernel", tag = "v0.1.0" }
+trit-core = { git = "https://github.com/bfxh/trit-agent-kernel", tag = "v0.1.0" }
 ```
 
 规则：
