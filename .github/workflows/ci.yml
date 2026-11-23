@@ -60,3 +60,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
       - run: cargo check ${{ matrix.args }} --all-targets --target ${{ matrix.target }}
+
+  stress:
+    name: runtime + chaos invariants (repeat)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 崩溃点回放：串行跑，避免测试之间共享临时文件掩盖恢复顺序问题。
+      - name: crash-point replay (serial)
+        run: cargo test --locked -p trit-orch --test recovery --test durable --test trace_replay -- --test-threads=1
+      # 同一批并发/预算不变量换两种并行度重复跑，抓调度窗口里的偶发失败。
+      - name: concurrency invariants (threads=1, then default)
+        run: |
+          set -e
+          for threads in 1 4; do
+            echo "::group::test-threads=$threads"
+            cargo test --locked -p trit-orch \
+              --test tick --test coordination --test claim_gate_parity --test budgets \
+              -- --test-threads=$threads
+            echo "::endgroup::"
+          done
+      # 子进程崩溃/重启与 MCP 握手：多轮重跑，专抓端口、临时目录与 wait 线程的竞态。
+      - name: supervisor restart + MCP handshake (5 rounds)
+        run: |
+          set -e
+          for round in 1 2 3 4 5; do
+            echo "::group::supervisor round $round"
+            cargo test --locked -p trit-host --test supervisor_cli -- --test-threads=1
+            echo "::endgroup::"
+          done
