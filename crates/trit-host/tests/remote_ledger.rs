@@ -55,6 +55,15 @@ fn endpoint(url: &str, token: Option<&str>, timeout_secs: u64) -> RemoteEndpoint
     }
 }
 
+fn state_file(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "trit-ledger-state-{}-{tag}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    path
+}
+
 #[test]
 fn ledger_claim_complete_and_pending_takeover() {
     let ledger = Arc::new(
@@ -164,6 +173,66 @@ fn two_nodes_share_ledger_and_execute_once() {
     assert_eq!(ledger.completions(), 1, "duplicate remote execution");
     handle_a.join().unwrap();
     handle_b.join().unwrap();
+}
+
+#[test]
+fn completed_records_survive_restart() {
+    let path = state_file("restart");
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"persisted".to_vec(),
+        tokens: 0,
+    })
+    .unwrap();
+
+    let ledger = Arc::new(
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_state_path(&path)).unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let running = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        running.serve_once().unwrap();
+        running.serve_once().unwrap();
+        running.serve_once().unwrap();
+    });
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::New
+    );
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &frame).unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &frame).unwrap();
+    handle.join().unwrap();
+    drop(ledger);
+
+    // 重启后从追加日志恢复：同一 key 直接回放，不再执行。
+    let restarted = Arc::new(
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_state_path(&path)).unwrap(),
+    );
+    let address = restarted.addr().unwrap();
+    let restarted_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || server.serve_once().unwrap());
+    match remote_ledger::claim(&restarted_endpoint, "t1@0").unwrap() {
+        Claim::Done(body) => {
+            let mut buffer = body;
+            let response: SubagentResponse = decode_frame(&mut buffer).unwrap().unwrap();
+            assert_eq!(response.content, b"persisted");
+        }
+        other => panic!("expected persisted Done, got {other:?}"),
+    }
+    handle.join().unwrap();
+    assert_eq!(restarted.completions(), 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("t1@0"), "{text}");
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "duplicate complete must not append: {text}"
+    );
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
