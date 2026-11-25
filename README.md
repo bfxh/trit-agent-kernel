@@ -34,6 +34,7 @@ Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**�
 - 三值裁决：`True` / `Unknown` / `False`，以及 Belnap 冲突处理。
 - 任务 brief、准入义务、预算与 claim/fencing。
 - 写工具效果台账；证据不足时 completion 不会自证。
+- 交接账本 `trit-orch delivery`：四态 `Sent → Delivered → Read → Acted` 落盘到 `.agent/delivery/<packet-id>.json`，包字节用 SHA-256 钉住；`gate` 只在 handoff gate 为 True 时补 `sent + delivered`，`check` 是只读预检，`acted` 必须带证据。见 [docs/DELIVERY.md](docs/DELIVERY.md)。
 - 影子策略学习：安全选择、增量/加权/窗口/跨宿主合并、Beta 先验与漂移窗口。
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
 - 分层上下文组装初版：`Session/Project/Shared` scope、引用句柄、稳定前缀/动态尾段、印象对比、三值 autonomy、模型/推理 profile 与真实 usage 校准。
@@ -99,6 +100,7 @@ cargo run -p trit-host -- rewind \
 ## 文档
 
 - [docs/README.md](docs/README.md)：按用户 / 前端 / 上层组件 / 维护者划分的文档地图。
+- [DELIVERY.md](docs/DELIVERY.md)：交接四态账本、`trit-orch delivery` CLI、包字节钉住与诚实边界。
 - [AGENT-MODEL-MANIFEST.md](docs/AGENT-MODEL-MANIFEST.md)：智能体 / 模型 / 插件清单、人类面与智能体面分工、多模态准入与论文式面板契约。
 - [CONTEXT-ORCHESTRATION.md](docs/CONTEXT-ORCHESTRATION.md)：上下文引用/复用、会话地址、推理记录、语义判断、调用缝合与交互式 UI 提案。
 - [SESSION-MIGRATION.md](docs/SESSION-MIGRATION.md)：会话/缓存/上下文版本/钩子迁移契约，以及网关/MCP 自动重启与恢复的 supervisor 实现。

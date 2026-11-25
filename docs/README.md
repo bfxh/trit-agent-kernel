@@ -11,6 +11,7 @@
 | 上层组件开发者 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | [RIGHTS.md](RIGHTS.md) | 引入哪些库？三进制原生库怎么用？哪些 API 不能碰？ |
 | 维护者 / 仓库所有者 | [RESPONSIBILITY.md](RESPONSIBILITY.md) | [RIGHTS.md](RIGHTS.md)、[MERGE-POLICY.md](MERGE-POLICY.md) | 五类问题谁负责？批次怎么合？权益怎么分层？ |
 | 智能体 / 模型 / 插件接入 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | [FRONTEND-CONTRACT.md](FRONTEND-CONTRACT.md) | 谁负责哪一层？哪些是后端、前端、内核各自的义务？人类面板与智能体清单怎么分开？ |
+| 交接 / 交付 | [DELIVERY.md](DELIVERY.md) | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 谁在什么时候收到、读到、动过手？账本能不能续？ |
 | 参与移植 / 合并的人 | [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | [MERGE-POLICY.md](MERGE-POLICY.md)、[LIBRARY-STACK.md](LIBRARY-STACK.md)、[RIGHTS.md](RIGHTS.md) | Reasonix 哪些能力先移？每批验收什么？ |
 
 ## 最小引入集
@@ -30,6 +31,7 @@
 | [RIGHTS.md](RIGHTS.md) | 政策草案，非法律意见 | 各仓库 LICENSE / NOTICE |
 | [MERGE-POLICY.md](MERGE-POLICY.md) | 现行流程 | CI 与 PR 模板 |
 | [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7.1–B7.4 首版已落地 | `reasonix_wire` / `provider_stream` / `context_projection` / `permissions` |
+| [DELIVERY.md](DELIVERY.md) | 已实现 | `trit-orch::delivery`、`trit-orch delivery` CLI、`.agent/delivery/` 账本 |
 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 契约草案，清单为模板 | [`agent-model-manifest.json`](agent-model-manifest.json)；运行时门禁仍归 `FeatureGate` |
 
 ## 维护规则
