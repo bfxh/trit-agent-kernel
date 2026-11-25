@@ -846,67 +846,83 @@ fn fail(message: impl Into<String>) -> Box<dyn Error> {
 /// 单次 `git status` 最多接受的变更路径数；超过就放弃自动取值（fail-closed）。
 const MAX_CHANGED_PATHS: usize = 10_000;
 
+/// 空设备路径：用来屏蔽用户级 / 系统级 git 配置。
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+/// 构造只读 git 命令：禁用 fsmonitor、屏蔽全局/系统配置、把工作树钉在 workspace。
+///
+/// 仓库自己的 `.git/config` 可以把 `core.fsmonitor` 指向一个程序（`git status`
+/// 会执行它），也可以把 `core.worktree` 指到 workspace 之外（扫描别的目录）。
+/// 这里用命令行配置与环境变量覆盖这两点，仓库配置仍会被读，但不能改变执行面。
+fn git_base_command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_WORK_TREE", root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE");
+    command
+}
+
 /// 取 workspace 当前 git 变更路径（相对 workspace，含未跟踪文件）。
 ///
-/// 不是 git 仓、命令失败或输出读不出时返回 `None`：调用方据此保持“未给 changed”
-/// 的语义，而不是把空集当成“没有变更”。
-///
-/// 两次 git 调用都带 `-c core.fsmonitor=false`：仓库自己的 `.git/config` 可以把
-/// `core.fsmonitor` 指向一个程序，普通的 `git status` 会执行它。宿主在不受信任的
-/// workspace 里跑时不能把仓库配置变成任意命令执行。
+/// 不是 git 仓、命令失败、路径不是 UTF-8 或输出读不出时返回 `None`：调用方据此
+/// 保持“未给 changed”的语义，而不是把空集当成“没有变更”。
 fn git_changed(root: &Path) -> Option<Vec<String>> {
     // `git status` 没有 `--relative`，用 `--show-prefix` 拿到当前目录相对 repo 根
     // 的前缀，再把 status 的 repo-relative 路径裁成 workspace-relative。
     let prefix = {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["-c", "core.fsmonitor=false", "rev-parse", "--show-prefix"])
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
+        let output = git_base_command(root, &["rev-parse", "--show-prefix"])
             .output()
             .ok()?;
         if !output.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&output.stdout)
-            .trim_end_matches(['\r', '\n'])
-            .to_owned()
+        let Ok(text) = std::str::from_utf8(&output.stdout) else {
+            eprintln!(
+                "trit-host: git rev-parse returned a non-UTF-8 prefix; \
+                 skipping automatic changed set"
+            );
+            return None;
+        };
+        text.trim_end_matches(['\r', '\n']).to_owned()
     };
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "-z",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .ok()?;
+    let output = git_base_command(
+        root,
+        &["status", "--porcelain", "--untracked-files=all", "-z"],
+    )
+    .output()
+    .ok()?;
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut entries = text.split('\0');
+    let mut entries = output.stdout.split(|byte| *byte == 0);
     let mut paths = Vec::new();
     while let Some(entry) = entries.next() {
         if entry.len() < 4 {
             continue;
         }
         let status = &entry[..2];
-        let path = entry[3..].trim();
+        let Ok(path) = std::str::from_utf8(&entry[3..]) else {
+            eprintln!(
+                "trit-host: git status returned a non-UTF-8 path; \
+                 skipping automatic changed set"
+            );
+            return None;
+        };
+        let path = path.trim();
         if path.is_empty() {
             continue;
         }
         // rename / copy 的下一条 NUL 是旧路径，属于同一处变更。
-        if status.contains('R') || status.contains('C') {
+        if status.contains(&b'R') || status.contains(&b'C') {
             let _ = entries.next();
         }
         let Some(rest) = path.strip_prefix(prefix.as_str()) else {

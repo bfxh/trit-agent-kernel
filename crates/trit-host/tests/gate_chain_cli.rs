@@ -764,3 +764,67 @@ fn host_disables_git_fsmonitor() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn host_ignores_repo_configured_worktree() {
+    let root = root("worktree");
+    fixture(&root);
+    git_repo(&root);
+    let outside = root.parent().unwrap().join(format!(
+        "{}-outside",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("outside.txt"), "x").unwrap();
+    git(
+        &root,
+        &["config", "core.worktree", outside.to_str().unwrap()],
+    );
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+        ],
+    );
+    // 仓库配置的 worktree 不能把扫描范围带出 workspace。
+    assert_eq!(code, Some(2), "{text}");
+    assert!(!text.contains("unlinked-change"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
+    let _ = fs::remove_dir_all(&outside);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_gives_up_on_non_utf8_git_paths() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let root = root("non-utf8");
+    fixture(&root);
+    git_repo(&root);
+    let name = std::ffi::OsStr::from_bytes(b"non-utf8-\xFF.txt");
+    fs::write(root.join(name), "x").unwrap();
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+        ],
+    );
+    // 非 UTF-8 路径让自动 changed 放弃取值；门链只做结构检查，不误报。
+    assert_eq!(code, Some(2), "{text}");
+    assert!(!text.contains("unlinked-change"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}

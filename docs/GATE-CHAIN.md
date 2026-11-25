@@ -240,7 +240,10 @@ trit-host run --task "..." --workspace . \
   `trit-orch delivery` 动作。
 - 从 git 取 changed 只反映**当前工作区**：未忽略的未跟踪文件可见，但被 `.gitignore`
   忽略的路径不会出现；需要时用 `--alignment-changed` 显式补。
-- changed 按字面比较：Windows 下大小写不同（`SRC/A.py` vs `src/a.py`）不会自动归一；
-  非 UTF-8 文件名在自动取值时可能被替换字符。
-- 读取 git 变更时禁用 `core.fsmonitor`，避免仓库配置触发命令执行；不做完整 git 配置
-  隔离（`include.path` 等仍会读取本地配置）。
+- changed 在 Windows 下按 ASCII 大小写不敏感比较（`SRC/A.py` 匹配 `src/a.py`）；
+  Unicode 大小写折叠不做。
+- 自动取 changed 时，遇到非 UTF-8 路径会放弃整次自动取值（pre 不传 changed，
+  post 拒绝），而不是用替换字符拼出一个匹配不上的路径。
+- 读取 git 变更时禁用 `core.fsmonitor`、屏蔽用户/系统级 git 配置，并用
+  `GIT_WORK_TREE` 把工作树钉在 workspace；仓库自带的 `include.path` 仍会被读取，
+  但不改变执行面。

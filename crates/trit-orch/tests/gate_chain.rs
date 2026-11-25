@@ -423,3 +423,28 @@ fn cli_out_rejects_workspace_escape() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(windows)]
+#[test]
+fn cli_changed_paths_are_case_insensitive_on_windows() {
+    let root = root("case-insensitive");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    options(&root);
+    let (code, value) = cli_support::run(
+        "gate-chain",
+        &json!({
+            "root": root.to_string_lossy(),
+            "expected": "bfxh/trit-agent-kernel",
+            "task_kind": "agent",
+            "packet": "packet.json",
+            "receiver_state_hash": "H",
+            "at": 1000,
+            "manifest": "alignment.json",
+            "changed": ["SRC/A.PY"]
+        }),
+    );
+    // Windows 文件系统不区分大小写：清单里的 src/a.py 应匹配 SRC/A.PY。
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["status"], "passed");
+    let _ = fs::remove_dir_all(root);
+}
