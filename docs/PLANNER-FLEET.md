@@ -87,6 +87,40 @@ cargo test -p trit-orch --test fleet
 cargo test -p trit-host --test separation
 ```
 
+## 4. 计划交接（`trit_orch::PlanHandoff`）
+
+planner 产出、executor 消费的结构化交接物，**构造即校验**：
+
+```text
+PlanHandoff { revision, tasks, capsule, profile }
+  new(...)     -> Plan::new 校验依赖图 + SubagentProfile::validate 校验执行契约
+  digest()     -> 内容摘要（FNV-1a 64）
+  reference()  -> plan@revision#digest
+  into_plan()  -> 还原 Plan，交给 fleet::execute
+```
+
+- 构造时保存排序后的规范形式：同一组任务不同输入顺序得到同一 digest；
+- 未知依赖、环、只读 profile 带写根都在构造期拒绝，失败不产生交接物；
+- JSON 往返后 digest 不变，可直接作为交接产物落盘或跨进程传递。
+
+planner 侧的组合方式：`ReadOnlyTools` 包执行器、`ReadOnlyCatalog` 包工具目录、
+独立 `SessionPaths`；产出计划后用 `PlanHandoff::new` 固化。
+
+## 5. CLI：`trit-orch fleet-run`
+
+stdin 收 JSON、stdout 回 JSON，用于确定性演练（**不执行外部命令**）：
+
+```json
+{"revision": 1, "workers": 2, "fail": ["b"], "cancel_after": 1, "tasks": [
+  {"task": {"id": "a", "duration": 1}, "requirements": {"cpu": 0, "memory": 0}, "max_tokens": 1000}
+]}
+```
+
+- `fail` 指定的任务返回失败，用来验证下游归入 `deferred`；
+- `cancel_after` 在执行满 N 个任务后触发取消，用来验证 `cancelled`（Aborted）；
+- 输出 `completed` / `failed` / `deferred` / `cancelled` / `references` /
+  `metrics` / `metrics_prometheus`；`references` 是 `task -> task@epoch#digest`。
+
 ## 非目标
 
 - 不把 fleet 依赖图塞进 `TaskSpec`：`TaskSpec.deps` 只有三元依赖，图的调度归属

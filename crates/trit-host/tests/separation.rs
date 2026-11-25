@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use trit_host::{
-    AgentError, READ_ONLY_TOOLS, ReadOnlyTools, ScriptedModel, ScriptedTools, Session,
-    SessionPaths, ToolExecutor, ToolOutcome, ToolRequest, is_read_only_tool,
+    AgentError, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, ScriptedModel, ScriptedTools,
+    Session, SessionPaths, ToolCatalog, ToolExecutor, ToolOutcome, ToolRequest, ToolSpec,
+    is_read_only_tool, planner_tool_specs,
 };
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -114,4 +115,52 @@ fn planner_and_executor_sessions_have_independent_state() {
         "executor must not see planner records"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn tool_spec(name: &str, read_only: bool) -> ToolSpec {
+    ToolSpec {
+        name: name.into(),
+        description: format!("{name} tool"),
+        read_only,
+        input_schema: None,
+    }
+}
+
+#[test]
+fn planner_catalog_drops_write_tools() {
+    let specs = vec![
+        tool_spec("read_file", true),
+        tool_spec("write_file", false),
+        tool_spec("grep", true),
+        tool_spec("bash", false),
+        tool_spec("move_path", false),
+        tool_spec("glob", true),
+    ];
+    let filtered = planner_tool_specs(&specs);
+    assert_eq!(
+        filtered
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read_file", "grep", "glob"]
+    );
+
+    struct Catalog(Vec<ToolSpec>);
+    impl ToolCatalog for Catalog {
+        fn tools(&self) -> Vec<ToolSpec> {
+            self.0.clone()
+        }
+    }
+    let catalog = ReadOnlyCatalog::new(Catalog(specs));
+    let names: Vec<String> = catalog.tools().into_iter().map(|tool| tool.name).collect();
+    assert_eq!(names, vec!["read_file", "grep", "glob"]);
+}
+
+#[test]
+fn planner_catalog_requires_both_name_and_flag() {
+    // 名字在白名单但标志声称可写：仍然过滤。
+    let specs = vec![tool_spec("read_file", false), tool_spec("read_file", true)];
+    let filtered = planner_tool_specs(&specs);
+    assert_eq!(filtered.len(), 1);
+    assert!(filtered[0].read_only);
 }

@@ -181,7 +181,8 @@ where
     };
 
     let epoch_of = |task: &str| plan.task(task).map(|spec| spec.epoch).unwrap_or(0);
-    let not_started = if cancel.is_cancelled() {
+    let cancelled_by_user = cancel.is_cancelled();
+    let not_started = if cancelled_by_user {
         DelegationStatus::Aborted
     } else {
         DelegationStatus::Deferred
@@ -222,12 +223,28 @@ where
             });
     }
 
+    // 列表与 results 状态保持一致：显式取消 → cancelled；上游失败 / 未知依赖 → deferred。
+    // runtime 对未执行任务可能同时记录在 deferred 与 cancelled，这里用集合去重。
+    let mut deferred: std::collections::BTreeSet<String> =
+        report.deferred.into_iter().map(|task| task.id).collect();
+    let mut cancelled: Vec<String> = Vec::new();
+    for id in &report.cancelled {
+        if cancelled_by_user {
+            cancelled.push(id.clone());
+        } else {
+            deferred.insert(id.clone());
+        }
+    }
+    let deferred: Vec<String> = deferred.into_iter().collect();
+    cancelled.sort_unstable();
+    cancelled.dedup();
+
     Ok(FleetReport {
         results,
         completed: report.completed,
         failed: report.failed,
-        deferred: report.deferred.into_iter().map(|task| task.id).collect(),
-        cancelled: report.cancelled,
+        deferred,
+        cancelled,
         metrics: report.metrics,
     })
 }

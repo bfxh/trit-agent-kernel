@@ -154,6 +154,8 @@ fn fleet_propagates_failure_and_defers_downstream() {
         report.result("c").unwrap().status,
         DelegationStatus::Deferred
     ));
+    assert_eq!(report.deferred, vec!["c"]);
+    assert!(report.cancelled.is_empty());
     assert!(!report.reusable("c"));
     assert!(report.reusable("a"));
 }

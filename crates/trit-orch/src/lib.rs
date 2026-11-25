@@ -29,6 +29,7 @@ mod obligation_guard;
 mod obligation_plan;
 mod orch_metrics;
 mod plan;
+mod plan_handoff;
 mod policy;
 mod progress;
 mod receipt;
@@ -103,6 +104,7 @@ pub use obligation_plan::{
 };
 pub use orch_metrics::OrchestrationMetrics;
 pub use plan::Plan;
+pub use plan_handoff::PlanHandoff;
 pub use policy::{
     Baseline, CriticalPath, Eager, LongestFirst, Proposal, ShadowContext, ShadowPolicy,
     bottom_levels, builtin,

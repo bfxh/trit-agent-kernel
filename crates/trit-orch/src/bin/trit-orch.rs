@@ -3,7 +3,7 @@
 //! 子命令：`plan` / `select` / `dispatch` / `finish` / `recover` / `shadow` / `compact-gate`
 //! 以及协调面 `claim` / `renew` / `release` / `claim-gate` / `receipt` / `handoff-gate` /
 //! `admit-with-claim`，交接账本 `delivery`，仓库身份门 `repo-gate`，对齐门 `alignment`，
-//! 对齐骨架 `alignment-scaffold`，三门串联 `gate-chain`。
+//! 对齐骨架 `alignment-scaffold`，三门串联 `gate-chain`，fleet 演练 `fleet-run`。
 //! 成功退出码 0，普通失败退出码 1；`alignment` 与 `gate-chain` 另有 1=unaligned/blocked、
 //! 3=unknown，`alignment-scaffold` 输入/写入拒绝退出 2，并输出
 //! `{"ok":false,"kind":"...","error":"..."}`；成功输出永远带 `"ok":true`。
@@ -27,6 +27,26 @@ use trit_orch::{
 struct PlanInput {
     revision: u64,
     tasks: Vec<TaskSpec>,
+}
+
+/// `fleet-run` 的输入：确定性演练，不执行外部命令。
+///
+/// `fail` 指定必然失败的任务；`cancel_after` 在执行满 N 个任务后触发取消，
+/// 用来复现“中途中断”时下游任务的 Aborted / Deferred 归类。
+#[derive(Deserialize)]
+struct FleetInput {
+    revision: u64,
+    tasks: Vec<TaskSpec>,
+    #[serde(default = "default_workers")]
+    workers: usize,
+    #[serde(default)]
+    fail: Vec<String>,
+    #[serde(default)]
+    cancel_after: Option<usize>,
+}
+
+fn default_workers() -> usize {
+    1
 }
 
 #[derive(Deserialize)]
@@ -551,9 +571,50 @@ fn run(command: &str, input: &str) -> Result<Value, trit_orch::Error> {
                 "identity": decision.identity,
             }))
         }
+        "fleet-run" => {
+            let request: FleetInput = parse(input)?;
+            let plan = Plan::new(request.revision, request.tasks)?;
+            let fail: std::collections::BTreeSet<String> = request.fail.into_iter().collect();
+            let cancel = trit_schedule::runtime::CancelToken::new();
+            let cancel_job = cancel.clone();
+            let executed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executed_job = std::sync::Arc::clone(&executed);
+            let cancel_after = request.cancel_after;
+            let report = trit_orch::execute(
+                &plan,
+                trit_orch::FleetConfig::new(request.workers),
+                cancel,
+                move |spec, _cancel| {
+                    let done = executed_job.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if cancel_after.is_some_and(|limit| done >= limit) {
+                        cancel_job.cancel();
+                    }
+                    if fail.contains(&spec.task.id) {
+                        return Err(format!("simulated failure: {}", spec.task.id));
+                    }
+                    Ok(trit_orch::FleetOutput {
+                        content: format!("simulated {}", spec.task.id).into_bytes(),
+                        tokens: 0,
+                    })
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "completed": report.completed,
+                "failed": report.failed.as_ref().map(|failure| json!({
+                    "task": failure.task,
+                    "message": failure.message,
+                })),
+                "deferred": report.deferred,
+                "cancelled": report.cancelled,
+                "references": report.references(),
+                "metrics": report.metrics,
+                "metrics_prometheus": report.metrics.to_prometheus(),
+            }))
+        }
         other => Err(trit_orch::Error::InputParse {
             message: format!(
-                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/alignment-scaffold/repo-gate/gate-chain/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
+                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/alignment-scaffold/repo-gate/gate-chain/fleet-run/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
             ),
         }),
     }

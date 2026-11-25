@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::provider::{ToolCatalog, ToolSpec};
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
 /// planner 可用的只读工具白名单。
@@ -97,5 +98,43 @@ impl SessionPaths {
     /// 两个路径必须不同（构造器保证，供调用方断言）。
     pub fn are_distinct(&self) -> bool {
         self.planner != self.executor
+    }
+}
+
+/// 从完整工具目录筛出 planner 可用的只读子集。
+///
+/// 两个条件同时满足才保留：名字在 [`READ_ONLY_TOOLS`] 白名单里，且
+/// `ToolSpec.read_only` 为 true。目录是给"模型能调什么"的清单，不能靠模型自我约束；
+/// 过滤后的目录与 [`ReadOnlyTools`] 的执行期拒绝是同一份契约的两端。
+pub fn planner_tool_specs(tools: &[ToolSpec]) -> Vec<ToolSpec> {
+    tools
+        .iter()
+        .filter(|tool| tool.read_only && is_read_only_tool(&tool.name))
+        .cloned()
+        .collect()
+}
+
+/// 把任意工具目录收窄成 planner 的只读视图，供 `ProviderModel` 使用。
+pub struct ReadOnlyCatalog<C> {
+    inner: C,
+}
+
+impl<C> ReadOnlyCatalog<C> {
+    pub fn new(inner: C) -> Self {
+        Self { inner }
+    }
+
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
+
+    pub fn into_inner(self) -> C {
+        self.inner
+    }
+}
+
+impl<C: ToolCatalog> ToolCatalog for ReadOnlyCatalog<C> {
+    fn tools(&self) -> Vec<ToolSpec> {
+        planner_tool_specs(&self.inner.tools())
     }
 }

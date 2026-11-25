@@ -1052,7 +1052,10 @@ pub use reasonix_wire::{
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
 pub use sampling::OpenAiSamplingHandler;
-pub use separation::{READ_ONLY_TOOLS, ReadOnlyTools, SessionPaths, is_read_only_tool};
+pub use separation::{
+    READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
+    planner_tool_specs,
+};
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
     SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
