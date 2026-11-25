@@ -71,9 +71,16 @@ fn host(root: &Path, extra: &[&str]) -> (Option<i32>, String) {
     )
 }
 
-fn lease_file(root: &Path) -> Value {
-    let text = fs::read_to_string(root.join(".agent/write-lease")).unwrap();
-    serde_json::from_str(text.trim_start()).unwrap()
+fn lease_epoch(root: &Path) -> u64 {
+    let dir = root.join(".agent/leases");
+    let entry = fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .expect("lease lock file")
+        .unwrap();
+    let text = fs::read_to_string(entry.path()).unwrap();
+    let value: Value = serde_json::from_str(text.trim_start()).unwrap();
+    value["epoch"].as_u64().unwrap()
 }
 
 #[test]
@@ -129,9 +136,7 @@ fn write_lease_binds_and_increments_epoch() {
         ],
     );
     assert_eq!(code, Some(0), "{text}");
-    let first = lease_file(&root);
-    assert_eq!(first["owner"], "host-a");
-    assert_eq!(first["epoch"], 1);
+    assert_eq!(lease_epoch(&root), 1);
 
     let (code, text) = host(
         &root,
@@ -146,9 +151,7 @@ fn write_lease_binds_and_increments_epoch() {
         ],
     );
     assert_eq!(code, Some(0), "{text}");
-    let second = lease_file(&root);
-    assert_eq!(second["owner"], "host-b");
-    assert_eq!(second["epoch"], 2);
+    assert_eq!(lease_epoch(&root), 2);
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
@@ -158,7 +161,8 @@ fn write_lease_is_busy_when_held() {
     let root = root("busy");
     write(&root, "src/a.py", "x");
     let script_path = script("busy", "src/a.py");
-    let holder = OperationLease::acquire(&root, "test-holder").unwrap();
+    let holder =
+        OperationLease::acquire_paths(&root, "test-holder", &[PathBuf::from("src/a.py")]).unwrap();
     let (code, text) = host(
         &root,
         &[

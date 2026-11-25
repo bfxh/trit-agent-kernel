@@ -345,7 +345,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             .map_err(|error| fail(error.to_string()))?;
         let lease = match write_lease_owner.as_deref() {
             Some(owner) => Some(
-                OperationLease::acquire(&workspace_root, owner)
+                OperationLease::acquire_paths(&workspace_root, owner, &write_claim_paths)
                     .map_err(|error| fail(error.to_string()))?,
             ),
             None => None,
