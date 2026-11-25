@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -57,6 +57,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut alignment_changed: Vec<String> = Vec::new();
     let mut alignment_changed_set = false;
     let mut alignment_no_git_changed = false;
+    let mut gate_chain_post = false;
     let mut script = None;
     let mut max_steps = 8usize;
     let mut allow_write = false;
@@ -118,6 +119,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "--alignment-changed-set" => alignment_changed_set = true,
             "--alignment-no-git-changed" => alignment_no_git_changed = true,
+            "--gate-chain-post" => gate_chain_post = true,
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => {
                 max_steps = next(&mut args, "--max-steps")?
@@ -299,6 +301,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(fail("--handoff-attach requires --handoff-packet"));
     }
     let workspace_root = workspace.clone();
+    // 路径归一化在拿到 workspace 之后做：`.\src\a.py`、`src//a.py`、workspace 内
+    // 绝对路径都折成 `src/a.py`；逃出 workspace 直接拒绝。
+    let alignment_changed: Vec<String> = alignment_changed
+        .iter()
+        .map(|raw| normalize_changed(raw, &workspace_root))
+        .collect::<Result<Vec<_>, _>>()?;
+    let manifest_path = alignment_manifest
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(".agent/alignment.json"));
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
     let gate_chain_requested = gate_chain
         || handoff_packet.is_some()
@@ -329,7 +340,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         } else {
             git_changed(&workspace_root)
         };
-        let manifest = alignment_manifest.unwrap_or_else(|| PathBuf::from(".agent/alignment.json"));
+        let manifest = manifest_path.clone();
         let report = gate_chain_mod::run(&GateChainOptions {
             root: workspace_root.clone(),
             expected_repo: repo_expected.clone(),
@@ -533,7 +544,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 _ => {
                     let store = CheckpointStore::open(dir)?;
-                    let mut tools = CheckpointingTools::new(store, workspace_root, local);
+                    let mut tools = CheckpointingTools::new(store, workspace_root.clone(), local);
                     if let Some(retain) = checkpoint_retain {
                         tools = tools.with_retain(retain);
                     }
@@ -659,6 +670,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "{}",
         serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
     )?;
+    if gate_chain_post {
+        verify_post_alignment(&workspace_root, &manifest_path)?;
+    }
     if !outcome.judgment.is_complete() {
         if let Some(runtime) = supervisor_runtime.as_mut() {
             runtime.stop();
@@ -841,6 +855,84 @@ fn git_changed(root: &Path) -> Option<Vec<String>> {
     Some(paths)
 }
 
+/// 把 `--alignment-changed` 的输入折成 workspace 相对的 `/` 路径。
+fn normalize_changed(raw: &str, root: &Path) -> Result<String, Box<dyn Error>> {
+    let text = raw.trim().replace('\\', "/");
+    if text.is_empty() {
+        return Err(fail("--alignment-changed must not be empty"));
+    }
+    let mut path = PathBuf::from(&text);
+    if path.is_absolute() {
+        let root_abs = std::path::absolute(root)
+            .map_err(|error| fail(format!("resolve workspace {}: {error}", root.display())))?;
+        let path_abs = std::path::absolute(&path)
+            .map_err(|error| fail(format!("resolve --alignment-changed {raw}: {error}")))?;
+        let Ok(stripped) = path_abs.strip_prefix(&root_abs) else {
+            return Err(fail(format!(
+                "--alignment-changed is outside the workspace: {raw}"
+            )));
+        };
+        path = stripped.to_path_buf();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Err(fail(format!(
+                        "--alignment-changed escapes the workspace: {raw}"
+                    )));
+                }
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            _ => {
+                return Err(fail(format!(
+                    "--alignment-changed is not a workspace relative path: {raw}"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(fail("--alignment-changed must name a file"));
+    }
+    Ok(parts.join("/"))
+}
+
+/// run 结束后用实际落盘变更复核对齐：`changed_known=true`，不再接受子集语义。
+fn verify_post_alignment(root: &Path, manifest: &Path) -> Result<(), Box<dyn Error>> {
+    let Some(changed) = git_changed(root) else {
+        return Err(fail(
+            "gate chain post: workspace is not a git repository; cannot read actual changes",
+        ));
+    };
+    let report = trit_orch::alignment::check(
+        root,
+        manifest,
+        &AlignmentOptions {
+            changed: Some(changed),
+            changed_known: true,
+            strict: true,
+            executed: None,
+        },
+    );
+    eprintln!(
+        "gate chain post: {} (must score {:.2}, {} failure(s))",
+        report.status,
+        report.must_score,
+        report.failures.len()
+    );
+    if report.status != "aligned" {
+        let reason = report
+            .failures
+            .first()
+            .map(|failure| format!("{}: {}", failure.code, failure.message))
+            .unwrap_or_else(|| format!("alignment {}", report.status));
+        return Err(fail(format!("gate chain post rejected: {reason}")));
+    }
+    Ok(())
+}
+
 fn usage() {
     eprintln!(
         "trit-host - headless Rust agent host\n\n\
@@ -850,7 +942,7 @@ fn usage() {
          [--gate-chain [--handoff-packet <path>] [--handoff-state-hash <hash>] \\\n    \
          [--handoff-attach] [--alignment-manifest <path>] \\\n    \
          [--alignment-changed <path>] [--alignment-changed-set] \\\n    \
-         [--alignment-no-git-changed]] \\\n    \
+         [--alignment-no-git-changed] [--gate-chain-post]] \\\n    \
          [--provider scripted|openai] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
@@ -877,9 +969,12 @@ fn usage() {
          It needs a handoff packet and an alignment manifest (default .agent/alignment.json);\n\
          Unknown or False stops the chain and the run does not start.\n\
          --handoff-attach: also write sent + delivered when the delivery gate passes.\n\
-         --alignment-changed: repeatable changed-path override; otherwise workspace git\n\
-         status is used as a subset. --alignment-no-git-changed disables that lookup;\n\
-         --alignment-changed-set marks the set complete and enforces declared changes.\n\
+         --alignment-changed: repeatable changed-path override (normalized to workspace\n\
+         relative / paths); otherwise workspace git status is used as a subset.\n\
+         --alignment-no-git-changed disables that lookup; --alignment-changed-set marks\n\
+         the set complete and enforces declared changes.\n\
+         --gate-chain-post: after the run, re-check alignment against actual git changes\n\
+         (complete set); a failure exits 2 and does not roll back the run.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\

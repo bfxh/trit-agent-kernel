@@ -182,9 +182,10 @@ trit-host run --task "..." --workspace . \
 | `--handoff-state-hash <hash>` | 交接门要求与包内 `state_hash` 一致；单独给出会报参数错误 |
 | `--handoff-attach` | 门通过后补 `sent + delivered`；单独给出会报参数错误 |
 | `--alignment-manifest <path>` | 默认 `.agent/alignment.json` |
-| `--alignment-changed <path>` | 可重复；显式给出时不再从 git 取 |
+| `--alignment-changed <path>` | 可重复；显式给出时不再从 git 取；`.\src\a.py` 归一化为 `src/a.py` |
 | `--alignment-changed-set` | 把 changed 标记为完整集，要求声明 changes 全部兑现 |
 | `--alignment-no-git-changed` | 关闭默认的 git 变更查找 |
+| `--gate-chain-post` | run 结束后用实际 git 变更（完整集）复核对齐；失败退出 `2` |
 
 - changed 默认取 workspace 的 `git status`（含未跟踪文件，路径相对 workspace）作为
   **子集**：只检查已给出的变更有没有对齐，不要求声明的 `changes` 全部兑现。不是
@@ -199,6 +200,9 @@ trit-host run --task "..." --workspace . \
   `trit-orch delivery check` / `trit-orch alignment`）。
 - 宿主默认不写账本：`delivery` 仍是只读 `check`；加 `--handoff-attach` 才补
   `sent + delivered`，`read/acted` 仍要单独推进。
+- `--gate-chain-post` 是 **post 语义**：run 已经发生，复核只判“实际写盘是否仍对齐”，
+  失败退出 `2` 但不回滚文件；stdout 的 outcome 仍按 run 的真实结果输出。工作区不是
+  git 仓时直接拒绝（读不到实际变更），不做“看起来通过”的降级。
 
 ## 8. 硬规则
 

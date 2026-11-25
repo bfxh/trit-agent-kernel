@@ -345,3 +345,154 @@ fn host_alignment_flags_alone_enable_the_chain() {
     assert!(text.contains("gate chain rejected at delivery"), "{text}");
     let _ = fs::remove_dir_all(root);
 }
+
+fn script(name: &str, path: &str) -> PathBuf {
+    let file = std::env::temp_dir().join(format!(
+        "trit-host-gate-chain-{name}-{}.json",
+        std::process::id()
+    ));
+    let body = format!(
+        r#"[
+  {{"tool_calls":[{{"call_id":"w1","tool":"write_file","read_only":false,"paths":["{path}"],"content":"x"}}]}},
+  {{"completion":{{"criteria":[{{"id":"c1","kind":{{"kind":"diff","paths":["{path}"]}}}}]}}}}
+]"#
+    );
+    fs::write(&file, body).unwrap();
+    file
+}
+
+#[test]
+fn host_normalizes_alignment_changed_paths() {
+    let root = root("normalize");
+    fixture(&root);
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--alignment-changed",
+            ".\\src\\a.py",
+        ],
+    );
+    // `.\src\a.py` 折成 `src/a.py`，命中清单的 changes，门链放行到 script 校验。
+    assert_eq!(code, Some(2), "{text}");
+    assert!(!text.contains("gate chain rejected"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_rejects_alignment_changed_escape() {
+    let root = root("changed-escape");
+    fixture(&root);
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--alignment-changed",
+            "../outside.py",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.contains("--alignment-changed escapes the workspace"),
+        "{text}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_post_passes_when_changes_align() {
+    let root = root("post-pass");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("post-pass", "src/a.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("gate chain post: aligned"), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn host_post_rejects_unlinked_change() {
+    let root = root("post-fail");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("post-fail", "src/b.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post",
+        ],
+    );
+    // run 自己成功（exit 0 的裁决），post 用完整变更集复核后拒绝。
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("gate chain post rejected"), "{text}");
+    assert!(text.contains("unlinked-change"), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn host_post_requires_git_workspace() {
+    let root = root("post-no-git");
+    fixture(&root);
+    let script_path = script("post-no-git", "src/a.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("not a git repository"), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}

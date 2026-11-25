@@ -37,7 +37,7 @@ Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**�
 - 交接账本 `trit-orch delivery`：四态 `Sent → Delivered → Read → Acted` 落盘到 `.agent/delivery/<packet-id>.json`，包字节用 SHA-256 钉住；`gate` 只在 handoff gate 为 True 时补 `sent + delivered`，`check` 是只读预检，`acted` 必须带证据。见 [docs/DELIVERY.md](docs/DELIVERY.md)。
 - 仓库身份门 `trit-orch repo-gate`：读 `.agent/repo.json`，在 `plan` / `dispatch` 前拒绝“在三进制主库接智能体任务”这类串仓；`trit-host run` 在 workspace 有 identity 时自动 fail-closed，也可用 `--repo-identity` / `--repo-expected <owner/repo> --task-kind agent` 显式强制；要跑完整门链用 `--gate-chain --handoff-packet <path> --alignment-manifest <path>`。见 [docs/REPO-BOUNDARY.md](docs/REPO-BOUNDARY.md) 与 [docs/GATE-CHAIN.md](docs/GATE-CHAIN.md)。
 - 对齐门 `trit-orch alignment`：`alignment/1`–`alignment/3` 的目标树、需求父链、产物/证据/sha256/locator、non-goal、声明变更与 v3 run provenance；`aligned=0` / `unaligned=1` / `unknown=3`。见 [docs/ALIGNMENT.md](docs/ALIGNMENT.md)。
-- 门链 `trit-orch gate-chain`：把 `repo-gate` → `delivery check` → `alignment` 固定成一条默认只读、stop-first 的链；只有 `True` 放行，`Unknown` / `False` 立即停链并把后续门记为 `skipped`，退出码 `0` / `1` / `3`；可选 `attach` / `--handoff-attach` 在门通过后补 `sent + delivered`，`trit-host run --gate-chain` 默认从 git 取 changed 子集。见 [docs/GATE-CHAIN.md](docs/GATE-CHAIN.md)。
+- 门链 `trit-orch gate-chain`：把 `repo-gate` → `delivery check` → `alignment` 固定成一条默认只读、stop-first 的链；只有 `True` 放行，`Unknown` / `False` 立即停链并把后续门记为 `skipped`，退出码 `0` / `1` / `3`；可选 `attach` / `--handoff-attach` 在门通过后补 `sent + delivered`，`trit-host run --gate-chain` 默认从 git 取 changed 子集，`--gate-chain-post` 在 run 后用实际变更复核。见 [docs/GATE-CHAIN.md](docs/GATE-CHAIN.md)。
 - 影子策略学习：安全选择、增量/加权/窗口/跨宿主合并、Beta 先验与漂移窗口。
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
 - 分层上下文组装初版：`Session/Project/Shared` scope、引用句柄、稳定前缀/动态尾段、印象对比、三值 autonomy、模型/推理 profile 与真实 usage 校准。

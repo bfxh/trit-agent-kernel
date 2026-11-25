@@ -55,7 +55,9 @@ trit-host run --task "演示门链" --workspace . \
 ```
 
 门链会在 `--script` 解析之前执行；拒绝时退出码 `2`，stderr 以
-`gate chain rejected at <门>:` 开头。
+`gate chain rejected at <门>:` 开头。要再用**实际写盘**复核一次，加
+`--gate-chain-post`：run 结束后以完整变更集重跑对齐检查，失败退出 `2`，但不会回滚
+已经发生的写入。
 
 ## 改成你自己的任务
 
