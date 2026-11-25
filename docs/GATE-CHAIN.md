@@ -209,6 +209,10 @@ trit-host run --task "..." --workspace . \
 - pre / post 报告可用 `--gate-chain-report` / `--gate-chain-post-report` 落盘；报告
   文件本身会从 post 的 `changed` 中排除，避免 `pre.json` 被当成未对齐变更；post
   失败时报告仍会写入，便于审计。
+- 给了 `--session` 时，pre / post 结论会作为 `gate_chain` 事件追加到 session
+  JSONL（`phase`、`status`、`exit`、`failed_at`、各状态计数、可选 `report` 路径）。
+  事件不改变 turn 状态机，`recover` 会忽略它；session 文件本身也会从 post 的
+  `changed` 中排除。
 
 ## 8. 硬规则
 

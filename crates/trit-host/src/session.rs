@@ -92,6 +92,36 @@ pub enum SessionEvent {
         steps: usize,
         complete: bool,
     },
+    /// 门链结论：派发前（`pre`）或 run 后复核（`post`）。
+    ///
+    /// 事件刻意只带判定摘要，不带完整报告；完整报告用 `report` 指向落盘路径。
+    GateChain {
+        phase: GateChainPhase,
+        status: String,
+        exit: i32,
+        #[serde(default)]
+        failed_at: Option<String>,
+        #[serde(default)]
+        failures: usize,
+        #[serde(default)]
+        passed: usize,
+        #[serde(default)]
+        blocked: usize,
+        #[serde(default)]
+        unknown: usize,
+        #[serde(default)]
+        skipped: usize,
+        #[serde(default)]
+        report: Option<String>,
+    },
+}
+
+/// 门链在 run 前后两个阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateChainPhase {
+    Pre,
+    Post,
 }
 
 #[derive(Debug, Clone)]

@@ -368,6 +368,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         if let Some(path) = gate_chain_report.as_ref() {
             write_report(&workspace_root, path, &report)?;
         }
+        if let Some(path) = session.as_deref() {
+            append_session_event(
+                path,
+                trit_host::SessionEvent::GateChain {
+                    phase: trit_host::GateChainPhase::Pre,
+                    status: report.status.clone(),
+                    exit: report.exit,
+                    failed_at: report.failed_at.clone(),
+                    failures: report.counts.blocked + report.counts.unknown,
+                    passed: report.counts.passed,
+                    blocked: report.counts.blocked,
+                    unknown: report.counts.unknown,
+                    skipped: report.counts.skipped,
+                    report: gate_chain_report
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                },
+            )?;
+        }
         if report.status != "passed" {
             let failed_at = report
                 .failed_at
@@ -534,7 +553,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|client| Arc::clone(client) as Arc<dyn ToolCatalog>);
     let (outcome, _cache_ledger) = if resume || checkpoint_dir.is_some() {
-        let path = session_path.ok_or_else(|| fail("--resume requires --session"))?;
+        let path = session_path
+            .as_ref()
+            .ok_or_else(|| fail("--resume requires --session"))?
+            .clone();
         let model = build_model(
             scripted,
             openai_config.as_ref(),
@@ -683,11 +705,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
     )?;
     if gate_chain_post {
+        let mut exclude: Vec<&Path> = Vec::new();
+        if let Some(path) = gate_chain_report.as_deref() {
+            exclude.push(path);
+        }
+        if let Some(path) = gate_chain_post_report.as_deref() {
+            exclude.push(path);
+        }
+        if let Some(path) = session_path.as_deref() {
+            exclude.push(path);
+        }
         verify_post_alignment(
             &workspace_root,
             &manifest_path,
             gate_chain_post_report.as_deref(),
-            gate_chain_report.as_deref(),
+            &exclude,
+            session_path.as_deref(),
         )?;
     }
     if !outcome.judgment.is_complete() {
@@ -924,14 +957,15 @@ fn verify_post_alignment(
     root: &Path,
     manifest: &Path,
     report_path: Option<&Path>,
-    exclude: Option<&Path>,
+    exclude: &[&Path],
+    session: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let Some(mut changed) = git_changed(root) else {
         return Err(fail(
             "gate chain post: workspace is not a git repository; cannot read actual changes",
         ));
     };
-    for path in [report_path, exclude].into_iter().flatten() {
+    for path in exclude {
         if let Some(relative) = relative_to_root(root, path) {
             changed.retain(|item| item != &relative);
         }
@@ -948,6 +982,23 @@ fn verify_post_alignment(
     );
     if let Some(path) = report_path {
         write_report(root, path, &report)?;
+    }
+    if let Some(path) = session {
+        append_session_event(
+            path,
+            trit_host::SessionEvent::GateChain {
+                phase: trit_host::GateChainPhase::Post,
+                status: report.status.clone(),
+                exit: report.exit,
+                failed_at: report.failures.first().map(|failure| failure.code.clone()),
+                failures: report.failures.len(),
+                passed: 0,
+                blocked: 0,
+                unknown: 0,
+                skipped: 0,
+                report: report_path.map(|path| path.display().to_string()),
+            },
+        )?;
     }
     eprintln!(
         "gate chain post: {} (must score {:.2}, {} failure(s))",
@@ -985,6 +1036,15 @@ fn write_report(
         .map_err(|error| fail(format!("serialize report: {error}")))?;
     std::fs::write(&path, bytes)
         .map_err(|error| fail(format!("write report {}: {error}", path.display())))?;
+    Ok(())
+}
+
+/// 追加一条审计事件到 session JSONL；`--session` 未给时调用方不调用。
+fn append_session_event(path: &Path, event: trit_host::SessionEvent) -> Result<(), Box<dyn Error>> {
+    let mut log = trit_host::SessionLog::open(path)
+        .map_err(|error| fail(format!("open session {}: {error}", path.display())))?;
+    log.append(event)
+        .map_err(|error| fail(format!("append session {}: {error}", path.display())))?;
     Ok(())
 }
 

@@ -570,3 +570,105 @@ fn host_post_report_is_written_on_failure() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
+
+#[test]
+fn host_logs_gate_chain_to_session() {
+    let root = root("session-log");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("session-log", "src/a.py");
+    let session = root.join("session.jsonl");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post",
+        ],
+    );
+    // session 自己也在 workspace 内：post 必须把它从 changed 里排除。
+    assert_eq!(code, Some(0), "{text}");
+
+    let records = trit_host::SessionLog::open(&session)
+        .unwrap()
+        .load()
+        .unwrap();
+    let mut phases = Vec::new();
+    let mut statuses = Vec::new();
+    for record in &records {
+        if let trit_host::SessionEvent::GateChain { phase, status, .. } = &record.event {
+            phases.push(match phase {
+                trit_host::GateChainPhase::Pre => "pre",
+                trit_host::GateChainPhase::Post => "post",
+            });
+            statuses.push(status.as_str());
+        }
+    }
+    assert_eq!(phases, ["pre", "post"], "{records:?}");
+    assert_eq!(statuses, ["passed", "aligned"], "{records:?}");
+
+    // 门链事件不改变 turn 状态机：recover 仍然只看到一轮。
+    let state = trit_host::recover(&records).unwrap();
+    assert_eq!(state.turns.len(), 1, "{state:?}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn host_logs_post_failure_to_session() {
+    let root = root("session-post-fail");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("session-post-fail", "src/b.py");
+    let session = root.join("session.jsonl");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--session",
+            session.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+
+    let records = trit_host::SessionLog::open(&session)
+        .unwrap()
+        .load()
+        .unwrap();
+    let post = records
+        .iter()
+        .find_map(|record| match &record.event {
+            trit_host::SessionEvent::GateChain {
+                phase: trit_host::GateChainPhase::Post,
+                status,
+                failures,
+                ..
+            } => Some((status.clone(), *failures)),
+            _ => None,
+        })
+        .expect("post gate_chain event");
+    assert_eq!(post.0, "unaligned");
+    assert!(post.1 > 0, "{post:?}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}

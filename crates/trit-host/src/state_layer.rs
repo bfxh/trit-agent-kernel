@@ -360,6 +360,8 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                 layer.projection_epoch = Some(*epoch);
                 layer.projection_freshness = Some(*freshness);
             }
+            // 门链结论不改变 turn 状态机；它只作为审计事件留在日志里。
+            SessionEvent::GateChain { .. } => {}
         }
     }
 
