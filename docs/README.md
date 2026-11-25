@@ -31,6 +31,8 @@
 | [RIGHTS.md](RIGHTS.md) | 政策草案，非法律意见 | 各仓库 LICENSE / NOTICE |
 | [MERGE-POLICY.md](MERGE-POLICY.md) | 现行流程 | CI 与 PR 模板 |
 | [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | B7.1–B7.4 首版已落地 | `reasonix_wire` / `provider_stream` / `context_projection` / `permissions` |
+| [REPO-BOUNDARY.md](REPO-BOUNDARY.md) | 已实现 | `.agent/repo.json`、`trit-orch repo-gate` |
+| [ALIGNMENT.md](ALIGNMENT.md) | v1/v2/v3 已实现；scaffold/stress 未迁 | `trit-orch::alignment`、`trit-orch alignment` CLI |
 | [DELIVERY.md](DELIVERY.md) | 已实现 | `trit-orch::delivery`、`trit-orch delivery` CLI、`.agent/delivery/` 账本 |
 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 契约草案，清单为模板 | [`agent-model-manifest.json`](agent-model-manifest.json)；运行时门禁仍归 `FeatureGate` |
 

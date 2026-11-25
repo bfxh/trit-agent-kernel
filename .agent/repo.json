@@ -1,0 +1,8 @@
+{
+  "schema": "repo-identity/1",
+  "repo": "bfxh/trit-agent-kernel",
+  "role": "agent-kernel",
+  "owns_agent_runtime": true,
+  "agent_runtime_repo": "bfxh/trit-agent-kernel",
+  "notes": "智能体内核与编排；三进制/训练主库是 bfxh/trit，不承载智能体运行时。"
+}
