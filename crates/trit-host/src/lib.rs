@@ -1020,8 +1020,8 @@ pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };
 pub use journal::{
-    JOURNAL_PATH, JOURNAL_SCHEMA, JournalEntry, JournalError, JournalPhase, JournalRecord,
-    JournalReport, MutationJournal,
+    BackupEntry, JOURNAL_PATH, JOURNAL_SCHEMA, JournalEntry, JournalError, JournalPhase,
+    JournalRecord, JournalReport, MutationJournal, RollbackOutcome,
 };
 pub use lease::{LEASE_PATH, LeaseError, OperationLease};
 pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};

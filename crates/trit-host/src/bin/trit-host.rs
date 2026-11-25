@@ -1251,8 +1251,9 @@ fn usage() {
          roots automatically and changes emit roots/list_changed.\n\n\
          session-status: trit-host session-status --session <jsonl>\n\
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
-         journal-status: trit-host journal-status --workspace <dir>\n\
-         prints the write-journal reconciliation; exits 1 when operations are in doubt.\n\n\
+         journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
+         prints the write-journal reconciliation; --rollback restores in-doubt writes;\n\
+         exits 1 on remaining doubt or rollback failure.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
@@ -1299,9 +1300,11 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
 /// 退出码：`0` 没有未闭合写，`1` 有 `in_doubt`，`2` 参数/读取错误。
 fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut workspace = PathBuf::from(".");
+    let mut rollback = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--rollback" => rollback = true,
             other => return Err(fail(format!("unknown journal-status argument: {other}"))),
         }
     }
@@ -1310,18 +1313,40 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
         // 没有账本时输出空报告，且不创建 `.agent/`（只读命令不产生副作用）。
         println!(
             "{}",
-            serde_json::to_string_pretty(&trit_host::JournalReport::default())
-                .map_err(|error| fail(error.to_string()))?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "report": trit_host::JournalReport::default(),
+                "rollbacks": [],
+            }))
+            .map_err(|error| fail(error.to_string()))?
         );
         return Ok(());
     }
-    let journal = MutationJournal::open(&workspace).map_err(|error| fail(error.to_string()))?;
+    let mut journal = MutationJournal::open(&workspace).map_err(|error| fail(error.to_string()))?;
     let report = journal.report().map_err(|error| fail(error.to_string()))?;
+    let mut rollbacks = Vec::new();
+    if rollback {
+        for record in &report.in_doubt {
+            let outcome = journal.rollback(record);
+            journal
+                .record_rollback(record.op_id, &outcome)
+                .map_err(|error| fail(error.to_string()))?;
+            rollbacks.push(outcome);
+        }
+    }
+    let after = if rollbacks.is_empty() {
+        report
+    } else {
+        journal.report().map_err(|error| fail(error.to_string()))?
+    };
+    let value = serde_json::json!({
+        "report": after,
+        "rollbacks": rollbacks,
+    });
     println!(
         "{}",
-        serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+        serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
     );
-    if report.has_in_doubt() {
+    if after.has_in_doubt() || rollbacks.iter().any(|outcome| !outcome.ok()) {
         std::process::exit(1);
     }
     Ok(())

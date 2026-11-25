@@ -97,8 +97,8 @@ fn run_writes_journal_and_status_reports_completed() {
 
     let (code, report) = journal_status(&root);
     assert_eq!(code, Some(0), "{report}");
-    assert_eq!(report["completed"], 1);
-    assert_eq!(report["in_doubt"].as_array().unwrap().len(), 0);
+    assert_eq!(report["report"]["completed"], 1);
+    assert_eq!(report["report"]["in_doubt"].as_array().unwrap().len(), 0);
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
@@ -116,8 +116,8 @@ fn journal_status_exits_one_on_unclosed_begin() {
 
     let (code, report) = journal_status(&root);
     assert_eq!(code, Some(1), "{report}");
-    assert_eq!(report["in_doubt"].as_array().unwrap().len(), 1);
-    assert_eq!(report["in_doubt"][0]["call_id"], "crash");
+    assert_eq!(report["report"]["in_doubt"].as_array().unwrap().len(), 1);
+    assert_eq!(report["report"]["in_doubt"][0]["call_id"], "crash");
     let _ = fs::remove_dir_all(root);
 }
 
@@ -145,10 +145,46 @@ fn journal_status_without_journal_creates_nothing() {
     let root = root("empty");
     let (code, report) = journal_status(&root);
     assert_eq!(code, Some(0), "{report}");
-    assert_eq!(report["total"], 0);
+    assert_eq!(report["report"]["total"], 0);
     assert!(
         !root.join(".agent").exists(),
         "read-only status created .agent"
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+fn journal_status_rollback(root: &Path) -> (Option<i32>, Value) {
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "journal-status",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--rollback",
+        ])
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
+
+#[test]
+fn journal_status_rolls_back_in_doubt_write() {
+    let root = root("rollback");
+    write(&root, "src/a.py", "old");
+    let mut journal = trit_host::MutationJournal::open(&root).unwrap();
+    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "new");
+    journal.record_begin(&request, None).unwrap();
+    // 模拟写了一半：文件已变成新内容，但没有 finish。
+    fs::write(root.join("src/a.py"), "new").unwrap();
+    drop(journal);
+
+    let (code, value) = journal_status_rollback(&root);
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
+    assert_eq!(value["report"]["in_doubt"].as_array().unwrap().len(), 0);
+    assert_eq!(value["report"]["rolled_back"], 1);
+    assert_eq!(value["rollbacks"][0]["restored"][0], "src/a.py");
     let _ = fs::remove_dir_all(root);
 }

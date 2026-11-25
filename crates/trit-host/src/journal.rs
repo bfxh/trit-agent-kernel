@@ -48,6 +48,24 @@ impl std::error::Error for JournalError {}
 pub enum JournalPhase {
     Begin,
     Finish,
+    Rollback,
+}
+
+/// 一次写操作涉及的文件快照；`backup` 指向 `.agent/journal-backups/<op_id>/` 下的副本。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupEntry {
+    /// workspace 相对路径（`/` 分隔）。
+    pub path: String,
+    /// 操作前文件是否存在。
+    pub existed: bool,
+    /// 备份文件名；`None` 表示没有备份（超限或被跳过）。
+    #[serde(default)]
+    pub backup: Option<String>,
+    /// 超过备份上限或路径不可归一化，回滚时无法恢复。
+    #[serde(default)]
+    pub skipped: bool,
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +87,8 @@ pub struct JournalRecord {
     pub in_doubt: bool,
     #[serde(default)]
     pub output: String,
+    #[serde(default)]
+    pub backups: Vec<BackupEntry>,
     pub at: u64,
 }
 
@@ -84,6 +104,7 @@ pub struct JournalReport {
     pub total: usize,
     pub completed: usize,
     pub failed: usize,
+    pub rolled_back: usize,
     pub orphans: usize,
     pub in_doubt: Vec<JournalRecord>,
 }
@@ -97,6 +118,7 @@ impl JournalReport {
 
 #[derive(Debug)]
 pub struct MutationJournal {
+    root: PathBuf,
     path: PathBuf,
     seq: u64,
 }
@@ -104,7 +126,8 @@ pub struct MutationJournal {
 impl MutationJournal {
     /// 打开（或创建）账本；已有记录会校验 schema 并续上 seq。
     pub fn open(root: impl AsRef<Path>) -> Result<Self, JournalError> {
-        let path = root.as_ref().join(JOURNAL_PATH);
+        let root = root.as_ref().to_path_buf();
+        let path = root.join(JOURNAL_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 JournalError::Io(format!("create {}: {error}", parent.display()))
@@ -112,7 +135,11 @@ impl MutationJournal {
         }
         let records = read_records(&path)?;
         let seq = records.last().map_or(0, |record| record.seq);
-        Ok(Self { path, seq })
+        Ok(Self { root, path, seq })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn path(&self) -> &Path {
@@ -139,6 +166,7 @@ impl MutationJournal {
             passed: false,
             in_doubt: false,
             output: String::new(),
+            backups: self.backup_paths(op_id, &request.paths)?,
             at: now_secs(),
         };
         self.append(&record)?;
@@ -164,6 +192,7 @@ impl MutationJournal {
             passed: outcome.passed,
             in_doubt: outcome.in_doubt,
             output: truncate(&outcome.output, MAX_OUTPUT),
+            backups: Vec::new(),
             at: now_secs(),
         };
         self.append(&record)
@@ -189,6 +218,7 @@ impl MutationJournal {
             passed: false,
             in_doubt: true,
             output: truncate(error, MAX_OUTPUT),
+            backups: Vec::new(),
             at: now_secs(),
         };
         self.append(&record)
@@ -215,10 +245,147 @@ impl MutationJournal {
                     }
                     None => report.orphans += 1,
                 },
+                JournalPhase::Rollback => {
+                    open.remove(&record.op_id);
+                    report.rolled_back += 1;
+                }
             }
         }
         report.in_doubt = open.into_values().collect();
         Ok(report)
+    }
+
+    /// 记录一次回滚结果，闭合对应的 `begin`。
+    pub fn record_rollback(
+        &mut self,
+        op_id: u64,
+        outcome: &RollbackOutcome,
+    ) -> Result<(), JournalError> {
+        self.seq = self.seq.saturating_add(1);
+        let record = JournalRecord {
+            schema: JOURNAL_SCHEMA,
+            seq: self.seq,
+            op_id,
+            phase: JournalPhase::Rollback,
+            tool: String::new(),
+            call_id: String::new(),
+            paths: Vec::new(),
+            lease_epoch: None,
+            passed: outcome.ok(),
+            in_doubt: false,
+            output: format!(
+                "restored={} removed={} skipped={} failed={}",
+                outcome.restored.len(),
+                outcome.removed.len(),
+                outcome.skipped.len(),
+                outcome.failed.len()
+            ),
+            backups: Vec::new(),
+            at: now_secs(),
+        };
+        self.append(&record)
+    }
+
+    /// 用 `begin` 记录里的备份恢复文件。
+    pub fn rollback(&self, record: &JournalRecord) -> RollbackOutcome {
+        let mut outcome = RollbackOutcome {
+            op_id: record.op_id,
+            ..RollbackOutcome::default()
+        };
+        let dir = self
+            .root
+            .join(".agent/journal-backups")
+            .join(record.op_id.to_string());
+        for entry in &record.backups {
+            if entry.skipped {
+                outcome.skipped.push(entry.path.clone());
+                continue;
+            }
+            let Some(relative) = backup_relative(&entry.path) else {
+                outcome.skipped.push(entry.path.clone());
+                continue;
+            };
+            let target = self.root.join(&relative);
+            if entry.existed {
+                let Some(name) = &entry.backup else {
+                    outcome.skipped.push(entry.path.clone());
+                    continue;
+                };
+                match std::fs::copy(dir.join(name), &target) {
+                    Ok(_) => outcome.restored.push(entry.path.clone()),
+                    Err(error) => outcome.failed.push(format!("{}: {error}", entry.path)),
+                }
+            } else {
+                match std::fs::remove_file(&target) {
+                    Ok(()) => outcome.removed.push(entry.path.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => outcome.failed.push(format!("{}: {error}", entry.path)),
+                }
+            }
+        }
+        outcome
+    }
+
+    fn backup_paths(&self, op_id: u64, paths: &[String]) -> Result<Vec<BackupEntry>, JournalError> {
+        let dir = self
+            .root
+            .join(".agent/journal-backups")
+            .join(op_id.to_string());
+        let mut entries = Vec::with_capacity(paths.len());
+        for (index, raw) in paths.iter().enumerate() {
+            let Some(relative) = backup_relative(raw) else {
+                entries.push(BackupEntry {
+                    path: raw.clone(),
+                    skipped: true,
+                    ..BackupEntry::default()
+                });
+                continue;
+            };
+            let target = self.root.join(&relative);
+            match std::fs::metadata(&target) {
+                Ok(metadata) if metadata.is_file() => {
+                    if metadata.len() > MAX_BACKUP_BYTES {
+                        entries.push(BackupEntry {
+                            path: relative,
+                            existed: true,
+                            backup: None,
+                            skipped: true,
+                            bytes: metadata.len(),
+                        });
+                        continue;
+                    }
+                    std::fs::create_dir_all(&dir).map_err(|error| {
+                        JournalError::Io(format!("create {}: {error}", dir.display()))
+                    })?;
+                    let name = index.to_string();
+                    std::fs::copy(&target, dir.join(&name)).map_err(|error| {
+                        JournalError::Io(format!("backup {}: {error}", target.display()))
+                    })?;
+                    entries.push(BackupEntry {
+                        path: relative,
+                        existed: true,
+                        backup: Some(name),
+                        skipped: false,
+                        bytes: metadata.len(),
+                    });
+                }
+                Ok(_) => entries.push(BackupEntry {
+                    path: relative,
+                    existed: true,
+                    backup: None,
+                    skipped: true,
+                    bytes: 0,
+                }),
+                Err(_) => entries.push(BackupEntry {
+                    path: relative,
+                    existed: false,
+                    backup: None,
+                    skipped: false,
+                    bytes: 0,
+                }),
+            }
+        }
+        Ok(entries)
     }
 
     fn append(&self, record: &JournalRecord) -> Result<(), JournalError> {
@@ -232,6 +399,43 @@ impl MutationJournal {
             .map_err(|error| JournalError::Io(format!("open {}: {error}", self.path.display())))?;
         file.write_all(line.as_bytes())
             .map_err(|error| JournalError::Io(format!("write {}: {error}", self.path.display())))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RollbackOutcome {
+    pub op_id: u64,
+    pub restored: Vec<String>,
+    pub removed: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+impl RollbackOutcome {
+    pub fn ok(&self) -> bool {
+        self.skipped.is_empty() && self.failed.is_empty()
+    }
+}
+
+/// 单个文件备份上限；超过只记录、不回滚。
+const MAX_BACKUP_BYTES: u64 = 8 * 1024 * 1024;
+
+fn backup_relative(raw: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for component in Path::new(&raw.replace('\\', "/")).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop()?;
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            _ => return None,
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
     }
 }
 
@@ -395,6 +599,50 @@ mod tests {
         let report = reopened.report().unwrap();
         assert_eq!(report.completed, 1);
         assert!(!report.has_in_doubt());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_existing_file() {
+        let root = root("rollback");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "old").unwrap();
+        let mut journal = MutationJournal::open(&root).unwrap();
+        let _ = journal.record_begin(&request(), None).unwrap();
+        // 模拟半完成写。
+        std::fs::write(root.join("src/a.py"), "new").unwrap();
+
+        let report = journal.report().unwrap();
+        assert_eq!(report.in_doubt.len(), 1);
+        let record = report.in_doubt[0].clone();
+        let outcome = journal.rollback(&record);
+        assert_eq!(outcome.restored, ["src/a.py"]);
+        assert!(outcome.ok(), "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.py")).unwrap(),
+            "old"
+        );
+
+        journal.record_rollback(record.op_id, &outcome).unwrap();
+        let report = journal.report().unwrap();
+        assert_eq!(report.rolled_back, 1);
+        assert!(!report.has_in_doubt());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_removes_new_file() {
+        let root = root("rollback-new");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let mut journal = MutationJournal::open(&root).unwrap();
+        let _ = journal.record_begin(&request(), None).unwrap();
+        std::fs::write(root.join("src/a.py"), "new").unwrap();
+
+        let report = journal.report().unwrap();
+        let outcome = journal.rollback(&report.in_doubt[0]);
+        assert_eq!(outcome.removed, ["src/a.py"]);
+        assert!(outcome.ok(), "{outcome:?}");
+        assert!(!root.join("src/a.py").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

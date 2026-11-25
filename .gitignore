@@ -14,3 +14,6 @@ __pycache__/
 # 跨进程写租约是本机状态，不进公开树。
 .agent/write-lease
 .agent/leases/
+
+# mutation journal 的备份目录。
+.agent/journal-backups/

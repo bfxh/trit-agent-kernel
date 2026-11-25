@@ -96,6 +96,20 @@ trit-host run --task "..." --workspace . \
 - 账本不存完整工具输出（单条最多 512 字符）；默认不 `fsync`，崩溃尾行损坏会被忽略，
   中间坏行仍然报错。
 
+### 回滚
+
+`begin` 记录会把涉及的文件备份到 `.agent/journal-backups/<op_id>/`（单文件上限
+8 MiB，超限记 `skipped`）。对未闭合的操作执行：
+
+```bash
+trit-host journal-status --workspace . --rollback
+```
+
+- 操作前存在的文件 → 用备份恢复；操作前不存在 → 删除新建文件；
+- 超限 / 无法归一化 → 记入 `skipped`，不静默当成成功；
+- 回滚会追加一条 `rollback` 记录闭合该 `begin`；有 `failed` / `skipped` 时退出 `1`；
+- 回滚是**显式动作**：默认 `journal-status` 只报告，不自动改文件。
+
 ## 7. 诚实边界
 
 - **本地文件系统**的租约，不是跨机器写权威；分布式存储需要在存储端校验 token。
