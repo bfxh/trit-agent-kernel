@@ -45,6 +45,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "journal-status" {
         return run_journal_status(args);
     }
+    if command == "appcontainer-run" {
+        return run_appcontainer(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1257,6 +1260,7 @@ fn usage() {
          --gate-chain-report / --gate-chain-post-report: write the pre/post report JSON\n\
          to the given path (workspace relative); report files are excluded from post checks.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
+         --sandbox builtin: Linux bwrap / macOS sandbox-exec / Windows AppContainer.\n\
          --write-claim: restrict write_file to declared paths (globs allowed; quote in shell).\n\
          --write-lease: acquire <workspace>/.agent/write-lease before running\n\
          (requires --write-claim; exits 2 when another owner holds it).\n\
@@ -1324,6 +1328,41 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `appcontainer-run --workspace <dir> -- <program> [args...]`：在 Windows
+/// AppContainer 内运行命令，并把退出码原样返回；失败不回落。
+fn run_appcontainer(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    let mut command: Vec<String> = Vec::new();
+    let mut after_separator = false;
+    while let Some(arg) = args.next() {
+        if after_separator {
+            command.push(arg);
+            continue;
+        }
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--" => after_separator = true,
+            other => return Err(fail(format!("unknown appcontainer-run argument: {other}"))),
+        }
+    }
+    if command.is_empty() {
+        return Err(fail("appcontainer-run requires a command after --"));
+    }
+    #[cfg(windows)]
+    {
+        let code = match trit_host::appcontainer::run(&workspace, &command[0], &command[1..]) {
+            Ok(code) => code,
+            Err(error) => return Err(fail(error)),
+        };
+        std::process::exit(code);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (workspace, command);
+        Err(fail("appcontainer-run is Windows only"))
+    }
 }
 
 /// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。

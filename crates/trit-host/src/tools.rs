@@ -81,7 +81,23 @@ impl SandboxCommand {
                 args: vec!["-p".into(), profile],
             })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let root = std::fs::canonicalize(root)
+                .map_err(|error| AgentError::Io(format!("sandbox root: {error}")))?;
+            let exe = std::env::current_exe()
+                .map_err(|error| AgentError::Io(format!("current exe: {error}")))?;
+            Ok(Self {
+                program: exe,
+                args: vec![
+                    "appcontainer-run".into(),
+                    "--workspace".into(),
+                    root.to_string_lossy().to_string(),
+                    "--".into(),
+                ],
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = root;
             Err(AgentError::Tool(

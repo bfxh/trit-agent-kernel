@@ -1,5 +1,9 @@
 # 任务：Windows AppContainer 内置沙箱后端
 
+> 状态：**已实现**（2026-11-26，`feat/gate-chain`）。实现见
+> `crates/trit-host/src/appcontainer.rs`、`trit-host appcontainer-run`、
+> `crates/trit-host/tests/appcontainer.rs`。本文保留作验收记录与后续回归基线。
+
 ## 级别与当量
 
 **S**。预计 3–5 天，不可与其它批次并行：涉及 Win32 安全 API、ACL 修改、进程创建与

@@ -563,7 +563,7 @@ fn builtin_sandbox_wraps_workspace_with_sandbox_exec() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 #[test]
 fn builtin_sandbox_is_rejected_off_unix() {
     let root = temp_workspace("builtin-sandbox-off");
@@ -572,5 +572,22 @@ fn builtin_sandbox_is_rejected_off_unix() {
         error.to_string().contains("only available on Linux"),
         "{error}"
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn builtin_sandbox_uses_appcontainer_run() {
+    let root = temp_workspace("builtin-sandbox-win");
+    let sandbox = SandboxCommand::builtin(&root).unwrap();
+    let (program, args) = sandbox.argv("echo hi");
+    assert_eq!(program, std::env::current_exe().unwrap());
+    assert_eq!(args[0], "appcontainer-run");
+    assert_eq!(args[1], "--workspace");
+    assert_eq!(args[3], "--");
+    let tail: Vec<&String> = args.iter().rev().take(3).collect();
+    assert_eq!(tail[2], "cmd");
+    assert_eq!(tail[1], "/C");
+    assert_eq!(tail[0], "echo hi");
     let _ = std::fs::remove_dir_all(root);
 }

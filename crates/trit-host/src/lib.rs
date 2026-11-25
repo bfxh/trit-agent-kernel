@@ -964,6 +964,8 @@ pub fn run_headless<M: Model>(
     }
 }
 
+#[cfg(windows)]
+pub mod appcontainer;
 pub mod checkpoint;
 pub mod context;
 pub mod context_layers;

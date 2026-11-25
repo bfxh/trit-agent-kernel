@@ -204,12 +204,13 @@ fn write_claim_accepts_glob_pattern() {
 
 #[cfg(windows)]
 #[test]
-fn builtin_sandbox_is_rejected_on_windows() {
+fn builtin_sandbox_is_configured_on_windows() {
     let root = root("builtin");
     write(&root, "src/a.py", "x");
     let (code, text) = host(&root, &["--sandbox", "builtin"]);
     assert_eq!(code, Some(2), "{text}");
-    assert!(text.contains("only available on Linux"), "{text}");
+    assert!(!text.contains("only available on Linux"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
     let _ = fs::remove_dir_all(root);
 }
 
