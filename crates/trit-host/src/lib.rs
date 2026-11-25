@@ -983,6 +983,7 @@ pub mod lease;
 pub mod mcp_tools;
 pub mod openai;
 pub mod permissions;
+pub mod planner;
 pub mod port_bridge;
 pub mod provider;
 pub mod provider_health;
@@ -1042,6 +1043,7 @@ pub use permissions::{
     ClaimingTools, PermissionApprover, PermissionDecision, PermissionGate, PermissionMode,
     PermissionPolicy, PermissionRule, WriteClaim, WriteGuard, wrap_claim,
 };
+pub use planner::{PlanCollectingTools, plan_from_capture, planner_catalog_specs, planner_tools};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
