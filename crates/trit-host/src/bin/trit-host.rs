@@ -264,7 +264,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(fail("--mcp-sampling requires --provider openai"));
     }
     let workspace_root = workspace.clone();
-    if repo_identity || !repo_expected.trim().is_empty() {
+    let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
+    if repo_identity || !repo_expected.trim().is_empty() || identity_path.exists() {
         let decision = trit_orch::repo::gate(&workspace_root, &repo_expected, &task_kind);
         if decision.gate != trit_orch::Ternary::True {
             return Err(fail(format!("repo gate rejected: {}", decision.reason)));
@@ -707,6 +708,7 @@ fn usage() {
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
          --repo-identity: fail closed unless .agent/repo.json is valid; --repo-expected\n\
          additionally pins owner/repo, and agent tasks require owns_agent_runtime=true.\n\
+         If the workspace already contains .agent/repo.json, the gate runs automatically.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
