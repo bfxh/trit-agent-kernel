@@ -1082,6 +1082,7 @@ dependencies = [
 name = "trit-orch"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "serde",
  "serde_json",
  "thiserror",

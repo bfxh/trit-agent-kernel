@@ -219,6 +219,8 @@ pub enum Error {
     FlipWindowZero,
     #[error("task brief for {task} is incomplete: {reason}")]
     BriefIncomplete { task: String, reason: String },
+    #[error("repo scope rejected: {reason}")]
+    RepoScopeRejected { reason: String },
 }
 
 pub(crate) fn add_tokens(left: u64, right: u64, task: Option<&str>) -> Result<u64, Error> {
@@ -312,6 +314,7 @@ impl Error {
             Error::LearnWindowMismatch { .. } => "learn_window_mismatch",
             Error::FlipWindowZero => "flip_window_zero",
             Error::BriefIncomplete { .. } => "brief_incomplete",
+            Error::RepoScopeRejected { .. } => "repo_scope_rejected",
         }
     }
 }

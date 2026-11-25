@@ -2,6 +2,7 @@
 
 mod adherence;
 mod admission;
+pub mod alignment;
 mod brief;
 mod budget;
 mod budget_book;
@@ -28,6 +29,7 @@ mod plan;
 mod policy;
 mod progress;
 mod receipt;
+pub mod repo;
 mod selection;
 mod shadow;
 mod shadow_learn;
@@ -102,6 +104,7 @@ pub use receipt::{
     DeliveryReceipt, HandoffPacket, ReceiptFailure, ReceiptLedger, ReceiptState, handoff_gate,
     handoff_obligation, receipt_obligation,
 };
+pub use repo::{RepoIdentity, RepoRole, ScopeDecision, gate as repo_gate};
 pub use shadow::{ShadowReport, TraceStep, TraceStore, replay};
 pub use shadow_learn::{
     PolicyEvaluation, PolicyLearnDeferReason, PolicyLearnDeferral, PolicyLearning,
