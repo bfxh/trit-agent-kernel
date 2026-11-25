@@ -38,6 +38,7 @@ mod selection;
 mod shadow;
 mod shadow_learn;
 mod status;
+mod subagent;
 mod tick;
 mod trace;
 mod trace_invariants;
@@ -122,6 +123,9 @@ pub use shadow_learn::{
     learn_policy,
 };
 pub use status::Counts;
+pub use subagent::{
+    MAX_FRAME_BYTES, SubagentRequest, SubagentResponse, decode_frame, encode_frame, exit_status,
+};
 pub use tick::{Tick, TickInput, tick};
 pub use trace::{
     Actor, AppendOutcome, CausalChain, ClaimAction, ClaimRecord, CoordinationFold, EffectRecord,

@@ -249,6 +249,8 @@ pub enum Error {
     FleetRuntime { message: String },
     #[error("plan handoff schema: {message}")]
     PlanHandoffSchema { message: String },
+    #[error("subagent protocol: {message}")]
+    SubagentProtocol { message: String },
 }
 
 pub(crate) fn add_tokens(left: u64, right: u64, task: Option<&str>) -> Result<u64, Error> {
@@ -355,6 +357,7 @@ impl Error {
             Error::DelegateCapsuleTooLarge { .. } => "delegate_capsule_too_large",
             Error::FleetRuntime { .. } => "fleet_runtime",
             Error::PlanHandoffSchema { .. } => "plan_handoff_schema",
+            Error::SubagentProtocol { .. } => "subagent_protocol",
         }
     }
 }
