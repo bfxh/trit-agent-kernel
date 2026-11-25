@@ -50,7 +50,7 @@
 | 12 | 沙箱 / isolation runner | `ISOLATION_*`、`SPEC §3.7` | 部分 | 已有外部 sandbox wrapper；缺 runner 生命周期、fail-closed 矩阵 | B7.4 |
 | 13 | 宿主裁决完成声明 | `SPEC §3.11`、`complete_subtask` | 已有 | 已有 EvidenceRails/义务；需补齐“criterion → 回执”逐条降级与 write scope | B7.5 |
 | 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 部分（原语 + 协议） | `ReadOnlyTools` + `ReadOnlyCatalog` + `SessionPaths` + 独立 `CacheLedger` + `PlanHandoff` + `submit_plan` 协议解析已实现；缺 provider 侧真实模型调用接线 | B7.6 |
-| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 部分（契约 + IPC） | `SubagentProfile` 权限单调、`ContextCapsule` 显式继承、`DelegationResult` 稳定引用、子 agent IPC 帧契约（半包/粘包、引用校验、结局映射）已实现；缺真实进程 spawn 与超时 kill | B7.6 |
+| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 部分（契约 + IPC + 进程） | `SubagentProfile` 权限单调、`ContextCapsule` 显式继承、`DelegationResult` 稳定引用、IPC 帧契约（半包/粘包、引用校验、结局映射）、真实 spawn/超时 kill（`subagent_process` + `subagent-echo`）已实现；缺子 agent 独立二进制分发与跨机器 | B7.6 |
 | 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 部分（执行层 + CLI + 宿主接线） | `fleet::execute` 接 `trit-schedule` runtime：并发上限、失败传播、Aborted/Deferred 归类、稳定引用；`fleet-run` CLI 导出 JSON + Prometheus；`HeadlessFleetRunner` 每任务独立 headless session 已实现；缺跨机器调度 | B7.6 |
 | 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 缺口 | 技能索引、命令解析、hook 匹配与检查点/失效联动 | B7.9 |
 | 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 缺口 | 记忆 CRUD、BM25 历史检索、归档与隐私边界 | B7.9 |

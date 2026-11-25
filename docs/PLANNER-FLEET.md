@@ -149,8 +149,16 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 - `exit_status`：零退出但无响应、非零退出、被信号/超时终止都不产生 `Completed`；
 - `decode_frame` 支持半包与粘包，超限/非法载荷一律 `subagent_protocol` 错误。
 
-宿主可用 stdin/stdout 管道、socket 或测试替身承载同一套帧；真实进程 spawn 与超时
-kill 属于宿主实现。
+宿主可用 stdin/stdout 管道、socket 或测试替身承载同一套帧。仓库内提供参考实现
+`trit_host::subagent_process`：
+
+- `SubagentProcessConfig { program, args, timeout }`（默认 30s）；
+- `run_subagent`：spawn → 写请求帧并关 stdin（子进程看到 EOF）→ 读线程收集
+  stdout、主线程 `recv_timeout`；超时 `kill` + `wait` 并返回 `Aborted`；收到响应
+  强制 `validate_for`；无响应走 `exit_status`；
+- `trit-host subagent-echo`（`--fail` / `--silent` / `--sleep-ms` / `--task`）是
+  可执行的真实子 agent 替身，用于端到端回归（真实 spawn、超时 kill、无响应、
+  引用不匹配四类）。
 
 ## 非目标
 
