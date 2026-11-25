@@ -1,13 +1,17 @@
-//! 跨机派发：真实双节点 loopback、失败隔离、全失败与预取消。
+//! 跨机派发：真实双节点 loopback、失败隔离、有界重试与幂等键复用。
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use trit_host::{RemotePlanConfig, run_remote_plan};
 use trit_orch::{
     AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, Dependency, Plan,
-    RemoteEndpoint, RemoteNode, SubagentProfile, SubagentRequest, Task, TaskSpec, Ternary,
+    RemoteEndpoint, RemoteNode, SubagentProfile, SubagentRequest, SubagentResponse, Task, TaskSpec,
+    Ternary, decode_frame, encode_frame,
 };
 
 struct TestNode {
@@ -269,6 +273,169 @@ fn pre_cancelled_plan_dispatches_nothing() {
             Some(DelegationStatus::Aborted)
         ));
     }
+}
+
+#[test]
+fn retry_switches_node_and_reuses_idempotency_key() {
+    // 同一个端点被登记成两个节点 id：第一次连接直接断开（Aborted），第二次回 Completed。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let keys: Arc<Mutex<Vec<String>>> = Arc::default();
+    let handle: JoinHandle<()> = {
+        let keys = Arc::clone(&keys);
+        std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut content_length = 0usize;
+                let mut idempotency = None;
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    let Some((name, value)) = trimmed.split_once(':') else {
+                        continue;
+                    };
+                    match name.trim().to_ascii_lowercase().as_str() {
+                        "content-length" => content_length = value.trim().parse().unwrap(),
+                        "x-trit-idempotency" => idempotency = Some(value.trim().to_string()),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let mut buffer = body;
+                let request: SubagentRequest = decode_frame(&mut buffer).unwrap().unwrap();
+                keys.lock().unwrap().push(idempotency.unwrap_or_default());
+
+                if attempt == 0 {
+                    // 不回任何 HTTP 响应就断开：客户端只能判 Aborted。
+                    continue;
+                }
+                let response = SubagentResponse {
+                    task: request.task.clone(),
+                    epoch: request.epoch,
+                    status: DelegationStatus::Completed,
+                    content: b"retried".to_vec(),
+                    tokens: 0,
+                };
+                let frame = encode_frame(&response).unwrap();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    trit_host::FRAME_CONTENT_TYPE,
+                    frame.len()
+                );
+                let _ = stream.write_all(&frame);
+                let _ = stream.flush();
+            }
+        })
+    };
+
+    let endpoint = RemoteEndpoint {
+        url: format!("http://{address}/run"),
+        auth_token: None,
+        timeout_secs: 5,
+    };
+    let plan = plan(vec![task("t1", &[])]);
+    let report = run_remote_plan(
+        &plan,
+        vec![
+            RemoteNode::new("node-a", endpoint.clone()),
+            RemoteNode::new("node-b", endpoint),
+        ],
+        RemotePlanConfig::new(1).with_retry_limit(1),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert_eq!(report.report.completed, ["t1"], "{:?}", report.report);
+    assert!(report.reusable("t1"));
+    assert_eq!(report.node_of("t1"), Some("node-b"), "重试必须换节点");
+    assert_eq!(report.attempts_of("t1").len(), 2);
+    assert_eq!(report.attempts_of("t1")[0].node, "node-a");
+    assert!(matches!(
+        report.attempts_of("t1")[0].status,
+        DelegationStatus::Aborted
+    ));
+    assert_eq!(report.attempts_of("t1")[1].node, "node-b");
+    assert!(matches!(
+        report.attempts_of("t1")[1].status,
+        DelegationStatus::Completed
+    ));
+
+    let keys = keys.lock().unwrap().clone();
+    assert_eq!(keys, ["t1@0", "t1@0"], "两次尝试必须复用同一个幂等键");
+    let _ = handle.join();
+}
+
+#[test]
+fn retry_limit_bounds_attempts() {
+    // 两个节点都不回包：retry_limit=1 只允许一次换节点重试。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        }
+    });
+
+    let endpoint = RemoteEndpoint {
+        url: format!("http://{address}/run"),
+        auth_token: None,
+        timeout_secs: 1,
+    };
+    let plan = plan(vec![task("t1", &[])]);
+    let report = run_remote_plan(
+        &plan,
+        vec![
+            RemoteNode::new("node-a", endpoint.clone()),
+            RemoteNode::new("node-b", endpoint),
+        ],
+        RemotePlanConfig::new(1).with_retry_limit(1),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert!(report.report.completed.is_empty());
+    assert_eq!(report.attempts_of("t1").len(), 2, "{:?}", report.report);
+    assert!(
+        report
+            .attempts_of("t1")
+            .iter()
+            .all(|attempt| matches!(attempt.status, DelegationStatus::Aborted))
+    );
+    assert!(report.report.failed.is_some());
+    assert!(report.nodes.iter().all(|node| !node.healthy));
+}
+
+#[test]
+fn task_failure_is_not_retried() {
+    // 远端明确回 Failed：任务级失败，换节点重试也不会改变结果，按设计不重试。
+    let node = spawn_node("only", 1, &["--fail"]);
+    let plan = plan(vec![task("t1", &[])]);
+    let report = run_remote_plan(
+        &plan,
+        vec![node.remote()],
+        RemotePlanConfig::new(1).with_retry_limit(3),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert_eq!(report.attempts_of("t1").len(), 1, "{:?}", report.attempts);
+    assert!(matches!(
+        report.attempts_of("t1")[0].status,
+        DelegationStatus::Failed { .. }
+    ));
 }
 
 #[test]

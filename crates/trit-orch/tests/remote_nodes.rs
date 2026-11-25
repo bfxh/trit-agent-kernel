@@ -210,6 +210,33 @@ fn snapshots_are_sorted_by_id() {
 }
 
 #[test]
+fn acquire_excluding_skips_failed_node() {
+    let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
+    let cancel = CancelToken::new();
+    let mut excluded = std::collections::BTreeSet::new();
+
+    let first = table
+        .acquire_excluding(&cancel, &excluded)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.node().id, "a");
+    first.finish(NodeOutcome::NodeFailed);
+    excluded.insert("a".into());
+
+    // 重试必须换节点，而不是回到刚失败的 a。
+    let retry = table
+        .acquire_excluding(&cancel, &excluded)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.node().id, "b");
+    retry.finish(NodeOutcome::Succeeded);
+
+    excluded.insert("b".into());
+    let error = table.acquire_excluding(&cancel, &excluded).unwrap_err();
+    assert_eq!(error.kind(), "remote_nodes");
+}
+
+#[test]
 fn remote_node_json_uses_documented_defaults() {
     let node: RemoteNode =
         serde_json::from_str(r#"{"id":"n1","endpoint":{"url":"https://agents.example.com/run"}}"#)

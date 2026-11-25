@@ -2,11 +2,15 @@
 //! 失败路径（鉴权、非 2xx、重定向、空体、截断、超限、引用不匹配、传输失败）。
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
-use trit_host::{FRAME_CONTENT_TYPE, MAX_RESPONSE_BYTES, run_remote_subagent};
+use trit_host::{
+    FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteServer, RemoteServerConfig,
+    run_remote_subagent,
+};
 use trit_orch::{
     AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint, SubagentProfile,
     SubagentRequest, SubagentResponse, Task, TaskSpec, decode_frame, encode_frame,
@@ -408,4 +412,116 @@ fn remote_timeout_is_aborted() {
     );
     assert!(!result.reusable());
     let _ = child.wait();
+}
+
+#[test]
+fn idempotency_header_carries_task_at_epoch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut content_length = 0usize;
+        let mut idempotency = None;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            let Some((name, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            match name.trim().to_ascii_lowercase().as_str() {
+                "content-length" => content_length = value.trim().parse().unwrap(),
+                "x-trit-idempotency" => idempotency = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let mut buffer = body;
+        let received: SubagentRequest = decode_frame(&mut buffer).unwrap().unwrap();
+        let frame = encode_frame(&response(&received, DelegationStatus::Completed)).unwrap();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: {FRAME_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            frame.len()
+        );
+        let _ = stream.write_all(&frame);
+        let _ = stream.flush();
+        idempotency
+    });
+
+    let result = run_remote_subagent(
+        &endpoint(&format!("http://{address}/run"), None, 5),
+        &request(),
+    )
+    .unwrap();
+    assert!(result.reusable(), "{:?}", result.status);
+    assert_eq!(handle.join().unwrap().as_deref(), Some("a@3"));
+}
+
+#[test]
+fn echo_server_dedupes_matching_idempotency_key() {
+    // 同一个 key 的第二次请求必须直接回缓存，不再执行（也就跳过 sleep）。
+    let server =
+        RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_sleep_ms(500)).unwrap();
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+
+    let started = Instant::now();
+    let first = run_remote_subagent(&endpoint(&url, None, 30), &request()).unwrap();
+    let first_elapsed = started.elapsed();
+    assert!(first.reusable(), "{:?}", first.status);
+    assert!(
+        first_elapsed >= Duration::from_millis(450),
+        "first request should execute and sleep: {first_elapsed:?}"
+    );
+
+    let started = Instant::now();
+    let second = run_remote_subagent(&endpoint(&url, None, 30), &request()).unwrap();
+    let second_elapsed = started.elapsed();
+    assert!(second.reusable(), "{:?}", second.status);
+    assert_eq!(second.reference(), first.reference());
+    assert!(
+        second_elapsed < Duration::from_millis(300),
+        "dedupe hit must skip execution: {second_elapsed:?}"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn echo_server_rejects_mismatched_idempotency_key() {
+    // 头里的 key 与帧里的 task@epoch 不一致：400，不解帧执行。
+    let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();
+    let address = server.addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let _ = server.serve_once();
+    });
+
+    let frame = encode_frame(&request()).unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    let _ = write!(
+        stream,
+        "POST /run HTTP/1.1\r\nHost: test\r\n{IDEMPOTENCY_HEADER}: b@3\r\nContent-Type: {FRAME_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        frame.len()
+    );
+    let _ = stream.write_all(&frame);
+    let _ = stream.flush();
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    let _ = reader.read_line(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "unexpected response: {response}"
+    );
+    handle.join().unwrap();
 }

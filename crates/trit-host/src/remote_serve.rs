@@ -11,10 +11,15 @@
 //!    直接 401，帧不解码；
 //! 3. **只回合法帧**：响应体永远是 `trit_orch::encode_frame` 的产物；
 //!    失败模式回 `Failed` 帧，而不是让宿主把错误当成完成；
-//! 4. **一连接一请求**：读满一帧即回包并关闭，便于宿主侧超时语义保持简单。
+//! 4. **一连接一请求**：读满一帧即回包并关闭，便于宿主侧超时语义保持简单；
+//! 5. **带键才去重**：`X-Trit-Idempotency` 必须等于帧里的 `task@epoch`，否则 400；
+//!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效），缓存上限
+//!    [`MAX_CACHED_RESPONSES`]，按 FIFO 淘汰。没有头就按普通请求处理。
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use trit_orch::{
@@ -24,6 +29,12 @@ use trit_orch::{
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 幂等缓存上限：参考实现按 FIFO 淘汰，不做 LRU。
+const MAX_CACHED_RESPONSES: usize = 1024;
+
+/// 幂等缓存：`"<task>@<epoch>" -> 首次响应`。
+type ResponseCache = Arc<Mutex<BTreeMap<String, SubagentResponse>>>;
 
 /// 服务端应答模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,13 +90,18 @@ impl RemoteServerConfig {
 pub struct RemoteServer {
     listener: TcpListener,
     config: RemoteServerConfig,
+    cache: ResponseCache,
 }
 
 impl RemoteServer {
     /// 绑定监听地址；失败即返回，不重试。
     pub fn bind(config: RemoteServerConfig) -> std::io::Result<Self> {
         let listener = TcpListener::bind(config.bind.as_str())?;
-        Ok(Self { listener, config })
+        Ok(Self {
+            listener,
+            config,
+            cache: Arc::default(),
+        })
     }
 
     /// 实际监听地址（`--bind 127.0.0.1:0` 时用它对外公布）。
@@ -96,7 +112,7 @@ impl RemoteServer {
     /// 服务一个连接后返回；测试与单次演示用。
     pub fn serve_once(&self) -> std::io::Result<()> {
         let (stream, _) = self.listener.accept()?;
-        handle(stream, &self.config)
+        handle(stream, &self.config, &self.cache)
     }
 
     /// 持续服务，直到进程被终止；单连接错误只丢弃该连接。
@@ -107,15 +123,20 @@ impl RemoteServer {
         loop {
             let (stream, _) = self.listener.accept()?;
             let config = self.config.clone();
+            let cache = Arc::clone(&self.cache);
             std::thread::spawn(move || {
-                let _ = handle(stream, &config);
+                let _ = handle(stream, &config, &cache);
             });
         }
     }
 }
 
-/// 处理一个连接：解析请求头 → 鉴权 → 读一帧 → 回一帧 → 关闭。
-fn handle(mut stream: TcpStream, config: &RemoteServerConfig) -> std::io::Result<()> {
+/// 处理一个连接：解析请求头 → 鉴权 → 读一帧 → 幂等查缓存/执行 → 回一帧 → 关闭。
+fn handle(
+    mut stream: TcpStream,
+    config: &RemoteServerConfig,
+    cache: &ResponseCache,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -134,6 +155,7 @@ fn handle(mut stream: TcpStream, config: &RemoteServerConfig) -> std::io::Result
 
     let mut content_length: Option<usize> = None;
     let mut authorization: Option<String> = None;
+    let mut idempotency: Option<String> = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -152,6 +174,7 @@ fn handle(mut stream: TcpStream, config: &RemoteServerConfig) -> std::io::Result
                 Err(_) => return respond(&mut stream, 400, "Bad Request", b""),
             },
             "authorization" => authorization = Some(value.to_string()),
+            "x-trit-idempotency" => idempotency = Some(value.to_string()),
             _ => {}
         }
     }
@@ -183,6 +206,21 @@ fn handle(mut stream: TcpStream, config: &RemoteServerConfig) -> std::io::Result
         Ok(None) | Err(_) => return respond(&mut stream, 400, "Bad Request", b""),
     };
 
+    // 幂等键必须与帧里的 task@epoch 一致；只有带键的请求才去重。
+    let key = format!("{}@{}", request.task, request.epoch);
+    let dedupe = match idempotency.as_deref() {
+        None => false,
+        Some(value) if value == key => true,
+        Some(_) => return respond(&mut stream, 400, "Bad Request", b""),
+    };
+    if dedupe && let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        let frame = match encode_frame(&cached) {
+            Ok(frame) => frame,
+            Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
+        };
+        return respond(&mut stream, 200, "OK", &frame);
+    }
+
     if config.sleep_ms > 0 {
         std::thread::sleep(Duration::from_millis(config.sleep_ms));
     }
@@ -205,6 +243,14 @@ fn handle(mut stream: TcpStream, config: &RemoteServerConfig) -> std::io::Result
         Ok(frame) => frame,
         Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
     };
+    if dedupe && let Ok(mut guard) = cache.lock() {
+        if guard.len() >= MAX_CACHED_RESPONSES
+            && let Some(oldest) = guard.keys().next().cloned()
+        {
+            guard.remove(&oldest);
+        }
+        guard.insert(key, response);
+    }
     respond(&mut stream, 200, "OK", &frame)
 }
 

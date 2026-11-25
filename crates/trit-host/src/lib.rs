@@ -1075,10 +1075,10 @@ pub use reasonix_wire::{
     REASONIX_EVENT_KINDS, REASONIX_WIRE_VERSION, WireCacheDiagnostics, WireContractError,
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
-pub use remote_fleet::{RemotePlanConfig, RemotePlanReport, run_remote_plan};
+pub use remote_fleet::{RemoteAttempt, RemotePlanConfig, RemotePlanReport, run_remote_plan};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
 pub use remote_subagent::{
-    FRAME_CONTENT_TYPE, MAX_RESPONSE_BYTES, RemoteReply, run_remote_subagent,
+    FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteReply, run_remote_subagent,
     run_remote_subagent_reply,
 };
 pub use sampling::OpenAiSamplingHandler;

@@ -50,8 +50,8 @@
 | 12 | 沙箱 / isolation runner | `ISOLATION_*`、`SPEC §3.7` | 部分 | 已有外部 sandbox wrapper；缺 runner 生命周期、fail-closed 矩阵 | B7.4 |
 | 13 | 宿主裁决完成声明 | `SPEC §3.11`、`complete_subtask` | 已有 | 已有 EvidenceRails/义务；需补齐“criterion → 回执”逐条降级与 write scope | B7.5 |
 | 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 部分（原语 + 协议） | `ReadOnlyTools` + `ReadOnlyCatalog` + `SessionPaths` + 独立 `CacheLedger` + `PlanHandoff` + `submit_plan` 协议解析已实现；缺 provider 侧真实模型调用接线 | B7.6 |
-| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 部分（契约 + IPC + 进程 + 远程传输） | `SubagentProfile` 权限单调、`ContextCapsule` 显式继承、`DelegationResult` 稳定引用、IPC 帧契约（半包/粘包、引用校验、结局映射）、真实 spawn/超时 kill（`subagent_process` + `subagent-echo` + `subagent-run`）已实现；跨机器已有 `RemoteEndpoint` 准入 + 宿主侧 ureq 单帧 POST（`run_remote_subagent`）与参考服务端（`remote_serve` + `remote-echo`）；节点发现、跨机调度、跨机失败恢复仍不在范围 | B7.6 |
-| 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 部分（执行层 + CLI + 宿主接线 + 跨机派发） | `fleet::execute` 接 `trit-schedule` runtime：并发上限、失败传播、Aborted/Deferred 归类、稳定引用；`fleet-run` CLI 导出 JSON + Prometheus；`HeadlessFleetRunner` 每任务独立 headless session 已实现；跨机派发已有 `NodeTable`（静态节点、最轻负载、容量准入、故障隔离）+ `run_remote_plan`（每任务节点归属与精确状态）；动态节点发现、跨机抢占与自动重试仍缺 | B7.6 |
+| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 部分（契约 + IPC + 进程 + 远程传输） | `SubagentProfile` 权限单调、`ContextCapsule` 显式继承、`DelegationResult` 稳定引用、IPC 帧契约（半包/粘包、引用校验、结局映射）、真实 spawn/超时 kill（`subagent_process` + `subagent-echo` + `subagent-run`）已实现；跨机器已有 `RemoteEndpoint` 准入 + 宿主侧 ureq 单帧 POST（`run_remote_subagent`，携带 `X-Trit-Idempotency`）与参考服务端（`remote_serve` + `remote-echo`，按 `task@epoch` 去重）；节点发现仍不在范围，跨机调度与有界失败恢复见第 16 行 | B7.6 |
+| 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 部分（执行层 + CLI + 宿主接线 + 跨机派发） | `fleet::execute` 接 `trit-schedule` runtime：并发上限、失败传播、Aborted/Deferred 归类、稳定引用；`fleet-run` CLI 导出 JSON + Prometheus；`HeadlessFleetRunner` 每任务独立 headless session 已实现；跨机派发已有 `NodeTable`（静态节点、最轻负载、容量准入、故障隔离、排除集合）+ `run_remote_plan`（每任务节点归属、每次尝试记录、精确状态）；节点级失败可按 `retry_limit`（默认 0）换节点重试并复用幂等键；动态节点发现、跨机抢占与无限自动重试仍缺 | B7.6 |
 | 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 部分（注册表） | `SkillIndex`（最长触发词优先）、`CommandRegistry`（斜杠命令解析、参数数量 fail-closed）、`HookRegistry`（事件 + 工具匹配、`*` 通配、`invalidate_on` 失效联动）已实现；缺技能目录发现与 hook 动作执行 | B7.9 |
 | 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 部分（内存索引） | `MemoryStore` CRUD + BM25（k1=1.2、b=0.75，分数降序、同分按 id 升序）+ `Sensitivity::Secret` 默认排除已实现；缺持久化/归档与 history 目录投影 | B7.9 |
 | 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分（准入 + 路由） | `ServeConfig::validate`（仅 loopback、token 非空）、`authorize`（Host / Origin / bearer）、`route`（golden 路由表，405 / 404）已实现；缺真实 HTTP/SSE 传输与响应编码 | B7.8 |
@@ -148,7 +148,7 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   - subagent profile、context capsule、结果引用、只读/写入权限；
   - fleet `depends_on`、并发上限、失败传播；
   - 用指标判断是否值得委派，不凭感觉并行。
-- 不做：把 fleet 图硬塞进 `TaskSpec`；跨机器调度。
+- 不做：把 fleet 图硬塞进 `TaskSpec`；动态节点发现与跨机抢占（静态节点表的派发、隔离与有界重试已补，见第 16 行）。
 - 验收：前缀缓存不被 planner 污染；子 agent 无隐式继承；越权写被拒绝；失败/中断结果可恢复；并发/成本有基线。
 - 依赖：B7.5。
 

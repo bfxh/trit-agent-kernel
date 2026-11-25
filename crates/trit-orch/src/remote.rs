@@ -14,6 +14,7 @@
 //! - **取消**：等待中的调用方按 [`CancelToken`] 退出，返回 `Ok(None)`；
 //! - **不自动重试**：远程可能已经执行过，重试需要幂等键；本层不做隐式重试。
 
+use std::collections::BTreeSet;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -153,16 +154,28 @@ impl NodeTable {
     /// - `Ok(Some(lease))`：已占用一个槽位，用完必须 [`NodeLease::finish`]
     ///   （或直接 drop，按节点级失败处理）；
     /// - `Ok(None)`：取消令牌已置位，未占用任何节点；
-    /// - `Err(remote_nodes)`：所有节点都被隔离，本轮不再有可用容量。
+    /// - `Err(remote_nodes)`：所有节点都被隔离/排除，本轮不再有可用容量。
     ///
     /// 满载时会阻塞等待，等待期间每 [`WAIT_STEP`] 复查取消令牌。
     pub fn acquire(&self, cancel: &CancelToken) -> Result<Option<NodeLease<'_>>, Error> {
+        self.acquire_excluding(cancel, &BTreeSet::new())
+    }
+
+    /// 同 [`NodeTable::acquire`]，但跳过 `excluded` 里的节点。
+    ///
+    /// 重试语义：一次尝试在节点 A 上出现节点级失败后，用 `excluded = {A}`
+    /// 再申请，保证重试落到**另一台**机器，而不是立刻回到刚失败的节点。
+    pub fn acquire_excluding(
+        &self,
+        cancel: &CancelToken,
+        excluded: &BTreeSet<String>,
+    ) -> Result<Option<NodeLease<'_>>, Error> {
         let mut slots = self.lock();
         loop {
             if cancel.is_cancelled() {
                 return Ok(None);
             }
-            if let Some(index) = pick(&slots) {
+            if let Some(index) = pick(&slots, excluded) {
                 slots[index].in_flight += 1;
                 let node = slots[index].node.clone();
                 return Ok(Some(NodeLease {
@@ -172,12 +185,20 @@ impl NodeTable {
                     released: false,
                 }));
             }
-            if !slots.iter().any(|slot| slot.healthy) {
+            let healthy = slots.iter().any(|slot| slot.healthy);
+            let usable = slots
+                .iter()
+                .any(|slot| slot.healthy && !excluded.contains(&slot.node.id));
+            if !usable {
                 return Err(Error::RemoteNodes {
-                    message: "no healthy remote nodes remain".into(),
+                    message: if healthy {
+                        "no remote nodes remain outside the excluded set".into()
+                    } else {
+                        "no healthy remote nodes remain".into()
+                    },
                 });
             }
-            // 还有健康节点，只是暂时满载：等释放，同时保持取消可响应。
+            // 还有可用节点，只是暂时满载：等释放，同时保持取消可响应。
             let (guard, _) = self
                 .cond
                 .wait_timeout(slots, WAIT_STEP)
@@ -244,10 +265,13 @@ impl std::fmt::Debug for NodeTable {
     }
 }
 
-fn pick(slots: &[Slot]) -> Option<usize> {
+fn pick(slots: &[Slot], excluded: &BTreeSet<String>) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (index, slot) in slots.iter().enumerate() {
-        if !slot.healthy || slot.in_flight >= slot.node.max_in_flight {
+        if !slot.healthy
+            || slot.in_flight >= slot.node.max_in_flight
+            || excluded.contains(&slot.node.id)
+        {
             continue;
         }
         best = Some(match best {

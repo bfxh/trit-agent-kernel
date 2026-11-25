@@ -171,22 +171,26 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 - 空 host（如 `https://`、`https://:8080`）、空白 token、0 超时一律
   `subagent_protocol` 错误；
 - `run_remote_subagent`：`validate` → 编码单帧 → `POST`
-  （`Content-Type: application/x-trit-frame`，可选 `Authorization: Bearer`）→
+  （`Content-Type: application/x-trit-frame`，可选 `Authorization: Bearer`，
+  幂等键 `X-Trit-Idempotency: <task>@<epoch>`）→
   有界读响应 → `validate_for` → `DelegationResult`；
-- 客户端**不跟随重定向**（3xx 直接记 `Failed`），**不自动重试**；传输失败/超时
-  记 `Aborted`；非 2xx、空体、截断帧、超过 `MAX_RESPONSE_BYTES` 记 `Failed`；
-  解帧失败或 `task + epoch` 不匹配返回协议错误。以上都不产生 `Completed`；
+- 客户端**不跟随重定向**（3xx 直接记 `Failed`），单次调用**不自动重试**；传输
+  失败/超时记 `Aborted`；非 2xx、空体、截断帧、超过 `MAX_RESPONSE_BYTES` 记
+  `Failed`；解帧失败或 `task + epoch` 不匹配返回协议错误。以上都不产生
+  `Completed`；跨机重试由 §9 的调度层显式开启。
 - 参考服务端 `trit_host::remote_serve` 与 CLI `trit-host remote-echo`：一次
   连接一个 `POST`，`Content-Length` 有界（≤ 8 MiB + 4），可选 Bearer 校验，
-  `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；启动先打印
+  `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；带
+  `X-Trit-Idempotency` 且与帧一致时按 `<task>@<epoch>` 缓存首次响应（重试直接
+  回缓存、不再执行），缓存上限 1024、FIFO 淘汰；头与帧不一致回 400。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口。
 
 回归在 `crates/trit-host/tests/remote_subagent.rs`：loopback 服务端与真实
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
-超时与连接失败。
+超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝。
 
-**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）与
-自动重试（需要幂等键）。静态节点表与派发见 §9。
+**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）。
+静态节点表、派发与有界换机重试见 §9。
 
 ## 9. 跨机器调度（`trit_orch::NodeTable` + `trit_host::run_remote_plan`）
 
@@ -196,30 +200,37 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 - `RemoteNode { id, max_in_flight, endpoint }`：静态节点表（发现 v1 由调用方/配置
   注入）；建表校验 id 唯一非空白、容量 ≥ 1、端点通过准入校验。
 - `NodeTable`：按负载比 `in_flight / max_in_flight` 选最轻节点（平手按 id 升序）；
-  各节点容量独立，满载时阻塞等待并每 25ms 复查取消令牌；取消返回 `Ok(None)`。
+  各节点容量独立，满载时阻塞等待并每 25ms 复查取消令牌；取消返回 `Ok(None)`；
+  `acquire_excluding(cancel, excluded)` 在故障重试时跳过已失败的节点。
 - 故障隔离：`NodeOutcome::{Succeeded, TaskFailed, NodeFailed}`。连续
   `failure_threshold`（默认 1）次节点级失败后该节点退出本轮调度；远端明确回
   `Failed` 只算任务失败，不隔离节点；`NodeLease` 未 `finish` 就 drop 按节点级
   失败记账，避免 panic 泄漏容量。
 - `run_remote_plan(plan, nodes, config, cancel, build_request)`：在 fleet runner
   内申请节点 → 编码请求 → ureq POST → 归还；返回
-  `RemotePlanReport { report, results, assignments, nodes }`：
-  - `assignments`：`task -> node id`；
+  `RemotePlanReport { report, results, assignments, attempts, nodes }`：
+  - `assignments`：`task -> node id`（重试时是最后一次尝试的节点）；
   - `results`：远端自报的精确状态（`Aborted` 不会在汇总里被改写成 `Failed`）；
+  - `attempts`：每次尝试的 `{ node, status }`，按发生顺序；
   - `nodes`：`attempts / failures / healthy` 快照。
-- **不自动重试**：远程可能已执行，重试需要幂等键。本轮的“恢复”= 故障隔离 +
-  失败不掩盖；失败向上传播仍由 fleet 负责（失败后不再启动新任务）。
+- **有界重试（默认 0，显式 opt-in）**：只有节点级失败（传输错误 / 超时 /
+  `Aborted` / 远端回 `Deferred`）才换节点重试，最多 `retry_limit` 次；任务级
+  `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: <task>@<epoch>`，
+  要求服务端按 key 去重；参考实现 `remote-echo` 将首次响应缓存
+  （上限 1024，FIFO 淘汰），带键命中直接回缓存、不再执行。没有幂等保证的
+  服务端不应开启重试。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
-隔离阈值、drop 记账、JSON 默认值）与 `crates/trit-host/tests/remote_fleet.rs`
-（真实双节点均衡、无响应节点隔离、远端任务失败、预取消、非法节点表）。
+隔离阈值、排除集合、drop 记账、JSON 默认值）与 `crates/trit-host/tests/remote_fleet.rs`
+（真实双节点均衡、无响应节点隔离、远端任务失败不重试、换节点重试复用幂等键、
+重试上限、预取消、非法节点表）。
 
 ## 非目标
 
 - 不把 fleet 依赖图塞进 `TaskSpec`：`TaskSpec.deps` 只有三元依赖，图的调度归属
   runtime；
-- 不做动态节点发现、跨机抢占与自动重试（幂等键未落地）；静态节点表内的
-  派发与故障隔离见 §9；
+- 不做动态节点发现、跨机抢占与无限自动重试；静态节点表内的派发、故障隔离与
+  有界换机重试见 §9；
 - 真实子 agent 进程的 spawn/超时 kill 由宿主实现，本批只固化 IPC 契约；
 - provider 侧的模型调用本身（HTTP/SSE 接线）不在本批：本批把模型输出解析成
   `PlanHandoff`（`submit_plan`），发请求仍走既有 provider 路径。

@@ -29,6 +29,12 @@ use crate::AgentError;
 /// 远程端点交换的帧媒体类型；请求与响应都用它。
 pub const FRAME_CONTENT_TYPE: &str = "application/x-trit-frame";
 
+/// 幂等键头：值是 `"<task>@<epoch>"`。
+///
+/// 跨机重试必须复用同一个键；服务端可据此去重（参考实现 `remote-echo` 会缓存
+/// 首次响应）。没有这个头时服务端按普通请求处理，不去重。
+pub const IDEMPOTENCY_HEADER: &str = "X-Trit-Idempotency";
+
 /// 响应体硬上限：单帧上限加 4 字节长度前缀。
 pub const MAX_RESPONSE_BYTES: usize = MAX_FRAME_BYTES + 4;
 
@@ -73,7 +79,12 @@ pub fn run_remote_subagent_reply(
     let mut call = agent
         .post(endpoint.url.trim())
         .set("Content-Type", FRAME_CONTENT_TYPE)
-        .set("Accept", FRAME_CONTENT_TYPE);
+        .set("Accept", FRAME_CONTENT_TYPE)
+        // 重试必须复用同一个幂等键；服务端据此去重。
+        .set(
+            IDEMPOTENCY_HEADER,
+            &format!("{}@{}", request.task, request.epoch),
+        );
     if let Some(token) = endpoint.auth_token.as_deref() {
         call = call.set("Authorization", &format!("Bearer {token}"));
     }
