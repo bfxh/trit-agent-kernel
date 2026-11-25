@@ -178,6 +178,21 @@ impl ToolRequest {
         }
     }
 
+    /// 移动：`paths` 固定为 `[from, to]`，两端都在 claim 校验范围内。
+    pub fn move_path(
+        call_id: impl Into<String>,
+        from: impl Into<String>,
+        to: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            tool: "move_path".into(),
+            read_only: false,
+            paths: vec![from.into(), to.into()],
+            ..Self::default()
+        }
+    }
+
     pub fn host_call(&self, task: &str) -> HostToolCall {
         HostToolCall {
             task: task.to_owned(),

@@ -42,6 +42,18 @@ fn script(name: &str, path: &str) -> PathBuf {
     file
 }
 
+fn script_move(name: &str, from: &str, to: &str) -> PathBuf {
+    let file = std::env::temp_dir().join(format!(
+        "trit-write-guard-move-{name}-{}.json",
+        std::process::id()
+    ));
+    let body = format!(
+        r#"[{{"tool_calls":[{{"call_id":"m1","tool":"move_path","read_only":false,"paths":["{from}","{to}"]}}]}},{{"completion":{{"criteria":[{{"id":"c1","kind":{{"kind":"diff","paths":["{to}"]}}}}]}}}}]"#
+    );
+    fs::write(&file, body).unwrap();
+    file
+}
+
 fn host(root: &Path, extra: &[&str]) -> (Option<i32>, String) {
     let mut args = vec!["run", "--task", "x", "--workspace", root.to_str().unwrap()];
     args.extend_from_slice(extra);
@@ -182,6 +194,46 @@ fn write_claim_accepts_glob_pattern() {
         ],
     );
     assert_eq!(code, Some(0), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn write_claim_checks_both_move_endpoints() {
+    let root = root("move");
+    write(&root, "src/a.py", "x");
+    let script_path = script_move("move", "src/a.py", "src/b.py");
+
+    // 目标未被 claim 覆盖：整个 move 被 blocked，源文件保持原位。
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--write-claim",
+            "src/a.py",
+        ],
+    );
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("write claim does not allow"), "{text}");
+    assert!(root.join("src/a.py").exists());
+    assert!(!root.join("src/b.py").exists());
+
+    // 两端都在 claim 内：移动成功。
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--write-claim",
+            "src",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(!root.join("src/a.py").exists());
+    assert!(root.join("src/b.py").exists());
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }

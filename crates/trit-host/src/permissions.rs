@@ -266,6 +266,10 @@ impl WriteClaim {
             "write_file" => {
                 !request.paths.is_empty() && request.paths.iter().all(|path| self.allows_path(path))
             }
+            // move 的两端都必须被 claim 覆盖：源可读、目标可写。
+            "move_path" => {
+                request.paths.len() == 2 && request.paths.iter().all(|path| self.allows_path(path))
+            }
             // shell 无法从命令文本证明路径范围；claim 存在时 fail-closed。
             "bash" => false,
             _ => true,
@@ -695,6 +699,22 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         let claim = WriteClaim::new(&root, vec![PathBuf::from("SRC/*.PY")]).unwrap();
         assert!(claim.allows_path("src/a.py"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_claim_requires_both_move_endpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-move-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src")]).unwrap();
+        assert!(claim.allows_request(&ToolRequest::move_path("m1", "src/a.txt", "src/b.txt")));
+        assert!(!claim.allows_request(&ToolRequest::move_path("m1", "src/a.txt", "other/b.txt")));
+        assert!(!claim.allows_request(&ToolRequest::move_path("m1", "other/a.txt", "src/b.txt")));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

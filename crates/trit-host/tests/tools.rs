@@ -483,3 +483,38 @@ fn writes_through_symlinks_and_symlinked_dirs_are_rejected() {
     let _ = std::fs::remove_dir_all(&outside_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn local_tools_move_path_moves_file() {
+    let root = temp_workspace("move");
+    let mut tools = make_tools(&root, true, false);
+    std::fs::write(root.join("a.txt"), "hello").unwrap();
+    let outcome = tools
+        .execute(&ToolRequest::move_path("m1", "a.txt", "sub/b.txt"))
+        .unwrap();
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(outcome.written_paths, ["a.txt", "sub/b.txt"]);
+    assert!(!root.join("a.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("sub/b.txt")).unwrap(),
+        "hello"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_tools_move_path_requires_two_paths_and_write() {
+    let root = temp_workspace("move-args");
+    let mut tools = make_tools(&root, true, false);
+    let error = tools
+        .execute(&ToolRequest::write("m1", "move_path", "a.txt", ""))
+        .unwrap_err();
+    assert!(error.to_string().contains("two paths"), "{error}");
+
+    let mut readonly = make_tools(&root, false, false);
+    let error = readonly
+        .execute(&ToolRequest::move_path("m1", "a.txt", "b.txt"))
+        .unwrap_err();
+    assert!(error.to_string().contains("not allowed"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}

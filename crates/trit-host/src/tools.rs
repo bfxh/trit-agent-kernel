@@ -608,6 +608,53 @@ impl LocalTools {
         })
     }
 
+    fn move_path(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        if !self.allow_write {
+            return Err(AgentError::Tool("move_path is not allowed".into()));
+        }
+        if request.paths.len() != 2 {
+            return Err(AgentError::Tool(
+                "move_path requires exactly two paths (from, to)".into(),
+            ));
+        }
+        let from_raw = &request.paths[0];
+        let to_raw = &request.paths[1];
+        let from = self.resolve_relative(from_raw)?;
+        let to = self.resolve_relative(to_raw)?;
+        self.reject_symlink(&from, from_raw)?;
+        self.reject_symlink(&to, to_raw)?;
+        let metadata = self
+            .dir
+            .symlink_metadata(&from)
+            .map_err(|error| AgentError::Io(format!("stat {from_raw}: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(AgentError::Tool(format!("refusing symlink: {from_raw}")));
+        }
+        if !metadata.is_file() {
+            return Err(AgentError::Tool(format!("not a regular file: {from_raw}")));
+        }
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|error| AgentError::Io(format!("mkdir {}: {error}", parent.display())))?;
+        }
+        self.dir
+            .rename(&from, &self.dir, &to)
+            .map_err(|error| AgentError::Io(format!("move {from_raw} -> {to_raw}: {error}")))?;
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed: true,
+            assertions: 0,
+            written_paths: vec![from_raw.clone(), to_raw.clone()],
+            in_doubt: false,
+            output: format!("moved {from_raw} -> {to_raw}"),
+        })
+    }
+
     fn bash(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
         if !self.allow_shell {
             return Err(AgentError::Tool("bash is not allowed".into()));
@@ -677,6 +724,7 @@ impl ToolExecutor for LocalTools {
         match request.tool.as_str() {
             "read_file" => self.read_file(request),
             "write_file" => self.write_file(request),
+            "move_path" => self.move_path(request),
             "search_code" => self.search_code(request),
             "glob" => self.glob(request),
             "bash" => self.bash(request),
