@@ -7,6 +7,8 @@ mod budget;
 mod budget_book;
 mod claim;
 mod context;
+pub mod delivery;
+mod digest;
 mod effects;
 mod error;
 mod evidence;
