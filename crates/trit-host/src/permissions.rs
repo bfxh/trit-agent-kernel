@@ -5,6 +5,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
 use crate::lease::OperationLease;
@@ -169,11 +170,12 @@ impl<T: ToolExecutor> ToolExecutor for PermissionGate<T> {
     }
 }
 
-/// 任务级写入范围；只允许已声明路径（文件或目录子树）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 任务级写入范围：已声明路径（文件/子树）或 glob 模式。
+#[derive(Debug, Clone)]
 pub struct WriteClaim {
     root: PathBuf,
     allowed: Vec<PathBuf>,
+    patterns: Vec<GlobMatcher>,
 }
 
 impl WriteClaim {
@@ -181,7 +183,23 @@ impl WriteClaim {
         let root = std::fs::canonicalize(root.into())
             .map_err(|error| AgentError::Io(format!("write claim root: {error}")))?;
         let mut allowed = Vec::with_capacity(paths.len());
+        let mut patterns = Vec::new();
         for path in paths {
+            let text = path.to_string_lossy().replace('\\', "/");
+            if has_glob(&text) {
+                let normalized = normalize_relative(&text)?;
+                let matcher = GlobBuilder::new(&normalized)
+                    // `*` 不跨目录，跨目录必须显式 `**`。
+                    .literal_separator(true)
+                    .case_insensitive(cfg!(windows))
+                    .build()
+                    .map_err(|error| {
+                        AgentError::Tool(format!("write claim glob {text:?}: {error}"))
+                    })?
+                    .compile_matcher();
+                patterns.push(matcher);
+                continue;
+            }
             let absolute = if path.is_absolute() {
                 path
             } else {
@@ -198,7 +216,11 @@ impl WriteClaim {
         }
         allowed.sort();
         allowed.dedup();
-        Ok(Self { root, allowed })
+        Ok(Self {
+            root,
+            allowed,
+            patterns,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -209,13 +231,30 @@ impl WriteClaim {
         &self.allowed
     }
 
+    /// 声明的 glob 模式数（字面路径不计入）。
+    pub fn pattern_count(&self) -> usize {
+        self.patterns.len()
+    }
+
     pub fn allows_path(&self, raw: &str) -> bool {
         if raw.trim().is_empty() {
             return false;
         }
         let path = self.root.join(raw);
         let path = normalize_absolute(&path);
-        path.starts_with(&self.root) && self.allowed.iter().any(|allowed| path.starts_with(allowed))
+        if !path.starts_with(&self.root) {
+            return false;
+        }
+        if self.allowed.iter().any(|allowed| path.starts_with(allowed)) {
+            return true;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        self.patterns
+            .iter()
+            .any(|pattern| pattern.is_match(&relative))
     }
 
     pub fn allows_request(&self, request: &ToolRequest) -> bool {
@@ -349,6 +388,39 @@ fn normalize_absolute(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+fn has_glob(text: &str) -> bool {
+    text.contains(['*', '?', '['])
+}
+
+/// 把 glob 模式折成 workspace 相对、`/` 分隔的形式；拒绝绝对路径与 `..` 逃逸。
+fn normalize_relative(raw: &str) -> Result<String, AgentError> {
+    let mut parts: Vec<String> = Vec::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Err(AgentError::Tool(format!(
+                        "write claim pattern escapes root: {raw}"
+                    )));
+                }
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            _ => {
+                return Err(AgentError::Tool(format!(
+                    "write claim pattern must be workspace relative: {raw}"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(AgentError::Tool(format!(
+            "write claim pattern must name a file: {raw}"
+        )));
+    }
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -532,6 +604,51 @@ mod tests {
                 .unwrap()
                 .passed
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_claim_accepts_glob_patterns() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-glob-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src/*.py")]).unwrap();
+        assert_eq!(claim.pattern_count(), 1);
+        assert!(claim.allows_path("src/a.py"));
+        assert!(!claim.allows_path("src/sub/b.py"));
+        assert!(!claim.allows_path("other/a.py"));
+
+        let recursive = WriteClaim::new(&root, vec![PathBuf::from("src/**/*.py")]).unwrap();
+        assert!(recursive.allows_path("src/a.py"));
+        assert!(recursive.allows_path("src/sub/b.py"));
+        assert!(!recursive.allows_path("tests/a.py"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_claim_glob_rejects_escape() {
+        let root =
+            std::env::temp_dir().join(format!("trit-claim-glob-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let error = WriteClaim::new(&root, vec![PathBuf::from("../*.py")]).unwrap_err();
+        assert!(error.to_string().contains("escapes root"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_claim_glob_is_case_insensitive_on_windows() {
+        let root =
+            std::env::temp_dir().join(format!("trit-claim-glob-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("SRC/*.PY")]).unwrap();
+        assert!(claim.allows_path("src/a.py"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

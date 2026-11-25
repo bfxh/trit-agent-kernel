@@ -71,9 +71,10 @@ trit-host run --task "..." --workspace . \
 
 | 参数 | 作用 |
 | --- | --- |
-| `--write-claim <path>` | 声明可写路径（可重复）；`write_file` 只能落在这些路径，`bash` 写入 fail-closed |
+| `--write-claim <path>` | 声明可写路径（可重复）；支持文件/子树前缀与 glob（`*` 不跨目录、`**` 跨目录；Windows 大小写不敏感） |
 | `--write-lease <owner>` | 运行前获取 `<workspace>/.agent/write-lease`；需要至少一个 `--write-claim` |
 
+- glob 在 shell 里要加引号（`--write-claim 'src/*.py'`），避免被 shell 先展开。
 - 获取失败（另一个持有者）→ 退出 `2`，stderr `write lease is busy: owner=... epoch=...`。
 - 命中 claim 之外的写入 → 工具结果
   `blocked: write claim does not allow this path or shell command`，不执行。

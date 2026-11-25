@@ -165,3 +165,23 @@ fn write_lease_is_busy_when_held() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
+
+#[test]
+fn write_claim_accepts_glob_pattern() {
+    let root = root("glob");
+    write(&root, "src/a.py", "x");
+    let script_path = script("glob", "src/a.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--write-claim",
+            "src/*.py",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}

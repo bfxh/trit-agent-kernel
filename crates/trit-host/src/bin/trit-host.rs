@@ -1205,7 +1205,7 @@ fn usage() {
          --gate-chain-report / --gate-chain-post-report: write the pre/post report JSON\n\
          to the given path (workspace relative); report files are excluded from post checks.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
-         --write-claim: restrict write_file to declared paths; shell writes fail closed.\n\
+         --write-claim: restrict write_file to declared paths (globs allowed; quote in shell).\n\
          --write-lease: acquire <workspace>/.agent/write-lease before running\n\
          (requires --write-claim; exits 2 when another owner holds it).\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
