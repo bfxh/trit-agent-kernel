@@ -239,18 +239,21 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   账本不可达时 fail-closed（503）。配合 `--state` 时已完成记录跨重启保留；
   例外是占位 TTL 过期后的接管：若老执行者仍然存活并完成，会再登记一次，
   TTL 越长越安全。
-- CLI `trit-host remote-plan [--input <json|->]`：输入
+- CLI `trit-host remote-plan [--input <json|->] [--health <path>]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
   含 `completed/failed/deferred/results/assignments/attempts/nodes/metrics` 的
   JSON 报告；用于跨机演练与运维冒烟。远端可以是 `remote-exec`（真实执行
-  `subagent-run`）或任何实现同一帧协议的服务端。
+  `subagent-run`）或任何实现同一帧协议的服务端。`--health` 读取上一次的节点
+  快照（`healthy/attempts/failures`），跳过已隔离节点，并在本次结束后原子写回；
+  文件里已删除的节点 ID 会被忽略，未知/损坏文件按错误退出。健康状态没有自动
+  恢复：节点修好后需删除该文件或把对应 `healthy` 改回 `true`。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
-隔离阈值、排除集合、drop 记账、JSON 默认值）、`crates/trit-host/tests/remote_fleet.rs`
+隔离阈值、排除集合、drop 记账、快照恢复、JSON 默认值）、`crates/trit-host/tests/remote_fleet.rs`
 （真实双节点均衡、无响应节点隔离、远端任务失败不重试、换节点重试复用幂等键、
 重试上限、预取消、非法节点表）、`crates/trit-host/tests/remote_plan_cli.rs`
-（`remote-plan` 真实双节点演练与重复节点 ID 拒绝）与
+（`remote-plan` 真实双节点演练、健康文件跨运行隔离与重复节点 ID 拒绝）与
 `crates/trit-host/tests/remote_ledger.rs`（共享账本下双节点单次执行）。
 
 ## 非目标

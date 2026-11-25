@@ -1328,7 +1328,7 @@ fn usage() {
          --workspace <dir> --script <proposals.json> [--max-steps N] [--exec-timeout-secs N] \\\n\
          [--once] [--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
-         remote-plan: trit-host remote-plan [--input <json|->]\n\
+         remote-plan: trit-host remote-plan [--input <json|->] [--health <path>]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?}},\n\
          dispatches tasks as read-only subagent requests to the static node table, prints JSON."
     );
@@ -1661,9 +1661,11 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 /// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
 fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut input_path: Option<String> = None;
+    let mut health_path: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--input" => input_path = Some(next(&mut args, "--input")?),
+            "--health" => health_path = Some(next(&mut args, "--health")?),
             other => return Err(fail(format!("unknown remote-plan argument: {other}"))),
         }
     }
@@ -1684,13 +1686,28 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let config = trit_host::RemotePlanConfig::new(input.workers)
         .with_failure_threshold(input.failure_threshold)
         .with_retry_limit(input.retry_limit);
-    let report = trit_host::run_remote_plan(
+    let mut table =
+        trit_orch::NodeTable::new(input.nodes)?.with_failure_threshold(input.failure_threshold);
+    if let Some(path) = health_path.as_deref()
+        && Path::new(path).exists()
+    {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| fail(format!("read health file {path}: {error}")))?;
+        let snapshots: Vec<trit_orch::NodeSnapshot> = serde_json::from_str(&text)
+            .map_err(|error| fail(format!("parse health file {path}: {error}")))?;
+        table = table.with_snapshots(&snapshots);
+    }
+    let table = Arc::new(table);
+    let report = trit_host::run_remote_plan_with_table(
         &plan,
-        input.nodes,
+        table,
         config,
         trit_orch::CancelToken::new(),
         remote_request_for,
     )?;
+    if let Some(path) = health_path.as_deref() {
+        save_health(path, &report.nodes)?;
+    }
 
     let failed = report
         .report
@@ -1710,6 +1727,24 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
         "metrics": report.report.metrics,
     });
     println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+/// 写节点健康快照：先写临时文件再替换，避免半截文件。
+fn save_health(path: &str, nodes: &[trit_orch::NodeSnapshot]) -> Result<(), Box<dyn Error>> {
+    let text = serde_json::to_string_pretty(nodes)?;
+    let target = Path::new(path);
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = target.with_extension("tmp");
+    std::fs::write(&temporary, &text)?;
+    if target.exists() {
+        std::fs::remove_file(target)?;
+    }
+    std::fs::rename(&temporary, target)?;
     Ok(())
 }
 

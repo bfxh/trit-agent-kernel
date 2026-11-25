@@ -126,6 +126,23 @@ where
     F: Fn(&TaskSpec) -> SubagentRequest + Send + Sync + 'static,
 {
     let table = Arc::new(NodeTable::new(nodes)?.with_failure_threshold(config.failure_threshold));
+    run_remote_plan_with_table(plan, table, config, cancel, build_request)
+}
+
+/// 同 [`run_remote_plan`]，但使用调用方预建的节点表。
+///
+/// 典型用途：先 [`NodeTable::with_snapshots`] 恢复上一次运行的节点健康状态，再派发。
+/// 调用方负责按 `config.failure_threshold` 配置该表；本函数不再重建。
+pub fn run_remote_plan_with_table<F>(
+    plan: &Plan,
+    table: Arc<NodeTable>,
+    config: RemotePlanConfig,
+    cancel: CancelToken,
+    build_request: F,
+) -> Result<RemotePlanReport, AgentError>
+where
+    F: Fn(&TaskSpec) -> SubagentRequest + Send + Sync + 'static,
+{
     let replies: Arc<Mutex<BTreeMap<String, DelegationResult>>> = Arc::default();
     let assignments: Arc<Mutex<BTreeMap<String, String>>> = Arc::default();
     let attempts: Arc<Mutex<BTreeMap<String, Vec<RemoteAttempt>>>> = Arc::default();

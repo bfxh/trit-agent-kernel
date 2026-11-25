@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use trit_orch::{CancelToken, Error, NodeOutcome, NodeTable, RemoteEndpoint, RemoteNode};
+use trit_orch::{
+    CancelToken, Error, NodeOutcome, NodeSnapshot, NodeTable, RemoteEndpoint, RemoteNode,
+};
 
 fn endpoint(url: &str) -> RemoteEndpoint {
     RemoteEndpoint {
@@ -48,6 +50,41 @@ fn table_validates_nodes() {
         NodeTable::new(vec![remote_plaintext]).unwrap_err().kind(),
         "remote_nodes"
     );
+}
+
+#[test]
+fn snapshots_restore_quarantine_and_counts() {
+    let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
+    let cancel = CancelToken::new();
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    assert_eq!(lease.node().id, "a");
+    lease.finish(NodeOutcome::NodeFailed);
+    let snapshots = table.snapshot();
+    assert!(!snapshots[0].healthy);
+    assert_eq!(snapshots[0].failures, 1);
+
+    let restored = NodeTable::new(vec![node("a", 1), node("b", 1)])
+        .unwrap()
+        .with_failure_threshold(1)
+        .with_snapshots(&snapshots);
+    assert_eq!(restored.healthy_nodes(), 1);
+    let lease = restored.acquire(&cancel).unwrap().unwrap();
+    assert_eq!(lease.node().id, "b");
+    lease.finish(NodeOutcome::Succeeded);
+
+    // 健康文件里已删除的节点会被忽略，不影响现有节点。
+    let ignored = NodeSnapshot {
+        id: "ghost".into(),
+        healthy: false,
+        in_flight: 0,
+        attempts: 9,
+        failures: 9,
+    };
+    let table = NodeTable::new(vec![node("a", 1), node("b", 1)])
+        .unwrap()
+        .with_snapshots(&[ignored]);
+    assert_eq!(table.healthy_nodes(), 2);
+    assert_eq!(table.snapshot()[0].attempts, 0);
 }
 
 #[test]

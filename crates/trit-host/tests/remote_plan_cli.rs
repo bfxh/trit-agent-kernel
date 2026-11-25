@@ -132,6 +132,94 @@ fn remote_plan_cli_dispatches_across_nodes() {
 }
 
 #[test]
+fn remote_plan_cli_persists_node_health() {
+    let good = spawn_node("node-b", &[]);
+    let dead = serde_json::to_value(
+        RemoteNode::new(
+            "node-a",
+            RemoteEndpoint {
+                url: "http://127.0.0.1:1/run".into(),
+                auth_token: None,
+                timeout_secs: 1,
+            },
+        )
+        .with_max_in_flight(1),
+    )
+    .unwrap();
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-health-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&health);
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 2,
+        "failure_threshold": 1,
+        "retry_limit": 0,
+        "tasks": [task("t1"), task("t2")],
+        "nodes": [dead, node_json(&good, 1)],
+    });
+    let path = input_file("health", &input);
+
+    let first = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "first remote-plan failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(report["completed"].as_array().unwrap().len(), 1, "{report}");
+    assert!(!report["failed"].is_null(), "{report}");
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&health).unwrap()).unwrap();
+    let bad_health = saved
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "node-a")
+        .unwrap();
+    assert_eq!(bad_health["healthy"], false, "{saved}");
+
+    // 第二次运行：node-a 已被隔离，两个任务都应落到 node-b。
+    let second = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&health);
+    assert!(
+        second.status.success(),
+        "second remote-plan failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(report["completed"].as_array().unwrap().len(), 2, "{report}");
+    assert!(report["failed"].is_null(), "{report}");
+    for task in ["t1", "t2"] {
+        assert_eq!(report["assignments"][task], "node-b", "{report}");
+    }
+    let bad_node = report["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "node-a")
+        .unwrap();
+    assert_eq!(bad_node["healthy"], false, "{report}");
+}
+
+#[test]
 fn remote_plan_cli_rejects_duplicate_node_ids() {
     let node = spawn_node("dup", &[]);
     let input = serde_json::json!({

@@ -149,6 +149,26 @@ impl NodeTable {
         self
     }
 
+    /// 用上一次运行的快照恢复健康度与计数。
+    ///
+    /// 只恢复同 id 的节点，未知 id 忽略；`in_flight` 不恢复（新表从 0 开始）。
+    /// 隔离节点的连续失败数按当前阈值补齐，因此应在
+    /// [`NodeTable::with_failure_threshold`] 之后调用。
+    pub fn with_snapshots(self, snapshots: &[NodeSnapshot]) -> Self {
+        let threshold = self.failure_threshold;
+        let mut slots = self.lock();
+        for snapshot in snapshots {
+            if let Some(slot) = slots.iter_mut().find(|slot| slot.node.id == snapshot.id) {
+                slot.attempts = snapshot.attempts;
+                slot.failures = snapshot.failures;
+                slot.healthy = snapshot.healthy;
+                slot.consecutive_failures = if snapshot.healthy { 0 } else { threshold };
+            }
+        }
+        drop(slots);
+        self
+    }
+
     /// 申请一个节点。
     ///
     /// - `Ok(Some(lease))`：已占用一个槽位，用完必须 [`NodeLease::finish`]

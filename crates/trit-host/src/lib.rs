@@ -1076,7 +1076,9 @@ pub use reasonix_wire::{
     REASONIX_EVENT_KINDS, REASONIX_WIRE_VERSION, WireCacheDiagnostics, WireContractError,
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
-pub use remote_fleet::{RemoteAttempt, RemotePlanConfig, RemotePlanReport, run_remote_plan};
+pub use remote_fleet::{
+    RemoteAttempt, RemotePlanConfig, RemotePlanReport, run_remote_plan, run_remote_plan_with_table,
+};
 pub use remote_ledger::{Claim, LedgerServer, LedgerServerConfig};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
 pub use remote_subagent::{
