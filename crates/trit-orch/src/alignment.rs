@@ -9,12 +9,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-use crate::digest;
+use crate::{Error, digest};
 
 pub const SCHEMA_V1: &str = "alignment/1";
 pub const SCHEMA_V2: &str = "alignment/2";
@@ -40,6 +42,21 @@ impl Default for AlignmentOptions {
             executed: None,
         }
     }
+}
+
+/// `scaffold` 的输入。骨架故意留空，不是自动对齐声明。
+#[derive(Debug, Clone)]
+pub struct ScaffoldOptions {
+    pub goal: String,
+    pub requirements: Vec<String>,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScaffoldOutcome {
+    pub manifest: String,
+    pub goals: usize,
+    pub requirements: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -317,6 +334,206 @@ pub fn check(root: &Path, manifest: &Path, options: &AlignmentOptions) -> Alignm
     validate(&root, &root_text, &doc, options, &mut report);
     report.settle();
     report
+}
+
+/// 生成一份故意不完整的 `alignment/2` 骨架。
+///
+/// 只写目标与需求文本，`artifacts` / `evidence` / `changes` 全留空：调用方
+/// 必须自己补齐图，门在此之前不会返回 `aligned`。这不是自动对齐。
+pub fn scaffold(
+    root: &Path,
+    manifest: &Path,
+    options: &ScaffoldOptions,
+) -> Result<ScaffoldOutcome, Error> {
+    let goal = options.goal.trim();
+    if goal.is_empty() {
+        return Err(Error::AlignmentScaffold {
+            reason: "--goal 不能为空".to_owned(),
+        });
+    }
+    let requirements: Vec<String> = options
+        .requirements
+        .iter()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect();
+    if requirements.is_empty() {
+        return Err(Error::AlignmentScaffold {
+            reason: "至少给一个 requirement（重复传参）".to_owned(),
+        });
+    }
+    if requirements.len() > MAX_ARRAY {
+        return Err(Error::AlignmentScaffold {
+            reason: format!("需求数量 {} 超过上限 {MAX_ARRAY}", requirements.len()),
+        });
+    }
+
+    let root = fs::canonicalize(root).map_err(|error| Error::AlignmentScaffoldIo {
+        path: root.display().to_string(),
+        message: format!("root 不可用：{error}"),
+    })?;
+    if !root.is_dir() {
+        return Err(Error::AlignmentScaffold {
+            reason: format!("root 不是目录：{}", root.display()),
+        });
+    }
+    let manifest_text = manifest.to_str().ok_or_else(|| Error::AlignmentScaffold {
+        reason: "manifest 路径必须能表示为 UTF-8".to_owned(),
+    })?;
+    let (normalized, full) =
+        safe_rel(&root, manifest_text).map_err(|reason| Error::AlignmentScaffold { reason })?;
+    if full.is_dir() {
+        return Err(Error::AlignmentScaffold {
+            reason: format!("目标是目录而不是文件：{normalized}"),
+        });
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&full)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(Error::AlignmentScaffold {
+            reason: format!("manifest 不能是符号链接：{normalized}"),
+        });
+    }
+    if full.exists() && !options.force {
+        return Err(Error::AlignmentScaffold {
+            reason: format!("已存在，未覆盖（要覆盖加 --force）：{normalized}"),
+        });
+    }
+
+    // 目标可以尚不存在，但它最近的已存在祖先必须仍在 root 内，防止
+    // 通过父目录符号链接把 MANIFEST 写到仓外。
+    let mut probe = full.parent();
+    while let Some(parent) = probe {
+        if parent.exists() {
+            let canonical =
+                fs::canonicalize(parent).map_err(|error| Error::AlignmentScaffoldIo {
+                    path: parent.display().to_string(),
+                    message: error.to_string(),
+                })?;
+            if !canonical.starts_with(&root) {
+                return Err(Error::AlignmentScaffold {
+                    reason: format!("manifest 经父目录逃出 root：{normalized}"),
+                });
+            }
+            break;
+        }
+        probe = parent.parent();
+    }
+
+    let parent = full.parent().ok_or_else(|| Error::AlignmentScaffold {
+        reason: format!("manifest 没有父目录：{normalized}"),
+    })?;
+    fs::create_dir_all(parent).map_err(|error| Error::AlignmentScaffoldIo {
+        path: parent.display().to_string(),
+        message: error.to_string(),
+    })?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| Error::AlignmentScaffoldIo {
+            path: parent.display().to_string(),
+            message: error.to_string(),
+        })?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(Error::AlignmentScaffold {
+            reason: format!("manifest 经父目录逃出 root：{normalized}"),
+        });
+    }
+
+    let document = json!({
+        "schema": SCHEMA_V2,
+        "goals": [{"id": "G1", "text": goal}],
+        "requirements": requirements
+            .iter()
+            .enumerate()
+            .map(|(index, text)| json!({
+                "id": format!("R{}", index + 1),
+                "text": text,
+                "priority": "must",
+                "parent": "G1",
+                "artifacts": [],
+                "evidence": [],
+                "changes": [],
+            }))
+            .collect::<Vec<_>>(),
+        "artifacts": [],
+        "evidence": [],
+        "non_goals": [],
+        "allow_unlinked": [],
+        "notes": "scaffold: artifacts/evidence/changes 故意留空；补齐前 gate 不会 aligned",
+    });
+    let mut bytes =
+        serde_json::to_vec_pretty(&document).map_err(|error| Error::AlignmentScaffoldIo {
+            path: normalized.clone(),
+            message: format!("序列化失败：{error}"),
+        })?;
+    bytes.push(b'\n');
+
+    if full.exists() {
+        // `force` 明确覆盖；为了不产生半截旧文件，先写同目录临时文件再替换。
+        let temp = scaffold_temp_path(&full);
+        write_scaffold_temp(&temp, &bytes)?;
+        if let Err(error) = fs::remove_file(&full) {
+            let _ = fs::remove_file(&temp);
+            return Err(Error::AlignmentScaffoldIo {
+                path: full.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+        if let Err(error) = fs::rename(&temp, &full) {
+            let _ = fs::remove_file(&temp);
+            return Err(Error::AlignmentScaffoldIo {
+                path: full.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    } else {
+        let temp = scaffold_temp_path(&full);
+        write_scaffold_temp(&temp, &bytes)?;
+        if let Err(error) = fs::rename(&temp, &full) {
+            let _ = fs::remove_file(&temp);
+            return Err(Error::AlignmentScaffoldIo {
+                path: full.display().to_string(),
+                message: error.to_string(),
+            });
+        }
+    }
+
+    Ok(ScaffoldOutcome {
+        manifest: normalized,
+        goals: 1,
+        requirements: requirements.len(),
+    })
+}
+
+fn scaffold_temp_path(full: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let name = full
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "alignment.json".to_owned());
+    full.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
+}
+
+fn write_scaffold_temp(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| Error::AlignmentScaffoldIo {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+    if let Err(error) = file.write_all(bytes) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(Error::AlignmentScaffoldIo {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn normalize_root(root: &Path) -> PathBuf {

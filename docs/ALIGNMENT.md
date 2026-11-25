@@ -140,16 +140,51 @@ v1/v2 里出现 `kind` / `command` 会被拒绝（unknown field），不会静�
 
 报告字段：`schema`、`status`、`exit`、`manifest`、`goal`、`score`、`must_score`、`counts`、`coverage`、`failures`、`warnings`。`score` / `must_score` 只统计 `artifact + evidence` 双全的需求，不是语义完成度。
 
+### `alignment-scaffold`：生成故意留空的 v2 骨架
+
+`trit-orch alignment-scaffold` 也走 stdin JSON；它只负责写出清单骨架，不替调用方填产物、证据或变更：
+
+```json
+{
+  "root": ".",
+  "manifest": ".agent/alignment.json",
+  "goal": "交付一个可复算的账本",
+  "requirements": ["四态顺序不可跳", "拒绝串仓"],
+  "force": false
+}
+```
+
+输出：
+
+```json
+{
+  "ok": true,
+  "manifest": ".agent/alignment.json",
+  "goals": 1,
+  "requirements": 2
+}
+```
+
+生成的内容固定为 `alignment/2`：一个根目标 `G1`，需求 `R1…Rn`（`priority=must`、`parent=G1`），`artifacts` / `evidence` / `changes` 及顶层 `artifacts` / `evidence` / `non_goals` / `allow_unlinked` 全部为空。因此紧接着跑 `trit-orch alignment` 必然得到 `unaligned`，直到调用方补齐引用链。这是**检查清单生成器**，不是自动对齐声明。
+
+规则：
+
+- `goal` 为空或过滤空白后没有 requirement：退出 2，不落盘。
+- `manifest` 必须是 root 内相对路径；拒绝 `..`、绝对路径、目录目标、符号链接目标，以及经父目录符号链接逃出 root 的路径。
+- 目标已存在且 `force=false`：退出 2，原文件字节不变。
+- `force=true`：先写同目录临时文件，再替换目标；临时文件写入失败不会留下半截目标。
+- 写入 IO 失败：退出 2，错误为 `alignment_scaffold_io`。
+
 ## 4. 与 Python 版的关系
 
 - 源文件：`bfxh/trit` 的 `tools/alignment_gate.py`；本仓库只移植语义，不复制 Python 文件、不把 Python 作为运行依赖。
-- 已移植：v1/v2/v3 结构、目标树、父链、覆盖、产物/证据/sha256/locator、non-goal、声明变更、矛盾、v3 run provenance。
-- 尚未移植：`scaffold`、`self-test`、`stress` 三个 Python 辅助命令；以及 Python 版对“所有字段长度/数组上限”的完整逐字段诊断。Rust 版用 `serde(deny_unknown_fields)` + 数组上限先做 fail-closed，未知字段直接报 `manifest-unreadable`。
+- 已移植：v1/v2/v3 结构、目标树、父链、覆盖、产物/证据/sha256/locator、non-goal、声明变更、矛盾、v3 run provenance，以及 `scaffold` 清单生成。
+- 尚未移植：`self-test`、`stress` 两个 Python 辅助命令；以及 Python 版对“所有字段长度/数组上限”的完整逐字段诊断。Rust 版用 `serde(deny_unknown_fields)` + 数组上限先做 fail-closed，未知字段直接报 `manifest-unreadable`。
 - 迁移不是整仓 merge：`bfxh/trit` 的 `trit-orch` 与本仓库的 `trit-orch` 已分叉，必须按模块搬，不能把 Python 主路径或 `trit` 的额外 crate 一起带进来。
 
 ## 5. 诚实边界
 
 - 这是**准入前 / 交付前**的清单门，不是运行时监控；它防“清单没对齐就宣称完成”，不防宿主伪造清单或伪造 `executed`。
 - `aligned` 不代表需求语义被满足；语义判断仍归 `trit-reasonix` / 人工复核 / 红队。
-- 它不做自动修复、不自动生成清单、不自动改代码；`scaffold` 仍是 Python 侧的辅助能力，未迁。
+- 它不做自动修复、不自动改代码；`scaffold` 只生成留空的骨架清单，不替调用方补图；`self-test` / `stress` 仍是 Python 侧辅助能力，未迁。
 - 文件检查是本地文件系统快照；检查后被替换的文件不会被再次发现，除非重新跑门。

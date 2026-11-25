@@ -2,8 +2,10 @@
 //!
 //! 子命令：`plan` / `select` / `dispatch` / `finish` / `recover` / `shadow` / `compact-gate`
 //! 以及协调面 `claim` / `renew` / `release` / `claim-gate` / `receipt` / `handoff-gate` /
-//! `admit-with-claim`，交接账本 `delivery`，仓库身份门 `repo-gate`，对齐门 `alignment`。
-//! 成功退出码 0，失败退出码 1 并输出
+//! `admit-with-claim`，交接账本 `delivery`，仓库身份门 `repo-gate`，对齐门 `alignment`，
+//! 对齐骨架 `alignment-scaffold`。
+//! 成功退出码 0，普通失败退出码 1；`alignment` 另有 1=unaligned、3=unknown，
+//! `alignment-scaffold` 输入/写入拒绝退出 2，并输出
 //! `{"ok":false,"kind":"...","error":"..."}`；成功输出永远带 `"ok":true`。
 
 mod cli_delivery;
@@ -130,6 +132,16 @@ struct AlignmentInput {
     executed: Option<Vec<String>>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct AlignmentScaffoldInput {
+    root: String,
+    manifest: String,
+    goal: String,
+    requirements: Vec<String>,
+    force: bool,
+}
+
 #[derive(Deserialize)]
 struct ReceiptInput {
     #[serde(default)]
@@ -203,7 +215,12 @@ fn fail(error: &trit_orch::Error) -> ! {
         "{}",
         json!({"ok": false, "kind": error.kind(), "error": error.to_string()})
     );
-    std::process::exit(1);
+    let exit = match error {
+        trit_orch::Error::AlignmentScaffold { .. }
+        | trit_orch::Error::AlignmentScaffoldIo { .. } => 2,
+        _ => 1,
+    };
+    std::process::exit(exit);
 }
 
 /// `select --capture <path>`：把这一步追加进轨迹文件（路径由宿主给，模型无法注入）。
@@ -481,6 +498,34 @@ fn run(command: &str, input: &str) -> Result<Value, trit_orch::Error> {
             println!("{value}");
             std::process::exit(report.exit);
         }
+        "alignment-scaffold" => {
+            let request: AlignmentScaffoldInput = parse(input)?;
+            let root = if request.root.trim().is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(request.root.trim())
+            };
+            let manifest = if request.manifest.trim().is_empty() {
+                Path::new(".agent/alignment.json").to_path_buf()
+            } else {
+                PathBuf::from(request.manifest.trim())
+            };
+            let outcome = trit_orch::alignment::scaffold(
+                &root,
+                &manifest,
+                &trit_orch::alignment::ScaffoldOptions {
+                    goal: request.goal,
+                    requirements: request.requirements,
+                    force: request.force,
+                },
+            )?;
+            Ok(json!({
+                "ok": true,
+                "manifest": outcome.manifest,
+                "goals": outcome.goals,
+                "requirements": outcome.requirements,
+            }))
+        }
         "repo-gate" => {
             let request: RepoGateInput = parse(input)?;
             let root = if request.root.trim().is_empty() {
@@ -502,7 +547,7 @@ fn run(command: &str, input: &str) -> Result<Value, trit_orch::Error> {
         }
         other => Err(trit_orch::Error::InputParse {
             message: format!(
-                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/repo-gate/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
+                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/alignment-scaffold/repo-gate/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
             ),
         }),
     }
