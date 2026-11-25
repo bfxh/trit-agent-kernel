@@ -9,8 +9,8 @@ use trit_host::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ClaimingTools,
     ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig,
-    InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile, OpenAiConfig,
-    OpenAiProvider, OpenAiSamplingHandler, OperationLease, Proposal, ProviderModel,
+    InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile, MutationJournal,
+    OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler, OperationLease, Proposal, ProviderModel,
     ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope, SamplingHandler, ScriptedModel,
     SearchOrder, SelectionPressure, Session, SupervisorConfig, SupervisorRuntime, ToolCatalog,
     ToolExecutor, WriteClaim, WriteGuard, default_tools, recovery_context_for_session,
@@ -41,6 +41,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if command == "session-status" {
         return run_session_status(args);
+    }
+    if command == "journal-status" {
+        return run_journal_status(args);
     }
     if command != "run" {
         usage();
@@ -75,6 +78,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut allow_hardlinks = false;
     let mut write_claim_paths: Vec<PathBuf> = Vec::new();
     let mut write_lease_owner: Option<String> = None;
+    let mut write_journal = false;
     let mut resume = false;
     let mut context = ContextPolicy::default();
     let mut checkpoint_dir: Option<PathBuf> = None;
@@ -152,6 +156,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 write_claim_paths.push(PathBuf::from(next(&mut args, "--write-claim")?));
             }
             "--write-lease" => write_lease_owner = Some(next(&mut args, "--write-lease")?),
+            "--write-journal" => write_journal = true,
             "--resume" => resume = true,
             "--checkpoint-dir" => {
                 checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
@@ -345,7 +350,25 @@ fn run() -> Result<(), Box<dyn Error>> {
             ),
             None => None,
         };
-        Some(WriteGuard { claim, lease })
+        let journal = if write_journal {
+            let journal =
+                MutationJournal::open(&workspace_root).map_err(|error| fail(error.to_string()))?;
+            let report = journal.report().map_err(|error| fail(error.to_string()))?;
+            if report.has_in_doubt() {
+                eprintln!(
+                    "write journal: {} operation(s) left in doubt from a previous run",
+                    report.in_doubt.len()
+                );
+            }
+            Some(journal)
+        } else {
+            None
+        };
+        Some(WriteGuard {
+            claim,
+            lease,
+            journal,
+        })
     };
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
     let gate_chain_requested = gate_chain
@@ -1173,7 +1196,7 @@ fn usage() {
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
-         [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \
+         [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] [--write-journal] \\\n    \
          [--context-receipts N] [--context-chars N] [--context-output N] \\\n    \
          [--context-catalog <json> [--context-project <id>] [--context-session-id <id>] \\\n    \
          [--context-budget N] [--context-window N] [--model-max-output N] \\\n    \
@@ -1208,6 +1231,8 @@ fn usage() {
          --write-claim: restrict write_file to declared paths (globs allowed; quote in shell).\n\
          --write-lease: acquire <workspace>/.agent/write-lease before running\n\
          (requires --write-claim; exits 2 when another owner holds it).\n\
+         --write-journal: append begin/finish records to\n\
+         <workspace>/.agent/write-journal.jsonl and warn about in-doubt writes.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
          context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\
@@ -1225,7 +1250,9 @@ fn usage() {
          provider (optionally --mcp-sampling-model); roots_watch directories contribute\n\
          roots automatically and changes emit roots/list_changed.\n\n\
          session-status: trit-host session-status --session <jsonl>\n\
-         prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\n\
+         prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
+         journal-status: trit-host journal-status --workspace <dir>\n\
+         prints the write-journal reconciliation; exits 1 when operations are in doubt.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
@@ -1262,6 +1289,39 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
         serde_json::to_string_pretty(&status).map_err(|error| fail(error.to_string()))?
     );
     if blocked {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。
+///
+/// 退出码：`0` 没有未闭合写，`1` 有 `in_doubt`，`2` 参数/读取错误。
+fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            other => return Err(fail(format!("unknown journal-status argument: {other}"))),
+        }
+    }
+    let path = workspace.join(trit_host::JOURNAL_PATH);
+    if !path.is_file() {
+        // 没有账本时输出空报告，且不创建 `.agent/`（只读命令不产生副作用）。
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&trit_host::JournalReport::default())
+                .map_err(|error| fail(error.to_string()))?
+        );
+        return Ok(());
+    }
+    let journal = MutationJournal::open(&workspace).map_err(|error| fail(error.to_string()))?;
+    let report = journal.report().map_err(|error| fail(error.to_string()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+    );
+    if report.has_in_doubt() {
         std::process::exit(1);
     }
     Ok(())

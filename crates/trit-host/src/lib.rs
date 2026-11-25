@@ -956,6 +956,7 @@ pub mod context_projection;
 pub mod context_tools;
 pub mod frontend_compat;
 pub mod git_checkpoint;
+pub mod journal;
 pub mod lease;
 pub mod mcp_tools;
 pub mod openai;
@@ -1002,6 +1003,10 @@ pub use frontend_compat::{
 };
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
+};
+pub use journal::{
+    JOURNAL_PATH, JOURNAL_SCHEMA, JournalEntry, JournalError, JournalPhase, JournalRecord,
+    JournalReport, MutationJournal,
 };
 pub use lease::{LEASE_PATH, LeaseError, OperationLease};
 pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};

@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
+use crate::journal::MutationJournal;
 use crate::lease::OperationLease;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
@@ -276,13 +277,15 @@ pub struct ClaimingTools<T> {
     inner: T,
     claim: WriteClaim,
     lease: Option<OperationLease>,
+    journal: Option<MutationJournal>,
 }
 
-/// 写入守卫：路径 claim + 可选跨进程租约。
+/// 写入守卫：路径 claim + 可选跨进程租约 + 可选 mutation journal。
 #[derive(Debug)]
 pub struct WriteGuard {
     pub claim: WriteClaim,
     pub lease: Option<OperationLease>,
+    pub journal: Option<MutationJournal>,
 }
 
 /// 把 guard 包到工具外层；没有 guard 时原样装箱。
@@ -296,6 +299,9 @@ pub fn wrap_claim<T: ToolExecutor + 'static>(
             if let Some(lease) = guard.lease {
                 claiming = claiming.with_lease(lease);
             }
+            if let Some(journal) = guard.journal {
+                claiming = claiming.with_journal(journal);
+            }
             Box::new(claiming)
         }
         None => Box::new(tools),
@@ -308,6 +314,7 @@ impl<T> ClaimingTools<T> {
             inner,
             claim,
             lease: None,
+            journal: None,
         }
     }
 
@@ -317,8 +324,18 @@ impl<T> ClaimingTools<T> {
         self
     }
 
+    /// 绑定 mutation journal：每次非只读调用前后各追加一条记录。
+    pub fn with_journal(mut self, journal: MutationJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
     pub fn lease(&self) -> Option<&OperationLease> {
         self.lease.as_ref()
+    }
+
+    pub fn journal(&self) -> Option<&MutationJournal> {
+        self.journal.as_ref()
     }
 
     pub fn claim(&self) -> &WriteClaim {
@@ -342,13 +359,42 @@ impl<T: ToolExecutor> ToolExecutor for ClaimingTools<T> {
         {
             return Ok(blocked(request, "write lease is no longer valid"));
         }
-        if self.claim.allows_request(request) {
-            self.inner.execute(request)
-        } else {
-            Ok(blocked(
+        if !self.claim.allows_request(request) {
+            return Ok(blocked(
                 request,
                 "write claim does not allow this path or shell command",
-            ))
+            ));
+        }
+        let entry = if request.read_only {
+            None
+        } else {
+            match self.journal.as_mut() {
+                Some(journal) => {
+                    let epoch = self.lease.as_ref().map(|lease| lease.epoch());
+                    Some(
+                        journal
+                            .record_begin(request, epoch)
+                            .map_err(|error| AgentError::Io(format!("write journal: {error}")))?,
+                    )
+                }
+                None => None,
+            }
+        };
+        match self.inner.execute(request) {
+            Ok(outcome) => {
+                if let (Some(journal), Some(entry)) = (self.journal.as_mut(), entry) {
+                    journal
+                        .record_finish(entry, &outcome)
+                        .map_err(|error| AgentError::Io(format!("write journal: {error}")))?;
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                if let (Some(journal), Some(entry)) = (self.journal.as_mut(), entry) {
+                    let _ = journal.record_error(entry, request, &error.to_string());
+                }
+                Err(error)
+            }
         }
     }
 

@@ -58,6 +58,7 @@ Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**�
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。
 - 工具边界：`cap-std` 目录能力、symlink/硬链接拒绝、shell 默认拒绝并要求外部 OS 沙箱；原生 `search_code`/`glob` 使用 ripgrep 同源 ignore/regex/globset，尊重 `.gitignore`，无需 shell；无沙箱 shell 默认复用持久 bash 会话（cwd/env 保持），沙箱模式仍逐条执行。
 - 跨进程写租约 `OperationLease`：`.agent/write-lease` 上的 OS 排他锁 + `epoch` fencing；`ClaimingTools::with_lease` 在每次非只读调用前校验 token，失效 fail-closed，另一个持有者占用时返回 `LeaseError::Busy`；`trit-host run --write-claim <path>... [--write-lease <owner>]` 可直接启用（claim 支持文件/子树前缀与 glob）。见 [docs/LEASE.md](docs/LEASE.md)。
+- 写入账本 `MutationJournal`：`--write-journal` 记录每次写前后的 `begin`/`finish`；`trit-host journal-status --workspace <dir>` 对账 `in_doubt`，崩溃后未闭合的写退出 `1`。见 [docs/LEASE.md](docs/LEASE.md)。
 
 ## 快速开始
 

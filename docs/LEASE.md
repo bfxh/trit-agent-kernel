@@ -80,7 +80,23 @@ trit-host run --task "..." --workspace . \
   `blocked: write claim does not allow this path or shell command`，不执行。
 - 租约在运行期间持续持有；进程退出自动释放，下一次运行 `epoch + 1`。
 
-## 6. 诚实边界
+## 6. Mutation journal
+
+`--write-journal` 在 `<workspace>/.agent/write-journal.jsonl` 追加 `begin` / `finish`：
+
+```json
+{"schema":1,"seq":1,"op_id":1,"phase":"begin","tool":"write_file","call_id":"w1","paths":["src/a.py"],"lease_epoch":1,"at":1760000000}
+{"schema":1,"seq":2,"op_id":1,"phase":"finish","tool":"write_file","call_id":"w1","paths":["src/a.py"],"passed":true,"in_doubt":false,"output":"ok","at":1760000001}
+```
+
+- 进程在 `begin` 与 `finish` 之间崩溃 → 对账报告把这些操作列为 `in_doubt`。
+- `trit-host journal-status --workspace <dir>` 输出 `total / completed / failed /
+  orphans / in_doubt`；有 `in_doubt` 时退出 `1`。
+- `trit-host run --write-journal` 启动时自动对账，有 `in_doubt` 时打印警告（不阻断）。
+- 账本不存完整工具输出（单条最多 512 字符）；默认不 `fsync`，崩溃尾行损坏会被忽略，
+  中间坏行仍然报错。
+
+## 7. 诚实边界
 
 - **本地文件系统**的租约，不是跨机器写权威；分布式存储需要在存储端校验 token。
 - 只约束经过 `ClaimingTools` 的写入；绕过包装器直接写文件不在保护范围内。
