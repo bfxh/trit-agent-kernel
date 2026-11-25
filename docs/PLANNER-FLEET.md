@@ -121,10 +121,42 @@ stdin 收 JSON、stdout 回 JSON，用于确定性演练（**不执行外部命�
 - 输出 `completed` / `failed` / `deferred` / `cancelled` / `references` /
   `metrics` / `metrics_prometheus`；`references` 是 `task -> task@epoch#digest`。
 
+## 6. 宿主执行器接线（`trit_host::fleet_runner`）
+
+fleet 的 runner 由宿主提供，内核不假设模型或工具的实现：
+
+```text
+FleetJob::run(task, cancel) -> Result<FleetOutput, String>
+run_fleet(plan, config, cancel, job) -> FleetReport
+HeadlessFleetRunner::new(workspace, dir, model_factory)
+```
+
+- `run_fleet` 把 job 放进 `Mutex` 后交给 `fleet::execute`，并发上限与失败传播仍由
+  runtime 决定；
+- `HeadlessFleetRunner` 给每个子任务一个 `<dir>/<task-id>.jsonl`，用 `run_headless`
+  在调用方给的 `WorkspaceConfig` 里跑真实一轮（模型 + 本地工具）；
+- 写权限沿用 `WorkspaceConfig` / `WriteGuard`，不存在 fleet 旁路；
+- `turn_spec_from_task`：`guidance` → `TurnSpec`，`produces.min_assertions` 与
+  `max_tokens` 原样传递。
+
+## 7. 子 agent IPC 契约（`trit_orch::subagent`）
+
+帧格式：4 字节大端长度 + UTF-8 JSON，单帧上限 8 MiB。
+
+- `SubagentRequest { task, epoch, capsule, profile }`；
+- `SubagentResponse { task, epoch, status, content, tokens }`；
+- `validate_for` 强制响应回显 `task + epoch`，旧响应/串话直接拒绝；
+- `exit_status`：零退出但无响应、非零退出、被信号/超时终止都不产生 `Completed`；
+- `decode_frame` 支持半包与粘包，超限/非法载荷一律 `subagent_protocol` 错误。
+
+宿主可用 stdin/stdout 管道、socket 或测试替身承载同一套帧；真实进程 spawn 与超时
+kill 属于宿主实现。
+
 ## 非目标
 
 - 不把 fleet 依赖图塞进 `TaskSpec`：`TaskSpec.deps` 只有三元依赖，图的调度归属
   runtime；
 - 不做跨机器调度；
-- planner 的模型调用接线（provider 侧、CLI 暴露）不在本批：本批交付的是契约与
-  执行原语，宿主按 `SessionPaths` + `ReadOnlyTools` 组合即可接入。
+- 真实子 agent 进程的 spawn/超时 kill 由宿主实现，本批只固化 IPC 契约；
+- provider 侧的模型调用本身（HTTP/SSE 接线）不在本批：本批把模型输出解析成
+  `PlanHandoff`（`submit_plan`），发请求仍走既有 provider 路径。
