@@ -135,6 +135,7 @@ pub use trace_merge::merge_logs;
 pub use trace_store::{TraceEventStore, events_from_step};
 pub use trit_core::tristate::TriState;
 pub use trit_core::value::Ternary;
+pub use trit_schedule::runtime::CancelToken;
 pub use trit_schedule::{Dependency, MAX_TASKS, Resources, Task};
 
 #[cfg(test)]

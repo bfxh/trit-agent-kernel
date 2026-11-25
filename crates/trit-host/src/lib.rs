@@ -975,6 +975,7 @@ pub mod context;
 pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
+pub mod fleet_runner;
 pub mod frontend_compat;
 pub mod git_checkpoint;
 pub mod journal;
@@ -1018,6 +1019,9 @@ pub use context_projection::{
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
+};
+pub use fleet_runner::{
+    FleetJob, HeadlessFleetRunner, run_fleet, session_path, turn_spec_from_task,
 };
 pub use frontend_compat::{
     FeatureDecision, FeatureGate, FeatureGroupDecision, FeatureGroupSpec, FeatureNotice,
