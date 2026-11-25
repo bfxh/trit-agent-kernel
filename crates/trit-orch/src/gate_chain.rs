@@ -26,6 +26,8 @@ use crate::{Error, Ternary};
 
 /// 报告 schema。
 pub const SCHEMA: &str = "gate-chain/1";
+/// 单次门链接受的 `changed` 路径上限；超过按 `Unknown` 停链。
+pub const MAX_CHANGED: usize = 4096;
 /// 第一道门：仓库身份。
 pub const STEP_REPO: &str = "repo";
 /// 第二道门：交接包只读预检。
@@ -223,6 +225,20 @@ fn alignment_step(options: &GateChainOptions) -> GateStep {
             detail: None,
         };
     };
+    if let Some(changed) = input.options.changed.as_ref()
+        && changed.len() > MAX_CHANGED
+    {
+        return GateStep {
+            id: STEP_ALIGNMENT.to_owned(),
+            gate: Ternary::Unknown,
+            state: state_of(Ternary::Unknown).to_owned(),
+            reason: format!(
+                "changed set has {} paths; limit is {MAX_CHANGED}",
+                changed.len()
+            ),
+            detail: None,
+        };
+    }
     let report = alignment::check(&options.root, &input.manifest, &input.options);
     let gate = match report.status.as_str() {
         "aligned" => Ternary::True,

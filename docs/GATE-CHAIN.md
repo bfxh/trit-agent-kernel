@@ -227,6 +227,8 @@ trit-host run --task "..." --workspace . \
 - **默认只读**：`delivery` 走 `check`，不写账本；`attach` / `--handoff-attach`
   显式开启才补 `sent + delivered`，且不写 `read/acted`。
 - **相对路径以 `root` 为基准**：`packet` 与 `manifest` 都先按 `root` 解析，绝对路径原样使用。
+- **changed 有上限**：超过 `MAX_CHANGED`（4096）条按 `Unknown` 停链，避免把超大变更集
+  读进内存；host 自动取 git 变更另有 10,000 条上限。
 - **不新增判据**：每道门的规则仍由各自模块负责；门链只做顺序与汇总。
 - **报告可复算**：同一输入重复运行得到同一 `status` / `exit` / `steps[].state`；
   `detail` 里的原始报告也来自各自门。

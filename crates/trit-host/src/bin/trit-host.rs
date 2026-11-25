@@ -680,6 +680,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(runtime) = supervisor_runtime.as_ref() {
         let recovery =
             supervisor_recovery(supervisor_session_path.as_deref(), &shared_cache_ledger)?;
+        if recovery.gate_chain_blocked() {
+            eprintln!(
+                "supervisor: latest gate-chain verdict is not passed; \
+                 review it before resuming autonomous work"
+            );
+        }
         runtime.refresh_recovery(recovery)?;
         eprintln!(
             "supervisor: gateways={} mcp={} bridges={}",
@@ -1303,5 +1309,39 @@ mod tests {
         // 排序去重。
         let dup = b"?? b.py\0?? a.py\0?? a.py\0";
         assert_eq!(parse_git_status("", dup).unwrap(), ["a.py", "b.py"]);
+    }
+
+    #[test]
+    fn supervisor_recovery_surfaces_blocked_gate_chain() {
+        let path = std::env::temp_dir().join(format!(
+            "trit-supervisor-recovery-{}-{:?}.jsonl",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut log = trit_host::SessionLog::open(&path).unwrap();
+        log.append(trit_host::SessionEvent::GateChain {
+            phase: trit_host::GateChainPhase::Pre,
+            status: "blocked".into(),
+            exit: 1,
+            failed_at: Some("repo".into()),
+            failures: 1,
+            passed: 0,
+            blocked: 1,
+            unknown: 0,
+            skipped: 2,
+            report: None,
+        })
+        .unwrap();
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(trit_host::CacheLedger::default()));
+        let recovery = supervisor_recovery(Some(&path), &cache).unwrap();
+        assert!(recovery.gate_chain_blocked());
+        assert_eq!(
+            recovery
+                .latest_gate_chain()
+                .map(|record| record.status.as_str()),
+            Some("blocked")
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

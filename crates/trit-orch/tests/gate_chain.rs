@@ -495,3 +495,21 @@ fn cli_changed_paths_fold_unicode_case_on_windows() {
     assert_eq!(value["status"], "passed");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn oversized_changed_set_stops_at_alignment() {
+    let root = root("too-many-changed");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    let mut options = options(&root);
+    options.alignment.as_mut().unwrap().options.changed =
+        Some(vec!["x".to_owned(); gate_chain::MAX_CHANGED + 1]);
+    let report = gate_chain::run(&options);
+    assert_eq!(report.status, "unknown");
+    assert_eq!(report.failed_at.as_deref(), Some("alignment"));
+    assert!(
+        report.steps[2].reason.contains("limit"),
+        "{:?}",
+        report.steps[2].reason
+    );
+    let _ = fs::remove_dir_all(root);
+}
