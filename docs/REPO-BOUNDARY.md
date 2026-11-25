@@ -50,6 +50,19 @@ printf '%s' '{"root":".","expected":"bfxh/trit-agent-kernel","task_kind":"agent"
 这不是“提醒”，而是 fail-closed 的准入前门。宿主在 `plan` / `dispatch` 之前
 必须先过它；没有过门就不派活。
 
+`trit-host run` 已提供入口参数：
+
+```bash
+trit-host run --task "..." --workspace . \
+  --repo-identity --repo-expected bfxh/trit-agent-kernel --task-kind agent ...
+```
+
+`--repo-identity` 缺省不开；一旦打开，identity 缺失、坏 JSON、`schema` 不对、
+`repo` 与 `--repo-expected` 不一致，或 `task-kind=agent` 但
+`owns_agent_runtime=false`，都会在读取脚本 / 建 session / 调模型之前退出 2。
+包装器应把它作为固定参数，不要交给模型自己决定是否检查。
+
+
 ## 给 `bfxh/trit` 的对应做法
 
 `bfxh/trit` 也应放一份自己的 `.agent/repo.json`：
