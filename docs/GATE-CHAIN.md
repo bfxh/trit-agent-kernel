@@ -187,7 +187,7 @@ trit-host run --task "..." --workspace . \
 | `--alignment-changed-set` | 把 changed 标记为完整集，要求声明 changes 全部兑现 |
 | `--alignment-no-git-changed` | 关闭默认的 git 变更查找 |
 | `--gate-chain-post` | run 结束后用实际 git 变更（完整集）复核对齐；失败退出 `2` |
-| `--gate-chain-report <path>` | 把 pre 报告写到该路径（workspace 相对） |
+| `--gate-chain-report <path>` | 把 pre 报告写到该路径（相对路径必须留在 workspace 内） |
 | `--gate-chain-post-report <path>` | 把 post 报告写到该路径；失败时也会写 |
 
 - changed 默认取 workspace 的 `git status`（含未跟踪文件，路径相对 workspace）作为
@@ -209,6 +209,9 @@ trit-host run --task "..." --workspace . \
 - pre / post 报告可用 `--gate-chain-report` / `--gate-chain-post-report` 落盘；报告
   文件本身会从 post 的 `changed` 中排除，避免 `pre.json` 被当成未对齐变更；post
   失败时报告仍会写入，便于审计。
+- 报告路径为相对路径时不允许 `..` 逃出 workspace；绝对路径按原样写入（显式选择）。
+- 自动取 changed 有 10,000 条上限；超过时放弃自动取值（pre 不传 changed，post 直接
+  拒绝），避免在超大工作区里把整份变更集读进内存。
 - 给了 `--session` 时，pre / post 结论会作为 `gate_chain` 事件追加到 session
   JSONL（`phase`、`status`、`exit`、`failed_at`、各状态计数、可选 `report` 路径）。
   事件不改变 turn 状态机，`recover` 会忽略它；session 文件本身也会从 post 的
@@ -237,3 +240,7 @@ trit-host run --task "..." --workspace . \
   `trit-orch delivery` 动作。
 - 从 git 取 changed 只反映**当前工作区**：未忽略的未跟踪文件可见，但被 `.gitignore`
   忽略的路径不会出现；需要时用 `--alignment-changed` 显式补。
+- changed 按字面比较：Windows 下大小写不同（`SRC/A.py` vs `src/a.py`）不会自动归一；
+  非 UTF-8 文件名在自动取值时可能被替换字符。
+- 读取 git 变更时禁用 `core.fsmonitor`，避免仓库配置触发命令执行；不做完整 git 配置
+  隔离（`include.path` 等仍会读取本地配置）。

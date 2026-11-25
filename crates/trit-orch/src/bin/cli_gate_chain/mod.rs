@@ -9,7 +9,7 @@
 //! `out` 非空时把报告同时写到该路径（`root` 相对），stdout 仍输出同一份 JSON。
 //! 输出 `gate-chain/1` 报告；退出码与 `alignment` 一致：
 //! `0` 全链通过、`1` 有明确拒绝、`3` 有无法判定的门。
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -83,12 +83,7 @@ pub(crate) fn run(input: &str) -> Result<(Value, i32), Error> {
     let report = gate_chain::run(&options);
     let out = request.out.trim();
     if !out.is_empty() {
-        let path = PathBuf::from(out);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            options.root.join(path)
-        };
+        let path = gate_chain::resolve_report_path(&options.root, Path::new(out))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| Error::InputParse {
                 message: format!("create {}: {error}", parent.display()),
@@ -97,9 +92,7 @@ pub(crate) fn run(input: &str) -> Result<(Value, i32), Error> {
         let bytes = serde_json::to_vec_pretty(&report).map_err(|error| Error::InputParse {
             message: format!("serialize gate-chain report: {error}"),
         })?;
-        std::fs::write(&path, bytes).map_err(|error| Error::InputParse {
-            message: format!("write gate-chain report {}: {error}", path.display()),
-        })?;
+        gate_chain::write_report_file(&path, &bytes)?;
     }
     let exit = report.exit;
     let value = serde_json::to_value(&report).map_err(|error| Error::InputParse {

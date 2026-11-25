@@ -390,3 +390,36 @@ fn cli_out_writes_report_file() {
     assert_eq!(saved["schema"], "gate-chain/1");
     assert_eq!(saved["status"], value["status"]);
 }
+
+#[test]
+fn cli_out_rejects_workspace_escape() {
+    let root = root("cli-out-escape");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    options(&root);
+    let name = format!("gate-chain-escape-{}.json", std::process::id());
+    let escaped = root.parent().unwrap().join(&name);
+    let _ = fs::remove_file(&escaped);
+    let (code, value) = cli_support::run(
+        "gate-chain",
+        &json!({
+            "root": root.to_string_lossy(),
+            "expected": "bfxh/trit-agent-kernel",
+            "task_kind": "agent",
+            "packet": "packet.json",
+            "receiver_state_hash": "H",
+            "at": 1000,
+            "manifest": "alignment.json",
+            "out": format!("../{name}")
+        }),
+    );
+    assert_eq!(code, 1, "{value}");
+    assert!(
+        value["error"].as_str().unwrap().contains("escapes"),
+        "{value}"
+    );
+    assert!(
+        !escaped.exists(),
+        "report escaped the workspace: {escaped:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}

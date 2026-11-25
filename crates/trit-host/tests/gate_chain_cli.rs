@@ -672,3 +672,95 @@ fn host_logs_post_failure_to_session() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
+
+#[test]
+fn host_report_path_rejects_workspace_escape() {
+    let root = root("report-escape");
+    fixture(&root);
+    let name = format!("gate-chain-host-escape-{}.json", std::process::id());
+    let escaped = root.parent().unwrap().join(&name);
+    let _ = fs::remove_file(&escaped);
+    let (code, text) = host(&root, &["--gate-chain-report", &format!("../{name}")]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("escapes the workspace"), "{text}");
+    assert!(
+        !escaped.exists(),
+        "report escaped the workspace: {escaped:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_report_flag_alone_enables_the_chain() {
+    let root = root("report-flag-only");
+    fixture(&root);
+    let (code, text) = host(
+        &root,
+        &["--gate-chain-report", ".agent/gate-chain/pre.json"],
+    );
+    // 只给报告路径也会进链；delivery 未配置，按 Unknown 停链。
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("gate chain rejected at delivery"), "{text}");
+    assert!(root.join(".agent/gate-chain/pre.json").exists(), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_post_report_flag_alone_enables_post_check() {
+    let root = root("post-report-flag");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("post-report-flag", "src/a.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post-report",
+            ".agent/gate-chain/post.json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(root.join(".agent/gate-chain/post.json").exists(), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn host_disables_git_fsmonitor() {
+    let root = root("fsmonitor");
+    fixture(&root);
+    git_repo(&root);
+    #[cfg(windows)]
+    let hook = "cmd /c echo pwned > fmon.txt";
+    #[cfg(not(windows))]
+    let hook = "sh -c 'echo pwned > fmon.txt'";
+    git(&root, &["config", "core.fsmonitor", hook]);
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+        ],
+    );
+    // 门链读取 git status 时不能执行仓库自带命令。
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        !root.join("fmon.txt").exists(),
+        "fsmonitor executed: {text}"
+    );
+    let _ = fs::remove_dir_all(root);
+}

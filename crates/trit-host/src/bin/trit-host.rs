@@ -312,10 +312,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     let workspace_root = workspace.clone();
     // 路径归一化在拿到 workspace 之后做：`.\src\a.py`、`src//a.py`、workspace 内
     // 绝对路径都折成 `src/a.py`；逃出 workspace 直接拒绝。
-    let alignment_changed: Vec<String> = alignment_changed
+    let mut alignment_changed: Vec<String> = alignment_changed
         .iter()
         .map(|raw| normalize_changed(raw, &workspace_root))
         .collect::<Result<Vec<_>, _>>()?;
+    alignment_changed.sort();
+    alignment_changed.dedup();
     let manifest_path = alignment_manifest
         .clone()
         .unwrap_or_else(|| PathBuf::from(".agent/alignment.json"));
@@ -325,7 +327,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         || alignment_manifest.is_some()
         || !alignment_changed.is_empty()
         || alignment_changed_set
-        || alignment_no_git_changed;
+        || alignment_no_git_changed
+        || gate_chain_report.is_some();
     if gate_chain_requested {
         let delivery = handoff_packet.map(|packet| {
             let packet = if packet.is_absolute() {
@@ -704,7 +707,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "{}",
         serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
     )?;
-    if gate_chain_post {
+    if gate_chain_post || gate_chain_post_report.is_some() {
         let mut exclude: Vec<&Path> = Vec::new();
         if let Some(path) = gate_chain_report.as_deref() {
             exclude.push(path);
@@ -840,10 +843,17 @@ fn fail(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(std::io::Error::new(ErrorKind::InvalidInput, message.into()))
 }
 
+/// 单次 `git status` 最多接受的变更路径数；超过就放弃自动取值（fail-closed）。
+const MAX_CHANGED_PATHS: usize = 10_000;
+
 /// 取 workspace 当前 git 变更路径（相对 workspace，含未跟踪文件）。
 ///
 /// 不是 git 仓、命令失败或输出读不出时返回 `None`：调用方据此保持“未给 changed”
 /// 的语义，而不是把空集当成“没有变更”。
+///
+/// 两次 git 调用都带 `-c core.fsmonitor=false`：仓库自己的 `.git/config` 可以把
+/// `core.fsmonitor` 指向一个程序，普通的 `git status` 会执行它。宿主在不受信任的
+/// workspace 里跑时不能把仓库配置变成任意命令执行。
 fn git_changed(root: &Path) -> Option<Vec<String>> {
     // `git status` 没有 `--relative`，用 `--show-prefix` 拿到当前目录相对 repo 根
     // 的前缀，再把 status 的 repo-relative 路径裁成 workspace-relative。
@@ -851,7 +861,7 @@ fn git_changed(root: &Path) -> Option<Vec<String>> {
         let output = Command::new("git")
             .arg("-C")
             .arg(root)
-            .args(["rev-parse", "--show-prefix"])
+            .args(["-c", "core.fsmonitor=false", "rev-parse", "--show-prefix"])
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
@@ -867,7 +877,14 @@ fn git_changed(root: &Path) -> Option<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["status", "--porcelain", "--untracked-files=all", "-z"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "-z",
+        ])
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -899,6 +916,13 @@ fn git_changed(root: &Path) -> Option<Vec<String>> {
             continue;
         }
         paths.push(rest.replace('\\', "/"));
+        if paths.len() > MAX_CHANGED_PATHS {
+            eprintln!(
+                "trit-host: git status returned more than {MAX_CHANGED_PATHS} paths; \
+                 skipping automatic changed set"
+            );
+            return None;
+        }
     }
     paths.sort();
     paths.dedup();
@@ -962,7 +986,8 @@ fn verify_post_alignment(
 ) -> Result<(), Box<dyn Error>> {
     let Some(mut changed) = git_changed(root) else {
         return Err(fail(
-            "gate chain post: workspace is not a git repository; cannot read actual changes",
+            "gate chain post: cannot read actual git changes (not a git repository, \
+             or more than 10000 changed paths)",
         ));
     };
     for path in exclude {
@@ -1023,19 +1048,15 @@ fn write_report(
     path: &Path,
     value: &impl serde::Serialize,
 ) -> Result<(), Box<dyn Error>> {
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
+    let path =
+        gate_chain_mod::resolve_report_path(root, path).map_err(|error| fail(error.to_string()))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| fail(format!("create {}: {error}", parent.display())))?;
     }
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| fail(format!("serialize report: {error}")))?;
-    std::fs::write(&path, bytes)
-        .map_err(|error| fail(format!("write report {}: {error}", path.display())))?;
+    gate_chain_mod::write_report_file(&path, &bytes).map_err(|error| fail(error.to_string()))?;
     Ok(())
 }
 

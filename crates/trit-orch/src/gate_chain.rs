@@ -14,15 +14,15 @@
 //! 默认不补 `sent/delivered` 账本；显式 `attach` 才补前两态，`read/acted` 仍走
 //! `trit-orch delivery`。
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::Ternary;
 use crate::alignment::{self, AlignmentOptions};
 use crate::delivery;
 use crate::repo;
+use crate::{Error, Ternary};
 
 /// 报告 schema。
 pub const SCHEMA: &str = "gate-chain/1";
@@ -302,5 +302,71 @@ fn ternary_name(gate: Ternary) -> &'static str {
         Ternary::True => "True",
         Ternary::Unknown => "Unknown",
         Ternary::False => "False",
+    }
+}
+
+/// 把报告输出路径解析成可用路径：绝对路径原样，相对路径必须留在 `root` 内。
+///
+/// 这是为了兑现“报告路径以 `root` 为基准”的文档：`../x` 不是“root 相对的
+/// 上级”，而是越界，直接拒绝；CLI 与 host 共用同一套判断。
+pub fn resolve_report_path(root: &Path, path: &Path) -> Result<PathBuf, Error> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Err(Error::InputParse {
+                        message: format!("report path escapes the workspace: {}", path.display()),
+                    });
+                }
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            _ => {
+                return Err(Error::InputParse {
+                    message: format!("report path is not workspace relative: {}", path.display()),
+                });
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(Error::InputParse {
+            message: "report path must name a file".to_owned(),
+        });
+    }
+    Ok(root.join(parts.join("/")))
+}
+
+/// 原子写报告：先写同目录临时文件再替换，避免留下半截 JSON。
+pub fn write_report_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let temporary = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(error) = std::fs::write(&temporary, bytes) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(Error::InputParse {
+            message: format!("write {}: {error}", temporary.display()),
+        });
+    }
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Windows 上目标已存在时 rename 会失败；先删再换。
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&temporary, path).map_err(|error| {
+                let _ = std::fs::remove_file(&temporary);
+                Error::InputParse {
+                    message: format!("write {}: {error}", path.display()),
+                }
+            })
+        }
     }
 }
