@@ -1692,11 +1692,17 @@ fn glob_match(path: &str, patterns: &[String]) -> bool {
 }
 
 /// 路径字面比较：Windows 文件系统不区分大小写，Linux 区分。
+///
+/// Windows 下按 Unicode 小写折叠比较（`Ä` 与 `ä` 视为同一路径）；不实现完整的
+/// Windows 大小写表（例如 `ß` / `SS` 的折叠不做）。
 fn path_eq(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
     if cfg!(windows) {
-        left.eq_ignore_ascii_case(right)
+        left.to_lowercase() == right.to_lowercase()
     } else {
-        left == right
+        false
     }
 }
 

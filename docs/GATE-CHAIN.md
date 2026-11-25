@@ -240,8 +240,8 @@ trit-host run --task "..." --workspace . \
   `trit-orch delivery` 动作。
 - 从 git 取 changed 只反映**当前工作区**：未忽略的未跟踪文件可见，但被 `.gitignore`
   忽略的路径不会出现；需要时用 `--alignment-changed` 显式补。
-- changed 在 Windows 下按 ASCII 大小写不敏感比较（`SRC/A.py` 匹配 `src/a.py`）；
-  Unicode 大小写折叠不做。
+- changed 在 Windows 下按 Unicode 小写折叠比较（`SRC/A.py`、`Ärger.md` 与
+  `ärger.md` 都视为同一路径）；不实现完整的 Windows 大小写表（`ß` / `SS` 不做）。
 - 自动取 changed 时，遇到非 UTF-8 路径会放弃整次自动取值（pre 不传 changed，
   post 拒绝），而不是用替换字符拼出一个匹配不上的路径。
 - 读取 git 变更时禁用 `core.fsmonitor`、屏蔽用户/系统级 git 配置，并用
@@ -255,8 +255,8 @@ trit-host run --task "..." --workspace . \
 
 | 项 | 本机状态 | 怎么确认 |
 | --- | --- | --- |
-| Windows 大小写不敏感 | 通过（`cli_changed_paths_are_case_insensitive_on_windows`） | `windows-latest` 的 `cargo test --workspace` 复核 |
-| Unix 非 UTF-8 路径 | 不编译、不运行（`#[cfg(unix)]`） | `ubuntu-latest` / `macos-latest` 跑 `host_gives_up_on_non_utf8_git_paths` |
+| Windows 大小写（ASCII + Unicode） | 通过（`cli_changed_paths_are_case_insensitive_on_windows`、`cli_changed_paths_fold_unicode_case_on_windows`） | `windows-latest` 的 `cargo test --workspace` 复核 |
+| 非 UTF-8 路径解析 | 通过（bin 单测 `parses_git_status_entries_and_rejects_non_utf8`） | `ubuntu-latest` / `macos-latest` 的 `host_gives_up_on_non_utf8_git_paths` 覆盖真实文件系统 |
 | macOS 上的 `git status` 行为 | 未在真机跑过 | `macos-latest` 的 `cargo test --workspace` |
 | `core.worktree` 越界 | 通过（`host_ignores_repo_configured_worktree`） | 三平台 `cargo test --workspace` |
 | `core.fsmonitor` 不执行 | 通过（`host_disables_git_fsmonitor`） | 三平台 `cargo test --workspace` |

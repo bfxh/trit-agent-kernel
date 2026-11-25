@@ -871,6 +871,45 @@ fn git_base_command(root: &Path, args: &[&str]) -> Command {
     command
 }
 
+/// 解析 `git status --porcelain -z`：返回 workspace 相对路径。
+///
+/// 非 UTF-8 路径、超过上限都返回 `Err`，由调用方放弃自动取值。
+fn parse_git_status(prefix: &str, stdout: &[u8]) -> Result<Vec<String>, String> {
+    let mut entries = stdout.split(|byte| *byte == 0);
+    let mut paths = Vec::new();
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = std::str::from_utf8(&entry[3..])
+            .map_err(|_| "git status returned a non-UTF-8 path".to_owned())?;
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        // rename / copy 的下一条 NUL 是旧路径，属于同一处变更。
+        if status.contains(&b'R') || status.contains(&b'C') {
+            let _ = entries.next();
+        }
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        paths.push(rest.replace('\\', "/"));
+        if paths.len() > MAX_CHANGED_PATHS {
+            return Err(format!(
+                "git status returned more than {MAX_CHANGED_PATHS} paths"
+            ));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 /// 取 workspace 当前 git 变更路径（相对 workspace，含未跟踪文件）。
 ///
 /// 不是 git 仓、命令失败、路径不是 UTF-8 或输出读不出时返回 `None`：调用方据此
@@ -903,46 +942,13 @@ fn git_changed(root: &Path) -> Option<Vec<String>> {
     if !output.status.success() {
         return None;
     }
-    let mut entries = output.stdout.split(|byte| *byte == 0);
-    let mut paths = Vec::new();
-    while let Some(entry) = entries.next() {
-        if entry.len() < 4 {
-            continue;
-        }
-        let status = &entry[..2];
-        let Ok(path) = std::str::from_utf8(&entry[3..]) else {
-            eprintln!(
-                "trit-host: git status returned a non-UTF-8 path; \
-                 skipping automatic changed set"
-            );
-            return None;
-        };
-        let path = path.trim();
-        if path.is_empty() {
-            continue;
-        }
-        // rename / copy 的下一条 NUL 是旧路径，属于同一处变更。
-        if status.contains(&b'R') || status.contains(&b'C') {
-            let _ = entries.next();
-        }
-        let Some(rest) = path.strip_prefix(prefix.as_str()) else {
-            continue;
-        };
-        if rest.is_empty() {
-            continue;
-        }
-        paths.push(rest.replace('\\', "/"));
-        if paths.len() > MAX_CHANGED_PATHS {
-            eprintln!(
-                "trit-host: git status returned more than {MAX_CHANGED_PATHS} paths; \
-                 skipping automatic changed set"
-            );
-            return None;
+    match parse_git_status(&prefix, &output.stdout) {
+        Ok(paths) => Some(paths),
+        Err(reason) => {
+            eprintln!("trit-host: {reason}; skipping automatic changed set");
+            None
         }
     }
-    paths.sort();
-    paths.dedup();
-    Some(paths)
 }
 
 /// 把 `--alignment-changed` 的输入折成 workspace 相对的 `/` 路径。
@@ -1272,5 +1278,30 @@ mod tests {
         let catalog = load_context_catalog(&path).unwrap();
         assert_eq!(catalog.len(), 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parses_git_status_entries_and_rejects_non_utf8() {
+        let stdout = b" M src/a.py\0?? src/b.py\0";
+        assert_eq!(
+            parse_git_status("", stdout).unwrap(),
+            ["src/a.py", "src/b.py"]
+        );
+
+        // rename：下一条 NUL 是旧路径，不应进 changed。
+        let renamed = b"R  new.py\0old.py\0";
+        assert_eq!(parse_git_status("", renamed).unwrap(), ["new.py"]);
+
+        // workspace 是 repo 子目录：前缀要裁掉。
+        let nested = b"?? sub/x.py\0";
+        assert_eq!(parse_git_status("sub/", nested).unwrap(), ["x.py"]);
+
+        // 非 UTF-8 路径：放弃自动取值，而不是替换字符。
+        let bad = b"?? non-utf8-\xFF.txt\0";
+        assert!(parse_git_status("", bad).is_err());
+
+        // 排序去重。
+        let dup = b"?? b.py\0?? a.py\0?? a.py\0";
+        assert_eq!(parse_git_status("", dup).unwrap(), ["a.py", "b.py"]);
     }
 }

@@ -448,3 +448,50 @@ fn cli_changed_paths_are_case_insensitive_on_windows() {
     assert_eq!(value["status"], "passed");
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(windows)]
+#[test]
+fn cli_changed_paths_fold_unicode_case_on_windows() {
+    let root = root("unicode-case");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    write(&root, "src/Ärger.md", "# ok\n");
+    write(&root, "tests/Ärger_check.md", "## 检查\n");
+    write(
+        &root,
+        "alignment.json",
+        &json!({
+            "schema": "alignment/1",
+            "goal": {"id": "G1", "text": "unicode"},
+            "requirements": [{
+                "id": "R1",
+                "text": "unicode path",
+                "priority": "must",
+                "parent": "G1",
+                "artifacts": ["A1"],
+                "evidence": ["E1"],
+                "changes": ["src/Ärger.md"]
+            }],
+            "artifacts": [{"id": "A1", "path": "src/Ärger.md"}],
+            "evidence": [{"id": "E1", "path": "tests/Ärger_check.md", "locator": "text:## 检查"}]
+        })
+        .to_string(),
+    );
+    packet(&root, "H");
+    let (code, value) = cli_support::run(
+        "gate-chain",
+        &json!({
+            "root": root.to_string_lossy(),
+            "expected": "bfxh/trit-agent-kernel",
+            "task_kind": "agent",
+            "packet": "packet.json",
+            "receiver_state_hash": "H",
+            "at": 1000,
+            "manifest": "alignment.json",
+            "changed": ["SRC/ÄRGER.MD"]
+        }),
+    );
+    // Windows 下按 Unicode 小写折叠：Ä 与 ä 视为同一路径。
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["status"], "passed");
+    let _ = fs::remove_dir_all(root);
+}
