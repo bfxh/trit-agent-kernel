@@ -151,6 +151,10 @@ pub fn exit_status(exit: Option<i32>) -> DelegationStatus {
 ///
 /// 只做**契约校验**，不做真实网络传输：载荷仍是本模块的帧，宿主决定用什么传输
 /// （HTTP POST、长连接、消息队列）。校验的目标是保证“认证 token 不会走明文远程”。
+///
+/// 宿主侧的最小真实传输在 `trit-host`：`remote_subagent::run_remote_subagent`
+/// 把一帧 POST 到 `url`，`remote_serve` / `trit-host remote-echo` 是对应的参考
+/// 服务端。节点发现、跨机调度与跨机失败恢复不在契约层范围。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteEndpoint {
     /// 端点地址；必须 `https://`，或 loopback 的 `http://`。

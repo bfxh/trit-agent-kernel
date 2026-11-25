@@ -160,24 +160,38 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   可执行的真实子 agent 替身，用于端到端回归（真实 spawn、超时 kill、无响应、
   引用不匹配四类）。
 
-## 8. 跨机器执行契约（`trit_orch::RemoteEndpoint`）
+## 8. 跨机器执行（`trit_orch::RemoteEndpoint` + `trit_host` 远程 runner）
 
-跨机器的载荷与进程内完全相同（subagent 帧）；这一层只定义端点的**准入校验**，
-不做真实网络传输。
+跨机器的载荷与进程内完全相同（subagent 帧）。准入仍由 `trit_orch::RemoteEndpoint`
+负责，真实传输由宿主实现（`trit_host::remote_subagent`）。
 
 - `RemoteEndpoint { url, auth_token, timeout_secs }`；
 - 远程必须 `https://`；明文 `http://` 只允许 loopback
   （`127.0.0.1` / `localhost` / `::1`，含 IPv6 方括号）；
 - 空 host（如 `https://`、`https://:8080`）、空白 token、0 超时一律
   `subagent_protocol` 错误；
-- 目的：认证 token 不会走明文远程；真实传输（HTTP POST / 长连接 / 消息队列）
-  由宿主实现，跨机器调度不在本批范围。
+- `run_remote_subagent`：`validate` → 编码单帧 → `POST`
+  （`Content-Type: application/x-trit-frame`，可选 `Authorization: Bearer`）→
+  有界读响应 → `validate_for` → `DelegationResult`；
+- 客户端**不跟随重定向**（3xx 直接记 `Failed`），**不自动重试**；传输失败/超时
+  记 `Aborted`；非 2xx、空体、截断帧、超过 `MAX_RESPONSE_BYTES` 记 `Failed`；
+  解帧失败或 `task + epoch` 不匹配返回协议错误。以上都不产生 `Completed`；
+- 参考服务端 `trit_host::remote_serve` 与 CLI `trit-host remote-echo`：一次
+  连接一个 `POST`，`Content-Length` 有界（≤ 8 MiB + 4），可选 Bearer 校验，
+  `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；启动先打印
+  `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口。
+
+回归在 `crates/trit-host/tests/remote_subagent.rs`：loopback 服务端与真实
+`remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
+超时与连接失败。
+
+**仍然非目标（本批不做）**：节点发现、跨机器调度、跨机失败恢复与幂等重试。
 
 ## 非目标
 
 - 不把 fleet 依赖图塞进 `TaskSpec`：`TaskSpec.deps` 只有三元依赖，图的调度归属
   runtime；
-- 不做跨机器调度；
+- 不做跨机器调度（节点发现、跨机失败恢复、幂等重试同样不在本批）；
 - 真实子 agent 进程的 spawn/超时 kill 由宿主实现，本批只固化 IPC 契约；
 - provider 侧的模型调用本身（HTTP/SSE 接线）不在本批：本批把模型输出解析成
   `PlanHandoff`（`submit_plan`），发请求仍走既有 provider 路径。

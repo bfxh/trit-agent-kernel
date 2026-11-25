@@ -995,6 +995,8 @@ pub mod provider;
 pub mod provider_health;
 pub mod provider_stream;
 pub mod reasonix_wire;
+pub mod remote_serve;
+pub mod remote_subagent;
 pub mod sampling;
 pub mod separation;
 pub mod serve;
@@ -1072,6 +1074,8 @@ pub use reasonix_wire::{
     REASONIX_EVENT_KINDS, REASONIX_WIRE_VERSION, WireCacheDiagnostics, WireContractError,
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
+pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
+pub use remote_subagent::{FRAME_CONTENT_TYPE, MAX_RESPONSE_BYTES, run_remote_subagent};
 pub use sampling::OpenAiSamplingHandler;
 pub use separation::{
     PLAN_TOOL, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,

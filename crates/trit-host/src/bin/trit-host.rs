@@ -57,6 +57,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "subagent-run" {
         return run_subagent_run(args);
     }
+    if command == "remote-echo" {
+        return run_remote_echo(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1302,7 +1305,11 @@ fn usage() {
          deletes AppContainer profiles recorded for the workspace.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
-         [--allow-unrewindable]"
+         [--allow-unrewindable]\n\n\
+         remote-echo: trit-host remote-echo [--bind <addr>] [--token <t>] [--once] \\\n\
+         [--fail] [--silent] [--sleep-ms N]\n\
+         reference remote endpoint: HTTP POST of one subagent frame per request;\n\
+         prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting."
     );
 }
 
@@ -1573,6 +1580,37 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;
+    Ok(())
+}
+
+/// `remote-echo [--bind <addr>] [--token <t>] [--once] [--fail] [--silent] [--sleep-ms N]`：
+/// 远程端点的参考服务端。HTTP、帧与鉴权规则见 `trit_host::remote_serve`。
+///
+/// 启动后先向 stdout 打一行 `{"bind":"127.0.0.1:PORT"}`（含系统分配的端口），
+/// 再开始 accept；`--once` 服务一个连接后退出，供端到端测试使用。
+fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut config = trit_host::RemoteServerConfig::new("127.0.0.1:0");
+    let mut once = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bind" => config.bind = next(&mut args, "--bind")?,
+            "--token" => config.token = Some(next(&mut args, "--token")?),
+            "--once" => once = true,
+            "--fail" => config.mode = trit_host::RemoteMode::Fail,
+            "--silent" => config.mode = trit_host::RemoteMode::Silent,
+            "--sleep-ms" => config.sleep_ms = next(&mut args, "--sleep-ms")?.parse()?,
+            other => return Err(fail(format!("unknown remote-echo argument: {other}"))),
+        }
+    }
+    let server = trit_host::RemoteServer::bind(config)?;
+    let addr = server.addr()?;
+    println!("{}", serde_json::json!({ "bind": addr.to_string() }));
+    std::io::stdout().flush()?;
+    if once {
+        server.serve_once()?;
+        return Ok(());
+    }
+    server.serve_forever()?;
     Ok(())
 }
 
