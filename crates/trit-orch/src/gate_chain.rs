@@ -1,4 +1,4 @@
-//! 门链：仓库身份 → 交接包 → 对齐清单，一条只读、stop-first 的链。
+//! 门链：仓库身份 → 交接包 → 对齐清单，一条默认只读、stop-first 的链。
 //!
 //! 三扇门各自回答一个很窄的问题：
 //!
@@ -7,11 +7,12 @@
 //! - `alignment`：这份“目标 → 需求 → 产物/证据/变更”清单有没有断链。
 //!
 //! 分开跑三次容易出两类错误：前一道门没过，后一道门已经跑过；或者把
-//! `Unknown` 当成“差不多通过”。门链把它们固定成一条 **只读**、
+//! `Unknown` 当成“差不多通过”。门链把它们固定成一条 **默认只读**、
 //! **stop-first** 的链：只有 `True` 放行，`Unknown` / `False` 立即停链，
-//! 后续门在报告里记为 `skipped`，一个字节都不写。
+//! 后续门在报告里记为 `skipped`；只有显式 `attach` 才补 `sent + delivered`。
 //!
-//! 门链不补 `sent/delivered` 账本；需要落账时仍走 `trit-orch delivery gate`。
+//! 默认不补 `sent/delivered` 账本；显式 `attach` 才补前两态，`read/acted` 仍走
+//! `trit-orch delivery`。
 
 use std::path::PathBuf;
 

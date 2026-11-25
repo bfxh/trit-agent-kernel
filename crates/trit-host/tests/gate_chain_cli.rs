@@ -334,3 +334,14 @@ fn host_attaches_delivery_when_requested() {
     assert_eq!(journal.state_names(), vec!["sent", "delivered"]);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn host_alignment_flags_alone_enable_the_chain() {
+    let root = root("flag-only");
+    fixture(&root);
+    // 只给 alignment 开关、不给 --gate-chain：也必须进链，而不是静默忽略参数。
+    let (code, text) = host(&root, &["--alignment-no-git-changed"]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("gate chain rejected at delivery"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}

@@ -1,6 +1,6 @@
 # 门链（Gate Chain）
 
-`gate-chain/1`：把仓库身份门、交接包只读预检与对齐门串成一条**只读、stop-first**
+`gate-chain/1`：把仓库身份门、交接包只读预检与对齐门串成一条**默认只读、stop-first**
 的链。它回答一个很窄的问题：
 
 > 现在这个仓、这个交接包、这份任务清单，是不是同时满足派发前提？
@@ -27,10 +27,10 @@
 | 顺序 | 门 | 调用 | 失败意味着 |
 | --- | --- | --- | --- |
 | 1 | `repo` | `repo::gate(root, expected, task_kind)` | 这不是能接智能体任务的仓，或与 `expected` 不一致 |
-| 2 | `delivery` | `delivery::check(root, packet, receiver_state_hash, at)` | 交接包结构不合法（`False`）、过期或状态哈希不一致（`Unknown`） |
+| 2 | `delivery` | `delivery::check(...)`；`attach=true` 时再调 `delivery::attach(...)` | 交接包结构不合法（`False`）、过期或状态哈希不一致（`Unknown`）；落账失败也是 `Unknown` |
 | 3 | `alignment` | `alignment::check(root, manifest, options)` | 清单断链（`unaligned`）或无法判定（缺失/坏 JSON/schema 不符） |
 
-`delivery` 默认用**只读** `check`：门链一个字节都不写，包括 `.agent/delivery/`。
+`delivery` 默认用**只读** `check`：默认不写任何文件，包括 `.agent/delivery/`。
 需要把“判断”和“落账”一次完成时显式开 `attach: true`（CLI）或 `--handoff-attach`
 （host）：门通过后补 `sent + delivered`，仍然只补这两态，不写 `read/acted`。
 落账失败会把该门降为 `Unknown`，不会对外宣称账本已推进。
@@ -46,7 +46,7 @@
   "steps": [
     {"id": "repo", "gate": "True", "state": "passed", "reason": "", "detail": {}},
     {"id": "delivery", "gate": "True", "state": "passed", "reason": "handoff gate passed; receipt missing", "detail": {}},
-    {"id": "alignment", "gate": "True", "state": "passed", "reason": "fallback: alignment aligned (must score 1.00, 0 failure(s))", "detail": {}}
+    {"id": "alignment", "gate": "True", "state": "passed", "reason": "alignment aligned (must score 1.00, 0 failure(s))", "detail": {}}
   ],
   "counts": {"passed": 3, "blocked": 0, "unknown": 0, "skipped": 0}
 }

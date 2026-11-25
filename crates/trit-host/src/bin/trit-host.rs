@@ -300,8 +300,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let workspace_root = workspace.clone();
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
-    let gate_chain_requested =
-        gate_chain || handoff_packet.is_some() || alignment_manifest.is_some();
+    let gate_chain_requested = gate_chain
+        || handoff_packet.is_some()
+        || alignment_manifest.is_some()
+        || !alignment_changed.is_empty()
+        || alignment_changed_set
+        || alignment_no_git_changed;
     if gate_chain_requested {
         let delivery = handoff_packet.map(|packet| {
             let packet = if packet.is_absolute() {
