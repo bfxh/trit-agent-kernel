@@ -338,6 +338,13 @@ pub struct GateChainRecord {
     pub report: Option<String>,
 }
 
+impl GateChainRecord {
+    /// 这一条门链结论是否放行：`exit == 0` 且 `status` 是 `passed` / `aligned`。
+    pub fn passed(&self) -> bool {
+        self.exit == 0 && matches!(self.status.as_str(), "passed" | "aligned")
+    }
+}
+
 impl SessionState {
     pub fn next_turn(&self) -> usize {
         self.turns.len()

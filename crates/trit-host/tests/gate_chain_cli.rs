@@ -631,6 +631,7 @@ fn host_logs_gate_chain_to_session() {
     assert_eq!(recovery.gate_chains.len(), 2);
     assert_eq!(recovery.gate_chains[0].status, "passed");
     assert_eq!(recovery.gate_chains[1].status, "aligned");
+    assert!(!recovery.gate_chain_blocked());
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }

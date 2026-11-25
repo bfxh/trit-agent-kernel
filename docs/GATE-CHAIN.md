@@ -217,6 +217,8 @@ trit-host run --task "..." --workspace . \
   事件不改变 turn 状态机，`recover` 会把它们填进 `SessionState.gate_chains`；
   supervisor 恢复包（`RecoveryContext.gate_chains`）也带同一份历史；session 文件
   本身也会从 post 的 `changed` 中排除。
+  `RecoveryContext` 另有 `latest_gate_chain()` / `gate_chain_blocked()`，宿主可以按
+  最新一条直接判断是否阻塞（没有记录时不阻塞）。
 
 ## 8. 硬规则
 
