@@ -1,0 +1,15 @@
+{
+  "id": "h-001",
+  "from": "agent-a",
+  "to": "agent-b",
+  "goal": "产出一份可验收的任务报告",
+  "base_commit": "6f39dee",
+  "state_hash": "H",
+  "decisions": ["先写报告，再补检查"],
+  "open_questions": [],
+  "claims": [],
+  "evidence": [],
+  "next_action": "读报告与检查",
+  "idempotency_key": "h-001-example",
+  "expires_at": 4102444800
+}

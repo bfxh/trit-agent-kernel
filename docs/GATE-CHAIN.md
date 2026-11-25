@@ -111,7 +111,30 @@
 | `1` | `blocked` | 至少一道门是 `False`；`failed_at` 指出哪一道 |
 | `3` | `unknown` | 至少一道门无法判定（没有 `False`）；不是通过 |
 
-## 5. 库入口
+## 5. 最小示例
+
+`docs/examples/gate-chain/workspace/` 是一份可直接跑通的工作区：
+
+```text
+.agent/repo.json              仓库身份
+.agent/handoff/h-001.json     交接包（state_hash = H）
+.agent/alignment.json         alignment/2 目标树 + 需求 + 产物/证据
+src/report.md                 产物 A1
+tests/report_check.md         证据 E1
+```
+
+把它复制到空目录后运行：
+
+```bash
+printf '%s' '{"root":".","expected":"bfxh/trit-agent-kernel","task_kind":"agent","packet":".agent/handoff/h-001.json","receiver_state_hash":"H","manifest":".agent/alignment.json"}' | trit-orch gate-chain
+```
+
+预期 `status: "passed"`、`exit: 0`、`counts.passed: 3`。完整说明与改造点见
+[docs/examples/gate-chain/README.md](examples/gate-chain/README.md)；
+`cargo test -p trit-orch --test gate_chain_example` 会把这份示例当输入跑一遍，
+示例改坏会直接红。
+
+## 6. 库入口
 
 ```rust
 use std::path::PathBuf;
@@ -140,7 +163,7 @@ assert_eq!(report.exit, 0);
 `Unknown` 并停链。要让调用方显式选择“只跑前两道门”，当前版本不支持——门链就是
 三道门齐备的派发前检查；只做局部检查请直接调用对应子命令。
 
-## 6. 接入 `trit-host`
+## 7. 接入 `trit-host`
 
 `trit-host run` 在 workspace 已声明 `.agent/repo.json` 时会自动跑 repo gate；要跑完整门链，显式加 `--gate-chain`：
 
@@ -177,7 +200,7 @@ trit-host run --task "..." --workspace . \
 - 宿主默认不写账本：`delivery` 仍是只读 `check`；加 `--handoff-attach` 才补
   `sent + delivered`，`read/acted` 仍要单独推进。
 
-## 7. 硬规则
+## 8. 硬规则
 
 - **只有 `True` 放行**：三值里 `Unknown` 与 `False` 都不继续。
 - **stop-first**：停链后不再执行任何门；`skipped` 不计入通过数。
@@ -188,7 +211,7 @@ trit-host run --task "..." --workspace . \
 - **报告可复算**：同一输入重复运行得到同一 `status` / `exit` / `steps[].state`；
   `detail` 里的原始报告也来自各自门。
 
-## 8. 诚实边界
+## 9. 诚实边界
 
 - 不证明“产物在语义上实现了需求”：`alignment` 只做结构检查，`passed` 只表示清单无断链。
 - 不是 ACL、不是沙盒、不是密码学签名：`repo identity` 与交接包都是仓内自报，

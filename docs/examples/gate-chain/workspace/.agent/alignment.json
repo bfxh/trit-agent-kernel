@@ -1,0 +1,22 @@
+{
+  "schema": "alignment/2",
+  "goals": [
+    { "id": "G1", "text": "产出一份可验收的任务报告" },
+    { "id": "G2", "text": "报告有可复核的检查", "parent": "G1" }
+  ],
+  "requirements": [
+    {
+      "id": "R1",
+      "text": "报告包含结论与证据两节",
+      "priority": "must",
+      "parent": "G2",
+      "artifacts": ["A1"],
+      "evidence": ["E1"],
+      "changes": ["src/report.md"]
+    }
+  ],
+  "artifacts": [{ "id": "A1", "path": "src/report.md" }],
+  "evidence": [
+    { "id": "E1", "path": "tests/report_check.md", "locator": "text:## 检查" }
+  ]
+}
