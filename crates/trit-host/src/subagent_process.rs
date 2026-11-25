@@ -53,11 +53,26 @@ impl SubagentProcessConfig {
     }
 }
 
-/// spawn 子 agent 并完成一次请求/响应交换。
+/// 一次子 agent 交换的完整回包：结果元数据 + 原始内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentReply {
+    pub result: DelegationResult,
+    pub content: Vec<u8>,
+}
+
+/// spawn 子 agent 并完成一次请求/响应交换，只返回结果元数据。
 pub fn run_subagent(
     config: &SubagentProcessConfig,
     request: &SubagentRequest,
 ) -> Result<DelegationResult, AgentError> {
+    run_subagent_reply(config, request).map(|reply| reply.result)
+}
+
+/// spawn 子 agent 并完成一次请求/响应交换，保留响应内容。
+pub fn run_subagent_reply(
+    config: &SubagentProcessConfig,
+    request: &SubagentRequest,
+) -> Result<SubagentReply, AgentError> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
         .stdin(Stdio::piped())
@@ -90,12 +105,15 @@ pub fn run_subagent(
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(DelegationResult {
-                task: request.task.clone(),
-                epoch: request.epoch,
-                digest: digest_hex(b""),
-                status: DelegationStatus::Aborted,
-                tokens: 0,
+            return Ok(SubagentReply {
+                result: DelegationResult {
+                    task: request.task.clone(),
+                    epoch: request.epoch,
+                    digest: digest_hex(b""),
+                    status: DelegationStatus::Aborted,
+                    tokens: 0,
+                },
+                content: Vec::new(),
             });
         }
     };
@@ -105,14 +123,19 @@ pub fn run_subagent(
     match decode_frame::<SubagentResponse>(&mut buffer) {
         Ok(Some(response)) => {
             response.validate_for(request)?;
-            Ok(response.into_delegation_result())
+            let content = response.content.clone();
+            let result = response.into_delegation_result();
+            Ok(SubagentReply { result, content })
         }
-        Ok(None) => Ok(DelegationResult {
-            task: request.task.clone(),
-            epoch: request.epoch,
-            digest: digest_hex(b""),
-            status: exit_status(exit),
-            tokens: 0,
+        Ok(None) => Ok(SubagentReply {
+            result: DelegationResult {
+                task: request.task.clone(),
+                epoch: request.epoch,
+                digest: digest_hex(b""),
+                status: exit_status(exit),
+                tokens: 0,
+            },
+            content: Vec::new(),
         }),
         Err(error) => Err(AgentError::Kernel(error)),
     }

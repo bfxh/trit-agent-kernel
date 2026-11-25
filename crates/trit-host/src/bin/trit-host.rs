@@ -66,6 +66,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "remote-ledger" {
         return run_remote_ledger(args);
     }
+    if command == "remote-exec" {
+        return run_remote_exec(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1321,6 +1324,10 @@ fn usage() {
          [--pending-ttl-ms N] [--max-entries N] [--once]\n\
          shared idempotency ledger: POST /claim and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
+         remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
+         --workspace <dir> --script <proposals.json> [--max-steps N] [--exec-timeout-secs N] \\\n\
+         [--once] [--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N]\n\
+         executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?}},\n\
          dispatches tasks as read-only subagent requests to the static node table, prints JSON."
@@ -1778,6 +1785,75 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         }
     }
     let server = trit_host::LedgerServer::bind(config)?;
+    let addr = server.addr()?;
+    println!("{}", serde_json::json!({ "bind": addr.to_string() }));
+    std::io::stdout().flush()?;
+    if once {
+        server.serve_once()?;
+        return Ok(());
+    }
+    server.serve_forever()?;
+    Ok(())
+}
+
+/// `remote-exec [--bind <addr>] [--token <t>] --workspace <dir> --script <proposals.json>`
+/// `[--max-steps N] [--exec-timeout-secs N] [--once] [--ledger <url> ...]`：
+/// 可执行的远程端点。每个请求 spawn 一个 `subagent-run` 子进程，帧走 stdin/stdout。
+fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut config = trit_host::RemoteServerConfig::new("127.0.0.1:0");
+    let mut once = false;
+    let mut workspace = PathBuf::from(".");
+    let mut script: Option<PathBuf> = None;
+    let mut max_steps = 20usize;
+    let mut exec_timeout_secs = 30u64;
+    let mut ledger_url: Option<String> = None;
+    let mut ledger_token: Option<String> = None;
+    let mut ledger_timeout_secs = 30u64;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bind" => config.bind = next(&mut args, "--bind")?,
+            "--token" => config.token = Some(next(&mut args, "--token")?),
+            "--once" => once = true,
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
+            "--max-steps" => max_steps = next(&mut args, "--max-steps")?.parse()?,
+            "--exec-timeout-secs" => {
+                exec_timeout_secs = next(&mut args, "--exec-timeout-secs")?.parse()?
+            }
+            "--ledger" => ledger_url = Some(next(&mut args, "--ledger")?),
+            "--ledger-token" => ledger_token = Some(next(&mut args, "--ledger-token")?),
+            "--ledger-timeout-secs" => {
+                ledger_timeout_secs = next(&mut args, "--ledger-timeout-secs")?.parse()?
+            }
+            other => return Err(fail(format!("unknown remote-exec argument: {other}"))),
+        }
+    }
+    let script = script.ok_or_else(|| fail("remote-exec requires --script <proposals.json>"))?;
+    let program = std::env::current_exe()
+        .map_err(|error| fail(format!("resolve current executable: {error}")))?;
+    let exec = trit_host::SubagentProcessConfig::new(program)
+        .with_args(vec![
+            "subagent-run".into(),
+            "--workspace".into(),
+            workspace.display().to_string(),
+            "--script".into(),
+            script.display().to_string(),
+            "--max-steps".into(),
+            max_steps.to_string(),
+        ])
+        .with_timeout(std::time::Duration::from_secs(exec_timeout_secs));
+    config = config.with_exec(exec);
+    if let Some(url) = ledger_url {
+        config.ledger = Some(trit_orch::RemoteEndpoint {
+            url,
+            auth_token: ledger_token,
+            timeout_secs: ledger_timeout_secs,
+        });
+    } else if ledger_token.is_some() {
+        return Err(fail("--ledger-token requires --ledger <url>"));
+    }
+
+    let server = trit_host::RemoteServer::bind(config)?;
     let addr = server.addr()?;
     println!("{}", serde_json::json!({ "bind": addr.to_string() }));
     std::io::stdout().flush()?;

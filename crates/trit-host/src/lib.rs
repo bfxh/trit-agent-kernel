@@ -1102,7 +1102,9 @@ pub use state_layer::{
     AgentState, CompactionState, InProgressState, StateIssue, StateIssueCode, StateIssueSeverity,
     StateLayer, StateValidation, state_layer,
 };
-pub use subagent_process::{SubagentProcessConfig, run_subagent};
+pub use subagent_process::{
+    SubagentProcessConfig, SubagentReply, run_subagent, run_subagent_reply,
+};
 pub use supervisor::{
     GatewaySupervisor, McpCapabilities, McpHandshake, McpLogLevel, McpNotification, McpPrompt,
     McpPromptArgument, McpPromptsCapability, McpResource, McpResourceContent, McpResourceRead,

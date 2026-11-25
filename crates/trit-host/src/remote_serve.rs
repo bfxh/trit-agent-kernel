@@ -18,7 +18,10 @@
 //! 6. **账本优先**：配置 `ledger` 后，带键请求先向共享账本 claim；账本返回完成帧
 //!    就直接回放，返回占位则轮询等待，拿到执行权才执行，执行后必须 complete。
 //!    账本不可达时回 503，宁可不执行也不冒重复执行的风险。`Silent` 模式不产生
-//!    响应帧，无法登记完成，账本占位会留到 TTL 过期。
+//!    响应帧，无法登记完成，账本占位会留到 TTL 过期；
+//! 7. **Exec 模式真实执行**：spawn `subagent-run`（或等价命令），请求帧走 stdin、
+//!    响应帧走 stdout；只有子进程判定完成才回 `Completed`，进程错误/超时按
+//!    `Failed`/`Aborted` 回帧，不误报完成。
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -32,6 +35,7 @@ use trit_orch::{
 };
 
 use crate::remote_ledger::{self, Claim};
+use crate::subagent_process::{SubagentProcessConfig, run_subagent_reply};
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,6 +55,8 @@ pub enum RemoteMode {
     Fail,
     /// 回 200 空体：让宿主走“没有合法响应”的分支。
     Silent,
+    /// 真实执行：按配置 spawn `subagent-run`（或等价命令）并回它的响应帧。
+    Exec,
 }
 
 /// 参考服务端配置。
@@ -66,6 +72,8 @@ pub struct RemoteServerConfig {
     pub sleep_ms: u64,
     /// 可选的共享幂等账本；配置后带键请求以账本为准，本地缓存不再参与。
     pub ledger: Option<RemoteEndpoint>,
+    /// `Exec` 模式下的子 agent 进程配置；其他模式必须为空。
+    pub exec: Option<SubagentProcessConfig>,
 }
 
 impl RemoteServerConfig {
@@ -76,6 +84,7 @@ impl RemoteServerConfig {
             mode: RemoteMode::Echo,
             sleep_ms: 0,
             ledger: None,
+            exec: None,
         }
     }
 
@@ -98,6 +107,12 @@ impl RemoteServerConfig {
         self.ledger = Some(ledger);
         self
     }
+
+    pub fn with_exec(mut self, exec: SubagentProcessConfig) -> Self {
+        self.mode = RemoteMode::Exec;
+        self.exec = Some(exec);
+        self
+    }
 }
 
 /// 已绑定的参考服务端。
@@ -114,6 +129,21 @@ impl RemoteServer {
             ledger.validate().map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
             })?;
+        }
+        match (config.mode, config.exec.is_some()) {
+            (RemoteMode::Exec, false) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "exec mode requires exec process config",
+                ));
+            }
+            (mode, true) if mode != RemoteMode::Exec => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "exec process config is only valid in exec mode",
+                ));
+            }
+            _ => {}
         }
         let listener = TcpListener::bind(config.bind.as_str())?;
         Ok(Self {
@@ -266,19 +296,42 @@ fn handle(
         std::thread::sleep(Duration::from_millis(config.sleep_ms));
     }
 
-    let status = match config.mode {
-        RemoteMode::Echo => DelegationStatus::Completed,
-        RemoteMode::Fail => DelegationStatus::Failed {
-            message: "remote echo configured to fail".into(),
-        },
+    let (status, content, tokens) = match config.mode {
+        RemoteMode::Echo => (
+            DelegationStatus::Completed,
+            format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
+            0,
+        ),
+        RemoteMode::Fail => (
+            DelegationStatus::Failed {
+                message: "remote echo configured to fail".into(),
+            },
+            format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
+            0,
+        ),
         RemoteMode::Silent => return respond(&mut stream, 200, "OK", b""),
+        RemoteMode::Exec => {
+            let Some(exec) = config.exec.as_ref() else {
+                return respond(&mut stream, 500, "Internal Server Error", b"");
+            };
+            match run_subagent_reply(exec, &request) {
+                Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
+                Err(error) => (
+                    DelegationStatus::Failed {
+                        message: error.to_string(),
+                    },
+                    Vec::new(),
+                    0,
+                ),
+            }
+        }
     };
     let response = SubagentResponse {
         task: request.task.clone(),
         epoch: request.epoch,
         status,
-        content: format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
-        tokens: 0,
+        content,
+        tokens,
     };
     let frame = match encode_frame(&response) {
         Ok(frame) => frame,
