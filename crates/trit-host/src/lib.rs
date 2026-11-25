@@ -39,6 +39,8 @@ pub enum AgentError {
     PlanProtocol { message: String },
     #[error("extension: {message}")]
     Extension { message: String },
+    #[error("memory: {message}")]
+    Memory { message: String },
     #[error("io error: {0}")]
     Io(String),
     #[error("provider error: {0}")]
@@ -984,6 +986,7 @@ pub mod git_checkpoint;
 pub mod journal;
 pub mod lease;
 pub mod mcp_tools;
+pub mod memory;
 pub mod openai;
 pub mod permissions;
 pub mod planner;
@@ -1045,6 +1048,7 @@ pub use journal::{
 };
 pub use lease::{LEASE_PATH, LeaseError, OperationLease};
 pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};
+pub use memory::{MemoryEntry, MemoryHit, MemoryStore};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use permissions::{
     ClaimingTools, PermissionApprover, PermissionDecision, PermissionGate, PermissionMode,
