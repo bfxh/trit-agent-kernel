@@ -2,12 +2,14 @@
 //!
 //! 子命令：`plan` / `select` / `dispatch` / `finish` / `recover` / `shadow` / `compact-gate`
 //! 以及协调面 `claim` / `renew` / `release` / `claim-gate` / `receipt` / `handoff-gate` /
-//! `admit-with-claim`，交接账本 `delivery`。成功退出码 0，失败退出码 1 并输出
+//! `admit-with-claim`，交接账本 `delivery`，仓库身份门 `repo-gate`，对齐门 `alignment`。
+//! 成功退出码 0，失败退出码 1 并输出
 //! `{"ok":false,"kind":"...","error":"..."}`；成功输出永远带 `"ok":true`。
 
 mod cli_delivery;
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -107,6 +109,25 @@ struct ClaimGateInput {
     owner: String,
     paths: Vec<String>,
     now: u64,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RepoGateInput {
+    root: String,
+    expected: String,
+    task_kind: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AlignmentInput {
+    root: String,
+    manifest: String,
+    strict: Option<bool>,
+    changed: Option<Vec<String>>,
+    changed_known: bool,
+    executed: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -434,9 +455,54 @@ fn run(command: &str, input: &str) -> Result<Value, trit_orch::Error> {
             }))
         }
         "delivery" => cli_delivery::run(input),
+        "alignment" => {
+            let request: AlignmentInput = parse(input)?;
+            let root = if request.root.trim().is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(request.root.trim())
+            };
+            let manifest = if request.manifest.trim().is_empty() {
+                Path::new(".agent/alignment.json").to_path_buf()
+            } else {
+                PathBuf::from(request.manifest.trim())
+            };
+            let options = trit_orch::alignment::AlignmentOptions {
+                changed: request.changed,
+                changed_known: request.changed_known,
+                strict: request.strict.unwrap_or(true),
+                executed: request.executed,
+            };
+            let report = trit_orch::alignment::check(&root, &manifest, &options);
+            let value =
+                serde_json::to_value(&report).map_err(|error| trit_orch::Error::InputParse {
+                    message: format!("serialize alignment report: {error}"),
+                })?;
+            println!("{value}");
+            std::process::exit(report.exit);
+        }
+        "repo-gate" => {
+            let request: RepoGateInput = parse(input)?;
+            let root = if request.root.trim().is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(request.root.trim())
+            };
+            let decision = trit_orch::repo_gate(&root, &request.expected, &request.task_kind);
+            if decision.gate != Ternary::True {
+                return Err(trit_orch::Error::RepoScopeRejected {
+                    reason: decision.reason,
+                });
+            }
+            Ok(json!({
+                "ok": true,
+                "gate": "True",
+                "identity": decision.identity,
+            }))
+        }
         other => Err(trit_orch::Error::InputParse {
             message: format!(
-                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
+                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/repo-gate/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
             ),
         }),
     }
