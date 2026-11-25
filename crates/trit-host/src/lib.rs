@@ -33,6 +33,8 @@ pub enum AgentError {
     NoBrief { task: String },
     #[error("tool error: {0}")]
     Tool(String),
+    #[error("tool {tool} denied: {reason}")]
+    ToolDenied { tool: String, reason: String },
     #[error("io error: {0}")]
     Io(String),
     #[error("provider error: {0}")]
@@ -984,6 +986,7 @@ pub mod provider_health;
 pub mod provider_stream;
 pub mod reasonix_wire;
 pub mod sampling;
+pub mod separation;
 pub mod session;
 pub mod session_migration;
 pub mod state_layer;
@@ -1049,6 +1052,7 @@ pub use reasonix_wire::{
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
 pub use sampling::OpenAiSamplingHandler;
+pub use separation::{READ_ONLY_TOOLS, ReadOnlyTools, SessionPaths, is_read_only_tool};
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
     SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,

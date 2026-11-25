@@ -8,6 +8,7 @@ mod budget;
 mod budget_book;
 mod claim;
 mod context;
+mod delegation;
 pub mod delivery;
 mod digest;
 mod effects;
@@ -15,6 +16,7 @@ mod error;
 mod evidence;
 mod evidence_rails;
 mod evidence_writeback;
+mod fleet;
 mod flip_rates;
 pub mod gate_chain;
 mod guidance;
@@ -60,6 +62,10 @@ pub use context::{
     CompactionBlock, CompactionDecision, ContextFacts, DEFAULT_THRESHOLD_BP, MAX_THRESHOLD_BP,
     MIN_THRESHOLD_BP, Obligation, Overflow, Tier, compaction_gate,
 };
+pub use delegation::{
+    AccessMode, CapsuleEntry, ContextCapsule, DelegationDecision, DelegationInput,
+    DelegationResult, DelegationStatus, SubagentProfile, digest_hex, should_delegate,
+};
 pub use effects::{
     Attempt, Effect, EffectSpec, Ledger, LedgerStore, Reconcile, Recovery, dispatch_ready,
     effect_operations, prepare_effects,
@@ -71,6 +77,7 @@ pub use evidence_writeback::{
     DeferredWriteback, EvidenceWritebackDeferReason, EvidenceWritebackReport,
     writeback_obligation_evidence,
 };
+pub use fleet::{FleetConfig, FleetOutput, FleetReport, execute};
 pub use flip_rates::{FlipPrior, FlipRates, ScorePolicy};
 pub use guidance::guidance_from_text;
 pub use intervention::{

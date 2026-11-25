@@ -49,9 +49,9 @@
 | 11 | Mutation journal / OS lease | `MUTATION_COORDINATOR_SECURITY.md`、`ISOLATION_OPERATION_LEASE_SECURITY.md` | 缺口 | 宿主 mutation record 作为外部事实；内核不复制文件锁 | B7.4/B7.7 |
 | 12 | 沙箱 / isolation runner | `ISOLATION_*`、`SPEC §3.7` | 部分 | 已有外部 sandbox wrapper；缺 runner 生命周期、fail-closed 矩阵 | B7.4 |
 | 13 | 宿主裁决完成声明 | `SPEC §3.11`、`complete_subtask` | 已有 | 已有 EvidenceRails/义务；需补齐“criterion → 回执”逐条降级与 write scope | B7.5 |
-| 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 缺口 | 独立 session、只读 planner、计划交接、缓存前缀不互相污染 | B7.6 |
-| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 缺口 | 显式继承、上下文胶囊、只读/写入子 agent、结果引用 | B7.6 |
-| 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 缺口 | `depends_on`、并发上限、失败传播、稳定子结果引用 | B7.6 |
+| 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 部分（原语） | `ReadOnlyTools` + `SessionPaths` + 独立 `CacheLedger` 已实现；缺 planner 模型接线与计划交接 CLI | B7.6 |
+| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 部分（契约） | `SubagentProfile` 权限单调、`ContextCapsule` 显式继承、`DelegationResult` 稳定引用；缺子 agent 进程与 catalog 暴露 | B7.6 |
+| 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 部分（执行层） | `fleet::execute` 接 `trit-schedule` runtime：并发上限、失败传播、Aborted/Deferred 归类、稳定引用；缺 CLI 与宿主指标导出 | B7.6 |
 | 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 缺口 | 技能索引、命令解析、hook 匹配与检查点/失效联动 | B7.9 |
 | 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 缺口 | 记忆 CRUD、BM25 历史检索、归档与隐私边界 | B7.9 |
 | 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分 | 当前只有 `PortBridge`；缺 loopback 认证、SSE、golden 路由 | B7.8 |
