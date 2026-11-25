@@ -42,8 +42,10 @@
 
 ## 非目标
 
-- 不改 Linux `bwrap` 与 macOS `sandbox-exec` 分支。
-- 不做网络隔离（AppContainer 的 capability 先留空，只做文件系统约束）。
+- 不改 Linux `bwrap` 与 macOS `sandbox-exec` 分支的文件系统参数（网络参数另有
+  单独提交：三平台内置沙箱默认不给网络）。
+- AppContainer profile 不带任何 capability（`CAPABILITY_COUNT = 0`），容器内没有
+  网络访问权限。
 - 不修改用户目录、系统目录的 ACL；只改 `--workspace` 指向的目录。
 - 不做“管理员模式”或绕过 UAC。
 
@@ -83,6 +85,10 @@ AI 断言：`exit code`、文件存在性、`icacls` 输出、`whoami /groups` �
 ## 性质测试 / 不变量
 
 - 同一 workspace 重复运行：profile 可复用，ACL 不重复叠加（ACE 幂等）。
+- profile TTL：超过 7 天未用的 profile 在下次 `appcontainer-run` 开工前被回收，
+  清单条目一并移除；被回收后再次运行会重建并重新授权。
+- 孤儿 ACE：`appcontainer-prune` 之后 workspace DACL 不再含 `S-1-15-2-*`
+  （SID 由 profile 名派生，profile 已消失也能撤销）。
 - 子进程异常退出（非零 / 被终止）：宿主返回同一退出码，profile 仍可清理。
 - ACL 授予失败：原 DACL 必须逐字节恢复（可用 `icacls` 保存前后快照比对）。
 - 无管理员权限：仍可创建 per-user AppContainer profile；若系统策略拒绝，明确报错。
