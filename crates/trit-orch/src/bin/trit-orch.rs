@@ -3,12 +3,13 @@
 //! 子命令：`plan` / `select` / `dispatch` / `finish` / `recover` / `shadow` / `compact-gate`
 //! 以及协调面 `claim` / `renew` / `release` / `claim-gate` / `receipt` / `handoff-gate` /
 //! `admit-with-claim`，交接账本 `delivery`，仓库身份门 `repo-gate`，对齐门 `alignment`，
-//! 对齐骨架 `alignment-scaffold`。
-//! 成功退出码 0，普通失败退出码 1；`alignment` 另有 1=unaligned、3=unknown，
-//! `alignment-scaffold` 输入/写入拒绝退出 2，并输出
+//! 对齐骨架 `alignment-scaffold`，三门串联 `gate-chain`。
+//! 成功退出码 0，普通失败退出码 1；`alignment` 与 `gate-chain` 另有 1=unaligned/blocked、
+//! 3=unknown，`alignment-scaffold` 输入/写入拒绝退出 2，并输出
 //! `{"ok":false,"kind":"...","error":"..."}`；成功输出永远带 `"ok":true`。
 
 mod cli_delivery;
+mod cli_gate_chain;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -472,6 +473,11 @@ fn run(command: &str, input: &str) -> Result<Value, trit_orch::Error> {
             }))
         }
         "delivery" => cli_delivery::run(input),
+        "gate-chain" => {
+            let (value, exit) = cli_gate_chain::run(input)?;
+            println!("{value}");
+            std::process::exit(exit);
+        }
         "alignment" => {
             let request: AlignmentInput = parse(input)?;
             let root = if request.root.trim().is_empty() {
@@ -547,7 +553,7 @@ fn run(command: &str, input: &str) -> Result<Value, trit_orch::Error> {
         }
         other => Err(trit_orch::Error::InputParse {
             message: format!(
-                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/alignment-scaffold/repo-gate/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
+                "未知子命令 {other:?}（可用：plan/select/dispatch/obligations/finish/recover/shadow/shadow-jsonl/compact-gate/delivery/alignment/alignment-scaffold/repo-gate/gate-chain/claim/renew/release/claim-gate/receipt/handoff-gate/admit-with-claim）"
             ),
         }),
     }

@@ -16,6 +16,7 @@ mod evidence;
 mod evidence_rails;
 mod evidence_writeback;
 mod flip_rates;
+pub mod gate_chain;
 mod guidance;
 mod intervention;
 mod lanes;
