@@ -38,6 +38,16 @@ pub struct DeliveryStep {
     pub packet: PathBuf,
     pub receiver_state_hash: String,
     pub at: u64,
+    /// 门通过后是否补 `sent + delivered`。默认 `false`：门链保持只读。
+    pub attach: bool,
+}
+
+/// `delivery` 门的完整结果：只读预检 + 可选落账。
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryOutcome {
+    pub check: delivery::DeliveryCheck,
+    /// 本次是否真的新推进了 `delivered`；已到中间态或未启用时为 `false`。
+    pub attached: bool,
 }
 
 /// `alignment` 的输入。
@@ -149,14 +159,14 @@ fn delivery_step(options: &GateChainOptions) -> GateStep {
         Ok(check) => {
             // `ready` 已经是“门通过且账本没有坏”；三值仍然保留 `Unknown`
             // 与 `False` 的区别，便于调用方决定先对账还是重新生成包。
-            let gate = if check.ready {
+            let mut gate = if check.ready {
                 Ternary::True
             } else if check.gate == Ternary::Unknown {
                 Ternary::Unknown
             } else {
                 Ternary::False
             };
-            let reason = if check.ready {
+            let mut reason = if check.ready {
                 format!("handoff gate passed; receipt {}", check.receipt.status)
             } else {
                 format!(
@@ -166,12 +176,30 @@ fn delivery_step(options: &GateChainOptions) -> GateStep {
                     check.receipt.reason
                 )
             };
+            let mut attached = false;
+            if gate == Ternary::True && input.attach {
+                match delivery::attach(&options.root, &input.packet, input.at) {
+                    Ok((_, wrote)) => {
+                        attached = wrote;
+                        if wrote {
+                            reason.push_str("; attached sent+delivered");
+                        }
+                    }
+                    Err(error) => {
+                        // 门本身通过了，但落账失败仍然是 Unknown：不能对外
+                        // 宣称账本已经推进。
+                        gate = Ternary::Unknown;
+                        reason = format!("delivery attach failed: {error}");
+                    }
+                }
+            }
+            let outcome = DeliveryOutcome { check, attached };
             GateStep {
                 id: STEP_DELIVERY.to_owned(),
                 gate,
                 state: state_of(gate).to_owned(),
                 reason,
-                detail: serde_json::to_value(&check).ok(),
+                detail: serde_json::to_value(&outcome).ok(),
             }
         }
         Err(error) => GateStep {

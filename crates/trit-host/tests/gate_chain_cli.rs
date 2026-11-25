@@ -180,3 +180,157 @@ fn host_requires_packet_when_state_hash_is_given() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_repo(root: &Path) {
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "trit"]);
+    git(root, &["config", "user.email", "trit@localhost"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "fixture"]);
+}
+
+#[test]
+fn host_uses_git_changes_and_rejects_unlinked_path() {
+    let root = root("git-changed");
+    fixture(&root);
+    git_repo(&root);
+    write(&root, "src/b.py", "print(2)\n");
+
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("gate chain rejected at alignment"), "{text}");
+    assert!(text.contains("unlinked-change"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_explicit_changed_overrides_git_lookup() {
+    let root = root("explicit-changed");
+    fixture(&root);
+    git_repo(&root);
+    write(&root, "src/b.py", "print(2)\n");
+
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--alignment-changed",
+            "src/a.py",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(!text.contains("gate chain rejected"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_can_disable_git_changed_lookup() {
+    let root = root("no-git-changed");
+    fixture(&root);
+    git_repo(&root);
+    write(&root, "src/b.py", "print(2)\n");
+
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--alignment-no-git-changed",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(!text.contains("gate chain rejected"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_changed_set_enforces_declared_changes() {
+    let root = root("changed-set");
+    fixture(&root);
+    git_repo(&root);
+    write(&root, "src/b.py", "print(2)\n");
+
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--alignment-changed",
+            "src/b.py",
+            "--alignment-changed-set",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("gate chain rejected at alignment"), "{text}");
+    assert!(text.contains("change"), "{text}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn host_attaches_delivery_when_requested() {
+    let root = root("attach");
+    fixture(&root);
+    let (code, text) = host(
+        &root,
+        &[
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--handoff-attach",
+            "--alignment-manifest",
+            "alignment.json",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(!text.contains("gate chain rejected"), "{text}");
+    assert!(text.contains("--script is required"), "{text}");
+    let journal = trit_orch::delivery::DeliveryJournal::load(&root, "h-001").unwrap();
+    assert_eq!(journal.state_names(), vec!["sent", "delivered"]);
+    let _ = fs::remove_dir_all(root);
+}

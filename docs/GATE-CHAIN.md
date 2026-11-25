@@ -30,9 +30,10 @@
 | 2 | `delivery` | `delivery::check(root, packet, receiver_state_hash, at)` | 交接包结构不合法（`False`）、过期或状态哈希不一致（`Unknown`） |
 | 3 | `alignment` | `alignment::check(root, manifest, options)` | 清单断链（`unaligned`）或无法判定（缺失/坏 JSON/schema 不符） |
 
-`delivery` 用的是**只读** `check`，不是会落账的 `gate`：门链一个字节都不写，
-包括 `.agent/delivery/`。需要补 `sent + delivered` 时仍单独跑
-`trit-orch delivery gate`，这样“判断”和“落账”两步分开，失败重跑不会留下半截账本。
+`delivery` 默认用**只读** `check`：门链一个字节都不写，包括 `.agent/delivery/`。
+需要把“判断”和“落账”一次完成时显式开 `attach: true`（CLI）或 `--handoff-attach`
+（host）：门通过后补 `sent + delivered`，仍然只补这两态，不写 `read/acted`。
+落账失败会把该门降为 `Unknown`，不会对外宣称账本已推进。
 
 ## 3. 报告
 
@@ -60,7 +61,7 @@
 | `steps[].gate` | 该门的三值裁决：`True` / `Unknown` / `False` |
 | `steps[].state` | 链上语义：`passed` / `blocked` / `unknown` / `skipped` |
 | `steps[].reason` | 一句话原因；`alignment` 取第一条 failure |
-| `steps[].detail` | 该门自己的原始报告（`ScopeDecision` / `DeliveryCheck` / `AlignmentReport`） |
+| `steps[].detail` | 该门自己的原始报告（`ScopeDecision` / `DeliveryOutcome` / `AlignmentReport`）；`DeliveryOutcome` 含 `check` 与 `attached` |
 | `failed_at` | 第一个没有放行的门；全通过时缺省 |
 | `counts` | 各状态步数，便于 CI 直接读计数 |
 
@@ -79,6 +80,7 @@
   "packet": ".agent/handoff/h-001.json",
   "receiver_state_hash": "H",
   "at": 0,
+  "attach": false,
   "manifest": ".agent/alignment.json",
   "changed": ["crates/trit-orch/src/gate_chain.rs"],
   "changed_known": true,
@@ -95,6 +97,7 @@
 | `packet` | 空 | 空表示 `delivery` 门未配置，按 `Unknown` 停链（fail-closed） |
 | `receiver_state_hash` | 空 | 交接门要求与包里的 `state_hash` 一致 |
 | `at` | `0` | `0` 由 delivery 侧取当前 Unix 秒 |
+| `attach` | `false` | `true` 时门通过后补 `sent + delivered`；失败把该门降为 `Unknown` |
 | `manifest` | `.agent/alignment.json` | 对齐清单；缺失是 `Unknown`，不是 `aligned` |
 | `changed` / `changed_known` | 未给 / `false` | 与 `alignment` 子命令同语义 |
 | `strict` | `true` | `false` 时 `should` 只警告 |
@@ -154,22 +157,32 @@ trit-host run --task "..." --workspace . \
 | `--gate-chain` | 启用完整链；给出下面任一参数也会启用 |
 | `--handoff-packet <path>` | 交接包；相对路径按 workspace 解析 |
 | `--handoff-state-hash <hash>` | 交接门要求与包内 `state_hash` 一致；单独给出会报参数错误 |
+| `--handoff-attach` | 门通过后补 `sent + delivered`；单独给出会报参数错误 |
 | `--alignment-manifest <path>` | 默认 `.agent/alignment.json` |
+| `--alignment-changed <path>` | 可重复；显式给出时不再从 git 取 |
+| `--alignment-changed-set` | 把 changed 标记为完整集，要求声明 changes 全部兑现 |
+| `--alignment-no-git-changed` | 关闭默认的 git 变更查找 |
 
+- changed 默认取 workspace 的 `git status`（含未跟踪文件，路径相对 workspace）作为
+  **子集**：只检查已给出的变更有没有对齐，不要求声明的 `changes` 全部兑现。不是
+  git 仓、命令失败或给了 `--alignment-no-git-changed` 时不传 changed。
+- `--alignment-changed-set` 只在 changed 存在时生效：完整集下每条声明的 `changes`
+  必须被实际变更兑现；空集也算已知，不是免检通行证。
 - 门链在 `--script` 解析与任何工具调用之前执行；拒绝时退出码 `2`，stderr 形如
   `gate chain rejected at delivery: ...`。
 - 启用门链后不再单独跑 repo gate：`repo` 已经是链上的第一道门。
 - 未配置的门按 `Unknown` 处理：只给 `--alignment-manifest` 而不给交接包，会在
   delivery 停链。只做局部检查请直接调用对应子命令（`trit-orch repo-gate` /
   `trit-orch delivery check` / `trit-orch alignment`）。
-- 宿主同样不写账本：`delivery` 仍是只读 `check`，需要推进四态时单独跑
-  `trit-orch delivery`。
+- 宿主默认不写账本：`delivery` 仍是只读 `check`；加 `--handoff-attach` 才补
+  `sent + delivered`，`read/acted` 仍要单独推进。
 
 ## 7. 硬规则
 
 - **只有 `True` 放行**：三值里 `Unknown` 与 `False` 都不继续。
 - **stop-first**：停链后不再执行任何门；`skipped` 不计入通过数。
-- **只读**：`delivery` 走 `check`，不写账本；`alignment` 与 `repo` 本身只读。
+- **默认只读**：`delivery` 走 `check`，不写账本；`attach` / `--handoff-attach`
+  显式开启才补 `sent + delivered`，且不写 `read/acted`。
 - **相对路径以 `root` 为基准**：`packet` 与 `manifest` 都先按 `root` 解析，绝对路径原样使用。
 - **不新增判据**：每道门的规则仍由各自模块负责；门链只做顺序与汇总。
 - **报告可复算**：同一输入重复运行得到同一 `status` / `exit` / `steps[].state`；
@@ -183,4 +196,7 @@ trit-host run --task "..." --workspace . \
 - 不自动修复：清单缺证据、交接包过期、仓库身份写错，都要调用方改输入或改仓内文件。
 - 不做网络或进程探测：只看本地文件与 `at` 时间。
 - 门链通过 ≠ 四态账本走完：`delivery` 在 `check` 模式下即使 `ready=true`，账本仍可能
-  停在 `missing` / `incomplete`；要推进四态仍需显式 `delivery` 动作。
+  停在 `missing` / `incomplete`；`attach` 只补到 `delivered`，`read/acted` 仍需显式
+  `trit-orch delivery` 动作。
+- 从 git 取 changed 只反映**当前工作区**：未忽略的未跟踪文件可见，但被 `.gitignore`
+  忽略的路径不会出现；需要时用 `--alignment-changed` 显式补。

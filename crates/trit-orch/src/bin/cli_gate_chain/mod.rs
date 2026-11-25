@@ -25,6 +25,7 @@ struct GateChainInput {
     packet: String,
     receiver_state_hash: String,
     at: u64,
+    attach: bool,
     manifest: String,
     changed: Option<Vec<String>>,
     changed_known: bool,
@@ -54,6 +55,7 @@ pub(crate) fn run(input: &str) -> Result<(Value, i32), Error> {
             },
             receiver_state_hash: request.receiver_state_hash.trim().to_owned(),
             at: request.at,
+            attach: request.attach,
         }
     });
     let manifest = if request.manifest.trim().is_empty() {

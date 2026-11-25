@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use trit_host::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
@@ -51,7 +52,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut gate_chain = false;
     let mut handoff_packet: Option<PathBuf> = None;
     let mut handoff_state_hash = String::new();
+    let mut handoff_attach = false;
     let mut alignment_manifest: Option<PathBuf> = None;
+    let mut alignment_changed: Vec<String> = Vec::new();
+    let mut alignment_changed_set = false;
+    let mut alignment_no_git_changed = false;
     let mut script = None;
     let mut max_steps = 8usize;
     let mut allow_write = false;
@@ -104,9 +109,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--handoff-state-hash" => {
                 handoff_state_hash = next(&mut args, "--handoff-state-hash")?;
             }
+            "--handoff-attach" => handoff_attach = true,
             "--alignment-manifest" => {
                 alignment_manifest = Some(PathBuf::from(next(&mut args, "--alignment-manifest")?));
             }
+            "--alignment-changed" => {
+                alignment_changed.push(next(&mut args, "--alignment-changed")?);
+            }
+            "--alignment-changed-set" => alignment_changed_set = true,
+            "--alignment-no-git-changed" => alignment_no_git_changed = true,
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => {
                 max_steps = next(&mut args, "--max-steps")?
@@ -284,6 +295,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if handoff_packet.is_none() && !handoff_state_hash.trim().is_empty() {
         return Err(fail("--handoff-state-hash requires --handoff-packet"));
     }
+    if handoff_attach && handoff_packet.is_none() {
+        return Err(fail("--handoff-attach requires --handoff-packet"));
+    }
     let workspace_root = workspace.clone();
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
     let gate_chain_requested =
@@ -299,8 +313,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                 packet,
                 receiver_state_hash: handoff_state_hash.trim().to_owned(),
                 at: 0,
+                attach: handoff_attach,
             }
         });
+        // 派发前的 changed 是“子集”语义：默认取当前 git 工作区变更，
+        // 只检查已给出的变更有没有对齐，不要求声明的 changes 全部兑现。
+        let changed = if !alignment_changed.is_empty() {
+            Some(alignment_changed.clone())
+        } else if alignment_no_git_changed {
+            None
+        } else {
+            git_changed(&workspace_root)
+        };
         let manifest = alignment_manifest.unwrap_or_else(|| PathBuf::from(".agent/alignment.json"));
         let report = gate_chain_mod::run(&GateChainOptions {
             root: workspace_root.clone(),
@@ -309,7 +333,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             delivery,
             alignment: Some(AlignmentStep {
                 manifest,
-                options: AlignmentOptions::default(),
+                options: AlignmentOptions {
+                    changed: changed.clone(),
+                    changed_known: alignment_changed_set && changed.is_some(),
+                    strict: true,
+                    executed: None,
+                },
             }),
         });
         if report.status != "passed" {
@@ -743,6 +772,71 @@ fn fail(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(std::io::Error::new(ErrorKind::InvalidInput, message.into()))
 }
 
+/// 取 workspace 当前 git 变更路径（相对 workspace，含未跟踪文件）。
+///
+/// 不是 git 仓、命令失败或输出读不出时返回 `None`：调用方据此保持“未给 changed”
+/// 的语义，而不是把空集当成“没有变更”。
+fn git_changed(root: &Path) -> Option<Vec<String>> {
+    // `git status` 没有 `--relative`，用 `--show-prefix` 拿到当前目录相对 repo 根
+    // 的前缀，再把 status 的 repo-relative 路径裁成 workspace-relative。
+    let prefix = {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--show-prefix"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_owned()
+    };
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "--untracked-files=all", "-z"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = text.split('\0');
+    let mut paths = Vec::new();
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = entry[3..].trim();
+        if path.is_empty() {
+            continue;
+        }
+        // rename / copy 的下一条 NUL 是旧路径，属于同一处变更。
+        if status.contains('R') || status.contains('C') {
+            let _ = entries.next();
+        }
+        let Some(rest) = path.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        paths.push(rest.replace('\\', "/"));
+    }
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
 fn usage() {
     eprintln!(
         "trit-host - headless Rust agent host\n\n\
@@ -750,7 +844,9 @@ fn usage() {
          trit-host run --task <text> --workspace <dir> \\\n    \
          [--repo-identity [--repo-expected <owner/repo>] [--task-kind agent|ternary|...]] \\\n    \
          [--gate-chain [--handoff-packet <path>] [--handoff-state-hash <hash>] \\\n    \
-         [--alignment-manifest <path>]] \\\n    \
+         [--handoff-attach] [--alignment-manifest <path>] \\\n    \
+         [--alignment-changed <path>] [--alignment-changed-set] \\\n    \
+         [--alignment-no-git-changed]] \\\n    \
          [--provider scripted|openai] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
@@ -776,6 +872,10 @@ fn usage() {
          --gate-chain: run the read-only repo -> delivery -> alignment chain before the run.\n\
          It needs a handoff packet and an alignment manifest (default .agent/alignment.json);\n\
          Unknown or False stops the chain and the run does not start.\n\
+         --handoff-attach: also write sent + delivered when the delivery gate passes.\n\
+         --alignment-changed: repeatable changed-path override; otherwise workspace git\n\
+         status is used as a subset. --alignment-no-git-changed disables that lookup;\n\
+         --alignment-changed-set marks the set complete and enforces declared changes.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\

@@ -104,6 +104,7 @@ fn options(root: &Path) -> GateChainOptions {
             packet: root.join("packet.json"),
             receiver_state_hash: "H".to_owned(),
             at: 1_000,
+            attach: false,
         }),
         alignment: Some(AlignmentStep {
             manifest: PathBuf::from("alignment.json"),
@@ -307,4 +308,58 @@ fn cli_stops_at_delivery_without_running_alignment() {
     assert_eq!(code, 3, "{value}");
     assert_eq!(value["failed_at"], "delivery");
     assert_eq!(value["steps"][2]["state"], "skipped");
+}
+
+#[test]
+fn chain_attaches_delivery_when_enabled() {
+    let root = root("attach");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    let mut options = options(&root);
+    options.delivery.as_mut().unwrap().attach = true;
+
+    let report = gate_chain::run(&options);
+    assert_eq!(
+        report.status,
+        "passed",
+        "{}",
+        serde_json::to_string(&report).unwrap()
+    );
+    assert_eq!(report.exit, 0);
+    let detail = report.steps[1].detail.as_ref().expect("delivery detail");
+    assert_eq!(detail["attached"], true, "{detail}");
+
+    let journal = trit_orch::delivery::DeliveryJournal::load(&root, "h-001").unwrap();
+    assert_eq!(journal.state_names(), vec!["sent", "delivered"]);
+
+    // 第二次运行：账本已到 delivered，attach 幂等且不重复写态。
+    let report = gate_chain::run(&options);
+    assert_eq!(report.status, "passed");
+    let detail = report.steps[1].detail.as_ref().expect("delivery detail");
+    assert_eq!(detail["attached"], false, "{detail}");
+    let journal = trit_orch::delivery::DeliveryJournal::load(&root, "h-001").unwrap();
+    assert_eq!(journal.state_names(), vec!["sent", "delivered"]);
+}
+
+#[test]
+fn cli_attach_writes_the_delivery_ledger() {
+    let root = root("cli-attach");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    options(&root);
+    let (code, value) = cli_support::run(
+        "gate-chain",
+        &json!({
+            "root": root.to_string_lossy(),
+            "expected": "bfxh/trit-agent-kernel",
+            "task_kind": "agent",
+            "packet": "packet.json",
+            "receiver_state_hash": "H",
+            "at": 1000,
+            "attach": true,
+            "manifest": "alignment.json"
+        }),
+    );
+    assert_eq!(code, 0, "{value}");
+    assert_eq!(value["steps"][1]["detail"]["attached"], true, "{value}");
+    let journal = trit_orch::delivery::DeliveryJournal::load(&root, "h-001").unwrap();
+    assert_eq!(journal.state_names(), vec!["sent", "delivered"]);
 }
