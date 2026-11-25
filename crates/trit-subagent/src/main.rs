@@ -43,13 +43,14 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
-    let request: trit_orch::SubagentRequest = trit_orch::decode_frame(&mut input)?
-        .ok_or_else(|| fail("no request frame on stdin"))?;
+    let request: trit_orch::SubagentRequest =
+        trit_orch::decode_frame(&mut input)?.ok_or_else(|| fail("no request frame on stdin"))?;
 
     let mut config = WorkspaceConfig::new(&workspace);
     config.allow_write = request.profile.access == trit_orch::AccessMode::ReadWrite;
     let local = LocalTools::new(config)?;
-    let tools: Box<dyn ToolExecutor> = if request.profile.access == trit_orch::AccessMode::ReadOnly {
+    let tools: Box<dyn ToolExecutor> = if request.profile.access == trit_orch::AccessMode::ReadOnly
+    {
         Box::new(ReadOnlyTools::new(local))
     } else {
         Box::new(local)

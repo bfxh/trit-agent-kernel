@@ -61,7 +61,11 @@ fn bm25_ranks_matching_document_first() {
         ))
         .unwrap();
     store
-        .insert(entry("go", "go channels and goroutines", Sensitivity::Public))
+        .insert(entry(
+            "go",
+            "go channels and goroutines",
+            Sensitivity::Public,
+        ))
         .unwrap();
 
     let hits = store.search("memory", 10, false);
@@ -75,7 +79,9 @@ fn bm25_ranks_matching_document_first() {
 #[test]
 fn bm25_prefers_shorter_document_on_equal_term() {
     let mut store = MemoryStore::new();
-    store.insert(entry("a", "rust", Sensitivity::Public)).unwrap();
+    store
+        .insert(entry("a", "rust", Sensitivity::Public))
+        .unwrap();
     store
         .insert(entry(
             "b",
@@ -139,7 +145,9 @@ fn empty_query_and_empty_store_return_nothing() {
     assert!(store.search("rust", 10, false).is_empty());
 
     let mut store = MemoryStore::new();
-    store.insert(entry("a", "rust", Sensitivity::Public)).unwrap();
+    store
+        .insert(entry("a", "rust", Sensitivity::Public))
+        .unwrap();
     assert!(store.search("", 10, false).is_empty());
     assert!(store.search("   ", 10, false).is_empty());
     assert!(store.search("rust", 0, false).is_empty());

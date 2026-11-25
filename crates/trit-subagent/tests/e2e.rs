@@ -127,10 +127,8 @@ fn published_binary_enforces_read_only_profile() {
 fn published_binary_reports_protocol_errors() {
     // 没有 --script：进程非零退出，宿主按 exit_status 映射为 Failed。
     let workspace = temp_dir("ws-bad");
-    let config = SubagentProcessConfig::new(env!("CARGO_BIN_EXE_trit-subagent")).with_args(vec![
-        "--workspace".into(),
-        workspace.display().to_string(),
-    ]);
+    let config = SubagentProcessConfig::new(env!("CARGO_BIN_EXE_trit-subagent"))
+        .with_args(vec!["--workspace".into(), workspace.display().to_string()]);
     let result = run_subagent(&config, &request(AccessMode::ReadOnly)).unwrap();
     assert!(
         matches!(result.status, DelegationStatus::Failed { .. }),

@@ -44,8 +44,15 @@ impl SkillSpec {
         if self.name.trim().is_empty() {
             return Err(extension("skill name is blank"));
         }
-        if self.triggers.iter().any(|trigger| trigger.trim().is_empty()) {
-            return Err(extension(format!("skill {} has a blank trigger", self.name)));
+        if self
+            .triggers
+            .iter()
+            .any(|trigger| trigger.trim().is_empty())
+        {
+            return Err(extension(format!(
+                "skill {} has a blank trigger",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -104,7 +111,9 @@ impl SkillIndex {
             }
         }
         hits.sort_by(|(left, left_len), (right, right_len)| {
-            right_len.cmp(left_len).then_with(|| left.name.cmp(&right.name))
+            right_len
+                .cmp(left_len)
+                .then_with(|| left.name.cmp(&right.name))
         });
         hits.into_iter().map(|(skill, _)| skill).collect()
     }
@@ -161,9 +170,7 @@ impl CommandRegistry {
     pub fn parse(&self, input: &str) -> Result<ParsedCommand, AgentError> {
         let input = input.trim();
         let Some(rest) = input.strip_prefix('/') else {
-            return Err(extension(format!(
-                "command must start with '/': {input:?}"
-            )));
+            return Err(extension(format!("command must start with '/': {input:?}")));
         };
         let mut parts = rest.split_whitespace();
         let name = parts.next().unwrap_or_default();

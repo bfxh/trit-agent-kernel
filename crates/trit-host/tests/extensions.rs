@@ -9,7 +9,10 @@ fn skill(name: &str, triggers: &[&str]) -> SkillSpec {
     SkillSpec {
         name: name.into(),
         description: String::new(),
-        triggers: triggers.iter().map(|trigger| (*trigger).to_owned()).collect(),
+        triggers: triggers
+            .iter()
+            .map(|trigger| (*trigger).to_owned())
+            .collect(),
         tools: Vec::new(),
         read_only: true,
         prompt: String::new(),
@@ -42,10 +45,14 @@ fn is_extension(error: &AgentError) -> bool {
 fn skills_reject_blank_and_duplicate() {
     let mut index = SkillIndex::new();
     assert!(is_extension(&index.register(skill("", &[])).unwrap_err()));
-    assert!(is_extension(&index.register(skill("a", &[" "])).unwrap_err()));
+    assert!(is_extension(
+        &index.register(skill("a", &[" "])).unwrap_err()
+    ));
 
     index.register(skill("a", &["x"])).unwrap();
-    assert!(is_extension(&index.register(skill("a", &["y"])).unwrap_err()));
+    assert!(is_extension(
+        &index.register(skill("a", &["y"])).unwrap_err()
+    ));
     assert_eq!(index.len(), 1);
     assert!(index.get("a").is_some());
 }
@@ -82,15 +89,23 @@ fn commands_parse_and_reject_bad_input() {
     assert!(is_extension(&registry.parse("/unknown").unwrap_err()));
     assert!(is_extension(&registry.parse("/review").unwrap_err()));
     assert!(is_extension(&registry.parse("/").unwrap_err()));
-    assert!(is_extension(&registry.register(command("review", &[])).unwrap_err()));
+    assert!(is_extension(
+        &registry.register(command("review", &[])).unwrap_err()
+    ));
 }
 
 #[test]
 fn hooks_match_event_and_tool_with_wildcards() {
     let mut registry = HookRegistry::new();
-    registry.register(hook("all", HookEvent::PreTool, "")).unwrap();
-    registry.register(hook("write", HookEvent::PreTool, "write_*")).unwrap();
-    registry.register(hook("turn", HookEvent::TurnStart, "")).unwrap();
+    registry
+        .register(hook("all", HookEvent::PreTool, ""))
+        .unwrap();
+    registry
+        .register(hook("write", HookEvent::PreTool, "write_*"))
+        .unwrap();
+    registry
+        .register(hook("turn", HookEvent::TurnStart, ""))
+        .unwrap();
 
     let pre_write: Vec<&str> = registry
         .matching(HookEvent::PreTool, Some("write_file"))
@@ -114,7 +129,11 @@ fn hooks_match_event_and_tool_with_wildcards() {
         .collect();
     assert_eq!(turn, vec!["turn"]);
 
-    assert!(is_extension(&registry.register(hook("all", HookEvent::TurnEnd, "")).unwrap_err()));
+    assert!(is_extension(
+        &registry
+            .register(hook("all", HookEvent::TurnEnd, ""))
+            .unwrap_err()
+    ));
 }
 
 #[test]
@@ -123,10 +142,14 @@ fn hooks_invalidate_on_checkpoint_events() {
     let mut lint = hook("lint", HookEvent::PostTool, "write_*");
     lint.invalidate_on = vec![HookEvent::TurnEnd];
     registry.register(lint).unwrap();
-    registry.register(hook("audit", HookEvent::PostTool, "")).unwrap();
+    registry
+        .register(hook("audit", HookEvent::PostTool, ""))
+        .unwrap();
 
     assert_eq!(
-        registry.matching(HookEvent::PostTool, Some("write_file")).len(),
+        registry
+            .matching(HookEvent::PostTool, Some("write_file"))
+            .len(),
         2
     );
     registry.invalidate(HookEvent::TurnEnd);
