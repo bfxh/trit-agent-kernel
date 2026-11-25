@@ -1082,8 +1082,9 @@ pub use remote_fleet::{
 pub use remote_ledger::{Claim, LedgerServer, LedgerServerConfig};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
 pub use remote_subagent::{
-    FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteReply, run_remote_subagent,
-    run_remote_subagent_reply,
+    CANCEL_PATH, FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteReply,
+    cancel_remote_subagent, run_remote_subagent, run_remote_subagent_reply,
+    run_remote_subagent_reply_cancellable,
 };
 pub use sampling::OpenAiSamplingHandler;
 pub use separation::{
@@ -1106,6 +1107,7 @@ pub use state_layer::{
 };
 pub use subagent_process::{
     SubagentProcessConfig, SubagentReply, run_subagent, run_subagent_reply,
+    run_subagent_reply_cancellable,
 };
 pub use supervisor::{
     GatewaySupervisor, McpCapabilities, McpHandshake, McpLogLevel, McpNotification, McpPrompt,

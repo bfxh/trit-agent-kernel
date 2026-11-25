@@ -65,6 +65,8 @@ pub enum NodeOutcome {
     TaskFailed,
     /// 传输失败、超时、协议违约或中止：无法确认节点还能继续服务。
     NodeFailed,
+    /// 调用方取消：归还容量，但既不算尝试也不影响节点健康。
+    Abandoned,
 }
 
 /// 节点状态快照（用于报告与测试断言）。
@@ -259,6 +261,10 @@ impl NodeTable {
         let mut slots = self.lock();
         let slot = &mut slots[index];
         slot.in_flight = slot.in_flight.saturating_sub(1);
+        if outcome == NodeOutcome::Abandoned {
+            self.cond.notify_all();
+            return;
+        }
         slot.attempts = slot.attempts.saturating_add(1);
         match outcome {
             NodeOutcome::Succeeded => slot.consecutive_failures = 0,
@@ -270,6 +276,7 @@ impl NodeTable {
                     slot.healthy = false;
                 }
             }
+            NodeOutcome::Abandoned => {}
         }
         self.cond.notify_all();
     }

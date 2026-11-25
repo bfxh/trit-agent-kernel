@@ -21,21 +21,34 @@
 //!    响应帧，无法登记完成，账本占位会留到 TTL 过期；
 //! 7. **Exec 模式真实执行**：spawn `subagent-run`（或等价命令），请求帧走 stdin、
 //!    响应帧走 stdout；只有子进程判定完成才回 `Completed`，进程错误/超时按
-//!    `Failed`/`Aborted` 回帧，不误报完成。
+//!    `Failed`/`Aborted` 回帧，不误报完成；
+//! 8. **取消传播**：`POST /cancel`（origin 上的固定路径）+ `X-Trit-Idempotency`
+//!    按幂等键置位在途请求；等待账本、`sleep_ms` 与执行前都会检查，Exec 用可
+//!    取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
+//!    账本/本地缓存，避免后续重试再次执行同一键。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use trit_orch::{
-    DelegationStatus, MAX_FRAME_BYTES, RemoteEndpoint, SubagentRequest, SubagentResponse,
-    decode_frame, encode_frame,
+    CancelToken, DelegationStatus, MAX_FRAME_BYTES, RemoteEndpoint, SubagentRequest,
+    SubagentResponse, decode_frame, encode_frame,
 };
 
 use crate::remote_ledger::{self, Claim};
-use crate::subagent_process::{SubagentProcessConfig, run_subagent_reply};
+use crate::remote_subagent::CANCEL_PATH;
+use crate::subagent_process::{
+    SubagentProcessConfig, run_subagent_reply, run_subagent_reply_cancellable,
+};
+
+/// 等待容量/执行期间检查取消的步长。
+const CANCEL_CHECK_STEP: Duration = Duration::from_millis(25);
+
+/// 预先取消但尚未到达的键上限，防止 `/cancel` 被用来无限占用内存。
+const MAX_PRE_CANCELLED: usize = 1024;
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,6 +58,73 @@ const MAX_CACHED_RESPONSES: usize = 1024;
 
 /// 幂等缓存：`"<task>@<epoch>" -> 首次响应`。
 type ResponseCache = Arc<Mutex<BTreeMap<String, SubagentResponse>>>;
+
+/// 在途请求的取消登记：按幂等键。
+#[derive(Default)]
+struct ActiveCancels {
+    inner: Mutex<CancelRegistry>,
+}
+
+#[derive(Default)]
+struct CancelRegistry {
+    active: BTreeMap<String, CancelToken>,
+    /// 取消先于请求到达的键；请求登记时立即继承取消状态。
+    pre: BTreeSet<String>,
+}
+
+impl ActiveCancels {
+    /// 登记一个请求并返回自动注销的守卫。
+    fn scope(&self, key: &str) -> CancelScope<'_> {
+        let token = CancelToken::new();
+        if let Ok(mut registry) = self.inner.lock() {
+            if registry.pre.remove(key) {
+                token.cancel();
+            }
+            registry.active.insert(key.to_string(), token.clone());
+        }
+        CancelScope {
+            registry: self,
+            key: key.to_string(),
+            token,
+        }
+    }
+
+    /// 取消一个键；在途请求立即置位，尚未到达的键先暂存。
+    fn cancel(&self, key: &str) {
+        if let Ok(mut registry) = self.inner.lock() {
+            if let Some(token) = registry.active.get(key) {
+                token.cancel();
+                return;
+            }
+            if registry.pre.len() >= MAX_PRE_CANCELLED
+                && let Some(oldest) = registry.pre.iter().next().cloned()
+            {
+                registry.pre.remove(&oldest);
+            }
+            registry.pre.insert(key.to_string());
+        }
+    }
+}
+
+struct CancelScope<'a> {
+    registry: &'a ActiveCancels,
+    key: String,
+    token: CancelToken,
+}
+
+impl CancelScope<'_> {
+    fn token(&self) -> &CancelToken {
+        &self.token
+    }
+}
+
+impl Drop for CancelScope<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.inner.lock() {
+            registry.active.remove(&self.key);
+        }
+    }
+}
 
 /// 服务端应答模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +200,7 @@ pub struct RemoteServer {
     listener: TcpListener,
     config: RemoteServerConfig,
     cache: ResponseCache,
+    cancels: Arc<ActiveCancels>,
 }
 
 impl RemoteServer {
@@ -150,6 +231,7 @@ impl RemoteServer {
             listener,
             config,
             cache: Arc::default(),
+            cancels: Arc::default(),
         })
     }
 
@@ -161,7 +243,7 @@ impl RemoteServer {
     /// 服务一个连接后返回；测试与单次演示用。
     pub fn serve_once(&self) -> std::io::Result<()> {
         let (stream, _) = self.listener.accept()?;
-        handle(stream, &self.config, &self.cache)
+        handle(stream, &self.config, &self.cache, &self.cancels)
     }
 
     /// 持续服务，直到进程被终止；单连接错误只丢弃该连接。
@@ -173,8 +255,9 @@ impl RemoteServer {
             let (stream, _) = self.listener.accept()?;
             let config = self.config.clone();
             let cache = Arc::clone(&self.cache);
+            let cancels = Arc::clone(&self.cancels);
             std::thread::spawn(move || {
-                let _ = handle(stream, &config, &cache);
+                let _ = handle(stream, &config, &cache, &cancels);
             });
         }
     }
@@ -185,6 +268,7 @@ fn handle(
     mut stream: TcpStream,
     config: &RemoteServerConfig,
     cache: &ResponseCache,
+    cancels: &ActiveCancels,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -242,6 +326,18 @@ fn handle(
         }
     }
 
+    if path == CANCEL_PATH {
+        if length != 0 {
+            return respond(&mut stream, 400, "Bad Request", b"");
+        }
+        let Some(key) = idempotency.as_deref() else {
+            return respond(&mut stream, 400, "Bad Request", b"");
+        };
+        // 未知键与重复取消都是 no-op；鉴权已在上面完成。
+        cancels.cancel(key);
+        return respond(&mut stream, 204, "No Content", b"");
+    }
+
     let mut body = vec![0u8; length];
     if let Err(error) = reader.read_exact(&mut body) {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -262,12 +358,17 @@ fn handle(
         Some(value) if value == key => true,
         Some(_) => return respond(&mut stream, 400, "Bad Request", b""),
     };
+    let _cancel_scope = dedupe.then(|| cancels.scope(&key));
+    let token = _cancel_scope.as_ref().map(|scope| scope.token());
     let mut ledger_owned = false;
     if dedupe {
         if let Some(endpoint) = config.ledger.as_ref() {
-            // 账本是跨机权威：先 claim，再执行；等待期内轮询完成响应。
+            // 账本是跨机权威：先 claim，再执行；等待期内轮询完成响应与取消。
             let deadline = std::time::Instant::now() + Duration::from_secs(endpoint.timeout_secs);
             loop {
+                if token.is_some_and(CancelToken::is_cancelled) {
+                    return respond_aborted(&mut stream, &request);
+                }
                 match remote_ledger::claim(endpoint, &key) {
                     Ok(Claim::New) => {
                         ledger_owned = true;
@@ -292,37 +393,47 @@ fn handle(
         }
     }
 
-    if config.sleep_ms > 0 {
-        std::thread::sleep(Duration::from_millis(config.sleep_ms));
-    }
+    let cancelled = if config.sleep_ms > 0 {
+        sleep_unless_cancelled(config.sleep_ms, token)
+    } else {
+        token.is_some_and(CancelToken::is_cancelled)
+    };
 
-    let (status, content, tokens) = match config.mode {
-        RemoteMode::Echo => (
-            DelegationStatus::Completed,
-            format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
-            0,
-        ),
-        RemoteMode::Fail => (
-            DelegationStatus::Failed {
-                message: "remote echo configured to fail".into(),
-            },
-            format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
-            0,
-        ),
-        RemoteMode::Silent => return respond(&mut stream, 200, "OK", b""),
-        RemoteMode::Exec => {
-            let Some(exec) = config.exec.as_ref() else {
-                return respond(&mut stream, 500, "Internal Server Error", b"");
-            };
-            match run_subagent_reply(exec, &request) {
-                Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
-                Err(error) => (
-                    DelegationStatus::Failed {
-                        message: error.to_string(),
-                    },
-                    Vec::new(),
-                    0,
-                ),
+    let (status, content, tokens) = if cancelled {
+        (DelegationStatus::Aborted, Vec::new(), 0)
+    } else {
+        match config.mode {
+            RemoteMode::Echo => (
+                DelegationStatus::Completed,
+                format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
+                0,
+            ),
+            RemoteMode::Fail => (
+                DelegationStatus::Failed {
+                    message: "remote echo configured to fail".into(),
+                },
+                format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
+                0,
+            ),
+            RemoteMode::Silent => return respond(&mut stream, 200, "OK", b""),
+            RemoteMode::Exec => {
+                let Some(exec) = config.exec.as_ref() else {
+                    return respond(&mut stream, 500, "Internal Server Error", b"");
+                };
+                let reply = match token {
+                    Some(token) => run_subagent_reply_cancellable(exec, &request, token),
+                    None => run_subagent_reply(exec, &request),
+                };
+                match reply {
+                    Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
+                    Err(error) => (
+                        DelegationStatus::Failed {
+                            message: error.to_string(),
+                        },
+                        Vec::new(),
+                        0,
+                    ),
+                }
             }
         }
     };
@@ -355,6 +466,34 @@ fn handle(
         guard.insert(key, response);
     }
     respond(&mut stream, 200, "OK", &frame)
+}
+
+/// 分片睡眠，取消置位时立即返回 `true`。
+fn sleep_unless_cancelled(ms: u64, token: Option<&CancelToken>) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(ms);
+    loop {
+        if token.is_some_and(CancelToken::is_cancelled) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep((deadline - now).min(CANCEL_CHECK_STEP));
+    }
+}
+
+/// 未开始执行就被取消：回一个合法 `Aborted` 帧，而不是空体。
+fn respond_aborted(stream: &mut TcpStream, request: &SubagentRequest) -> std::io::Result<()> {
+    let response = SubagentResponse {
+        task: request.task.clone(),
+        epoch: request.epoch,
+        status: DelegationStatus::Aborted,
+        content: Vec::new(),
+        tokens: 0,
+    };
+    let frame = encode_frame(&response).map_err(std::io::Error::other)?;
+    respond(stream, 200, "OK", &frame)
 }
 
 /// 写一个带长度与 `Connection: close` 的响应。

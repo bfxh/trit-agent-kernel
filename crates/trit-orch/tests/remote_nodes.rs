@@ -53,6 +53,23 @@ fn table_validates_nodes() {
 }
 
 #[test]
+fn abandoned_lease_releases_without_health_penalty() {
+    let table = NodeTable::new(vec![node("a", 1)]).unwrap();
+    let cancel = CancelToken::new();
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::Abandoned);
+    let snapshot = table.snapshot();
+    assert!(snapshot[0].healthy);
+    assert_eq!(snapshot[0].attempts, 0);
+    assert_eq!(snapshot[0].failures, 0);
+
+    // 容量已归还，可以再次准入。
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    assert_eq!(lease.node().id, "a");
+    lease.finish(NodeOutcome::Succeeded);
+}
+
+#[test]
 fn snapshots_restore_quarantine_and_counts() {
     let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
     let cancel = CancelToken::new();

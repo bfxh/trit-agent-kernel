@@ -239,6 +239,15 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   账本不可达时 fail-closed（503）。配合 `--state` 时已完成记录跨重启保留；
   例外是占位 TTL 过期后的接管：若老执行者仍然存活并完成，会再登记一次，
   TTL 越长越安全。
+- **取消传播**：`run_remote_subagent_reply_cancellable` 在独立线程执行请求，
+  等待期间每 25ms 检查取消令牌；置位后向端点 origin 的 `/cancel` 发同一幂等
+  键，最多再等 2s 收尾，超时按 `Aborted` 返回。服务端按幂等键登记在途请求：
+  等待账本、`sleep_ms` 与执行前都会检查，`Exec` 模式直接 kill 子进程；取消
+  回合法 `Aborted` 帧并照常登记账本/本地缓存，后续重试不会再次执行同一键。
+  跨机派发对应用户取消：在途任务以 `Aborted` 结束、容量按
+  `NodeOutcome::Abandoned` 归还（不计 attempts/failures、不换节点重试）。
+  边界：对端未实现 `/cancel` 时，客户端仍会在 2s 后返回，但远端请求会继续到
+  端点超时，可能已经写盘；`Aborted` 不等于“远端一定没执行”。
 - CLI `trit-host remote-plan [--input <json|->] [--health <path>]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
@@ -250,11 +259,14 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   恢复：节点修好后需删除该文件或把对应 `healthy` 改回 `true`。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
-隔离阈值、排除集合、drop 记账、快照恢复、JSON 默认值）、`crates/trit-host/tests/remote_fleet.rs`
-（真实双节点均衡、无响应节点隔离、远端任务失败不重试、换节点重试复用幂等键、
-重试上限、预取消、非法节点表）、`crates/trit-host/tests/remote_plan_cli.rs`
-（`remote-plan` 真实双节点演练、健康文件跨运行隔离与重复节点 ID 拒绝）与
-`crates/trit-host/tests/remote_ledger.rs`（共享账本下双节点单次执行）。
+隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、快照恢复、JSON 默认值）、
+`crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
+任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表）、
+`crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、取消慢请求）、
+`crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
+`crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
+文件跨运行隔离与重复节点 ID 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
+（共享账本下双节点单次执行）。
 
 ## 非目标
 

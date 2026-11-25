@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use trit_host::{
     FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteServer, RemoteServerConfig,
-    run_remote_subagent,
+    run_remote_subagent, run_remote_subagent_reply_cancellable,
 };
 use trit_orch::{
-    AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint, SubagentProfile,
-    SubagentRequest, SubagentResponse, Task, TaskSpec, decode_frame, encode_frame,
+    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint,
+    SubagentProfile, SubagentRequest, SubagentResponse, Task, TaskSpec, decode_frame, encode_frame,
 };
 
 fn task(id: &str, epoch: u64) -> TaskSpec {
@@ -524,4 +524,33 @@ fn echo_server_rejects_mismatched_idempotency_key() {
         "unexpected response: {response}"
     );
     handle.join().unwrap();
+}
+
+#[test]
+fn cancellation_reaches_slow_server_and_returns_aborted() {
+    let (url, mut child) = spawn_echo(&["--sleep-ms", "3000"]);
+    let endpoint = endpoint(&url, None, 10);
+    let request = request();
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let started = Instant::now();
+    let worker = std::thread::spawn(move || {
+        run_remote_subagent_reply_cancellable(&endpoint, &request, &token)
+    });
+
+    std::thread::sleep(Duration::from_millis(150));
+    cancel.cancel();
+    let reply = worker.join().unwrap().unwrap();
+    assert!(
+        matches!(&reply.result.status, DelegationStatus::Aborted),
+        "expected Aborted, got {:?}",
+        reply.result.status
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancel must not wait for the 3s sleep: {:?}",
+        started.elapsed()
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

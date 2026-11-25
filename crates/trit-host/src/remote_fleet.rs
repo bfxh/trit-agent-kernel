@@ -29,7 +29,7 @@ use trit_orch::{
 };
 
 use crate::AgentError;
-use crate::remote_subagent::run_remote_subagent_reply;
+use crate::remote_subagent::run_remote_subagent_reply_cancellable;
 
 /// 一次派发尝试。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -160,6 +160,9 @@ where
             let mut last_error: Option<String> = None;
 
             loop {
+                if cancel.is_cancelled() {
+                    return Err("remote plan cancelled before dispatch".into());
+                }
                 let lease = match table.acquire_excluding(cancel, &excluded) {
                     Ok(Some(lease)) => lease,
                     Ok(None) => return Err("remote plan cancelled before dispatch".into()),
@@ -167,12 +170,20 @@ where
                         return Err(last_error.unwrap_or_else(|| error.to_string()));
                     }
                 };
+                if cancel.is_cancelled() {
+                    lease.finish(NodeOutcome::Abandoned);
+                    return Err("remote plan cancelled before dispatch".into());
+                }
                 let node_id = lease.node().id.clone();
                 if let Ok(mut map) = assignments.lock() {
                     map.insert(task_id.clone(), node_id.clone());
                 }
 
-                match run_remote_subagent_reply(&lease.node().endpoint, &request) {
+                match run_remote_subagent_reply_cancellable(
+                    &lease.node().endpoint,
+                    &request,
+                    cancel,
+                ) {
                     Ok(reply) => {
                         if let Ok(mut map) = replies.lock() {
                             map.insert(task_id.clone(), reply.result.clone());
@@ -191,6 +202,11 @@ where
                             DelegationStatus::Failed { message } => {
                                 lease.finish(NodeOutcome::TaskFailed);
                                 return Err(format!("remote node {node_id}: {message}"));
+                            }
+                            // 用户取消：不把节点判成故障，也不换节点重试。
+                            DelegationStatus::Aborted if cancel.is_cancelled() => {
+                                lease.finish(NodeOutcome::Abandoned);
+                                return Err("remote plan cancelled".into());
                             }
                             // 没有合法响应：节点是否还能服务无法确认，可换节点重试。
                             DelegationStatus::Aborted => {
@@ -211,6 +227,10 @@ where
                             message: error.to_string(),
                         };
                         record_attempt(&attempts, &task_id, &node_id, &status);
+                        if cancel.is_cancelled() {
+                            lease.finish(NodeOutcome::Abandoned);
+                            return Err("remote plan cancelled".into());
+                        }
                         lease.finish(NodeOutcome::NodeFailed);
                         last_error = Some(format!("remote node {node_id}: {error}"));
                     }

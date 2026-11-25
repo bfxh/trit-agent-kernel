@@ -6,6 +6,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use trit_host::{RemotePlanConfig, run_remote_plan};
 use trit_orch::{
@@ -436,6 +437,47 @@ fn task_failure_is_not_retried() {
         report.attempts_of("t1")[0].status,
         DelegationStatus::Failed { .. }
     ));
+}
+
+#[test]
+fn user_cancel_aborts_in_flight_without_quarantining_node() {
+    let node = spawn_node("slow", 1, &["--sleep-ms", "3000"]);
+    let remote = node.remote();
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let plan = plan(vec![task("t1", &[]), task("t2", &[])]);
+    let started = Instant::now();
+    let handle = std::thread::spawn(move || {
+        run_remote_plan(
+            &plan,
+            vec![remote],
+            RemotePlanConfig::new(1),
+            token,
+            request_for,
+        )
+    });
+
+    std::thread::sleep(Duration::from_millis(150));
+    cancel.cancel();
+    let report = handle.join().unwrap().unwrap();
+
+    assert!(
+        matches!(
+            &report.result("t1").unwrap().status,
+            DelegationStatus::Aborted
+        ),
+        "{:?}",
+        report.result("t1")
+    );
+    assert!(report.report.completed.is_empty(), "{:?}", report.report);
+    // 用户取消不记账：容量归还、节点仍健康、没有产生 attempts。
+    assert_eq!(report.nodes[0].attempts, 0, "{:?}", report.nodes);
+    assert!(report.nodes[0].healthy, "{:?}", report.nodes);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancel must not wait for the 3s sleep: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

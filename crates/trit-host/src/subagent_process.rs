@@ -7,20 +7,24 @@
 //! 3. 读线程收集 stdout，主线程 `recv_timeout` 等待；
 //! 4. 超时 → `kill` + `wait`，返回 [`DelegationStatus::Aborted`]；
 //! 5. 收到响应 → 强制校验 `task + epoch`，不匹配按协议错误拒绝；
-//! 6. 无响应 → 用 [`trit_orch::exit_status`] 映射进程结局，绝不产生 `Completed`。
+//! 6. 无响应 → 用 [`trit_orch::exit_status`] 映射进程结局，绝不产生 `Completed`；
+//! 7. 取消令牌置位 → kill 直接子进程并回 `Aborted`，不等到超时。
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use trit_orch::{
-    DelegationResult, DelegationStatus, SubagentRequest, SubagentResponse, decode_frame,
-    digest_hex, encode_frame, exit_status,
+    CancelToken, DelegationResult, DelegationStatus, SubagentRequest, SubagentResponse,
+    decode_frame, digest_hex, encode_frame, exit_status,
 };
 
 use crate::AgentError;
+
+/// 取消轮询步长：保证 `kill` 不会等到整个超时才发生。
+const CANCEL_POLL: Duration = Duration::from_millis(25);
 
 /// 子 agent 进程配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +77,25 @@ pub fn run_subagent_reply(
     config: &SubagentProcessConfig,
     request: &SubagentRequest,
 ) -> Result<SubagentReply, AgentError> {
+    run_subagent_reply_with_cancel(config, request, None)
+}
+
+/// 同 [`run_subagent_reply`]，但取消令牌置位时 kill 子进程并返回 `Aborted`。
+///
+/// 只 kill 直接子进程；如果子进程自己又起了外部进程，那些进程不在本层管理。
+pub fn run_subagent_reply_cancellable(
+    config: &SubagentProcessConfig,
+    request: &SubagentRequest,
+    cancel: &CancelToken,
+) -> Result<SubagentReply, AgentError> {
+    run_subagent_reply_with_cancel(config, request, Some(cancel))
+}
+
+fn run_subagent_reply_with_cancel(
+    config: &SubagentProcessConfig,
+    request: &SubagentRequest,
+    cancel: Option<&CancelToken>,
+) -> Result<SubagentReply, AgentError> {
     let mut child = Command::new(&config.program)
         .args(&config.args)
         .stdin(Stdio::piped())
@@ -100,21 +123,23 @@ pub fn run_subagent_reply(
         let _ = sender.send(buffer);
     });
 
-    let buffer = match receiver.recv_timeout(config.timeout) {
-        Ok(buffer) => buffer,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(SubagentReply {
-                result: DelegationResult {
-                    task: request.task.clone(),
-                    epoch: request.epoch,
-                    digest: digest_hex(b""),
-                    status: DelegationStatus::Aborted,
-                    tokens: 0,
-                },
-                content: Vec::new(),
-            });
+    let deadline = Instant::now() + config.timeout;
+    let poll = config.timeout.min(CANCEL_POLL);
+    let buffer = loop {
+        match receiver.recv_timeout(poll) {
+            Ok(buffer) => break buffer,
+            Err(RecvTimeoutError::Timeout) => {
+                if cancel.is_some_and(CancelToken::is_cancelled) || Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(aborted_reply(request));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(aborted_reply(request));
+            }
         }
     };
     let exit = child.wait().ok().and_then(|status| status.code());
@@ -138,5 +163,19 @@ pub fn run_subagent_reply(
             content: Vec::new(),
         }),
         Err(error) => Err(AgentError::Kernel(error)),
+    }
+}
+
+/// 未确认完成（超时 / 取消 / 读出断开）时的保守回包。
+fn aborted_reply(request: &SubagentRequest) -> SubagentReply {
+    SubagentReply {
+        result: DelegationResult {
+            task: request.task.clone(),
+            epoch: request.epoch,
+            digest: digest_hex(b""),
+            status: DelegationStatus::Aborted,
+            tokens: 0,
+        },
+        content: Vec::new(),
     }
 }

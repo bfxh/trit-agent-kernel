@@ -14,7 +14,10 @@
 //! 3. **响应体有界**：最多读 [`MAX_RESPONSE_BYTES`] + 1 字节，超限不解码；
 //! 4. **没有合法帧就没有完成**：空体、截断帧、坏 JSON、非 2xx、传输失败
 //!    都不产生 [`DelegationStatus::Completed`]；
-//! 5. **不自动重试**：远程可能已经执行过，重试需要幂等键；本模块不做隐式重试。
+//! 5. **不自动重试**：远程可能已经执行过，重试需要幂等键；本模块不做隐式重试；
+//! 6. **取消是通知**：可取消版本等待期间发现令牌置位，会向端点 origin 的
+//!    `/cancel` 发同一幂等键；最多等 2s 收尾后按 `Aborted` 返回。对端未实现
+//!    `/cancel` 时远端仍可能执行完，调用方不能把 `Aborted` 当作“一定没写”。
 
 use std::io::Read;
 use std::time::Duration;
@@ -165,6 +168,101 @@ pub fn run_remote_subagent_reply(
         Err(error) => Err(AgentError::Kernel(error)),
     }
 }
+
+/// [`run_remote_subagent_reply`] 的可取消版本。
+///
+/// 请求在独立线程里执行，调用线程每 25ms 检查一次取消令牌；令牌置位后向端点
+/// `POST /cancel`（带同一幂等键），最多再等 2s 收尾，之后返回 `Aborted`。
+/// 对端若不支持 `/cancel`，请求线程会继续到端点超时；因此远端可能仍执行完，
+/// 调用方不应把 `Aborted` 当成“远端一定没写”。
+pub fn run_remote_subagent_reply_cancellable(
+    endpoint: &RemoteEndpoint,
+    request: &SubagentRequest,
+    cancel: &trit_orch::CancelToken,
+) -> Result<RemoteReply, AgentError> {
+    if cancel.is_cancelled() {
+        return Ok(unresolved_reply(request, DelegationStatus::Aborted));
+    }
+    let endpoint_for_call = endpoint.clone();
+    let request_for_call = request.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(run_remote_subagent_reply(
+            &endpoint_for_call,
+            &request_for_call,
+        ));
+    });
+
+    loop {
+        match receiver.recv_timeout(CLIENT_CANCEL_POLL) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_cancelled() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(AgentError::Io(
+                    "remote request worker ended without a reply".into(),
+                ));
+            }
+        }
+    }
+
+    let key = format!("{}@{}", request.task, request.epoch);
+    // 取消是 best-effort：通知失败也要按 Aborted 返回，不能让调用方卡住。
+    let _ = cancel_remote_subagent(endpoint, &key);
+    match receiver.recv_timeout(CLIENT_CANCEL_GRACE) {
+        Ok(result) => result,
+        Err(_) => Ok(unresolved_reply(request, DelegationStatus::Aborted)),
+    }
+}
+
+/// 取消入口固定在端点 **origin** 上：`http://host:port/run` → `http://host:port/cancel`。
+fn cancel_endpoint_url(endpoint_url: &str) -> String {
+    let trimmed = endpoint_url.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return format!("{trimmed}{CANCEL_PATH}");
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+    format!("{scheme}://{authority}{CANCEL_PATH}")
+}
+
+/// 通知远程端点取消一个在途请求；未知键按服务端语义视为 no-op。
+///
+/// 返回 `Ok(())` 只代表通知被端点接受，不代表远端已经停止执行。
+pub fn cancel_remote_subagent(endpoint: &RemoteEndpoint, key: &str) -> Result<(), String> {
+    endpoint.validate().map_err(|error| error.to_string())?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(
+            endpoint.timeout_secs.clamp(1, CANCEL_REQUEST_TIMEOUT_SECS),
+        ))
+        .redirects(0)
+        .build();
+    let url = cancel_endpoint_url(&endpoint.url);
+    let mut call = agent.post(&url).set(IDEMPOTENCY_HEADER, key);
+    if let Some(token) = endpoint.auth_token.as_deref() {
+        call = call.set("Authorization", &format!("Bearer {token}"));
+    }
+    match call.send_bytes(&[]) {
+        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+        Ok(response) => Err(format!("cancel rejected with HTTP {}", response.status())),
+        Err(ureq::Error::Status(code, _)) => Err(format!("cancel rejected with HTTP {code}")),
+        Err(ureq::Error::Transport(error)) => Err(format!("cancel transport: {error}")),
+    }
+}
+
+/// 服务端取消入口：`POST <endpoint>/cancel` + `X-Trit-Idempotency: <task>@<epoch>`。
+pub const CANCEL_PATH: &str = "/cancel";
+
+/// 取消轮询步长。
+const CLIENT_CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// 发出取消后等待对端收尾的上限；超时即按未确认完成返回。
+const CLIENT_CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+/// 取消请求自身的短超时，避免取消动作把调用方拖住。
+const CANCEL_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// 没有合法响应时的保守结局：digest 为空，token 记 0，绝不伪装成完成。
 fn unresolved(request: &SubagentRequest, status: DelegationStatus) -> DelegationResult {

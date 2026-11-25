@@ -1,11 +1,11 @@
 //! 真实子 agent 进程：spawn、帧往返、失败/无响应/超时/引用不匹配。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use trit_host::{AgentError, SubagentProcessConfig, run_subagent};
+use trit_host::{AgentError, SubagentProcessConfig, run_subagent, run_subagent_reply_cancellable};
 use trit_orch::{
-    AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, SubagentProfile, SubagentRequest,
-    Task, TaskSpec,
+    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, SubagentProfile,
+    SubagentRequest, Task, TaskSpec,
 };
 
 fn request() -> SubagentRequest {
@@ -89,6 +89,31 @@ fn timeout_kills_the_process_and_returns_aborted() {
         matches!(result.status, DelegationStatus::Aborted),
         "{:?}",
         result.status
+    );
+}
+
+#[test]
+fn cancel_kills_slow_child_and_returns_aborted() {
+    let mut config = config();
+    config.args.extend(["--sleep-ms".into(), "2000".into()]);
+    let cancel = CancelToken::new();
+    let token = cancel.clone();
+    let started = Instant::now();
+    let worker =
+        std::thread::spawn(move || run_subagent_reply_cancellable(&config, &request(), &token));
+
+    std::thread::sleep(Duration::from_millis(100));
+    cancel.cancel();
+    let reply = worker.join().unwrap().unwrap();
+    assert!(
+        matches!(reply.result.status, DelegationStatus::Aborted),
+        "{:?}",
+        reply.result.status
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancel must kill before the 2s sleep: {:?}",
+        started.elapsed()
     );
 }
 
