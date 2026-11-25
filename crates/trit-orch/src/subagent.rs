@@ -146,3 +146,76 @@ pub fn exit_status(exit: Option<i32>) -> DelegationStatus {
         },
     }
 }
+
+/// 跨机器执行的端点描述。
+///
+/// 只做**契约校验**，不做真实网络传输：载荷仍是本模块的帧，宿主决定用什么传输
+/// （HTTP POST、长连接、消息队列）。校验的目标是保证“认证 token 不会走明文远程”。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteEndpoint {
+    /// 端点地址；必须 `https://`，或 loopback 的 `http://`。
+    pub url: String,
+    /// 可选 bearer token；空白视为错误。
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// 请求超时（秒）；必须大于 0。
+    #[serde(default = "default_remote_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_remote_timeout_secs() -> u64 {
+    30
+}
+
+impl RemoteEndpoint {
+    /// 校验端点：远程必须 https；明文 http 只允许 loopback。
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.url.trim().is_empty() {
+            return Err(Error::SubagentProtocol {
+                message: "remote endpoint url is blank".into(),
+            });
+        }
+        if self.timeout_secs == 0 {
+            return Err(Error::SubagentProtocol {
+                message: "remote endpoint timeout must be positive".into(),
+            });
+        }
+        let url = self.url.trim();
+        if !url.starts_with("https://") && !is_loopback_http(url) {
+            return Err(Error::SubagentProtocol {
+                message: format!("remote endpoint must use https (or loopback http): {url}"),
+            });
+        }
+        if authority_host(url).is_empty() {
+            return Err(Error::SubagentProtocol {
+                message: "remote endpoint has no host".into(),
+            });
+        }
+        if self
+            .auth_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(Error::SubagentProtocol {
+                message: "remote auth token is blank".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_loopback_http(url: &str) -> bool {
+    url.strip_prefix("http://").is_some()
+        && matches!(authority_host(url), "127.0.0.1" | "localhost" | "::1")
+}
+
+/// 从 `scheme://authority/path` 里取出 host（处理 IPv6 方括号）。
+fn authority_host(url: &str) -> &str {
+    let rest = url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
+}

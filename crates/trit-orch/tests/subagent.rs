@@ -1,8 +1,8 @@
 //! 子 agent IPC 契约：帧往返、半包/粘包、上限、引用校验与结局映射。
 
 use trit_orch::{
-    AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, SubagentProfile, SubagentRequest,
-    SubagentResponse, Task, TaskSpec, decode_frame, encode_frame, exit_status,
+    AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint, SubagentProfile,
+    SubagentRequest, SubagentResponse, Task, TaskSpec, decode_frame, encode_frame, exit_status,
 };
 
 fn task(id: &str, epoch: u64) -> TaskSpec {
@@ -163,4 +163,46 @@ fn exit_status_never_claims_completion() {
             "{code:?} must not become Completed: {status:?}"
         );
     }
+}
+
+#[test]
+fn remote_endpoint_requires_https_or_loopback() {
+    let endpoint = |url: &str| RemoteEndpoint {
+        url: url.into(),
+        auth_token: None,
+        timeout_secs: 30,
+    };
+    for url in [
+        "https://agents.example.com/run",
+        "http://127.0.0.1:8080/run",
+        "http://localhost/run",
+        "http://[::1]:9000/run",
+    ] {
+        assert!(endpoint(url).validate().is_ok(), "{url}");
+    }
+    for url in [
+        "http://agents.example.com/run",
+        "",
+        "ftp://example.com",
+        "https://",
+        "https://:8080/run",
+    ] {
+        assert_eq!(
+            endpoint(url).validate().unwrap_err().kind(),
+            "subagent_protocol",
+            "{url}"
+        );
+    }
+
+    // 认证字段与超时同样 fail-closed。
+    let mut endpoint = RemoteEndpoint {
+        url: "https://agents.example.com/run".into(),
+        auth_token: Some("  ".into()),
+        timeout_secs: 30,
+    };
+    assert_eq!(endpoint.validate().unwrap_err().kind(), "subagent_protocol");
+    endpoint.auth_token = Some("token".into());
+    assert!(endpoint.validate().is_ok());
+    endpoint.timeout_secs = 0;
+    assert_eq!(endpoint.validate().unwrap_err().kind(), "subagent_protocol");
 }
