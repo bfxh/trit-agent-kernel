@@ -543,9 +543,29 @@ fn builtin_sandbox_wraps_workspace_with_bwrap() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[test]
-fn builtin_sandbox_is_rejected_off_linux() {
+fn builtin_sandbox_wraps_workspace_with_sandbox_exec() {
+    let root = temp_workspace("builtin-sandbox-macos");
+    let sandbox = SandboxCommand::builtin(&root).unwrap();
+    let (program, args) = sandbox.argv("echo hi");
+    assert_eq!(program, PathBuf::from("sandbox-exec"));
+    assert_eq!(args[0], "-p");
+    let root_text = std::fs::canonicalize(&root)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(args[1].contains(&root_text), "{}", args[1]);
+    let tail: Vec<&String> = args.iter().rev().take(3).collect();
+    assert_eq!(tail[2], "sh");
+    assert_eq!(tail[1], "-c");
+    assert_eq!(tail[0], "echo hi");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn builtin_sandbox_is_rejected_off_unix() {
     let root = temp_workspace("builtin-sandbox-off");
     let error = SandboxCommand::builtin(&root).unwrap_err();
     assert!(

@@ -188,3 +188,34 @@ fn journal_status_rolls_back_in_doubt_write() {
     assert_eq!(value["rollbacks"][0]["restored"][0], "src/a.py");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn run_can_roll_back_in_doubt_writes_on_start() {
+    let root = root("auto-rollback");
+    write(&root, "src/a.py", "old");
+    let mut journal = trit_host::MutationJournal::open(&root).unwrap();
+    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "new");
+    journal.record_begin(&request, None).unwrap();
+    fs::write(root.join("src/a.py"), "new").unwrap();
+    drop(journal);
+
+    // run 写的是另一个文件，避免回滚结果被本次运行覆盖。
+    let script_path = script("auto-rollback", "src/b.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--write-claim",
+            "src",
+            "--write-journal",
+            "--write-journal-rollback",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("rolled back op"), "{text}");
+    assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}

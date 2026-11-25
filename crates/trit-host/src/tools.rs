@@ -66,11 +66,26 @@ impl SandboxCommand {
                 ],
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            let root = std::fs::canonicalize(root)
+                .map_err(|error| AgentError::Io(format!("sandbox root: {error}")))?;
+            let root_text = root.to_string_lossy();
+            let profile = format!(
+                "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n\
+                 (allow file-write* (subpath \"{root_text}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n\
+                 (allow network*)\n"
+            );
+            Ok(Self {
+                program: PathBuf::from("sandbox-exec"),
+                args: vec!["-p".into(), profile],
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = root;
             Err(AgentError::Tool(
-                "builtin sandbox is only available on Linux; pass --sandbox <program>".into(),
+                "builtin sandbox is only available on Linux/macOS; pass --sandbox <program>".into(),
             ))
         }
     }
@@ -682,9 +697,19 @@ impl LocalTools {
                 .create_dir_all(parent)
                 .map_err(|error| AgentError::Io(format!("mkdir {}: {error}", parent.display())))?;
         }
-        self.dir
-            .rename(&from, &self.dir, &to)
-            .map_err(|error| AgentError::Io(format!("move {from_raw} -> {to_raw}: {error}")))?;
+        match self.dir.rename(&from, &self.dir, &to) {
+            Ok(()) => {}
+            Err(error) if is_cross_device(&error) => {
+                self.copy_then_remove(&from, &to).map_err(|error| {
+                    AgentError::Io(format!("move {from_raw} -> {to_raw}: {error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(AgentError::Io(format!(
+                    "move {from_raw} -> {to_raw}: {error}"
+                )));
+            }
+        }
         Ok(ToolOutcome {
             call_id: request.call_id.clone(),
             tool: request.tool.clone(),
@@ -695,6 +720,17 @@ impl LocalTools {
             in_doubt: false,
             output: format!("moved {from_raw} -> {to_raw}"),
         })
+    }
+
+    fn copy_then_remove(&self, from: &Path, to: &Path) -> Result<(), AgentError> {
+        let source = self.root.join(from);
+        let target = self.root.join(to);
+        std::fs::copy(&source, &target)
+            .map_err(|error| AgentError::Io(format!("copy {}: {error}", source.display())))?;
+        self.dir
+            .remove_file(from)
+            .map_err(|error| AgentError::Io(format!("remove {}: {error}", source.display())))?;
+        Ok(())
     }
 
     fn bash(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
@@ -772,6 +808,22 @@ impl ToolExecutor for LocalTools {
             "bash" => self.bash(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
+    }
+}
+
+fn is_cross_device(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        error.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -872,4 +924,51 @@ fn truncate(mut text: String, max: usize) -> String {
     text.truncate(end);
     text.push_str("...(truncated)");
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "trit-tools-unit-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn copy_then_remove_moves_file() {
+        let root = temp("copy");
+        let mut config = WorkspaceConfig::new(&root);
+        config.allow_write = true;
+        let tools = LocalTools::new(config).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        tools
+            .copy_then_remove(Path::new("a.txt"), Path::new("b.txt"))
+            .unwrap();
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "hello"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cross_device_detection_uses_platform_error() {
+        #[cfg(windows)]
+        assert!(is_cross_device(&std::io::Error::from_raw_os_error(17)));
+        #[cfg(unix)]
+        {
+            assert!(is_cross_device(&std::io::Error::from_raw_os_error(
+                libc::EXDEV
+            )));
+            assert!(!is_cross_device(&std::io::Error::from_raw_os_error(17)));
+        }
+    }
 }

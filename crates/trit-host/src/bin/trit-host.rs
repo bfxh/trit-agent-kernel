@@ -79,6 +79,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut write_claim_paths: Vec<PathBuf> = Vec::new();
     let mut write_lease_owner: Option<String> = None;
     let mut write_journal = false;
+    let mut write_journal_rollback = false;
     let mut resume = false;
     let mut context = ContextPolicy::default();
     let mut checkpoint_dir: Option<PathBuf> = None;
@@ -157,6 +158,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             "--write-lease" => write_lease_owner = Some(next(&mut args, "--write-lease")?),
             "--write-journal" => write_journal = true,
+            "--write-journal-rollback" => write_journal_rollback = true,
             "--resume" => resume = true,
             "--checkpoint-dir" => {
                 checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
@@ -326,6 +328,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if write_lease_owner.is_some() && write_claim_paths.is_empty() {
         return Err(fail("--write-lease requires --write-claim"));
     }
+    if write_journal_rollback && !write_journal {
+        return Err(fail("--write-journal-rollback requires --write-journal"));
+    }
     let workspace_root = workspace.clone();
     // 路径归一化在拿到 workspace 之后做：`.\src\a.py`、`src//a.py`、workspace 内
     // 绝对路径都折成 `src/a.py`；逃出 workspace 直接拒绝。
@@ -351,14 +356,31 @@ fn run() -> Result<(), Box<dyn Error>> {
             None => None,
         };
         let journal = if write_journal {
-            let journal =
+            let mut journal =
                 MutationJournal::open(&workspace_root).map_err(|error| fail(error.to_string()))?;
             let report = journal.report().map_err(|error| fail(error.to_string()))?;
             if report.has_in_doubt() {
-                eprintln!(
-                    "write journal: {} operation(s) left in doubt from a previous run",
-                    report.in_doubt.len()
-                );
+                if write_journal_rollback {
+                    for record in &report.in_doubt {
+                        let outcome = journal.rollback(record);
+                        journal
+                            .record_rollback(record.op_id, &outcome)
+                            .map_err(|error| fail(error.to_string()))?;
+                        eprintln!(
+                            "write journal: rolled back op {} (restored={} removed={} skipped={} failed={})",
+                            record.op_id,
+                            outcome.restored.len(),
+                            outcome.removed.len(),
+                            outcome.skipped.len(),
+                            outcome.failed.len()
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "write journal: {} operation(s) left in doubt from a previous run",
+                        report.in_doubt.len()
+                    );
+                }
             }
             Some(journal)
         } else {
@@ -1202,7 +1224,8 @@ fn usage() {
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
-         [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] [--write-journal] \\\n    \
+         [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \
+         [--write-journal [--write-journal-rollback]] \\\n    \
          [--context-receipts N] [--context-chars N] [--context-output N] \\\n    \
          [--context-catalog <json> [--context-project <id>] [--context-session-id <id>] \\\n    \
          [--context-budget N] [--context-window N] [--model-max-output N] \\\n    \
@@ -1239,6 +1262,8 @@ fn usage() {
          (requires --write-claim; exits 2 when another owner holds it).\n\
          --write-journal: append begin/finish records to\n\
          <workspace>/.agent/write-journal.jsonl and warn about in-doubt writes.\n\
+         --write-journal-rollback: roll back in-doubt writes at startup\n\
+         (requires --write-journal).\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
          context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\
