@@ -179,12 +179,13 @@ v1/v2 里出现 `kind` / `command` 会被拒绝（unknown field），不会静�
 
 - 源文件：`bfxh/trit` 的 `tools/alignment_gate.py`；本仓库只移植语义，不复制 Python 文件、不把 Python 作为运行依赖。
 - 已移植：v1/v2/v3 结构、目标树、父链、覆盖、产物/证据/sha256/locator、non-goal、声明变更、矛盾、v3 run provenance，以及 `scaffold` 清单生成。
-- 尚未移植：`self-test`、`stress` 两个 Python 辅助命令；以及 Python 版对“所有字段长度/数组上限”的完整逐字段诊断。Rust 版用 `serde(deny_unknown_fields)` + 数组上限先做 fail-closed，未知字段直接报 `manifest-unreadable`。
+- `stress` 的随机对拍已由 Rust 集成测试 `crates/trit-orch/tests/alignment_stress.rs` 承接：100 个确定性随机用例，每个同时验证有效清单 aligned 和三类变异 unaligned，不引入 Python 运行时。
+- 尚未移植：`self-test` 这个 Python 内置自检命令；它的大量断言已分散在 Rust 单元/集成测试中，但未逐条复刻为一个运行时子命令。以及 Python 版对“所有字段长度/数组上限”的完整逐字段诊断。Rust 版用 `serde(deny_unknown_fields)` + 数组上限先做 fail-closed，未知字段直接报 `manifest-unreadable`。
 - 迁移不是整仓 merge：`bfxh/trit` 的 `trit-orch` 与本仓库的 `trit-orch` 已分叉，必须按模块搬，不能把 Python 主路径或 `trit` 的额外 crate 一起带进来。
 
 ## 5. 诚实边界
 
 - 这是**准入前 / 交付前**的清单门，不是运行时监控；它防“清单没对齐就宣称完成”，不防宿主伪造清单或伪造 `executed`。
 - `aligned` 不代表需求语义被满足；语义判断仍归 `trit-reasonix` / 人工复核 / 红队。
-- 它不做自动修复、不自动改代码；`scaffold` 只生成留空的骨架清单，不替调用方补图；`self-test` / `stress` 仍是 Python 侧辅助能力，未迁。
+- 它不做自动修复、不自动改代码；`scaffold` 只生成留空的骨架清单，不替调用方补图；`stress` 以 Rust 测试承接，`self-test` 仍是 Python 侧辅助能力，未作为 CLI 迁入。
 - 文件检查是本地文件系统快照；检查后被替换的文件不会被再次发现，除非重新跑门。
