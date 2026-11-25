@@ -95,3 +95,72 @@ fn cli_missing_manifest_is_unknown_exit_three() {
     assert_eq!(value["status"], "unknown");
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn cli_manifest_outside_root_is_unknown_exit_three() {
+    let root = root("outside");
+    let outside = root.parent().unwrap().join(format!(
+        "{}-outside.json",
+        root.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&outside, serde_json::to_vec(&manifest()).unwrap()).unwrap();
+    let (code, value) = cli_support::run(
+        "alignment",
+        &json!({
+            "root": root.to_string_lossy(),
+            "manifest": outside.to_string_lossy()
+        }),
+    );
+    assert_eq!(code, 3, "{value}");
+    assert_eq!(value["status"], "unknown");
+    assert!(
+        value["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["code"] == "manifest-outside-root"),
+        "{value}"
+    );
+    let _ = fs::remove_file(outside);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cli_goal_cycle_is_unaligned_exit_one() {
+    let root = root("goal-cycle");
+    write(&root, "src/a.py", "print(1)\n");
+    write(&root, "tests/a.py", "def test_a(): pass\n");
+    let cycle = json!({
+        "schema": "alignment/2",
+        "goals": [
+            {"id": "G1", "text": "root", "parent": "G2"},
+            {"id": "G2", "text": "child", "parent": "G1"}
+        ],
+        "requirements": [{
+            "id": "R1",
+            "text": "a",
+            "priority": "must",
+            "parent": "G1",
+            "artifacts": ["A1"],
+            "evidence": ["E1"]
+        }],
+        "artifacts": [{"id": "A1", "path": "src/a.py"}],
+        "evidence": [{"id": "E1", "path": "tests/a.py"}]
+    });
+    fs::write(root.join("cycle.json"), serde_json::to_vec(&cycle).unwrap()).unwrap();
+    let (code, value) = cli_support::run(
+        "alignment",
+        &json!({"root": root.to_string_lossy(), "manifest": "cycle.json"}),
+    );
+    assert_eq!(code, 1, "{value}");
+    assert_eq!(value["status"], "unaligned");
+    assert!(
+        value["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure["code"] == "goal-cycle"),
+        "{value}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
