@@ -57,6 +57,27 @@ impl PlanHandoff {
         Plan::new(self.revision, self.tasks)
     }
 
+    /// 从 JSON 解析并**全量重校验**：结构 → 胶囊白名单 → 计划依赖图 → 执行契约。
+    ///
+    /// 不能信任输入：手写 JSON 可以直接构造出绕过构造器校验的字段，所以这里把字段
+    /// 拆开重跑 [`ContextCapsule::inherit`] 与 [`PlanHandoff::new`]。胶囊只接受
+    /// `capsule_allowed` 列出的键，超出预算同样拒绝。
+    pub fn from_json(
+        text: &str,
+        capsule_allowed: &[&str],
+        capsule_budget: usize,
+    ) -> Result<Self, Error> {
+        let raw: Self = serde_json::from_str(text).map_err(|error| Error::PlanHandoffSchema {
+            message: error.to_string(),
+        })?;
+        let capsule = ContextCapsule::inherit(
+            raw.capsule.entries().to_vec(),
+            capsule_allowed,
+            capsule_budget,
+        )?;
+        Self::new(raw.revision, raw.tasks, capsule, raw.profile)
+    }
+
     /// 交接物内容的稳定摘要（16 位十六进制）。
     pub fn digest(&self) -> String {
         let bytes = serde_json::to_vec(self).unwrap_or_default();

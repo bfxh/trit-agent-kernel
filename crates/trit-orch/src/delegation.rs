@@ -220,6 +220,11 @@ impl ContextCapsule {
             .map(|entry| entry.value.as_str())
     }
 
+    /// 胶囊里的条目（只读视图）。
+    pub fn entries(&self) -> &[CapsuleEntry] {
+        &self.entries
+    }
+
     /// 按键升序的键列表。
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.key.as_str())

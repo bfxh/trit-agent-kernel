@@ -247,6 +247,8 @@ pub enum Error {
     DelegateCapsuleTooLarge { bytes: usize, max: usize },
     #[error("fleet runtime failed: {message}")]
     FleetRuntime { message: String },
+    #[error("plan handoff schema: {message}")]
+    PlanHandoffSchema { message: String },
 }
 
 pub(crate) fn add_tokens(left: u64, right: u64, task: Option<&str>) -> Result<u64, Error> {
@@ -352,6 +354,7 @@ impl Error {
             Error::DelegateCapsuleDuplicate { .. } => "delegate_capsule_duplicate",
             Error::DelegateCapsuleTooLarge { .. } => "delegate_capsule_too_large",
             Error::FleetRuntime { .. } => "fleet_runtime",
+            Error::PlanHandoffSchema { .. } => "plan_handoff_schema",
         }
     }
 }

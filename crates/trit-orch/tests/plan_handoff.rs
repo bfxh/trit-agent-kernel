@@ -116,3 +116,88 @@ fn handoff_round_trips_through_json() {
     assert_eq!(plan.revision(), 2);
     assert_eq!(plan.tasks().len(), 1);
 }
+
+#[test]
+fn from_json_revalidates_and_matches_constructor_digest() {
+    let handoff = PlanHandoff::new(1, vec![spec("a", vec![])], capsule(), profile()).unwrap();
+    let json = serde_json::to_string(&handoff).unwrap();
+    let parsed = PlanHandoff::from_json(&json, &["goal"], 64).unwrap();
+    assert_eq!(parsed, handoff);
+    assert_eq!(parsed.digest(), handoff.digest());
+}
+
+#[test]
+fn from_json_rejects_bad_schema_with_machine_readable_kind() {
+    assert_eq!(
+        PlanHandoff::from_json("not-json", &["goal"], 64)
+            .unwrap_err()
+            .kind(),
+        "plan_handoff_schema"
+    );
+
+    // 缺 profile 字段。
+    let missing = serde_json::json!({
+        "revision": 1,
+        "tasks": [{
+            "task": {"id": "a", "duration": 1},
+            "requirements": {"cpu": 0, "memory": 0},
+            "max_tokens": 1,
+        }],
+    })
+    .to_string();
+    assert_eq!(
+        PlanHandoff::from_json(&missing, &["goal"], 64)
+            .unwrap_err()
+            .kind(),
+        "plan_handoff_schema"
+    );
+}
+
+#[test]
+fn from_json_cannot_bypass_semantic_checks() {
+    // 手写 JSON 绕过构造器：未知依赖仍被拒绝。
+    let bad_dep = serde_json::json!({
+        "revision": 1,
+        "tasks": [{
+            "task": {"id": "a", "duration": 1, "deps": [{"task": "missing", "required": "True"}]},
+            "requirements": {"cpu": 0, "memory": 0},
+            "max_tokens": 1,
+        }],
+        "profile": {
+            "name": "executor",
+            "access": "read_write",
+            "write_roots": ["src"],
+            "tools": ["write_file"],
+            "max_tokens": 100,
+        },
+    })
+    .to_string();
+    assert_eq!(
+        PlanHandoff::from_json(&bad_dep, &["goal"], 64)
+            .unwrap_err()
+            .kind(),
+        "unknown_dependency"
+    );
+
+    // 胶囊键不在白名单。
+    let mut value: serde_json::Value = serde_json::from_str(&bad_dep).unwrap();
+    value["tasks"][0]["task"]["deps"] = serde_json::json!([]);
+    value["capsule"] = serde_json::json!({"entries": [{"key": "secret", "value": "x"}]});
+    assert_eq!(
+        PlanHandoff::from_json(&value.to_string(), &["goal"], 64)
+            .unwrap_err()
+            .kind(),
+        "delegate_capsule_key"
+    );
+
+    // 只读 profile 带写根。
+    let mut read_only = value.clone();
+    read_only["capsule"] = serde_json::json!({"entries": []});
+    read_only["profile"]["access"] = serde_json::json!("read_only");
+    assert_eq!(
+        PlanHandoff::from_json(&read_only.to_string(), &["goal"], 64)
+            .unwrap_err()
+            .kind(),
+        "delegate_read_only_writes"
+    );
+}

@@ -35,6 +35,8 @@ pub enum AgentError {
     Tool(String),
     #[error("tool {tool} denied: {reason}")]
     ToolDenied { tool: String, reason: String },
+    #[error("plan protocol: {message}")]
+    PlanProtocol { message: String },
     #[error("io error: {0}")]
     Io(String),
     #[error("provider error: {0}")]
@@ -1053,8 +1055,8 @@ pub use reasonix_wire::{
 };
 pub use sampling::OpenAiSamplingHandler;
 pub use separation::{
-    READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
-    planner_tool_specs,
+    PLAN_TOOL, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
+    plan_handoff_from_proposal, planner_tool_specs,
 };
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,

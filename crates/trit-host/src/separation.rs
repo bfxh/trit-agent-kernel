@@ -23,10 +23,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::provider::{ToolCatalog, ToolSpec};
-use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
+use crate::{AgentError, Proposal, ToolExecutor, ToolOutcome, ToolRequest};
 
 /// planner 可用的只读工具白名单。
-pub const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep", "glob", "ls"];
+///
+/// `submit_plan` 也在这里：它是 planner 唯一的输出通道，只提交结构化计划，
+/// 不读写工作区文件。
+pub const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep", "glob", "ls", "submit_plan"];
+
+/// planner 提交结构化计划时调用的工具名。
+pub const PLAN_TOOL: &str = "submit_plan";
 
 /// 该工具名是否属于 planner 的只读白名单。
 pub fn is_read_only_tool(name: &str) -> bool {
@@ -137,4 +143,40 @@ impl<C: ToolCatalog> ToolCatalog for ReadOnlyCatalog<C> {
     fn tools(&self) -> Vec<ToolSpec> {
         planner_tool_specs(&self.inner.tools())
     }
+}
+
+/// 从 planner 的 proposal 里提取并校验计划交接物。
+///
+/// 协议：planner 必须**恰好调用一次** [`PLAN_TOOL`]，`content` 是
+/// [`trit_orch::PlanHandoff`] 的 JSON。解析后由 `PlanHandoff::from_json` 全量
+/// 重校验，模型输出不能绕过依赖图、胶囊白名单与执行契约。
+pub fn plan_handoff_from_proposal(
+    proposal: &Proposal,
+    capsule_allowed: &[&str],
+    capsule_budget: usize,
+) -> Result<trit_orch::PlanHandoff, AgentError> {
+    let mut calls = proposal
+        .tool_calls
+        .iter()
+        .filter(|call| call.tool == PLAN_TOOL);
+    let call = calls.next().ok_or_else(|| AgentError::PlanProtocol {
+        message: format!("planner did not call {PLAN_TOOL}"),
+    })?;
+    if calls.next().is_some() {
+        return Err(AgentError::PlanProtocol {
+            message: format!("{PLAN_TOOL} called more than once"),
+        });
+    }
+    let content = call
+        .content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| AgentError::PlanProtocol {
+            message: format!("{PLAN_TOOL} content is empty"),
+        })?;
+    trit_orch::PlanHandoff::from_json(content, capsule_allowed, capsule_budget).map_err(|error| {
+        AgentError::PlanProtocol {
+            message: format!("{}: {error}", error.kind()),
+        }
+    })
 }

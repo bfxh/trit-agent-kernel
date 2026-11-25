@@ -58,6 +58,8 @@ fn planner_rejects_mislabelled_read_only_requests() {
 fn read_only_whitelist_is_explicit() {
     assert!(is_read_only_tool("read_file"));
     assert!(is_read_only_tool("grep"));
+    // submit_plan 是 planner 的输出通道，不写工作区。
+    assert!(is_read_only_tool("submit_plan"));
     for write_tool in ["write_file", "move_path", "bash", "shell", "checkpoint"] {
         assert!(
             !is_read_only_tool(write_tool),
@@ -65,6 +67,7 @@ fn read_only_whitelist_is_explicit() {
         );
     }
     assert!(READ_ONLY_TOOLS.contains(&"read_file"));
+    assert!(READ_ONLY_TOOLS.contains(&"submit_plan"));
 }
 
 #[test]
