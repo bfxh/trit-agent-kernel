@@ -41,6 +41,9 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut task = None;
     let mut workspace = PathBuf::from(".");
+    let mut repo_identity = false;
+    let mut repo_expected = String::new();
+    let mut task_kind = "agent".to_owned();
     let mut script = None;
     let mut max_steps = 8usize;
     let mut allow_write = false;
@@ -83,6 +86,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         match arg.as_str() {
             "--task" => task = Some(next(&mut args, "--task")?),
             "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--repo-identity" => repo_identity = true,
+            "--repo-expected" => repo_expected = next(&mut args, "--repo-expected")?,
+            "--task-kind" => task_kind = next(&mut args, "--task-kind")?,
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => {
                 max_steps = next(&mut args, "--max-steps")?
@@ -258,6 +264,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Err(fail("--mcp-sampling requires --provider openai"));
     }
     let workspace_root = workspace.clone();
+    if repo_identity || !repo_expected.trim().is_empty() {
+        let decision = trit_orch::repo::gate(&workspace_root, &repo_expected, &task_kind);
+        if decision.gate != trit_orch::Ternary::True {
+            return Err(fail(format!("repo gate rejected: {}", decision.reason)));
+        }
+    }
     let mut workspace = WorkspaceConfig::new(workspace);
     workspace.allow_write = allow_write;
     workspace.allow_shell = allow_shell;
@@ -673,6 +685,7 @@ fn usage() {
         "trit-host - headless Rust agent host\n\n\
          usage:\n  \
          trit-host run --task <text> --workspace <dir> \\\n    \
+         [--repo-identity [--repo-expected <owner/repo>] [--task-kind agent|ternary|...]] \\\n    \
          [--provider scripted|openai] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
@@ -692,6 +705,8 @@ fn usage() {
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
+         --repo-identity: fail closed unless .agent/repo.json is valid; --repo-expected\n\
+         additionally pins owner/repo, and agent tasks require owns_agent_runtime=true.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\

@@ -35,7 +35,7 @@ Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**�
 - 任务 brief、准入义务、预算与 claim/fencing。
 - 写工具效果台账；证据不足时 completion 不会自证。
 - 交接账本 `trit-orch delivery`：四态 `Sent → Delivered → Read → Acted` 落盘到 `.agent/delivery/<packet-id>.json`，包字节用 SHA-256 钉住；`gate` 只在 handoff gate 为 True 时补 `sent + delivered`，`check` 是只读预检，`acted` 必须带证据。见 [docs/DELIVERY.md](docs/DELIVERY.md)。
-- 仓库身份门 `trit-orch repo-gate`：读 `.agent/repo.json`，在 `plan` / `dispatch` 前拒绝“在三进制主库接智能体任务”这类串仓。见 [docs/REPO-BOUNDARY.md](docs/REPO-BOUNDARY.md)。
+- 仓库身份门 `trit-orch repo-gate`：读 `.agent/repo.json`，在 `plan` / `dispatch` 前拒绝“在三进制主库接智能体任务”这类串仓；`trit-host run --repo-identity --repo-expected <owner/repo> --task-kind agent` 在开工前 fail-closed。见 [docs/REPO-BOUNDARY.md](docs/REPO-BOUNDARY.md)。
 - 对齐门 `trit-orch alignment`：`alignment/1`–`alignment/3` 的目标树、需求父链、产物/证据/sha256/locator、non-goal、声明变更与 v3 run provenance；`aligned=0` / `unaligned=1` / `unknown=3`。见 [docs/ALIGNMENT.md](docs/ALIGNMENT.md)。
 - 影子策略学习：安全选择、增量/加权/窗口/跨宿主合并、Beta 先验与漂移窗口。
 - 引导遵循度、跨任务干预与主循环 `tick`；Prometheus 指标导出。
