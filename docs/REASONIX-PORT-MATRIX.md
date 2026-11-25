@@ -54,7 +54,7 @@
 | 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 部分（执行层 + CLI + 宿主接线） | `fleet::execute` 接 `trit-schedule` runtime：并发上限、失败传播、Aborted/Deferred 归类、稳定引用；`fleet-run` CLI 导出 JSON + Prometheus；`HeadlessFleetRunner` 每任务独立 headless session 已实现；缺跨机器调度 | B7.6 |
 | 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 部分（注册表） | `SkillIndex`（最长触发词优先）、`CommandRegistry`（斜杠命令解析、参数数量 fail-closed）、`HookRegistry`（事件 + 工具匹配、`*` 通配、`invalidate_on` 失效联动）已实现；缺技能目录发现与 hook 动作执行 | B7.9 |
 | 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 部分（内存索引） | `MemoryStore` CRUD + BM25（k1=1.2、b=0.75，分数降序、同分按 id 升序）+ `Sensitivity::Secret` 默认排除已实现；缺持久化/归档与 history 目录投影 | B7.9 |
-| 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分 | 当前只有 `PortBridge`；缺 loopback 认证、SSE、golden 路由 | B7.8 |
+| 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分（准入 + 路由） | `ServeConfig::validate`（仅 loopback、token 非空）、`authorize`（Host / Origin / bearer）、`route`（golden 路由表，405 / 404）已实现；缺真实 HTTP/SSE 传输与响应编码 | B7.8 |
 | 20 | CLI / TUI / ACP | `CLI.md`、`ACP.md` | 部分 | 无头 CLI 已有；缺 TUI、ACP 编辑器、结构化 JSON 输出 | B7.8 |
 | 21 | Tauri / 桌面 host | `desktop-tauri` | 阶段外 | 不进入本仓；只保留 `FeatureGate` 与宿主契约 | B7.8 |
 | 22 | Capability diagnostics | `CAPABILITY_DIAGNOSTICS.md` | 缺口 | 静态/实时能力报告、MCP 启动阶段、脱敏 stderr tail | B7.8 |

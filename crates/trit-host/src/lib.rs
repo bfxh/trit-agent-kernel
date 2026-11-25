@@ -997,6 +997,7 @@ pub mod provider_stream;
 pub mod reasonix_wire;
 pub mod sampling;
 pub mod separation;
+pub mod serve;
 pub mod session;
 pub mod session_migration;
 pub mod state_layer;
@@ -1076,6 +1077,7 @@ pub use separation::{
     PLAN_TOOL, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
     plan_handoff_from_proposal, planner_tool_specs,
 };
+pub use serve::{Route, ServeConfig, ServeError, ServeHeaders, authorize, route};
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
     SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
