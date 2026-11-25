@@ -247,3 +247,21 @@ trit-host run --task "..." --workspace . \
 - 读取 git 变更时禁用 `core.fsmonitor`、屏蔽用户/系统级 git 配置，并用
   `GIT_WORK_TREE` 把工作树钉在 workspace；仓库自带的 `include.path` 仍会被读取，
   但不改变执行面。
+
+## 10. 未验证 / 待 CI
+
+本机是 Windows；下面这些项要么依赖平台，要么还没在 CI 上跑过。**没有 CI 结果之前，
+不要把表里的项当成已验证。**
+
+| 项 | 本机状态 | 怎么确认 |
+| --- | --- | --- |
+| Windows 大小写不敏感 | 通过（`cli_changed_paths_are_case_insensitive_on_windows`） | `windows-latest` 的 `cargo test --workspace` 复核 |
+| Unix 非 UTF-8 路径 | 不编译、不运行（`#[cfg(unix)]`） | `ubuntu-latest` / `macos-latest` 跑 `host_gives_up_on_non_utf8_git_paths` |
+| macOS 上的 `git status` 行为 | 未在真机跑过 | `macos-latest` 的 `cargo test --workspace` |
+| `core.worktree` 越界 | 通过（`host_ignores_repo_configured_worktree`） | 三平台 `cargo test --workspace` |
+| `core.fsmonitor` 不执行 | 通过（`host_disables_git_fsmonitor`） | 三平台 `cargo test --workspace` |
+
+不在这张表里的项：
+
+- `include.path` 仍会读取本地配置：这是 §9 的明确边界，不是“待验证”。
+- Unicode 大小写折叠：明确不做（§9），不要用 CI 结果推断它支持。
