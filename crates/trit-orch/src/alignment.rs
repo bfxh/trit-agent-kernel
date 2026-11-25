@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
@@ -297,6 +297,10 @@ pub fn check(root: &Path, manifest: &Path, options: &AlignmentOptions) -> Alignm
     };
     let display = display_path(&root, &manifest_abs);
     let mut report = AlignmentReport::new(SCHEMA_V1, &display);
+    if let Err(reason) = manifest_inside_root(&root, &manifest_abs) {
+        report.fail("manifest-outside-root", reason, None);
+        return report;
+    }
     let bytes = match fs::read(&manifest_abs) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -532,6 +536,38 @@ fn write_scaffold_temp(path: &Path, bytes: &[u8]) -> Result<(), Error> {
             path: path.display().to_string(),
             message: error.to_string(),
         });
+    }
+    Ok(())
+}
+
+fn manifest_inside_root(root: &Path, manifest: &Path) -> Result<(), String> {
+    if manifest
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!("manifest 不能包含 ..：{}", manifest.display()));
+    }
+    let mut probe = manifest.parent();
+    while let Some(parent) = probe {
+        if parent.exists() {
+            let canonical = fs::canonicalize(parent)
+                .map_err(|error| format!("manifest 父目录读不出：{error}"))?;
+            if !canonical.starts_with(root) {
+                return Err(format!("manifest 逃出 root：{}", manifest.display()));
+            }
+            break;
+        }
+        probe = parent.parent();
+    }
+    if manifest.exists() {
+        let canonical =
+            fs::canonicalize(manifest).map_err(|error| format!("manifest 读不出：{error}"))?;
+        if !canonical.starts_with(root) {
+            return Err(format!(
+                "manifest 经符号链接逃出 root：{}",
+                manifest.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -1177,6 +1213,47 @@ fn unique_root<'a>(
     if goal_map.is_empty() {
         return None;
     }
+    // 先报更具体的父引用/成环错误，再判“必须有且只有一个根”。
+    // 否则一个成环的目标树会先被误报成 goal-root。
+    for goal in goal_map.values() {
+        if let Some(parent) = goal
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            && !goal_map.contains_key(parent)
+        {
+            report.fail(
+                "unknown-goal-parent",
+                format!("{} 的 parent 不存在：{parent}", goal.id),
+                Some(&goal.id),
+            );
+            return None;
+        }
+    }
+    for goal in goal_map.values() {
+        let mut seen = BTreeSet::new();
+        let mut current = goal.id.clone();
+        loop {
+            if !seen.insert(current.clone()) {
+                report.fail(
+                    "goal-cycle",
+                    format!("goal parent 链成环：{}", goal.id),
+                    Some(&goal.id),
+                );
+                return None;
+            }
+            let Some(parent) = goal_map
+                .get(&current)
+                .and_then(|item| item.parent.as_deref())
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            else {
+                break;
+            };
+            current = parent.to_owned();
+        }
+    }
     let roots: Vec<String> = goal_map
         .values()
         .filter(|goal| {
@@ -1207,7 +1284,7 @@ fn unique_root<'a>(
         loop {
             if !seen.insert(current.clone()) {
                 report.fail(
-                    "goal-parent-cycle",
+                    "goal-cycle",
                     format!("goal parent 链成环：{}", goal.id),
                     Some(&goal.id),
                 );
@@ -1469,7 +1546,7 @@ fn checked_file(
     locator: Option<&str>,
     what: &str,
 ) -> Result<String, (String, String)> {
-    let (norm, full) = safe_rel(root, rel).map_err(|e| (format!("{what}-path"), e))?;
+    let (norm, full) = safe_rel(root, rel).map_err(|e| ("bad-path".to_owned(), e))?;
     let canonical = fs::canonicalize(&full).map_err(|_| {
         (
             format!("{what}-missing"),
@@ -1485,7 +1562,7 @@ fn checked_file(
     let root_canon = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     if !canonical.starts_with(&root_canon) {
         return Err((
-            format!("{what}-path"),
+            "bad-path".to_owned(),
             format!("{what} 经符号链接逃出 root：{norm}"),
         ));
     }

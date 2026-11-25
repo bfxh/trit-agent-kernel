@@ -98,6 +98,7 @@ v1/v2 里出现 `kind` / `command` 会被拒绝（unknown field），不会静�
 - **目标树**：v2/v3 必须有且只有一个根 `goal`（`parent` 为空）；每个 `goal.parent` 必须存在；不能成环；每条 requirement 的 `parent` 链必须终止在一个 `goal`。
 - **目标覆盖**：每条 `goal` 必须至少被一条 requirement 的父链覆盖；否则 `goal-uncovered`。
 - **需求优先级**：`must` 必须有有效 artifact + evidence；v3 的 `must` 还必须有 run provenance。`should` 在 `strict:true`（默认）下按 must，`strict:false` 只警告；`may` 只警告。
+- **清单路径**：manifest 本身也必须在 root 内；拒绝 `..`、绝对路径逃逸和符号链接逃逸，否则 `unknown` + `manifest-outside-root`。
 - **产物/证据**：必须存在、是普通文件、在 root 内（拒绝 `..`、绝对路径、符号链接逃逸）；`sha256` 是 64 位十六进制且与磁盘一致；`locator` 只支持 `Lx`、`Lx-Ly`、`text:<片段>`。
 - **non-goal**：`paths` 必须是仓库相对 glob；产物路径落进 non-goal、requirement 的 `changes` / `allow_unlinked` 与 non-goal 重叠，都失败。
 - **声明变更**：`changed` 是实际变更集；`changed_known` 表示这是完整集（空集也算已知）。完整集下，每条声明的 `changes` 必须被实际变更兑现；must（strict 下 should）缺失失败，may 警告。只给 `changed` 不给 `changed_known` 时，只检查“已给的变化有没有对齐”，不要求声明变更全部出现。
@@ -180,12 +181,13 @@ v1/v2 里出现 `kind` / `command` 会被拒绝（unknown field），不会静�
 - 源文件：`bfxh/trit` 的 `tools/alignment_gate.py`；本仓库只移植语义，不复制 Python 文件、不把 Python 作为运行依赖。
 - 已移植：v1/v2/v3 结构、目标树、父链、覆盖、产物/证据/sha256/locator、non-goal、声明变更、矛盾、v3 run provenance，以及 `scaffold` 清单生成。
 - `stress` 的随机对拍已由 Rust 集成测试 `crates/trit-orch/tests/alignment_stress.rs` 承接：100 个确定性随机用例，每个同时验证有效清单 aligned 和三类变异 unaligned，不引入 Python 运行时。
-- 尚未移植：`self-test` 这个 Python 内置自检命令；它的大量断言已分散在 Rust 单元/集成测试中，但未逐条复刻为一个运行时子命令。以及 Python 版对“所有字段长度/数组上限”的完整逐字段诊断。Rust 版用 `serde(deny_unknown_fields)` + 数组上限先做 fail-closed，未知字段直接报 `manifest-unreadable`。
+- `self-test` 的核心契约已由 Rust 集成测试 `crates/trit-orch/tests/alignment_selftest.rs` 承接：目标树/schema、v3 provenance、字段与路径、声明变更、non-goal、manifest 错误和确定性输出。不逐条复制 Python 的终端文案，也不把自检脚本做成运行时子命令。
+- 仍不同：Python 版对“所有字段长度/数组上限”的逐字段诊断；Rust 版用 `serde(deny_unknown_fields)` + 数组上限先做 fail-closed，未知字段直接报 `manifest-unreadable`，不细分到 Python 的 `unknown-field` 文案。
 - 迁移不是整仓 merge：`bfxh/trit` 的 `trit-orch` 与本仓库的 `trit-orch` 已分叉，必须按模块搬，不能把 Python 主路径或 `trit` 的额外 crate 一起带进来。
 
 ## 5. 诚实边界
 
 - 这是**准入前 / 交付前**的清单门，不是运行时监控；它防“清单没对齐就宣称完成”，不防宿主伪造清单或伪造 `executed`。
 - `aligned` 不代表需求语义被满足；语义判断仍归 `trit-reasonix` / 人工复核 / 红队。
-- 它不做自动修复、不自动改代码；`scaffold` 只生成留空的骨架清单，不替调用方补图；`stress` 以 Rust 测试承接，`self-test` 仍是 Python 侧辅助能力，未作为 CLI 迁入。
+- 它不做自动修复、不自动改代码；`scaffold` 只生成留空的骨架清单，不替调用方补图；`stress` / `self-test` 的核心契约以 Rust 测试承接，不提供运行时自检 CLI。
 - 文件检查是本地文件系统快照；检查后被替换的文件不会被再次发现，除非重新跑门。
