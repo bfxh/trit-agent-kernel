@@ -993,6 +993,7 @@ pub mod separation;
 pub mod session;
 pub mod session_migration;
 pub mod state_layer;
+pub mod subagent_process;
 pub mod supervisor;
 pub mod tools;
 pub use trit_orch::SelectionPressure;
@@ -1075,6 +1076,7 @@ pub use state_layer::{
     AgentState, CompactionState, InProgressState, StateIssue, StateIssueCode, StateIssueSeverity,
     StateLayer, StateValidation, state_layer,
 };
+pub use subagent_process::{SubagentProcessConfig, run_subagent};
 pub use supervisor::{
     GatewaySupervisor, McpCapabilities, McpHandshake, McpLogLevel, McpNotification, McpPrompt,
     McpPromptArgument, McpPromptsCapability, McpResource, McpResourceContent, McpResourceRead,

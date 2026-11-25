@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if command == "appcontainer-prune" {
         return run_appcontainer_prune(args);
+    }
+    if command == "subagent-echo" {
+        return run_subagent_echo(args);
     }
     if command != "run" {
         usage();
@@ -1520,6 +1523,53 @@ fn run_rewind(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Erro
         "{}",
         serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
     );
+    Ok(())
+}
+
+/// `subagent-echo`：测试/演示用子 agent。读一个请求帧，回一个响应帧。
+///
+/// 选项：`--fail` 回 Failed；`--silent` 不回响应直接退出；`--sleep-ms N` 延迟
+/// N 毫秒；`--task <id>` 用指定任务 ID 回显（用于构造引用不匹配）。
+fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut fail_mode = false;
+    let mut silent = false;
+    let mut sleep_ms = 0u64;
+    let mut task_override: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fail" => fail_mode = true,
+            "--silent" => silent = true,
+            "--sleep-ms" => sleep_ms = next(&mut args, "--sleep-ms")?.parse()?,
+            "--task" => task_override = Some(next(&mut args, "--task")?),
+            other => return Err(fail(format!("unknown subagent-echo argument: {other}"))),
+        }
+    }
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input)?;
+    let request: trit_orch::SubagentRequest = trit_orch::decode_frame(&mut input)?
+        .ok_or_else(|| fail("subagent-echo: no request frame"))?;
+    if sleep_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+    }
+    if silent {
+        return Ok(());
+    }
+    let status = if fail_mode {
+        trit_orch::DelegationStatus::Failed {
+            message: "scripted failure".into(),
+        }
+    } else {
+        trit_orch::DelegationStatus::Completed
+    };
+    let response = trit_orch::SubagentResponse {
+        task: task_override.unwrap_or_else(|| request.task.clone()),
+        epoch: request.epoch,
+        status,
+        content: request.task.as_bytes().to_vec(),
+        tokens: 1,
+    };
+    let frame = trit_orch::encode_frame(&response)?;
+    std::io::stdout().write_all(&frame)?;
     Ok(())
 }
 
