@@ -100,10 +100,16 @@ impl RemoteServer {
     }
 
     /// 持续服务，直到进程被终止；单连接错误只丢弃该连接。
+    ///
+    /// 每个连接一个线程（参考实现不做线程池）：跨机 fleet 会从多个 worker
+    /// 同时打到一个端点，串行处理会让 `max_in_flight > 1` 的容量形同虚设。
     pub fn serve_forever(&self) -> std::io::Result<()> {
         loop {
             let (stream, _) = self.listener.accept()?;
-            let _ = handle(stream, &self.config);
+            let config = self.config.clone();
+            std::thread::spawn(move || {
+                let _ = handle(stream, &config);
+            });
         }
     }
 }

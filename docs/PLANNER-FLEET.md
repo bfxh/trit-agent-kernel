@@ -185,13 +185,41 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败。
 
-**仍然非目标（本批不做）**：节点发现、跨机器调度、跨机失败恢复与幂等重试。
+**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）与
+自动重试（需要幂等键）。静态节点表与派发见 §9。
+
+## 9. 跨机器调度（`trit_orch::NodeTable` + `trit_host::run_remote_plan`）
+
+DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` runtime）负责；
+这一层只补“任务放哪台机器、失败怎么记账”。
+
+- `RemoteNode { id, max_in_flight, endpoint }`：静态节点表（发现 v1 由调用方/配置
+  注入）；建表校验 id 唯一非空白、容量 ≥ 1、端点通过准入校验。
+- `NodeTable`：按负载比 `in_flight / max_in_flight` 选最轻节点（平手按 id 升序）；
+  各节点容量独立，满载时阻塞等待并每 25ms 复查取消令牌；取消返回 `Ok(None)`。
+- 故障隔离：`NodeOutcome::{Succeeded, TaskFailed, NodeFailed}`。连续
+  `failure_threshold`（默认 1）次节点级失败后该节点退出本轮调度；远端明确回
+  `Failed` 只算任务失败，不隔离节点；`NodeLease` 未 `finish` 就 drop 按节点级
+  失败记账，避免 panic 泄漏容量。
+- `run_remote_plan(plan, nodes, config, cancel, build_request)`：在 fleet runner
+  内申请节点 → 编码请求 → ureq POST → 归还；返回
+  `RemotePlanReport { report, results, assignments, nodes }`：
+  - `assignments`：`task -> node id`；
+  - `results`：远端自报的精确状态（`Aborted` 不会在汇总里被改写成 `Failed`）；
+  - `nodes`：`attempts / failures / healthy` 快照。
+- **不自动重试**：远程可能已执行，重试需要幂等键。本轮的“恢复”= 故障隔离 +
+  失败不掩盖；失败向上传播仍由 fleet 负责（失败后不再启动新任务）。
+
+回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
+隔离阈值、drop 记账、JSON 默认值）与 `crates/trit-host/tests/remote_fleet.rs`
+（真实双节点均衡、无响应节点隔离、远端任务失败、预取消、非法节点表）。
 
 ## 非目标
 
 - 不把 fleet 依赖图塞进 `TaskSpec`：`TaskSpec.deps` 只有三元依赖，图的调度归属
   runtime；
-- 不做跨机器调度（节点发现、跨机失败恢复、幂等重试同样不在本批）；
+- 不做动态节点发现、跨机抢占与自动重试（幂等键未落地）；静态节点表内的
+  派发与故障隔离见 §9；
 - 真实子 agent 进程的 spawn/超时 kill 由宿主实现，本批只固化 IPC 契约；
 - provider 侧的模型调用本身（HTTP/SSE 接线）不在本批：本批把模型输出解析成
   `PlanHandoff`（`submit_plan`），发请求仍走既有 provider 路径。

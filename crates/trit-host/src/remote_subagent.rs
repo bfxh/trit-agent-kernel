@@ -32,6 +32,15 @@ pub const FRAME_CONTENT_TYPE: &str = "application/x-trit-frame";
 /// 响应体硬上限：单帧上限加 4 字节长度前缀。
 pub const MAX_RESPONSE_BYTES: usize = MAX_FRAME_BYTES + 4;
 
+/// 一次远程调用的完整产出：稳定引用 + 原始内容。
+///
+/// 内容只在宿主侧用于拼下游输入；跨机传递本身仍以 `task@epoch#digest` 为引用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteReply {
+    pub result: DelegationResult,
+    pub content: Vec<u8>,
+}
+
 /// 把请求帧 POST 到 `endpoint`，把合法响应映射成稳定结果引用。
 ///
 /// 返回 `Ok` 的两种情况：
@@ -46,6 +55,14 @@ pub fn run_remote_subagent(
     endpoint: &RemoteEndpoint,
     request: &SubagentRequest,
 ) -> Result<DelegationResult, AgentError> {
+    Ok(run_remote_subagent_reply(endpoint, request)?.result)
+}
+
+/// [`run_remote_subagent`] 的完整版本：同时返回响应内容，供跨机派发拼装下游输入。
+pub fn run_remote_subagent_reply(
+    endpoint: &RemoteEndpoint,
+    request: &SubagentRequest,
+) -> Result<RemoteReply, AgentError> {
     endpoint.validate()?;
     let frame = encode_frame(request)?;
 
@@ -64,7 +81,7 @@ pub fn run_remote_subagent(
     let response = match call.send_bytes(&frame) {
         Ok(response) => response,
         Err(ureq::Error::Status(code, _)) => {
-            return Ok(unresolved(
+            return Ok(unresolved_reply(
                 request,
                 DelegationStatus::Failed {
                     message: format!("remote endpoint rejected the request with HTTP {code}"),
@@ -73,13 +90,13 @@ pub fn run_remote_subagent(
         }
         // 连接 / DNS / 超时：对端是否执行过无法判定，只能按未确认（Aborted）处理。
         Err(ureq::Error::Transport(_)) => {
-            return Ok(unresolved(request, DelegationStatus::Aborted));
+            return Ok(unresolved_reply(request, DelegationStatus::Aborted));
         }
     };
 
     // 3xx（redirects(0) 时不跳转）与其它非 2xx 都按拒绝处理。
     if !(200..300).contains(&response.status()) {
-        return Ok(unresolved(
+        return Ok(unresolved_reply(
             request,
             DelegationStatus::Failed {
                 message: format!("remote endpoint answered HTTP {}", response.status()),
@@ -95,11 +112,11 @@ pub fn run_remote_subagent(
         .read_to_end(&mut body)
         .is_err()
     {
-        return Ok(unresolved(request, DelegationStatus::Aborted));
+        return Ok(unresolved_reply(request, DelegationStatus::Aborted));
     }
     if body.len() > MAX_RESPONSE_BYTES {
         // 超限体不解码：避免畸形长度前缀造成内存放大。
-        return Ok(unresolved(
+        return Ok(unresolved_reply(
             request,
             DelegationStatus::Failed {
                 message: format!("remote response exceeds {MAX_RESPONSE_BYTES} bytes"),
@@ -110,15 +127,25 @@ pub fn run_remote_subagent(
     match decode_frame::<SubagentResponse>(&mut body) {
         Ok(Some(response)) => {
             response.validate_for(request)?;
-            Ok(response.into_delegation_result())
+            let result = DelegationResult {
+                task: response.task,
+                epoch: response.epoch,
+                digest: digest_hex(&response.content),
+                status: response.status,
+                tokens: response.tokens,
+            };
+            Ok(RemoteReply {
+                result,
+                content: response.content,
+            })
         }
-        Ok(None) if body.is_empty() => Ok(unresolved(
+        Ok(None) if body.is_empty() => Ok(unresolved_reply(
             request,
             DelegationStatus::Failed {
                 message: "remote endpoint returned no response frame".into(),
             },
         )),
-        Ok(None) => Ok(unresolved(
+        Ok(None) => Ok(unresolved_reply(
             request,
             DelegationStatus::Failed {
                 message: "remote endpoint returned a truncated response frame".into(),
@@ -136,5 +163,12 @@ fn unresolved(request: &SubagentRequest, status: DelegationStatus) -> Delegation
         digest: digest_hex(b""),
         status,
         tokens: 0,
+    }
+}
+
+fn unresolved_reply(request: &SubagentRequest, status: DelegationStatus) -> RemoteReply {
+    RemoteReply {
+        result: unresolved(request, status),
+        content: Vec::new(),
     }
 }
