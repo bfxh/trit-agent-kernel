@@ -54,6 +54,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "subagent-echo" {
         return run_subagent_echo(args);
     }
+    if command == "subagent-run" {
+        return run_subagent_run(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1567,6 +1570,79 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         status,
         content: request.task.as_bytes().to_vec(),
         tokens: 1,
+    };
+    let frame = trit_orch::encode_frame(&response)?;
+    std::io::stdout().write_all(&frame)?;
+    Ok(())
+}
+
+/// `subagent-run --workspace <dir> --script <proposals.json> [--max-steps N]`：
+/// 可执行子 agent 参考实现。读一个请求帧，按 profile 权限跑一轮，回响应帧。
+///
+/// 权限映射：`ReadOnly` → `ReadOnlyTools` 包 `LocalTools` 且 `allow_write = false`；
+/// `ReadWrite` → 直接用 `LocalTools` 且 `allow_write = true`。响应状态只有
+/// `judgment.is_complete()` 为 true 时才是 `Completed`。
+fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    let mut script: Option<PathBuf> = None;
+    let mut max_steps = 20usize;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
+            "--max-steps" => max_steps = next(&mut args, "--max-steps")?.parse()?,
+            other => return Err(fail(format!("unknown subagent-run argument: {other}"))),
+        }
+    }
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input)?;
+    let request: trit_orch::SubagentRequest = trit_orch::decode_frame(&mut input)?
+        .ok_or_else(|| fail("subagent-run: no request frame"))?;
+
+    let mut config = WorkspaceConfig::new(&workspace);
+    config.allow_write = request.profile.access == trit_orch::AccessMode::ReadWrite;
+    let local = LocalTools::new(config)?;
+    let tools: Box<dyn ToolExecutor> = if request.profile.access == trit_orch::AccessMode::ReadOnly
+    {
+        Box::new(trit_host::ReadOnlyTools::new(local))
+    } else {
+        Box::new(local)
+    };
+
+    let script_path =
+        script.ok_or_else(|| fail("subagent-run requires --script <proposals.json>"))?;
+    let text = std::fs::read_to_string(&script_path)?;
+    let proposals: Vec<Proposal> = serde_json::from_str(&text)?;
+    let model = ScriptedModel::new(proposals);
+
+    let objective = request
+        .capsule
+        .get("objective")
+        .unwrap_or(request.task.as_str())
+        .to_owned();
+    let turn = TurnSpec {
+        task: request.task.clone(),
+        objective,
+        constraints: Vec::new(),
+        stop_when: Vec::new(),
+        min_assertions: 0,
+        max_tokens: request.profile.max_tokens,
+    };
+    let mut host = AgentHost::new(model, tools).with_max_steps(max_steps);
+    let outcome = host.run_turn(&turn)?;
+    let status = if outcome.judgment.is_complete() {
+        trit_orch::DelegationStatus::Completed
+    } else {
+        trit_orch::DelegationStatus::Failed {
+            message: "task did not complete".into(),
+        }
+    };
+    let response = trit_orch::SubagentResponse {
+        task: request.task,
+        epoch: request.epoch,
+        status,
+        content: serde_json::to_vec(&outcome)?,
+        tokens: outcome.usage.total()?,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;
