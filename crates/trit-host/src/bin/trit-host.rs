@@ -48,6 +48,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "appcontainer-run" {
         return run_appcontainer(args);
     }
+    if command == "appcontainer-prune" {
+        return run_appcontainer_prune(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1288,7 +1291,9 @@ fn usage() {
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
          journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes;\n\
-         exits 1 on remaining doubt or rollback failure.\n\n\
+         exits 1 on remaining doubt or rollback failure.\n\
+         appcontainer-prune: trit-host appcontainer-prune --workspace <dir>\n\
+         deletes AppContainer profiles recorded for the workspace.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
@@ -1363,6 +1368,35 @@ fn run_appcontainer(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
         let _ = (workspace, command);
         Err(fail("appcontainer-run is Windows only"))
     }
+}
+
+/// `appcontainer-prune --workspace <dir>`：删除本 workspace 记录过的 AppContainer profile。
+fn run_appcontainer_prune(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            other => {
+                return Err(fail(format!(
+                    "unknown appcontainer-prune argument: {other}"
+                )));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let removed = match trit_host::appcontainer::prune(&workspace) {
+            Ok(removed) => removed,
+            Err(error) => return Err(fail(error)),
+        };
+        println!("pruned {removed} AppContainer profile(s)");
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = workspace;
+        return Err(fail("appcontainer-prune is Windows only"));
+    }
+    Ok(())
 }
 
 /// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。

@@ -27,7 +27,7 @@ use windows_sys::Win32::Security::Authorization::{
     SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, FreeSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
@@ -40,12 +40,16 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
+/// 本 workspace 记录过的 profile 清单（相对路径）。
+const PROFILE_LIST: &str = ".agent/appcontainer-profiles";
+
 /// 在 AppContainer 内运行 `program args`，返回子进程退出码。
 pub fn run(workspace: &Path, program: &str, args: &[String]) -> Result<i32, String> {
     let workspace = std::fs::canonicalize(workspace)
         .map_err(|error| format!("workspace {}: {error}", workspace.display()))?;
     let name = profile_name(&workspace);
     let sid = ensure_profile(&name)?;
+    remember_profile(&workspace, &name)?;
     let result = (|| {
         grant_workspace(&workspace, sid)?;
         spawn_in_container(&workspace, program, args, sid)
@@ -53,6 +57,46 @@ pub fn run(workspace: &Path, program: &str, args: &[String]) -> Result<i32, Stri
     // SAFETY: sid came from CreateAppContainerProfile / DeriveAppContainerSidFromAppContainerName.
     unsafe { FreeSid(sid) };
     result
+}
+
+/// 删除本 workspace 记录过的 AppContainer profile。
+pub fn prune(workspace: &Path) -> Result<usize, String> {
+    let workspace = std::fs::canonicalize(workspace)
+        .map_err(|error| format!("workspace {}: {error}", workspace.display()))?;
+    let path = workspace.join(PROFILE_LIST);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let mut removed = 0usize;
+    for name in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let name_wide = wide(name);
+        // SAFETY: name_wide is NUL-terminated.
+        unsafe { DeleteAppContainerProfile(name_wide.as_ptr()) };
+        removed += 1;
+    }
+    let _ = std::fs::remove_file(&path);
+    Ok(removed)
+}
+
+fn remember_profile(workspace: &Path, name: &str) -> Result<(), String> {
+    let path = workspace.join(PROFILE_LIST);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == name) {
+        return Ok(());
+    }
+    let mut text = existing;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(name);
+    text.push('\n');
+    std::fs::write(&path, text).map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 fn profile_name(workspace: &Path) -> String {

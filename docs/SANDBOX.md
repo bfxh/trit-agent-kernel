@@ -42,7 +42,10 @@ bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
 边界：
 
 - 只授予 workspace 的写权限；`C:\Windows\Temp`、用户目录等写入被拒绝（有回归测试）。
-- profile 按 workspace 复用，不自动删除；需要清理时用系统工具删除。
+- `TEMP` / `TMP` 由 AppContainer 指向自己的包目录
+  （`%LOCALAPPDATA%\Packages\trit-sandbox-<hash>\AC\Temp`），不落到用户 TEMP。
+- profile 按 workspace 复用；名字记录在 `<workspace>/.agent/appcontainer-profiles`，
+  用 `trit-host appcontainer-prune --workspace <dir>` 删除。
 - 失败 fail-closed：profile / ACL / 进程创建任一步失败 → 非零退出，不回退裸 shell。
 - 不是网络隔离；`SECURITY_CAPABILITIES` 为空。
 

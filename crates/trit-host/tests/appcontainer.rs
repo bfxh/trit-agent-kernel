@@ -115,3 +115,36 @@ fn host_run_uses_builtin_sandbox_for_shell() {
     let _ = fs::remove_file(script);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn appcontainer_temp_is_isolated() {
+    let root = root("temp");
+    let (code, text) = run(&root, "echo %TEMP% > temp.txt");
+    assert_eq!(code, Some(0), "{text}");
+    let temp = fs::read_to_string(root.join("temp.txt"))
+        .unwrap()
+        .to_lowercase();
+    // AppContainer 会把 TEMP 指向自己的包目录，而不是用户 TEMP。
+    assert!(
+        temp.contains("packages") && temp.contains("trit-sandbox-"),
+        "TEMP not isolated: {temp}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn appcontainer_prune_removes_recorded_profiles() {
+    let root = root("prune");
+    let (code, text) = run(&root, "echo hi");
+    assert_eq!(code, Some(0), "{text}");
+    let list = root.join(".agent/appcontainer-profiles");
+    assert!(list.is_file(), "profile list missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args(["appcontainer-prune", "--workspace", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!list.exists(), "profile list not removed");
+    let _ = fs::remove_dir_all(root);
+}

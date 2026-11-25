@@ -17,3 +17,6 @@ __pycache__/
 
 # mutation journal 的备份目录。
 .agent/journal-backups/
+
+# AppContainer profile 清单（本机状态）。
+.agent/appcontainer-profiles
