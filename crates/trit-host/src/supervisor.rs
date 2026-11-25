@@ -697,6 +697,9 @@ pub struct RecoveryContext {
     pub hooks: Vec<HookDescriptor>,
     #[serde(default)]
     pub cache: Option<CacheLedger>,
+    /// 门链结论历史（与 session 事件一致）；旧恢复包缺省为空。
+    #[serde(default)]
+    pub gate_chains: Vec<crate::session::GateChainRecord>,
 }
 
 impl RecoveryContext {
@@ -3325,6 +3328,7 @@ done
                 enabled: true,
             }],
             cache: Some(CacheLedger::default()),
+            gate_chains: Vec::new(),
         };
         assert_eq!(
             supervisor.ensure_connected(&recovery).unwrap(),

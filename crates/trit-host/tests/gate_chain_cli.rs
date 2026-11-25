@@ -625,6 +625,12 @@ fn host_logs_gate_chain_to_session() {
     assert_eq!(state.gate_chains[0].status, "passed");
     assert_eq!(state.gate_chains[1].phase, trit_host::GateChainPhase::Post);
     assert_eq!(state.gate_chains[1].status, "aligned");
+
+    // 恢复包也带同一份门链历史，宿主重连后不需要重读事件。
+    let recovery = trit_host::recovery_context_for_session(&session).unwrap();
+    assert_eq!(recovery.gate_chains.len(), 2);
+    assert_eq!(recovery.gate_chains[0].status, "passed");
+    assert_eq!(recovery.gate_chains[1].status, "aligned");
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }

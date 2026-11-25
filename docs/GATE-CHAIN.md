@@ -215,7 +215,8 @@ trit-host run --task "..." --workspace . \
 - 给了 `--session` 时，pre / post 结论会作为 `gate_chain` 事件追加到 session
   JSONL（`phase`、`status`、`exit`、`failed_at`、各状态计数、可选 `report` 路径）。
   事件不改变 turn 状态机，`recover` 会把它们填进 `SessionState.gate_chains`；
-  session 文件本身也会从 post 的 `changed` 中排除。
+  supervisor 恢复包（`RecoveryContext.gate_chains`）也带同一份历史；session 文件
+  本身也会从 post 的 `changed` 中排除。
 
 ## 8. 硬规则
 

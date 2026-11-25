@@ -229,7 +229,45 @@ pub fn recovery_context_for_session(
         state: Some(crate::state_layer::state_layer(&records)),
         hooks: Vec::new(),
         cache: Some(cache_ledger_from_records(&records)),
+        gate_chains: gate_chains_from_records(&records),
     })
+}
+
+/// 从事件里提取门链历史；不校验 turn 状态，供恢复包使用。
+pub fn gate_chains_from_records(records: &[SessionRecord]) -> Vec<GateChainRecord> {
+    records
+        .iter()
+        .filter_map(|record| gate_chain_record(&record.event))
+        .collect()
+}
+
+fn gate_chain_record(event: &SessionEvent) -> Option<GateChainRecord> {
+    match event {
+        SessionEvent::GateChain {
+            phase,
+            status,
+            exit,
+            failed_at,
+            failures,
+            passed,
+            blocked,
+            unknown,
+            skipped,
+            report,
+        } => Some(GateChainRecord {
+            phase: *phase,
+            status: status.clone(),
+            exit: *exit,
+            failed_at: failed_at.clone(),
+            failures: *failures,
+            passed: *passed,
+            blocked: *blocked,
+            unknown: *unknown,
+            skipped: *skipped,
+            report: report.clone(),
+        }),
+        _ => None,
+    }
 }
 
 fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
@@ -286,7 +324,7 @@ pub struct SessionState {
 }
 
 /// 一条门链结论，字段与 `SessionEvent::GateChain` 对应。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateChainRecord {
     pub phase: GateChainPhase,
     pub status: String,
@@ -377,30 +415,10 @@ pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
                 turn.finished = true;
                 state.turns.push(turn);
             }
-            SessionEvent::GateChain {
-                phase,
-                status,
-                exit,
-                failed_at,
-                failures,
-                passed,
-                blocked,
-                unknown,
-                skipped,
-                report,
-            } => {
-                state.gate_chains.push(GateChainRecord {
-                    phase: *phase,
-                    status: status.clone(),
-                    exit: *exit,
-                    failed_at: failed_at.clone(),
-                    failures: *failures,
-                    passed: *passed,
-                    blocked: *blocked,
-                    unknown: *unknown,
-                    skipped: *skipped,
-                    report: report.clone(),
-                });
+            SessionEvent::GateChain { .. } => {
+                if let Some(record) = gate_chain_record(&record.event) {
+                    state.gate_chains.push(record);
+                }
             }
             _ => {}
         }
@@ -471,6 +489,7 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
             state: Some(self.state_layer()?),
             hooks: Vec::new(),
             cache,
+            gate_chains: self.state().gate_chains.clone(),
         })
     }
 
