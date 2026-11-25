@@ -61,7 +61,25 @@ ClaimingTools       两者都在写调用前检查；lease 失效优先 fail-clo
 2. 再过 `WriteClaim::allows_request`；`bash` 在 claim 下仍然 fail-closed；
 3. 才调用内部执行器。
 
-## 5. 诚实边界
+## 5. CLI
+
+```bash
+trit-host run --task "..." --workspace . \
+  --write-claim src/report.md --write-claim tests/ \
+  --write-lease host-a
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `--write-claim <path>` | 声明可写路径（可重复）；`write_file` 只能落在这些路径，`bash` 写入 fail-closed |
+| `--write-lease <owner>` | 运行前获取 `<workspace>/.agent/write-lease`；需要至少一个 `--write-claim` |
+
+- 获取失败（另一个持有者）→ 退出 `2`，stderr `write lease is busy: owner=... epoch=...`。
+- 命中 claim 之外的写入 → 工具结果
+  `blocked: write claim does not allow this path or shell command`，不执行。
+- 租约在运行期间持续持有；进程退出自动释放，下一次运行 `epoch + 1`。
+
+## 6. 诚实边界
 
 - **本地文件系统**的租约，不是跨机器写权威；分布式存储需要在存储端校验 token。
 - 只约束经过 `ClaimingTools` 的写入；绕过包装器直接写文件不在保护范围内。

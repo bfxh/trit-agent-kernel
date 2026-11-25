@@ -920,12 +920,14 @@ fn log_session(
 }
 
 /// 无头运行配置：工作区权限与步数上限。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HeadlessConfig {
     pub workspace: crate::tools::WorkspaceConfig,
     pub max_steps: usize,
     pub session: Option<std::path::PathBuf>,
     pub context: ContextPolicy,
+    /// 可选的写入守卫（路径 claim + 跨进程租约）。
+    pub write_guard: Option<crate::permissions::WriteGuard>,
 }
 
 /// 无头运行：本地工具 + 模型提议 + 内核裁决。
@@ -935,6 +937,7 @@ pub fn run_headless<M: Model>(
     config: HeadlessConfig,
 ) -> Result<TurnOutcome, AgentError> {
     let tools = crate::tools::LocalTools::new(config.workspace)?;
+    let tools = crate::permissions::wrap_claim(tools, config.write_guard);
     let mut host = AgentHost::new(model, tools)
         .with_max_steps(config.max_steps)
         .with_context(config.context);
@@ -1005,7 +1008,7 @@ pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use permissions::{
     ClaimingTools, PermissionApprover, PermissionDecision, PermissionGate, PermissionMode,
-    PermissionPolicy, PermissionRule, WriteClaim,
+    PermissionPolicy, PermissionRule, WriteClaim, WriteGuard, wrap_claim,
 };
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{

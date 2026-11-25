@@ -239,6 +239,30 @@ pub struct ClaimingTools<T> {
     lease: Option<OperationLease>,
 }
 
+/// 写入守卫：路径 claim + 可选跨进程租约。
+#[derive(Debug)]
+pub struct WriteGuard {
+    pub claim: WriteClaim,
+    pub lease: Option<OperationLease>,
+}
+
+/// 把 guard 包到工具外层；没有 guard 时原样装箱。
+pub fn wrap_claim<T: ToolExecutor + 'static>(
+    tools: T,
+    guard: Option<WriteGuard>,
+) -> Box<dyn ToolExecutor> {
+    match guard {
+        Some(guard) => {
+            let mut claiming = ClaimingTools::new(tools, guard.claim);
+            if let Some(lease) = guard.lease {
+                claiming = claiming.with_lease(lease);
+            }
+            Box::new(claiming)
+        }
+        None => Box::new(tools),
+    }
+}
+
 impl<T> ClaimingTools<T> {
     pub fn new(inner: T, claim: WriteClaim) -> Self {
         Self {

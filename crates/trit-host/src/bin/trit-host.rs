@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex};
 use trit_host::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_host::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
-    CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ContextPolicy,
-    ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig, InMemoryContext,
-    LowHitPolicy, McpToolExecutor, Model, ModelProfile, OpenAiConfig, OpenAiProvider,
-    OpenAiSamplingHandler, Proposal, ProviderModel, ReasoningEffort, RecoveryContext,
-    ResolvedContext, RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure,
-    Session, SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, default_tools,
-    recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
-    run_headless,
+    CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ClaimingTools,
+    ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig,
+    InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile, OpenAiConfig,
+    OpenAiProvider, OpenAiSamplingHandler, OperationLease, Proposal, ProviderModel,
+    ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope, SamplingHandler, ScriptedModel,
+    SearchOrder, SelectionPressure, Session, SupervisorConfig, SupervisorRuntime, ToolCatalog,
+    ToolExecutor, WriteClaim, WriteGuard, default_tools, recovery_context_for_session,
+    rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
 };
 use trit_orch::alignment::AlignmentOptions;
 use trit_orch::gate_chain::{
@@ -73,6 +73,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut sandbox_args: Vec<String> = Vec::new();
     let mut allow_unsandboxed_shell = false;
     let mut allow_hardlinks = false;
+    let mut write_claim_paths: Vec<PathBuf> = Vec::new();
+    let mut write_lease_owner: Option<String> = None;
     let mut resume = false;
     let mut context = ContextPolicy::default();
     let mut checkpoint_dir: Option<PathBuf> = None;
@@ -146,6 +148,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
+            "--write-claim" => {
+                write_claim_paths.push(PathBuf::from(next(&mut args, "--write-claim")?));
+            }
+            "--write-lease" => write_lease_owner = Some(next(&mut args, "--write-lease")?),
             "--resume" => resume = true,
             "--checkpoint-dir" => {
                 checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
@@ -312,6 +318,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if handoff_attach && handoff_packet.is_none() {
         return Err(fail("--handoff-attach requires --handoff-packet"));
     }
+    if write_lease_owner.is_some() && write_claim_paths.is_empty() {
+        return Err(fail("--write-lease requires --write-claim"));
+    }
     let workspace_root = workspace.clone();
     // 路径归一化在拿到 workspace 之后做：`.\src\a.py`、`src//a.py`、workspace 内
     // 绝对路径都折成 `src/a.py`；逃出 workspace 直接拒绝。
@@ -324,6 +333,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     let manifest_path = alignment_manifest
         .clone()
         .unwrap_or_else(|| PathBuf::from(".agent/alignment.json"));
+    let mut write_guard = if write_claim_paths.is_empty() {
+        None
+    } else {
+        let claim = WriteClaim::new(&workspace_root, write_claim_paths.clone())
+            .map_err(|error| fail(error.to_string()))?;
+        let lease = match write_lease_owner.as_deref() {
+            Some(owner) => Some(
+                OperationLease::acquire(&workspace_root, owner)
+                    .map_err(|error| fail(error.to_string()))?,
+            ),
+            None => None,
+        };
+        Some(WriteGuard { claim, lease })
+    };
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
     let gate_chain_requested = gate_chain
         || handoff_packet.is_some()
@@ -424,11 +447,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     });
     workspace.forbid_hardlinks = !allow_hardlinks;
     let session_path = session.clone();
-    let config = HeadlessConfig {
+    let mut config = HeadlessConfig {
         workspace,
         max_steps,
         session,
         context,
+        write_guard: None,
     };
     let scripted = match provider.as_str() {
         "scripted" => {
@@ -605,6 +629,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some(client) => Box::new(McpToolExecutor::new(client.clone(), tools)),
             None => tools,
         };
+        let tools = apply_write_guard(tools, write_guard.take());
         let mut session = Session::open(model, tools, &path)?
             .with_max_steps(max_steps)
             .with_context(context)
@@ -629,6 +654,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some(client) => Box::new(McpToolExecutor::new(client.clone(), tools)),
             None => Box::new(tools),
         };
+        let tools = apply_write_guard(tools, write_guard.take());
         if let Some(path) = config.session.as_ref() {
             let mut session = Session::open(model, tools, path)?
                 .with_max_steps(max_steps)
@@ -647,6 +673,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             (outcome, Some(ledger))
         }
     } else {
+        config.write_guard = write_guard.take();
         let model = build_model(
             scripted,
             openai_config.as_ref(),
@@ -658,6 +685,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         if let Some(client) = mcp_tool_client.as_ref() {
             let local = LocalTools::new(config.workspace.clone())?;
             let tools = McpToolExecutor::new(client.clone(), local);
+            let tools = apply_write_guard(Box::new(tools), config.write_guard.take());
             if let Some(path) = config.session.as_ref() {
                 let mut session = Session::open(model, tools, path)?
                     .with_max_steps(max_steps)
@@ -846,6 +874,22 @@ fn parse_reasoning(value: &str) -> Result<ReasoningEffort, Box<dyn Error>> {
 fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| fail(format!("{flag} requires a value")))
+}
+
+fn apply_write_guard(
+    tools: Box<dyn ToolExecutor>,
+    guard: Option<WriteGuard>,
+) -> Box<dyn ToolExecutor> {
+    match guard {
+        Some(guard) => {
+            let mut claiming = ClaimingTools::new(tools, guard.claim);
+            if let Some(lease) = guard.lease {
+                claiming = claiming.with_lease(lease);
+            }
+            Box::new(claiming)
+        }
+        None => tools,
+    }
 }
 
 fn fail(message: impl Into<String>) -> Box<dyn Error> {
@@ -1129,7 +1173,8 @@ fn usage() {
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
-         [--allow-hardlinks] [--context-receipts N] [--context-chars N] [--context-output N] \\\n    \
+         [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \
+         [--context-receipts N] [--context-chars N] [--context-output N] \\\n    \
          [--context-catalog <json> [--context-project <id>] [--context-session-id <id>] \\\n    \
          [--context-budget N] [--context-window N] [--model-max-output N] \\\n    \
          [--supports-reasoning] [--reasoning off|low|medium|high] \\\n    \
@@ -1160,6 +1205,9 @@ fn usage() {
          --gate-chain-report / --gate-chain-post-report: write the pre/post report JSON\n\
          to the given path (workspace relative); report files are excluded from post checks.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
+         --write-claim: restrict write_file to declared paths; shell writes fail closed.\n\
+         --write-lease: acquire <workspace>/.agent/write-lease before running\n\
+         (requires --write-claim; exits 2 when another owner holds it).\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
          context-catalog: JSON array of {{reference, document}} entries; enables agent-driven\n\

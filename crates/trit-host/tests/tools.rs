@@ -281,6 +281,7 @@ fn headless_run_writes_and_proves_from_local_receipts() {
             max_steps: 2,
             session: None,
             context: trit_host::ContextPolicy::default(),
+            write_guard: None,
         },
     )
     .unwrap();
@@ -316,6 +317,7 @@ fn headless_run_rejects_escape_before_writing() {
             max_steps: 2,
             session: None,
             context: trit_host::ContextPolicy::default(),
+            write_guard: None,
         },
     )
     .unwrap_err();
