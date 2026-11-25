@@ -39,6 +39,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "rewind" {
         return run_rewind(args);
     }
+    if command == "session-status" {
+        return run_session_status(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1173,10 +1176,47 @@ fn usage() {
          recovery. --mcp-sampling serves sampling/createMessage with the OpenAI-compatible\n\
          provider (optionally --mcp-sampling-model); roots_watch directories contribute\n\
          roots automatically and changes emit roots/list_changed.\n\n\
+         session-status: trit-host session-status --session <jsonl>\n\
+         prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]"
     );
+}
+
+/// `session-status --session <jsonl>`：只读输出 turn 数与最新门链裁决。
+///
+/// 退出码：`0` 正常（最新门链未阻塞），`1` 最新门链阻塞，`2` 参数/读取错误。
+fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut session = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
+            other => return Err(fail(format!("unknown session-status argument: {other}"))),
+        }
+    }
+    let session = session.ok_or_else(|| fail("--session is required"))?;
+    let records = trit_host::SessionLog::open(&session)?.load()?;
+    let state = trit_host::recover(&records)?;
+    let latest = state.gate_chains.last();
+    let blocked = latest.is_some_and(|record| !record.passed());
+    let status = serde_json::json!({
+        "session": session.display().to_string(),
+        "turns": state.turns.len(),
+        "gate_chains": {
+            "history": state.gate_chains.len(),
+            "latest": latest,
+            "blocked": blocked,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status).map_err(|error| fail(error.to_string()))?
+    );
+    if blocked {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_rewind(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {

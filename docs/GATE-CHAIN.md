@@ -220,6 +220,29 @@ trit-host run --task "..." --workspace . \
   `RecoveryContext` 另有 `latest_gate_chain()` / `gate_chain_blocked()`，宿主可以按
   最新一条直接判断是否阻塞（没有记录时不阻塞）。
 
+### 查看现状：`trit-host session-status`
+
+```bash
+trit-host session-status --session .agent/session.jsonl
+```
+
+只读输出 turn 数与最新门链裁决：
+
+```json
+{
+  "session": ".agent/session.jsonl",
+  "turns": 1,
+  "gate_chains": {
+    "history": 2,
+    "latest": { "phase": "post", "status": "aligned", "exit": 0 },
+    "blocked": false
+  }
+}
+```
+
+退出码：`0` 最新门链未阻塞、`1` 最新门链阻塞、`2` 参数/读取错误。不存在的
+session 文件按空日志处理（`history=0`、`blocked=false`）。
+
 ## 8. 硬规则
 
 - **只有 `True` 放行**：三值里 `Unknown` 与 `False` 都不继续。
