@@ -137,7 +137,35 @@ assert_eq!(report.exit, 0);
 `Unknown` 并停链。要让调用方显式选择“只跑前两道门”，当前版本不支持——门链就是
 三道门齐备的派发前检查；只做局部检查请直接调用对应子命令。
 
-## 6. 硬规则
+## 6. 接入 `trit-host`
+
+`trit-host run` 在 workspace 已声明 `.agent/repo.json` 时会自动跑 repo gate；要跑完整门链，显式加 `--gate-chain`：
+
+```bash
+trit-host run --task "..." --workspace . \
+  --gate-chain \
+  --handoff-packet .agent/handoff/h-001.json \
+  --handoff-state-hash "$RECEIVER_HASH" \
+  --alignment-manifest .agent/alignment.json
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `--gate-chain` | 启用完整链；给出下面任一参数也会启用 |
+| `--handoff-packet <path>` | 交接包；相对路径按 workspace 解析 |
+| `--handoff-state-hash <hash>` | 交接门要求与包内 `state_hash` 一致；单独给出会报参数错误 |
+| `--alignment-manifest <path>` | 默认 `.agent/alignment.json` |
+
+- 门链在 `--script` 解析与任何工具调用之前执行；拒绝时退出码 `2`，stderr 形如
+  `gate chain rejected at delivery: ...`。
+- 启用门链后不再单独跑 repo gate：`repo` 已经是链上的第一道门。
+- 未配置的门按 `Unknown` 处理：只给 `--alignment-manifest` 而不给交接包，会在
+  delivery 停链。只做局部检查请直接调用对应子命令（`trit-orch repo-gate` /
+  `trit-orch delivery check` / `trit-orch alignment`）。
+- 宿主同样不写账本：`delivery` 仍是只读 `check`，需要推进四态时单独跑
+  `trit-orch delivery`。
+
+## 7. 硬规则
 
 - **只有 `True` 放行**：三值里 `Unknown` 与 `False` 都不继续。
 - **stop-first**：停链后不再执行任何门；`skipped` 不计入通过数。
@@ -147,7 +175,7 @@ assert_eq!(report.exit, 0);
 - **报告可复算**：同一输入重复运行得到同一 `status` / `exit` / `steps[].state`；
   `detail` 里的原始报告也来自各自门。
 
-## 7. 诚实边界
+## 8. 诚实边界
 
 - 不证明“产物在语义上实现了需求”：`alignment` 只做结构检查，`passed` 只表示清单无断链。
 - 不是 ACL、不是沙盒、不是密码学签名：`repo identity` 与交接包都是仓内自报，

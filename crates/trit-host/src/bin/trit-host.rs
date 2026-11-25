@@ -15,6 +15,10 @@ use trit_host::{
     recovery_context_for_session, rewind_session_git_with_policy, rewind_session_with_policy,
     run_headless,
 };
+use trit_orch::alignment::AlignmentOptions;
+use trit_orch::gate_chain::{
+    self as gate_chain_mod, AlignmentStep, DeliveryStep, GateChainOptions,
+};
 use trit_reasonix::TurnSpec;
 
 fn main() {
@@ -44,6 +48,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut repo_identity = false;
     let mut repo_expected = String::new();
     let mut task_kind = "agent".to_owned();
+    let mut gate_chain = false;
+    let mut handoff_packet: Option<PathBuf> = None;
+    let mut handoff_state_hash = String::new();
+    let mut alignment_manifest: Option<PathBuf> = None;
     let mut script = None;
     let mut max_steps = 8usize;
     let mut allow_write = false;
@@ -89,6 +97,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--repo-identity" => repo_identity = true,
             "--repo-expected" => repo_expected = next(&mut args, "--repo-expected")?,
             "--task-kind" => task_kind = next(&mut args, "--task-kind")?,
+            "--gate-chain" => gate_chain = true,
+            "--handoff-packet" => {
+                handoff_packet = Some(PathBuf::from(next(&mut args, "--handoff-packet")?));
+            }
+            "--handoff-state-hash" => {
+                handoff_state_hash = next(&mut args, "--handoff-state-hash")?;
+            }
+            "--alignment-manifest" => {
+                alignment_manifest = Some(PathBuf::from(next(&mut args, "--alignment-manifest")?));
+            }
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => {
                 max_steps = next(&mut args, "--max-steps")?
@@ -263,9 +281,53 @@ fn run() -> Result<(), Box<dyn Error>> {
     if mcp_sampling && provider != "openai" {
         return Err(fail("--mcp-sampling requires --provider openai"));
     }
+    if handoff_packet.is_none() && !handoff_state_hash.trim().is_empty() {
+        return Err(fail("--handoff-state-hash requires --handoff-packet"));
+    }
     let workspace_root = workspace.clone();
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
-    if repo_identity || !repo_expected.trim().is_empty() || identity_path.exists() {
+    let gate_chain_requested =
+        gate_chain || handoff_packet.is_some() || alignment_manifest.is_some();
+    if gate_chain_requested {
+        let delivery = handoff_packet.map(|packet| {
+            let packet = if packet.is_absolute() {
+                packet
+            } else {
+                workspace_root.join(packet)
+            };
+            DeliveryStep {
+                packet,
+                receiver_state_hash: handoff_state_hash.trim().to_owned(),
+                at: 0,
+            }
+        });
+        let manifest = alignment_manifest.unwrap_or_else(|| PathBuf::from(".agent/alignment.json"));
+        let report = gate_chain_mod::run(&GateChainOptions {
+            root: workspace_root.clone(),
+            expected_repo: repo_expected.clone(),
+            task_kind: task_kind.clone(),
+            delivery,
+            alignment: Some(AlignmentStep {
+                manifest,
+                options: AlignmentOptions::default(),
+            }),
+        });
+        if report.status != "passed" {
+            let failed_at = report
+                .failed_at
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let reason = report
+                .steps
+                .iter()
+                .find(|step| Some(step.id.as_str()) == report.failed_at.as_deref())
+                .map(|step| step.reason.clone())
+                .unwrap_or_default();
+            return Err(fail(format!(
+                "gate chain rejected at {failed_at}: {reason}"
+            )));
+        }
+    } else if repo_identity || !repo_expected.trim().is_empty() || identity_path.exists() {
         let decision = trit_orch::repo::gate(&workspace_root, &repo_expected, &task_kind);
         if decision.gate != trit_orch::Ternary::True {
             return Err(fail(format!("repo gate rejected: {}", decision.reason)));
@@ -687,6 +749,8 @@ fn usage() {
          usage:\n  \
          trit-host run --task <text> --workspace <dir> \\\n    \
          [--repo-identity [--repo-expected <owner/repo>] [--task-kind agent|ternary|...]] \\\n    \
+         [--gate-chain [--handoff-packet <path>] [--handoff-state-hash <hash>] \\\n    \
+         [--alignment-manifest <path>]] \\\n    \
          [--provider scripted|openai] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
@@ -709,6 +773,9 @@ fn usage() {
          --repo-identity: fail closed unless .agent/repo.json is valid; --repo-expected\n\
          additionally pins owner/repo, and agent tasks require owns_agent_runtime=true.\n\
          If the workspace already contains .agent/repo.json, the gate runs automatically.\n\
+         --gate-chain: run the read-only repo -> delivery -> alignment chain before the run.\n\
+         It needs a handoff packet and an alignment manifest (default .agent/alignment.json);\n\
+         Unknown or False stops the chain and the run does not start.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\
