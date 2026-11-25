@@ -1023,8 +1023,8 @@ pub use reasonix_wire::{
 };
 pub use sampling::OpenAiSamplingHandler;
 pub use session::{
-    GateChainPhase, SESSION_SCHEMA, Session, SessionEvent, SessionLog, SessionRecord, SessionState,
-    TurnRecord, recover, recovery_context_for_session,
+    GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
+    SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
 };
 pub use session_migration::{
     CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,

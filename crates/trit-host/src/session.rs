@@ -281,6 +281,23 @@ fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
 pub struct SessionState {
     pub turns: Vec<TurnRecord>,
     pub usage: TokenUsage,
+    /// 门链结论历史（按出现顺序）；`recover` 从 `GateChain` 事件填充。
+    pub gate_chains: Vec<GateChainRecord>,
+}
+
+/// 一条门链结论，字段与 `SessionEvent::GateChain` 对应。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateChainRecord {
+    pub phase: GateChainPhase,
+    pub status: String,
+    pub exit: i32,
+    pub failed_at: Option<String>,
+    pub failures: usize,
+    pub passed: usize,
+    pub blocked: usize,
+    pub unknown: usize,
+    pub skipped: usize,
+    pub report: Option<String>,
 }
 
 impl SessionState {
@@ -359,6 +376,31 @@ pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
                 turn.complete = *complete;
                 turn.finished = true;
                 state.turns.push(turn);
+            }
+            SessionEvent::GateChain {
+                phase,
+                status,
+                exit,
+                failed_at,
+                failures,
+                passed,
+                blocked,
+                unknown,
+                skipped,
+                report,
+            } => {
+                state.gate_chains.push(GateChainRecord {
+                    phase: *phase,
+                    status: status.clone(),
+                    exit: *exit,
+                    failed_at: failed_at.clone(),
+                    failures: *failures,
+                    passed: *passed,
+                    blocked: *blocked,
+                    unknown: *unknown,
+                    skipped: *skipped,
+                    report: report.clone(),
+                });
             }
             _ => {}
         }

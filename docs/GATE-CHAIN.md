@@ -214,8 +214,8 @@ trit-host run --task "..." --workspace . \
   拒绝），避免在超大工作区里把整份变更集读进内存。
 - 给了 `--session` 时，pre / post 结论会作为 `gate_chain` 事件追加到 session
   JSONL（`phase`、`status`、`exit`、`failed_at`、各状态计数、可选 `report` 路径）。
-  事件不改变 turn 状态机，`recover` 会忽略它；session 文件本身也会从 post 的
-  `changed` 中排除。
+  事件不改变 turn 状态机，`recover` 会把它们填进 `SessionState.gate_chains`；
+  session 文件本身也会从 post 的 `changed` 中排除。
 
 ## 8. 硬规则
 

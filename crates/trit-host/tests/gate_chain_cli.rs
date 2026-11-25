@@ -620,6 +620,11 @@ fn host_logs_gate_chain_to_session() {
     // 门链事件不改变 turn 状态机：recover 仍然只看到一轮。
     let state = trit_host::recover(&records).unwrap();
     assert_eq!(state.turns.len(), 1, "{state:?}");
+    assert_eq!(state.gate_chains.len(), 2, "{state:?}");
+    assert_eq!(state.gate_chains[0].phase, trit_host::GateChainPhase::Pre);
+    assert_eq!(state.gate_chains[0].status, "passed");
+    assert_eq!(state.gate_chains[1].phase, trit_host::GateChainPhase::Post);
+    assert_eq!(state.gate_chains[1].status, "aligned");
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
