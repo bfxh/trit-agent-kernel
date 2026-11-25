@@ -10,3 +10,6 @@ __pycache__/
 
 # DeliveryReceipt 四态账本是本机自报证据，不进公开树。
 .agent/delivery/
+
+# 跨进程写租约是本机状态，不进公开树。
+.agent/write-lease

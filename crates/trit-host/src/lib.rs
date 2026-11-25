@@ -953,6 +953,7 @@ pub mod context_projection;
 pub mod context_tools;
 pub mod frontend_compat;
 pub mod git_checkpoint;
+pub mod lease;
 pub mod mcp_tools;
 pub mod openai;
 pub mod permissions;
@@ -999,6 +1000,7 @@ pub use frontend_compat::{
 pub use git_checkpoint::{
     GitCheckpointStore, GitCheckpointingTools, rewind_session_git, rewind_session_git_with_policy,
 };
+pub use lease::{LEASE_PATH, LeaseError, OperationLease};
 pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use permissions::{

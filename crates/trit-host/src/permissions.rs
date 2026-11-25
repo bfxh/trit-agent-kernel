@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::lease::OperationLease;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,11 +236,26 @@ impl WriteClaim {
 pub struct ClaimingTools<T> {
     inner: T,
     claim: WriteClaim,
+    lease: Option<OperationLease>,
 }
 
 impl<T> ClaimingTools<T> {
     pub fn new(inner: T, claim: WriteClaim) -> Self {
-        Self { inner, claim }
+        Self {
+            inner,
+            claim,
+            lease: None,
+        }
+    }
+
+    /// 绑定跨进程写租约：每次非只读调用前校验 fencing token，失效即 fail-closed。
+    pub fn with_lease(mut self, lease: OperationLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    pub fn lease(&self) -> Option<&OperationLease> {
+        self.lease.as_ref()
     }
 
     pub fn claim(&self) -> &WriteClaim {
@@ -257,6 +273,12 @@ impl<T> ClaimingTools<T> {
 
 impl<T: ToolExecutor> ToolExecutor for ClaimingTools<T> {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        if !request.read_only
+            && let Some(lease) = self.lease.as_ref()
+            && !lease.check()
+        {
+            return Ok(blocked(request, "write lease is no longer valid"));
+        }
         if self.claim.allows_request(request) {
             self.inner.execute(request)
         } else {
