@@ -17,8 +17,10 @@
 //! 与幂等键一致。
 
 use std::collections::BTreeMap;
+use std::fs::{OpenOptions, read_to_string};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +49,8 @@ pub struct LedgerServerConfig {
     pub pending_ttl: Duration,
     /// 最多保存多少个键（含占位与完成）。
     pub max_entries: usize,
+    /// 可选持久化文件：只追加“已完成”记录，重启时回放；占位不落盘。
+    pub state_path: Option<PathBuf>,
 }
 
 impl LedgerServerConfig {
@@ -56,6 +60,7 @@ impl LedgerServerConfig {
             token: None,
             pending_ttl: DEFAULT_PENDING_TTL,
             max_entries: DEFAULT_MAX_ENTRIES,
+            state_path: None,
         }
     }
 
@@ -71,6 +76,11 @@ impl LedgerServerConfig {
 
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries.max(1);
+        self
+    }
+
+    pub fn with_state_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.state_path = Some(path.into());
         self
     }
 }
@@ -129,10 +139,16 @@ impl LedgerServer {
             ));
         }
         let listener = TcpListener::bind(config.bind.as_str())?;
+        let state = match config.state_path.as_deref() {
+            Some(path) => Arc::new(Mutex::new(LedgerState {
+                entries: load_entries(path, config.max_entries)?,
+            })),
+            None => Arc::default(),
+        };
         Ok(Self {
             listener,
             config,
-            state: Arc::default(),
+            state,
             completions: Arc::default(),
         })
     }
@@ -330,7 +346,19 @@ impl LedgerServerView<'_> {
                 None => return false,
             }
         }
-        state.entries.insert(key.to_string(), Entry::Done { frame });
+        state.entries.insert(
+            key.to_string(),
+            Entry::Done {
+                frame: frame.clone(),
+            },
+        );
+        if let Some(path) = self.config.state_path.as_deref()
+            && append_record(path, key, &frame).is_err()
+        {
+            // 写盘失败就不承认完成：撤掉刚插入的记录，调用方拿到 5xx。
+            state.entries.remove(key);
+            return false;
+        }
         true
     }
 }
@@ -344,6 +372,108 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> std:
     )?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredRecord {
+    key: String,
+    /// 响应帧的十六进制编码；避免为字节引入额外依赖。
+    frame: String,
+}
+
+/// 从追加日志加载已完成记录；只保留最后 `max_entries` 条。
+fn load_entries(path: &Path, max_entries: usize) -> std::io::Result<BTreeMap<String, Entry>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let text = read_to_string(path)?;
+    let mut records = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: StoredRecord = serde_json::from_str(line)
+            .map_err(|error| invalid_data(format!("{}:{}: {error}", path.display(), index + 1)))?;
+        records.push(record);
+    }
+    let keep_from = records.len().saturating_sub(max_entries);
+    let mut entries = BTreeMap::new();
+    for record in records.into_iter().skip(keep_from) {
+        let frame = hex_decode(&record.frame)
+            .ok_or_else(|| invalid_data(format!("{}: bad hex frame", path.display())))?;
+        let mut buffer = frame.clone();
+        let response: SubagentResponse = match decode_frame(&mut buffer) {
+            Ok(Some(response)) => response,
+            _ => {
+                return Err(invalid_data(format!(
+                    "{}: stored frame is not a valid response",
+                    path.display()
+                )));
+            }
+        };
+        if format!("{}@{}", response.task, response.epoch) != record.key {
+            return Err(invalid_data(format!(
+                "{}: stored frame does not match key {}",
+                path.display(),
+                record.key
+            )));
+        }
+        entries.insert(record.key, Entry::Done { frame });
+    }
+    Ok(entries)
+}
+
+/// 追加一条已完成记录并落盘。
+fn append_record(path: &Path, key: &str, frame: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let record = StoredRecord {
+        key: key.to_string(),
+        frame: hex_encode(frame),
+    };
+    let line = serde_json::to_string(&record)
+        .map_err(|error| invalid_data(format!("serialize ledger record: {error}")))?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
+    file.sync_all()
+}
+
+fn invalid_data(message: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let high = hex_value(pair[0])?;
+        let low = hex_value(pair[1])?;
+        output.push(high << 4 | low);
+    }
+    Some(output)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// 账本客户端：申请执行权。

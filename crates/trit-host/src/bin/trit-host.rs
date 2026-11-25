@@ -1321,7 +1321,7 @@ fn usage() {
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
-         [--pending-ttl-ms N] [--max-entries N] [--once]\n\
+         [--pending-ttl-ms N] [--max-entries N] [--state <path>] [--once]\n\
          shared idempotency ledger: POST /claim and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
@@ -1780,6 +1780,7 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                     std::time::Duration::from_millis(next(&mut args, "--pending-ttl-ms")?.parse()?);
             }
             "--max-entries" => config.max_entries = next(&mut args, "--max-entries")?.parse()?,
+            "--state" => config.state_path = Some(PathBuf::from(next(&mut args, "--state")?)),
             "--once" => once = true,
             other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),
         }

@@ -192,7 +192,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `POST /claim` + `POST /complete`，键仍是 `X-Trit-Idempotency: <task>@<epoch>`。
   claim 返回 `200` 空体 = 获得执行权，`200` + 帧 = 已完成、直接回放，`409` = 他人
   持有；complete 用同一帧登记（`204`，重复登记幂等）。占位 TTL 默认 60s，过期
-  允许接管；容量默认 4096，满时先淘汰已完成项。
+  允许接管；容量默认 4096，满时先淘汰已完成项。`--state <path>` 打开追加日志，
+  complete 先落盘再登记（写盘失败回 5xx），重启时回放最后 `max_entries` 条，
+  已完成任务不会再执行；占位不落盘，崩溃后按 TTL 语义重新可执行。
   `remote-echo --ledger <url>` 接入后，带键请求以账本为权威：账本不可达回 503
   且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权。
 
@@ -200,7 +202,7 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝。`tests/remote_ledger.rs`
 覆盖 claim/pending/完成回放/TTL 接管、共享账本下双节点只执行一次、账本不可达
-时 fail-closed；`tests/remote_exec.rs` 覆盖 `remote-exec` 真实写文件与
+时 fail-closed，以及落盘账本重启后回放；`tests/remote_exec.rs` 覆盖 `remote-exec` 真实写文件与
 `run_remote_plan` 派发到真实执行器。
 
 **仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）。
@@ -234,8 +236,9 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
   **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/complete，
   换机重试也能做到**至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
-  账本不可达时 fail-closed（503）。例外是占位 TTL 过期后的接管：若老执行者
-  仍然存活并完成，会再登记一次，TTL 越长越安全。
+  账本不可达时 fail-closed（503）。配合 `--state` 时已完成记录跨重启保留；
+  例外是占位 TTL 过期后的接管：若老执行者仍然存活并完成，会再登记一次，
+  TTL 越长越安全。
 - CLI `trit-host remote-plan [--input <json|->]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
