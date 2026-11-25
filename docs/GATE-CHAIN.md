@@ -102,6 +102,7 @@
 | `changed` / `changed_known` | 未给 / `false` | 与 `alignment` 子命令同语义 |
 | `strict` | `true` | `false` 时 `should` 只警告 |
 | `executed` | 未给 | `alignment/3` 的 run provenance 复核 |
+| `out` | 未给 | 把同一份报告写到该路径（`root` 相对）；stdout 仍输出 |
 
 退出码与 `alignment` 一致：
 
@@ -186,6 +187,8 @@ trit-host run --task "..." --workspace . \
 | `--alignment-changed-set` | 把 changed 标记为完整集，要求声明 changes 全部兑现 |
 | `--alignment-no-git-changed` | 关闭默认的 git 变更查找 |
 | `--gate-chain-post` | run 结束后用实际 git 变更（完整集）复核对齐；失败退出 `2` |
+| `--gate-chain-report <path>` | 把 pre 报告写到该路径（workspace 相对） |
+| `--gate-chain-post-report <path>` | 把 post 报告写到该路径；失败时也会写 |
 
 - changed 默认取 workspace 的 `git status`（含未跟踪文件，路径相对 workspace）作为
   **子集**：只检查已给出的变更有没有对齐，不要求声明的 `changes` 全部兑现。不是
@@ -203,6 +206,9 @@ trit-host run --task "..." --workspace . \
 - `--gate-chain-post` 是 **post 语义**：run 已经发生，复核只判“实际写盘是否仍对齐”，
   失败退出 `2` 但不回滚文件；stdout 的 outcome 仍按 run 的真实结果输出。工作区不是
   git 仓时直接拒绝（读不到实际变更），不做“看起来通过”的降级。
+- pre / post 报告可用 `--gate-chain-report` / `--gate-chain-post-report` 落盘；报告
+  文件本身会从 post 的 `changed` 中排除，避免 `pre.json` 被当成未对齐变更；post
+  失败时报告仍会写入，便于审计。
 
 ## 8. 硬规则
 

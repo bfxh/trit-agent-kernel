@@ -4,8 +4,9 @@
 //! `{"root":".","expected":"owner/repo","task_kind":"agent",
 //!  "packet":".agent/handoff/h-001.json","receiver_state_hash":"H","at":0,
 //!  "manifest":".agent/alignment.json","changed":[],"changed_known":false,
-//!  "strict":true,"executed":[]}`
+//!  "strict":true,"executed":[],"out":""}`
 //!
+//! `out` 非空时把报告同时写到该路径（`root` 相对），stdout 仍输出同一份 JSON。
 //! 输出 `gate-chain/1` 报告；退出码与 `alignment` 一致：
 //! `0` 全链通过、`1` 有明确拒绝、`3` 有无法判定的门。
 use std::path::PathBuf;
@@ -31,6 +32,7 @@ struct GateChainInput {
     changed_known: bool,
     strict: Option<bool>,
     executed: Option<Vec<String>>,
+    out: String,
 }
 
 pub(crate) fn run(input: &str) -> Result<(Value, i32), Error> {
@@ -79,6 +81,26 @@ pub(crate) fn run(input: &str) -> Result<(Value, i32), Error> {
         }),
     };
     let report = gate_chain::run(&options);
+    let out = request.out.trim();
+    if !out.is_empty() {
+        let path = PathBuf::from(out);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            options.root.join(path)
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| Error::InputParse {
+                message: format!("create {}: {error}", parent.display()),
+            })?;
+        }
+        let bytes = serde_json::to_vec_pretty(&report).map_err(|error| Error::InputParse {
+            message: format!("serialize gate-chain report: {error}"),
+        })?;
+        std::fs::write(&path, bytes).map_err(|error| Error::InputParse {
+            message: format!("write gate-chain report {}: {error}", path.display()),
+        })?;
+    }
     let exit = report.exit;
     let value = serde_json::to_value(&report).map_err(|error| Error::InputParse {
         message: format!("serialize gate-chain report: {error}"),

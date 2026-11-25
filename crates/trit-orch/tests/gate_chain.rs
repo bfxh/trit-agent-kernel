@@ -363,3 +363,30 @@ fn cli_attach_writes_the_delivery_ledger() {
     let journal = trit_orch::delivery::DeliveryJournal::load(&root, "h-001").unwrap();
     assert_eq!(journal.state_names(), vec!["sent", "delivered"]);
 }
+
+#[test]
+fn cli_out_writes_report_file() {
+    let root = root("cli-out");
+    identity(&root, "bfxh/trit-agent-kernel", true);
+    options(&root);
+    let (code, value) = cli_support::run(
+        "gate-chain",
+        &json!({
+            "root": root.to_string_lossy(),
+            "expected": "bfxh/trit-agent-kernel",
+            "task_kind": "agent",
+            "packet": "packet.json",
+            "receiver_state_hash": "H",
+            "at": 1000,
+            "manifest": "alignment.json",
+            "out": ".agent/gate-chain/report.json"
+        }),
+    );
+    assert_eq!(code, 0, "{value}");
+    let saved: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join(".agent/gate-chain/report.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["schema"], "gate-chain/1");
+    assert_eq!(saved["status"], value["status"]);
+}

@@ -58,6 +58,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut alignment_changed_set = false;
     let mut alignment_no_git_changed = false;
     let mut gate_chain_post = false;
+    let mut gate_chain_report: Option<PathBuf> = None;
+    let mut gate_chain_post_report: Option<PathBuf> = None;
     let mut script = None;
     let mut max_steps = 8usize;
     let mut allow_write = false;
@@ -120,6 +122,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--alignment-changed-set" => alignment_changed_set = true,
             "--alignment-no-git-changed" => alignment_no_git_changed = true,
             "--gate-chain-post" => gate_chain_post = true,
+            "--gate-chain-report" => {
+                gate_chain_report = Some(PathBuf::from(next(&mut args, "--gate-chain-report")?));
+            }
+            "--gate-chain-post-report" => {
+                gate_chain_post_report =
+                    Some(PathBuf::from(next(&mut args, "--gate-chain-post-report")?));
+            }
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => {
                 max_steps = next(&mut args, "--max-steps")?
@@ -356,6 +365,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 },
             }),
         });
+        if let Some(path) = gate_chain_report.as_ref() {
+            write_report(&workspace_root, path, &report)?;
+        }
         if report.status != "passed" {
             let failed_at = report
                 .failed_at
@@ -671,7 +683,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
     )?;
     if gate_chain_post {
-        verify_post_alignment(&workspace_root, &manifest_path)?;
+        verify_post_alignment(
+            &workspace_root,
+            &manifest_path,
+            gate_chain_post_report.as_deref(),
+            gate_chain_report.as_deref(),
+        )?;
     }
     if !outcome.judgment.is_complete() {
         if let Some(runtime) = supervisor_runtime.as_mut() {
@@ -900,12 +917,25 @@ fn normalize_changed(raw: &str, root: &Path) -> Result<String, Box<dyn Error>> {
 }
 
 /// run 结束后用实际落盘变更复核对齐：`changed_known=true`，不再接受子集语义。
-fn verify_post_alignment(root: &Path, manifest: &Path) -> Result<(), Box<dyn Error>> {
-    let Some(changed) = git_changed(root) else {
+///
+/// `report_path` 为 `None` 时不落盘；`exclude` 是 pre 报告路径，报告文件本身
+/// 不应被当成“未对齐变更”。
+fn verify_post_alignment(
+    root: &Path,
+    manifest: &Path,
+    report_path: Option<&Path>,
+    exclude: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(mut changed) = git_changed(root) else {
         return Err(fail(
             "gate chain post: workspace is not a git repository; cannot read actual changes",
         ));
     };
+    for path in [report_path, exclude].into_iter().flatten() {
+        if let Some(relative) = relative_to_root(root, path) {
+            changed.retain(|item| item != &relative);
+        }
+    }
     let report = trit_orch::alignment::check(
         root,
         manifest,
@@ -916,6 +946,9 @@ fn verify_post_alignment(root: &Path, manifest: &Path) -> Result<(), Box<dyn Err
             executed: None,
         },
     );
+    if let Some(path) = report_path {
+        write_report(root, path, &report)?;
+    }
     eprintln!(
         "gate chain post: {} (must score {:.2}, {} failure(s))",
         report.status,
@@ -933,6 +966,42 @@ fn verify_post_alignment(root: &Path, manifest: &Path) -> Result<(), Box<dyn Err
     Ok(())
 }
 
+/// 把报告写到 `root` 相对（或绝对）路径；父目录不存在时创建。
+fn write_report(
+    root: &Path,
+    path: &Path,
+    value: &impl serde::Serialize,
+) -> Result<(), Box<dyn Error>> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| fail(format!("create {}: {error}", parent.display())))?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| fail(format!("serialize report: {error}")))?;
+    std::fs::write(&path, bytes)
+        .map_err(|error| fail(format!("write report {}: {error}", path.display())))?;
+    Ok(())
+}
+
+/// `path` 相对 `root` 的 `/` 路径；不在 root 下或无法解析时返回 `None`。
+fn relative_to_root(root: &Path, path: &Path) -> Option<String> {
+    let root_abs = std::path::absolute(root).ok()?;
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let path_abs = std::path::absolute(&candidate).ok()?;
+    let stripped = path_abs.strip_prefix(&root_abs).ok()?;
+    let text = stripped.to_string_lossy();
+    (!text.is_empty()).then(|| text.replace('\\', "/"))
+}
+
 fn usage() {
     eprintln!(
         "trit-host - headless Rust agent host\n\n\
@@ -942,7 +1011,8 @@ fn usage() {
          [--gate-chain [--handoff-packet <path>] [--handoff-state-hash <hash>] \\\n    \
          [--handoff-attach] [--alignment-manifest <path>] \\\n    \
          [--alignment-changed <path>] [--alignment-changed-set] \\\n    \
-         [--alignment-no-git-changed] [--gate-chain-post]] \\\n    \
+         [--alignment-no-git-changed] [--gate-chain-post] \\\n    \
+         [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
          [--provider scripted|openai] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
@@ -975,6 +1045,8 @@ fn usage() {
          the set complete and enforces declared changes.\n\
          --gate-chain-post: after the run, re-check alignment against actual git changes\n\
          (complete set); a failure exits 2 and does not roll back the run.\n\
+         --gate-chain-report / --gate-chain-post-report: write the pre/post report JSON\n\
+         to the given path (workspace relative); report files are excluded from post checks.\n\
          Shell needs an OS sandbox; --allow-unsandboxed-shell is an explicit downgrade.\n\
          --resume reloads prior turns from --session and appends one new turn.\n\
          checkpoint: files (per-file snapshots) or git (shadow bare repo of the workspace).\n\

@@ -496,3 +496,77 @@ fn host_post_requires_git_workspace() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
+
+#[test]
+fn host_writes_gate_chain_reports() {
+    let root = root("reports");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("reports", "src/a.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-report",
+            ".agent/gate-chain/pre.json",
+            "--gate-chain-post-report",
+            ".agent/gate-chain/post.json",
+            "--gate-chain-post",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let pre: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".agent/gate-chain/pre.json")).unwrap())
+            .unwrap();
+    assert_eq!(pre["schema"], "gate-chain/1");
+    assert_eq!(pre["status"], "passed");
+    let post: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".agent/gate-chain/post.json")).unwrap())
+            .unwrap();
+    assert_eq!(post["status"], "aligned");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn host_post_report_is_written_on_failure() {
+    let root = root("post-report-fail");
+    fixture(&root);
+    git_repo(&root);
+    let script_path = script("post-report-fail", "src/b.py");
+    let (code, text) = host(
+        &root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--gate-chain",
+            "--handoff-packet",
+            "packet.json",
+            "--handoff-state-hash",
+            "H",
+            "--alignment-manifest",
+            "alignment.json",
+            "--gate-chain-post-report",
+            ".agent/gate-chain/post.json",
+            "--gate-chain-post",
+        ],
+    );
+    assert_eq!(code, Some(2), "{text}");
+    let post: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join(".agent/gate-chain/post.json")).unwrap())
+            .unwrap();
+    assert_eq!(post["status"], "unaligned");
+    assert!(!post["failures"].as_array().unwrap().is_empty());
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
