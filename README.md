@@ -55,6 +55,7 @@ Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**�
 - 内核-前端能力门禁：`FeatureGate` 按 `api_level`、前端能力表、依赖和显式开关决定启用 / 关闭 / 锁住；锁住的能力对前端隐藏并产生带 owner 的通知，扩展坞按组 fail-closed。实现见 `frontend_compat.rs`，契约见 `docs/FRONTEND-CONTRACT.md`。
 - 远程子 agent（最小真实传输）：`run_remote_subagent` 把 subagent 帧以 `application/x-trit-frame` 单次 `POST` 送到 `RemoteEndpoint`（可选 Bearer、整请求超时、不跟随重定向、响应体 ≤ 8 MiB + 4，并携带幂等键 `X-Trit-Idempotency`）；`trit-host remote-echo` 是参考服务端，带键请求按 `task@epoch` 去重。非 2xx / 空体 / 截断 / 超限 / 传输失败都不产生 `Completed`；节点发现仍不在范围。见 [docs/PLANNER-FLEET.md](docs/PLANNER-FLEET.md)。
 - 跨机调度（第一切片）：`NodeTable` 按 `in_flight / max_in_flight` 负载比选节点、按节点容量准入并对连续失败的节点隔离；`run_remote_plan` 复用 fleet 的 DAG/并发/失败传播，把任务派到静态 `RemoteNode` 表，报告保留每任务节点归属、每次尝试记录、精确 `Aborted`/`Failed` 状态与节点快照；节点级失败可显式开启有界换机重试（同幂等键，默认 0 次）；`trit-host remote-plan` 提供跨机演练 CLI（读任务与节点 JSON，输出带 `attempts`/`nodes` 的报告）。动态节点发现与无限自动重试仍不在范围。见 [docs/PLANNER-FLEET.md](docs/PLANNER-FLEET.md)。
+- 跨机幂等账本（可选的严格至多一次）：`trit-host remote-ledger` 提供 `/claim` + `/complete`，`remote-echo --ledger <url>` 接入后所有带键请求先 claim 再执行、完成帧跨节点回放；账本不可达时 fail-closed，占位 TTL 过期才允许接管。见 [docs/PLANNER-FLEET.md](docs/PLANNER-FLEET.md)。
 - 无头 agent：OpenAI-compatible provider、scripted replay、session JSONL、`--resume`。
 - 文件级 checkpoint/rewind：预检、symlink/类型拒绝、应用失败逆序回滚。
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。

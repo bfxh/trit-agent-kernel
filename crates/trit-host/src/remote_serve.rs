@@ -14,7 +14,11 @@
 //! 4. **一连接一请求**：读满一帧即回包并关闭，便于宿主侧超时语义保持简单；
 //! 5. **带键才去重**：`X-Trit-Idempotency` 必须等于帧里的 `task@epoch`，否则 400；
 //!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效），缓存上限
-//!    [`MAX_CACHED_RESPONSES`]，按 FIFO 淘汰。没有头就按普通请求处理。
+//!    [`MAX_CACHED_RESPONSES`]，按 FIFO 淘汰。没有头就按普通请求处理；
+//! 6. **账本优先**：配置 `ledger` 后，带键请求先向共享账本 claim；账本返回完成帧
+//!    就直接回放，返回占位则轮询等待，拿到执行权才执行，执行后必须 complete。
+//!    账本不可达时回 503，宁可不执行也不冒重复执行的风险。`Silent` 模式不产生
+//!    响应帧，无法登记完成，账本占位会留到 TTL 过期。
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -23,9 +27,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use trit_orch::{
-    DelegationStatus, MAX_FRAME_BYTES, SubagentRequest, SubagentResponse, decode_frame,
-    encode_frame,
+    DelegationStatus, MAX_FRAME_BYTES, RemoteEndpoint, SubagentRequest, SubagentResponse,
+    decode_frame, encode_frame,
 };
+
+use crate::remote_ledger::{self, Claim};
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -58,6 +64,8 @@ pub struct RemoteServerConfig {
     pub mode: RemoteMode,
     /// 回包前的人为延迟（毫秒），用于验证宿主超时。
     pub sleep_ms: u64,
+    /// 可选的共享幂等账本；配置后带键请求以账本为准，本地缓存不再参与。
+    pub ledger: Option<RemoteEndpoint>,
 }
 
 impl RemoteServerConfig {
@@ -67,6 +75,7 @@ impl RemoteServerConfig {
             token: None,
             mode: RemoteMode::Echo,
             sleep_ms: 0,
+            ledger: None,
         }
     }
 
@@ -84,6 +93,11 @@ impl RemoteServerConfig {
         self.sleep_ms = sleep_ms;
         self
     }
+
+    pub fn with_ledger(mut self, ledger: RemoteEndpoint) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
 }
 
 /// 已绑定的参考服务端。
@@ -96,6 +110,11 @@ pub struct RemoteServer {
 impl RemoteServer {
     /// 绑定监听地址；失败即返回，不重试。
     pub fn bind(config: RemoteServerConfig) -> std::io::Result<Self> {
+        if let Some(ledger) = config.ledger.as_ref() {
+            ledger.validate().map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })?;
+        }
         let listener = TcpListener::bind(config.bind.as_str())?;
         Ok(Self {
             listener,
@@ -213,12 +232,34 @@ fn handle(
         Some(value) if value == key => true,
         Some(_) => return respond(&mut stream, 400, "Bad Request", b""),
     };
-    if dedupe && let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
-        let frame = match encode_frame(&cached) {
-            Ok(frame) => frame,
-            Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
-        };
-        return respond(&mut stream, 200, "OK", &frame);
+    let mut ledger_owned = false;
+    if dedupe {
+        if let Some(endpoint) = config.ledger.as_ref() {
+            // 账本是跨机权威：先 claim，再执行；等待期内轮询完成响应。
+            let deadline = std::time::Instant::now() + Duration::from_secs(endpoint.timeout_secs);
+            loop {
+                match remote_ledger::claim(endpoint, &key) {
+                    Ok(Claim::New) => {
+                        ledger_owned = true;
+                        break;
+                    }
+                    Ok(Claim::Done(frame)) => return respond(&mut stream, 200, "OK", &frame),
+                    Ok(Claim::Pending) => {
+                        if std::time::Instant::now() >= deadline {
+                            return respond(&mut stream, 409, "Conflict", b"");
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => return respond(&mut stream, 503, "Service Unavailable", b""),
+                }
+            }
+        } else if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+            let frame = match encode_frame(&cached) {
+                Ok(frame) => frame,
+                Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
+            };
+            return respond(&mut stream, 200, "OK", &frame);
+        }
     }
 
     if config.sleep_ms > 0 {
@@ -243,7 +284,16 @@ fn handle(
         Ok(frame) => frame,
         Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
     };
-    if dedupe && let Ok(mut guard) = cache.lock() {
+    if ledger_owned && let Some(endpoint) = config.ledger.as_ref() {
+        // 执行后必须登记；登记失败时回 5xx，宁可让调用方失败也不谎报完成。
+        if remote_ledger::complete(endpoint, &key, &frame).is_err() {
+            return respond(&mut stream, 503, "Service Unavailable", b"");
+        }
+    }
+    if dedupe
+        && !ledger_owned
+        && let Ok(mut guard) = cache.lock()
+    {
         if guard.len() >= MAX_CACHED_RESPONSES
             && let Some(oldest) = guard.keys().next().cloned()
         {

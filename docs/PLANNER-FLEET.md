@@ -184,10 +184,19 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `X-Trit-Idempotency` 且与帧一致时按 `<task>@<epoch>` 缓存首次响应（重试直接
   回缓存、不再执行），缓存上限 1024、FIFO 淘汰；头与帧不一致回 400。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口。
+- 共享幂等账本 `trit_host::remote_ledger`（CLI `trit-host remote-ledger`）：
+  `POST /claim` + `POST /complete`，键仍是 `X-Trit-Idempotency: <task>@<epoch>`。
+  claim 返回 `200` 空体 = 获得执行权，`200` + 帧 = 已完成、直接回放，`409` = 他人
+  持有；complete 用同一帧登记（`204`，重复登记幂等）。占位 TTL 默认 60s，过期
+  允许接管；容量默认 4096，满时先淘汰已完成项。
+  `remote-echo --ledger <url>` 接入后，带键请求以账本为权威：账本不可达回 503
+  且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权。
 
 回归在 `crates/trit-host/tests/remote_subagent.rs`：loopback 服务端与真实
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
-超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝。
+超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝。`tests/remote_ledger.rs`
+覆盖 claim/pending/完成回放/TTL 接管、共享账本下双节点只执行一次、账本不可达
+时 fail-closed。
 
 **仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）。
 静态节点表、派发与有界换机重试见 §9。
@@ -215,12 +224,13 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   - `nodes`：`attempts / failures / healthy` 快照。
 - **有界重试（默认 0，显式 opt-in）**：只有节点级失败（传输错误 / 超时 /
   `Aborted` / 远端回 `Deferred`）才换节点重试，最多 `retry_limit` 次；任务级
-  `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: <task>@<epoch>`，
-  要求服务端按 key 去重；参考实现 `remote-echo` 将首次响应缓存
-  （上限 1024，FIFO 淘汰），带键命中直接回缓存、不再执行。没有幂等保证的
-  服务端不应开启重试。**注意这是 at-least-once**：换到一台从未见过该 key 的
-  机器时，服务端无法判重；要跨机严格至多一次，需要共享幂等账本或把重试固定
-  在同一端点。
+  `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: <task>@<epoch>`。
+  未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（上限 1024，FIFO
+  淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
+  **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/complete，
+  换机重试也能做到**至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
+  账本不可达时 fail-closed（503）。例外是占位 TTL 过期后的接管：若老执行者
+  仍然存活并完成，会再登记一次，TTL 越长越安全。
 - CLI `trit-host remote-plan [--input <json|->]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
@@ -230,8 +240,9 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
 隔离阈值、排除集合、drop 记账、JSON 默认值）、`crates/trit-host/tests/remote_fleet.rs`
 （真实双节点均衡、无响应节点隔离、远端任务失败不重试、换节点重试复用幂等键、
-重试上限、预取消、非法节点表）与 `crates/trit-host/tests/remote_plan_cli.rs`
-（`remote-plan` 真实双节点演练与重复节点 ID 拒绝）。
+重试上限、预取消、非法节点表）、`crates/trit-host/tests/remote_plan_cli.rs`
+（`remote-plan` 真实双节点演练与重复节点 ID 拒绝）与
+`crates/trit-host/tests/remote_ledger.rs`（共享账本下双节点单次执行）。
 
 ## 非目标
 

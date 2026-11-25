@@ -996,6 +996,7 @@ pub mod provider_health;
 pub mod provider_stream;
 pub mod reasonix_wire;
 pub mod remote_fleet;
+pub mod remote_ledger;
 pub mod remote_serve;
 pub mod remote_subagent;
 pub mod sampling;
@@ -1076,6 +1077,7 @@ pub use reasonix_wire::{
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
 pub use remote_fleet::{RemoteAttempt, RemotePlanConfig, RemotePlanReport, run_remote_plan};
+pub use remote_ledger::{Claim, LedgerServer, LedgerServerConfig};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
 pub use remote_subagent::{
     FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteReply, run_remote_subagent,

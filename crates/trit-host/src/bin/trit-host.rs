@@ -63,6 +63,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "remote-plan" {
         return run_remote_plan_cli(args);
     }
+    if command == "remote-ledger" {
+        return run_remote_ledger(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1310,8 +1313,13 @@ fn usage() {
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]\n\n\
          remote-echo: trit-host remote-echo [--bind <addr>] [--token <t>] [--once] \\\n\
-         [--fail] [--silent] [--sleep-ms N]\n\
+         [--fail] [--silent] [--sleep-ms N] [--ledger <url>] [--ledger-token <t>] \\\n\
+         [--ledger-timeout-secs N]\n\
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
+         prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
+         remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
+         [--pending-ttl-ms N] [--max-entries N] [--once]\n\
+         shared idempotency ledger: POST /claim and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-plan: trit-host remote-plan [--input <json|->]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?}},\n\
@@ -1597,6 +1605,9 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
 fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut config = trit_host::RemoteServerConfig::new("127.0.0.1:0");
     let mut once = false;
+    let mut ledger_url: Option<String> = None;
+    let mut ledger_token: Option<String> = None;
+    let mut ledger_timeout_secs = 30u64;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => config.bind = next(&mut args, "--bind")?,
@@ -1605,8 +1616,22 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             "--fail" => config.mode = trit_host::RemoteMode::Fail,
             "--silent" => config.mode = trit_host::RemoteMode::Silent,
             "--sleep-ms" => config.sleep_ms = next(&mut args, "--sleep-ms")?.parse()?,
+            "--ledger" => ledger_url = Some(next(&mut args, "--ledger")?),
+            "--ledger-token" => ledger_token = Some(next(&mut args, "--ledger-token")?),
+            "--ledger-timeout-secs" => {
+                ledger_timeout_secs = next(&mut args, "--ledger-timeout-secs")?.parse()?
+            }
             other => return Err(fail(format!("unknown remote-echo argument: {other}"))),
         }
+    }
+    if let Some(url) = ledger_url {
+        config.ledger = Some(trit_orch::RemoteEndpoint {
+            url,
+            auth_token: ledger_token,
+            timeout_secs: ledger_timeout_secs,
+        });
+    } else if ledger_token.is_some() {
+        return Err(fail("--ledger-token requires --ledger <url>"));
     }
     let server = trit_host::RemoteServer::bind(config)?;
     let addr = server.addr()?;
@@ -1732,6 +1757,36 @@ fn remote_request_for(task: &trit_orch::TaskSpec) -> trit_orch::SubagentRequest 
         max_tokens: task.max_tokens,
     };
     trit_orch::SubagentRequest::new(task, capsule, profile)
+}
+
+/// `remote-ledger [--bind <addr>] [--token <t>] [--pending-ttl-ms N] [--max-entries N] [--once]`：
+/// 共享幂等账本服务端；协议见 `trit_host::remote_ledger`。
+fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut config = trit_host::LedgerServerConfig::new("127.0.0.1:0");
+    let mut once = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--bind" => config.bind = next(&mut args, "--bind")?,
+            "--token" => config.token = Some(next(&mut args, "--token")?),
+            "--pending-ttl-ms" => {
+                config.pending_ttl =
+                    std::time::Duration::from_millis(next(&mut args, "--pending-ttl-ms")?.parse()?);
+            }
+            "--max-entries" => config.max_entries = next(&mut args, "--max-entries")?.parse()?,
+            "--once" => once = true,
+            other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),
+        }
+    }
+    let server = trit_host::LedgerServer::bind(config)?;
+    let addr = server.addr()?;
+    println!("{}", serde_json::json!({ "bind": addr.to_string() }));
+    std::io::stdout().flush()?;
+    if once {
+        server.serve_once()?;
+        return Ok(());
+    }
+    server.serve_forever()?;
+    Ok(())
 }
 
 /// `subagent-run --workspace <dir> --script <proposals.json> [--max-steps N]`：
