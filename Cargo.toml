@@ -6,6 +6,7 @@ members = [
     "crates/trit-orch",
     "crates/trit-reasonix",
     "crates/trit-host",
+    "crates/trit-subagent",
 ]
 
 [workspace.package]
