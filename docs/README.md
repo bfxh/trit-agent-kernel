@@ -35,7 +35,7 @@
 | [ALIGNMENT.md](ALIGNMENT.md) | v1/v2/v3 与 scaffold 已实现；self-test/stress 契约由 Rust 测试承接 | `trit-orch::alignment`、`trit-orch alignment` / `alignment-scaffold` CLI |
 | [DELIVERY.md](DELIVERY.md) | 已实现 | `trit-orch::delivery`、`trit-orch delivery` CLI、`.agent/delivery/` 账本 |
 | [LEASE.md](LEASE.md) | 已实现（lease + claim + journal） | `trit-host::lease` / `::journal`、`trit-host run --write-claim/--write-lease/--write-journal`、`journal-status` |
-| [SANDBOX.md](SANDBOX.md) | Linux 内置 bwrap；Windows/macOS 仅外部 wrapper | `SandboxCommand::builtin`、`--sandbox builtin` |
+| [SANDBOX.md](SANDBOX.md) | Linux bwrap + macOS sandbox-exec；Windows AppContainer 待办（S 级任务包） | `SandboxCommand::builtin`、`--sandbox builtin` |
 | [GATE-CHAIN.md](GATE-CHAIN.md) | 已实现 | `trit-orch::gate_chain`、`trit-orch gate-chain` CLI |
 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 契约草案，清单为模板 | [`agent-model-manifest.json`](agent-model-manifest.json)；运行时门禁仍归 `FeatureGate` |
 
