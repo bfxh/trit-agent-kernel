@@ -160,6 +160,19 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   可执行的真实子 agent 替身，用于端到端回归（真实 spawn、超时 kill、无响应、
   引用不匹配四类）。
 
+## 8. 跨机器执行契约（`trit_orch::RemoteEndpoint`）
+
+跨机器的载荷与进程内完全相同（subagent 帧）；这一层只定义端点的**准入校验**，
+不做真实网络传输。
+
+- `RemoteEndpoint { url, auth_token, timeout_secs }`；
+- 远程必须 `https://`；明文 `http://` 只允许 loopback
+  （`127.0.0.1` / `localhost` / `::1`，含 IPv6 方括号）；
+- 空 host（如 `https://`、`https://:8080`）、空白 token、0 超时一律
+  `subagent_protocol` 错误；
+- 目的：认证 token 不会走明文远程；真实传输（HTTP POST / 长连接 / 消息队列）
+  由宿主实现，跨机器调度不在本批范围。
+
 ## 非目标
 
 - 不把 fleet 依赖图塞进 `TaskSpec`：`TaskSpec.deps` 只有三元依赖，图的调度归属
