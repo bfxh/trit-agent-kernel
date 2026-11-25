@@ -68,7 +68,7 @@ pub enum NodeOutcome {
 }
 
 /// 节点状态快照（用于报告与测试断言）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSnapshot {
     pub id: String,
     pub healthy: bool,

@@ -60,6 +60,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "remote-echo" {
         return run_remote_echo(args);
     }
+    if command == "remote-plan" {
+        return run_remote_plan_cli(args);
+    }
     if command != "run" {
         usage();
         return Err(fail(format!("unknown command: {command}")));
@@ -1309,7 +1312,10 @@ fn usage() {
          remote-echo: trit-host remote-echo [--bind <addr>] [--token <t>] [--once] \\\n\
          [--fail] [--silent] [--sleep-ms N]\n\
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
-         prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting."
+         prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
+         remote-plan: trit-host remote-plan [--input <json|->]\n\
+         cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?}},\n\
+         dispatches tasks as read-only subagent requests to the static node table, prints JSON."
     );
 }
 
@@ -1612,6 +1618,120 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     }
     server.serve_forever()?;
     Ok(())
+}
+
+/// `remote-plan [--input <json|->]`：跨机演练。
+///
+/// 输入是一个 JSON 文档：`{revision, tasks, nodes, workers?, failure_threshold?,
+/// retry_limit?}`。任务按 `TaskSpec` 反序列化，节点按 `RemoteNode` 反序列化；
+/// 每个任务都映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），
+/// 由 `run_remote_plan` 复用 fleet 调度并输出 JSON 报告（含每次尝试与节点快照）。
+/// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
+fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut input_path: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--input" => input_path = Some(next(&mut args, "--input")?),
+            other => return Err(fail(format!("unknown remote-plan argument: {other}"))),
+        }
+    }
+    let text = match input_path.as_deref() {
+        None | Some("-") => {
+            let mut buffer = String::new();
+            std::io::stdin().read_to_string(&mut buffer)?;
+            buffer
+        }
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|error| fail(format!("read remote plan input {path}: {error}")))?,
+    };
+    let input: RemotePlanInput = serde_json::from_str(&text)
+        .map_err(|error| fail(format!("parse remote plan input: {error}")))?;
+
+    let plan = trit_orch::Plan::new(input.revision, input.tasks)
+        .map_err(|error| fail(format!("invalid plan: {error}")))?;
+    let config = trit_host::RemotePlanConfig::new(input.workers)
+        .with_failure_threshold(input.failure_threshold)
+        .with_retry_limit(input.retry_limit);
+    let report = trit_host::run_remote_plan(
+        &plan,
+        input.nodes,
+        config,
+        trit_orch::CancelToken::new(),
+        remote_request_for,
+    )?;
+
+    let failed = report
+        .report
+        .failed
+        .as_ref()
+        .map(|failure| serde_json::json!({ "task": failure.task, "message": failure.message }));
+    let value = serde_json::json!({
+        "ok": true,
+        "completed": report.report.completed,
+        "failed": failed,
+        "deferred": report.report.deferred,
+        "cancelled": report.report.cancelled,
+        "results": report.results,
+        "assignments": report.assignments,
+        "attempts": report.attempts,
+        "nodes": report.nodes,
+        "metrics": report.report.metrics,
+    });
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct RemotePlanInput {
+    revision: u64,
+    tasks: Vec<trit_orch::TaskSpec>,
+    #[serde(default = "default_workers")]
+    workers: usize,
+    #[serde(default = "default_failure_threshold")]
+    failure_threshold: u32,
+    #[serde(default)]
+    retry_limit: u32,
+    nodes: Vec<trit_orch::RemoteNode>,
+}
+
+fn default_workers() -> usize {
+    1
+}
+
+fn default_failure_threshold() -> u32 {
+    1
+}
+
+/// 把任务定义映射成远程 subagent 请求：只读、无写根，工具限定 `read_file`。
+///
+/// 这是演练用的保守映射；真实执行器可以在调用 `run_remote_plan` 时换成自己的
+/// `build_request`，权限与 capsule 由调用方决定。
+fn remote_request_for(task: &trit_orch::TaskSpec) -> trit_orch::SubagentRequest {
+    let mut goal = if task.guidance.objective.trim().is_empty() {
+        task.task.id.clone()
+    } else {
+        task.guidance.objective.clone()
+    };
+    if goal.chars().count() > 256 {
+        goal = goal.chars().take(256).collect();
+    }
+    let capsule = trit_orch::ContextCapsule::inherit(
+        vec![trit_orch::CapsuleEntry {
+            key: "goal".into(),
+            value: goal,
+        }],
+        &["goal"],
+        512,
+    )
+    .unwrap_or_default();
+    let profile = trit_orch::SubagentProfile {
+        name: format!("{}@remote", task.task.id),
+        access: trit_orch::AccessMode::ReadOnly,
+        write_roots: Vec::new(),
+        tools: vec!["read_file".into()],
+        max_tokens: task.max_tokens,
+    };
+    trit_orch::SubagentRequest::new(task, capsule, profile)
 }
 
 /// `subagent-run --workspace <dir> --script <proposals.json> [--max-steps N]`：

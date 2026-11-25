@@ -218,12 +218,20 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: <task>@<epoch>`，
   要求服务端按 key 去重；参考实现 `remote-echo` 将首次响应缓存
   （上限 1024，FIFO 淘汰），带键命中直接回缓存、不再执行。没有幂等保证的
-  服务端不应开启重试。
+  服务端不应开启重试。**注意这是 at-least-once**：换到一台从未见过该 key 的
+  机器时，服务端无法判重；要跨机严格至多一次，需要共享幂等账本或把重试固定
+  在同一端点。
+- CLI `trit-host remote-plan [--input <json|->]`：输入
+  `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?}`，把每个
+  任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
+  含 `completed/failed/deferred/results/assignments/attempts/nodes/metrics` 的
+  JSON 报告；用于跨机演练与运维冒烟。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
-隔离阈值、排除集合、drop 记账、JSON 默认值）与 `crates/trit-host/tests/remote_fleet.rs`
+隔离阈值、排除集合、drop 记账、JSON 默认值）、`crates/trit-host/tests/remote_fleet.rs`
 （真实双节点均衡、无响应节点隔离、远端任务失败不重试、换节点重试复用幂等键、
-重试上限、预取消、非法节点表）。
+重试上限、预取消、非法节点表）与 `crates/trit-host/tests/remote_plan_cli.rs`
+（`remote-plan` 真实双节点演练与重复节点 ID 拒绝）。
 
 ## 非目标
 

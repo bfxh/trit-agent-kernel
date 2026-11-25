@@ -21,6 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
+
 use trit_orch::{
     CancelToken, DelegationResult, DelegationStatus, FleetConfig, FleetOutput, FleetReport,
     NodeOutcome, NodeSnapshot, NodeTable, Plan, RemoteNode, SubagentRequest, TaskSpec, execute,
@@ -30,7 +32,7 @@ use crate::AgentError;
 use crate::remote_subagent::run_remote_subagent_reply;
 
 /// 一次派发尝试。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoteAttempt {
     /// 本次尝试落到的节点。
     pub node: String,
