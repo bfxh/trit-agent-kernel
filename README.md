@@ -99,6 +99,19 @@ cargo run -p trit-host -- rewind \
 - 回退的“原子”是进程内语义：应用失败会回滚；进程中途崩溃没有持久化 journal，不会自动恢复半完成回退。
 - Session JSONL 可能包含工具输出，宿主应按敏感数据管理（脱敏/轮转不在本层）。
 
+## 形式化验证门（内嵌 trit-core 的 K3 语义）
+
+`verified-core` workflow 在每次 PR / push `main` 时，从主库 `bfxh/trit` 的 `main`
+取 Verus 验证锚点（`verus/` + `scripts/verify.py`），对**本仓内嵌的
+`crates/trit-core`** 做：
+
+- K3 规格与代数律的 Verus 证明；
+- 3×3 完备穷举对拍本仓 `Ternary` 的 `!`/`&`/`|`/`^` 与 `index()`。
+
+验证锚点不提交到本仓（单一来源），由 workflow 临时取用；本地复跑见
+[主库 docs/engineering/VERIFICATION.md](https://github.com/bfxh/trit/blob/main/docs/engineering/VERIFICATION.md)。
+未验证：Ł3/B3/四值、位平面/批量实现、并发与 unsafe、Verus/z3/Rust 编译器可信基。
+
 ## 文档
 
 - [docs/README.md](docs/README.md)：按用户 / 前端 / 上层组件 / 维护者划分的文档地图。
