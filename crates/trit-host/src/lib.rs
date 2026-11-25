@@ -37,6 +37,8 @@ pub enum AgentError {
     ToolDenied { tool: String, reason: String },
     #[error("plan protocol: {message}")]
     PlanProtocol { message: String },
+    #[error("extension: {message}")]
+    Extension { message: String },
     #[error("io error: {0}")]
     Io(String),
     #[error("provider error: {0}")]
@@ -975,6 +977,7 @@ pub mod context;
 pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
+pub mod extensions;
 pub mod fleet_runner;
 pub mod frontend_compat;
 pub mod git_checkpoint;
@@ -1021,6 +1024,10 @@ pub use context_projection::{
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
+};
+pub use extensions::{
+    CommandRegistry, CommandSpec, HookEvent, HookRegistry, HookSpec, ParsedCommand, SkillIndex,
+    SkillSpec,
 };
 pub use fleet_runner::{
     FleetJob, HeadlessFleetRunner, run_fleet, session_path, turn_spec_from_task,
