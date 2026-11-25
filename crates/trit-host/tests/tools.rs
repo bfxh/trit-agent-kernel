@@ -518,3 +518,39 @@ fn local_tools_move_path_requires_two_paths_and_write() {
     assert!(error.to_string().contains("not allowed"), "{error}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn builtin_sandbox_wraps_workspace_with_bwrap() {
+    let root = temp_workspace("builtin-sandbox");
+    let sandbox = SandboxCommand::builtin(&root).unwrap();
+    let (program, args) = sandbox.argv("echo hi");
+    assert_eq!(program, PathBuf::from("bwrap"));
+    let root_text = std::fs::canonicalize(&root)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        args.windows(3)
+            .any(|w| w[0] == "--bind" && w[1] == root_text && w[2] == root_text)
+    );
+    assert!(args.iter().any(|arg| arg == "--unshare-all"));
+    assert!(args.iter().any(|arg| arg == "--die-with-parent"));
+    let tail: Vec<&String> = args.iter().rev().take(3).collect();
+    assert_eq!(tail[2], "sh");
+    assert_eq!(tail[1], "-c");
+    assert_eq!(tail[0], "echo hi");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn builtin_sandbox_is_rejected_off_linux() {
+    let root = temp_workspace("builtin-sandbox-off");
+    let error = SandboxCommand::builtin(&root).unwrap_err();
+    assert!(
+        error.to_string().contains("only available on Linux"),
+        "{error}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

@@ -464,10 +464,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     workspace.allow_write = allow_write;
     workspace.allow_shell = allow_shell;
     workspace.allow_unsandboxed_shell = allow_unsandboxed_shell;
-    workspace.sandbox = sandbox.map(|program| SandboxCommand {
-        program,
-        args: sandbox_args,
-    });
+    workspace.sandbox = match sandbox {
+        Some(program) if program == Path::new("builtin") => Some(
+            SandboxCommand::builtin(&workspace_root).map_err(|error| fail(error.to_string()))?,
+        ),
+        Some(program) => Some(SandboxCommand {
+            program,
+            args: sandbox_args,
+        }),
+        None => None,
+    };
     workspace.forbid_hardlinks = !allow_hardlinks;
     let session_path = session.clone();
     let mut config = HeadlessConfig {

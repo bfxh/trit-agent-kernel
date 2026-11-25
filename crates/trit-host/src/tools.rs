@@ -32,6 +32,48 @@ impl SandboxCommand {
         append_shell(&mut args, command);
         (self.program.clone(), args)
     }
+
+    /// 内置 Linux 后端：用 `bwrap` 构造只读系统 + 可写 workspace 的沙箱。
+    ///
+    /// 仍要求系统安装了 `bubblewrap`；内核负责参数构造与 fail-closed。
+    /// 非 Linux 平台直接返回错误，不回退到无沙箱。
+    pub fn builtin(root: &std::path::Path) -> Result<Self, AgentError> {
+        #[cfg(target_os = "linux")]
+        {
+            let root = std::fs::canonicalize(root)
+                .map_err(|error| AgentError::Io(format!("sandbox root: {error}")))?;
+            let root_text = root.to_string_lossy().to_string();
+            Ok(Self {
+                program: PathBuf::from("bwrap"),
+                args: vec![
+                    "--ro-bind".into(),
+                    "/".into(),
+                    "/".into(),
+                    "--dev".into(),
+                    "/dev".into(),
+                    "--proc".into(),
+                    "/proc".into(),
+                    "--tmpfs".into(),
+                    "/tmp".into(),
+                    "--bind".into(),
+                    root_text.clone(),
+                    root_text.clone(),
+                    "--chdir".into(),
+                    root_text,
+                    "--unshare-all".into(),
+                    "--die-with-parent".into(),
+                    "--".into(),
+                ],
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = root;
+            Err(AgentError::Tool(
+                "builtin sandbox is only available on Linux; pass --sandbox <program>".into(),
+            ))
+        }
+    }
 }
 
 fn append_shell(args: &mut Vec<String>, command: &str) {
