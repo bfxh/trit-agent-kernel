@@ -247,6 +247,8 @@ pub enum Error {
     DelegateCapsuleTooLarge { bytes: usize, max: usize },
     #[error("fleet runtime failed: {message}")]
     FleetRuntime { message: String },
+    #[error("remote nodes: {message}")]
+    RemoteNodes { message: String },
     #[error("plan handoff schema: {message}")]
     PlanHandoffSchema { message: String },
     #[error("subagent protocol: {message}")]
@@ -356,6 +358,7 @@ impl Error {
             Error::DelegateCapsuleDuplicate { .. } => "delegate_capsule_duplicate",
             Error::DelegateCapsuleTooLarge { .. } => "delegate_capsule_too_large",
             Error::FleetRuntime { .. } => "fleet_runtime",
+            Error::RemoteNodes { .. } => "remote_nodes",
             Error::PlanHandoffSchema { .. } => "plan_handoff_schema",
             Error::SubagentProtocol { .. } => "subagent_protocol",
         }

@@ -33,6 +33,7 @@ mod plan_handoff;
 mod policy;
 mod progress;
 mod receipt;
+mod remote;
 pub mod repo;
 mod selection;
 mod shadow;
@@ -115,6 +116,7 @@ pub use receipt::{
     DeliveryReceipt, HandoffPacket, ReceiptFailure, ReceiptLedger, ReceiptState, handoff_gate,
     handoff_obligation, receipt_obligation,
 };
+pub use remote::{NodeLease, NodeOutcome, NodeSnapshot, NodeTable, RemoteNode};
 pub use repo::{RepoIdentity, RepoRole, ScopeDecision, gate as repo_gate};
 pub use shadow::{ShadowReport, TraceStep, TraceStore, replay};
 pub use shadow_learn::{
