@@ -61,6 +61,7 @@ impl SandboxCommand {
                     "--chdir".into(),
                     root_text,
                     "--unshare-all".into(),
+                    "--unshare-net".into(),
                     "--die-with-parent".into(),
                     "--".into(),
                 ],
@@ -73,8 +74,7 @@ impl SandboxCommand {
             let root_text = root.to_string_lossy();
             let profile = format!(
                 "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n\
-                 (allow file-write* (subpath \"{root_text}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n\
-                 (allow network*)\n"
+                 (allow file-write* (subpath \"{root_text}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
             );
             Ok(Self {
                 program: PathBuf::from("sandbox-exec"),

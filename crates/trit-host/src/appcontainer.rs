@@ -23,8 +23,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
-    SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT,
+    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -42,11 +42,14 @@ use windows_sys::Win32::System::Threading::{
 
 /// 本 workspace 记录过的 profile 清单（相对路径）。
 const PROFILE_LIST: &str = ".agent/appcontainer-profiles";
+/// profile 的默认 TTL（秒）：超过后下次运行自动回收。
+const PROFILE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// 在 AppContainer 内运行 `program args`，返回子进程退出码。
 pub fn run(workspace: &Path, program: &str, args: &[String]) -> Result<i32, String> {
     let workspace = std::fs::canonicalize(workspace)
         .map_err(|error| format!("workspace {}: {error}", workspace.display()))?;
+    let _ = prune_expired(&workspace, PROFILE_TTL_SECS);
     let name = profile_name(&workspace);
     let sid = ensure_profile(&name)?;
     remember_profile(&workspace, &name)?;
@@ -59,44 +62,132 @@ pub fn run(workspace: &Path, program: &str, args: &[String]) -> Result<i32, Stri
     result
 }
 
-/// 删除本 workspace 记录过的 AppContainer profile。
+/// 删除本 workspace 记录过的全部 AppContainer profile，并撤销它们在 workspace 上的 ACE。
 pub fn prune(workspace: &Path) -> Result<usize, String> {
     let workspace = std::fs::canonicalize(workspace)
         .map_err(|error| format!("workspace {}: {error}", workspace.display()))?;
-    let path = workspace.join(PROFILE_LIST);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(format!("read {}: {error}", path.display())),
-    };
+    let entries = read_profiles(&workspace)?;
     let mut removed = 0usize;
-    for name in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let name_wide = wide(name);
-        // SAFETY: name_wide is NUL-terminated.
-        unsafe { DeleteAppContainerProfile(name_wide.as_ptr()) };
-        removed += 1;
+    for (name, _) in &entries {
+        if remove_profile(&workspace, name).is_ok() {
+            removed += 1;
+        }
     }
-    let _ = std::fs::remove_file(&path);
+    write_profiles(&workspace, &[])?;
     Ok(removed)
 }
 
-fn remember_profile(workspace: &Path, name: &str) -> Result<(), String> {
+/// 回收超过 `ttl_secs` 未使用的 profile，并撤销其遗留 ACE。
+fn prune_expired(workspace: &Path, ttl_secs: u64) -> Result<usize, String> {
+    let entries = read_profiles(workspace)?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let now = unix_now();
+    let total = entries.len();
+    let mut kept = Vec::with_capacity(entries.len());
+    let mut removed = 0usize;
+    for (name, stamp) in entries {
+        if now.saturating_sub(stamp) >= ttl_secs {
+            if remove_profile(workspace, &name).is_ok() {
+                removed += 1;
+            }
+        } else {
+            kept.push((name, stamp));
+        }
+    }
+    if kept.len() != total {
+        write_profiles(workspace, &kept)?;
+    }
+    Ok(removed)
+}
+
+/// 删除一个 profile 并撤销它在 workspace 上的 ACE。
+///
+/// SID 由 profile 名确定性派生，所以即使 profile 早已被删掉，遗留在 workspace
+/// 上的孤儿 ACE 仍然能按同一个 SID 撤销。派生必须先于
+/// `DeleteAppContainerProfile`，这里保持这个顺序以免依赖实现细节。
+fn remove_profile(workspace: &Path, name: &str) -> Result<(), String> {
+    let name_wide = wide(name);
+    let mut sid: PSID = null_mut();
+    // SAFETY: name_wide is NUL-terminated; sid points to writable storage.
+    let derived =
+        unsafe { DeriveAppContainerSidFromAppContainerName(name_wide.as_ptr(), &mut sid) };
+    // SAFETY: name_wide is NUL-terminated.
+    unsafe { DeleteAppContainerProfile(name_wide.as_ptr()) };
+    if derived < 0 {
+        return Err(format!("derive appcontainer sid: 0x{:08x}", derived as u32));
+    }
+    let revoked = update_workspace_ace(workspace, sid, REVOKE_ACCESS);
+    // SAFETY: sid came from DeriveAppContainerSidFromAppContainerName.
+    unsafe { FreeSid(sid) };
+    revoked
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// profile 清单格式：`<name>\t<unix_secs>`，一行一个；旧版无时间戳的行按“刚用过”处理。
+fn read_profiles(workspace: &Path) -> Result<Vec<(String, u64)>, String> {
     let path = workspace.join(PROFILE_LIST);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let now = unix_now();
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let (name, stamp) = match line.split_once('\t') {
+            Some((name, stamp)) => (name.trim(), stamp.trim().parse::<u64>().unwrap_or(now)),
+            None => (line, now),
+        };
+        if !name.is_empty() {
+            entries.push((name.to_owned(), stamp));
+        }
+    }
+    Ok(entries)
+}
+
+fn write_profiles(workspace: &Path, entries: &[(String, u64)]) -> Result<usize, String> {
+    let path = workspace.join(PROFILE_LIST);
+    if entries.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("remove {}: {error}", path.display())),
+        }
+        return Ok(0);
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
     }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == name) {
-        return Ok(());
-    }
-    let mut text = existing;
-    if !text.is_empty() && !text.ends_with('\n') {
+    let mut text = String::new();
+    for (name, stamp) in entries {
+        text.push_str(name);
+        text.push('\t');
+        text.push_str(&stamp.to_string());
         text.push('\n');
     }
-    text.push_str(name);
-    text.push('\n');
-    std::fs::write(&path, text).map_err(|error| format!("write {}: {error}", path.display()))
+    std::fs::write(&path, text).map_err(|error| format!("write {}: {error}", path.display()))?;
+    Ok(entries.len())
+}
+
+/// 记录/刷新 profile 的最近使用时间，供 TTL 回收判断。
+fn remember_profile(workspace: &Path, name: &str) -> Result<(), String> {
+    let mut entries = read_profiles(workspace)?;
+    let now = unix_now();
+    match entries.iter_mut().find(|(existing, _)| existing == name) {
+        Some(entry) => entry.1 = now,
+        None => entries.push((name.to_owned(), now)),
+    }
+    write_profiles(workspace, &entries)?;
+    Ok(())
 }
 
 fn profile_name(workspace: &Path) -> String {
@@ -153,6 +244,14 @@ fn ensure_profile(name: &str) -> Result<PSID, String> {
 }
 
 fn grant_workspace(workspace: &Path, sid: PSID) -> Result<(), String> {
+    update_workspace_ace(workspace, sid, GRANT_ACCESS)
+}
+
+/// 以 `mode`（`GRANT_ACCESS` / `REVOKE_ACCESS`）修改 workspace 根目录 DACL。
+///
+/// `REVOKE_ACCESS` 会移除该 trustee 在这个 ACL 上的全部 ACE，用于 profile 删除后
+/// 清理孤儿授权。
+fn update_workspace_ace(workspace: &Path, sid: PSID, mode: i32) -> Result<(), String> {
     let path_wide = wide(&workspace.to_string_lossy());
     let mut old_dacl: *mut ACL = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
@@ -174,7 +273,7 @@ fn grant_workspace(workspace: &Path, sid: PSID) -> Result<(), String> {
     }
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: mode,
         grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: null_mut(),
@@ -340,5 +439,79 @@ mod tests {
             String::from_utf16_lossy(&line[..line.len() - 1]),
             "cmd /C \"echo hi\""
         );
+    }
+
+    fn workspace(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "trit-appcontainer-unit-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn profile_list_round_trips_with_timestamps() {
+        let root = workspace("list");
+        remember_profile(&root, "trit-sandbox-aaaa").unwrap();
+        remember_profile(&root, "trit-sandbox-bbbb").unwrap();
+        let entries = read_profiles(&root).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .all(|(name, stamp)| name.starts_with("trit-sandbox-") && *stamp > 0)
+        );
+        // 重复记录只刷新时间戳，不新增行。
+        remember_profile(&root, "trit-sandbox-aaaa").unwrap();
+        assert_eq!(read_profiles(&root).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn profile_list_accepts_legacy_names_without_timestamps() {
+        let root = workspace("legacy");
+        let path = root.join(PROFILE_LIST);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "trit-sandbox-legacy\n").unwrap();
+        let entries = read_profiles(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "trit-sandbox-legacy");
+        // 旧格式没有时间戳：按“刚用过”处理，不会被立刻判过期。
+        assert!(unix_now().saturating_sub(entries[0].1) < 60);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_expired_drops_only_stale_entries() {
+        let root = workspace("ttl");
+        let path = root.join(PROFILE_LIST);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let now = unix_now();
+        let stale = now.saturating_sub(PROFILE_TTL_SECS + 60);
+        std::fs::write(
+            &path,
+            format!("trit-sandbox-stale\t{stale}\ntrit-sandbox-fresh\t{now}\n"),
+        )
+        .unwrap();
+        // SID 由 profile 名派生，过期条目对应的 ACE 总能撤销；计数是回收的条目数。
+        let removed = prune_expired(&root, PROFILE_TTL_SECS).unwrap();
+        assert_eq!(removed, 1);
+        let entries = read_profiles(&root).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "trit-sandbox-fresh");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prune_without_list_is_a_noop() {
+        let root = workspace("empty");
+        assert_eq!(prune(&root).unwrap(), 0);
+        assert!(!root.join(PROFILE_LIST).exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

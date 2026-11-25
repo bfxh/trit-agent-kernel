@@ -535,6 +535,7 @@ fn builtin_sandbox_wraps_workspace_with_bwrap() {
             .any(|w| w[0] == "--bind" && w[1] == root_text && w[2] == root_text)
     );
     assert!(args.iter().any(|arg| arg == "--unshare-all"));
+    assert!(args.iter().any(|arg| arg == "--unshare-net"));
     assert!(args.iter().any(|arg| arg == "--die-with-parent"));
     let tail: Vec<&String> = args.iter().rev().take(3).collect();
     assert_eq!(tail[2], "sh");
@@ -556,6 +557,7 @@ fn builtin_sandbox_wraps_workspace_with_sandbox_exec() {
         .to_string_lossy()
         .to_string();
     assert!(args[1].contains(&root_text), "{}", args[1]);
+    assert!(!args[1].contains("allow network"), "{}", args[1]);
     let tail: Vec<&String> = args.iter().rev().take(3).collect();
     assert_eq!(tail[2], "sh");
     assert_eq!(tail[1], "-c");

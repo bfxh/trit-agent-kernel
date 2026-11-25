@@ -148,3 +148,69 @@ fn appcontainer_prune_removes_recorded_profiles() {
     assert!(!list.exists(), "profile list not removed");
     let _ = fs::remove_dir_all(root);
 }
+
+fn acl(root: &Path) -> String {
+    let output = Command::new("icacls").arg(root).output().unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[test]
+fn appcontainer_prune_revokes_workspace_ace() {
+    let root = root("revoke");
+    let (code, text) = run(&root, "echo hi");
+    assert_eq!(code, Some(0), "{text}");
+    let before = acl(&root);
+    assert!(
+        before.contains("S-1-15-2-"),
+        "no AppContainer ACE before prune: {before}"
+    );
+    let removed = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args(["appcontainer-prune", "--workspace", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(removed.status.success(), "{removed:?}");
+    let after = acl(&root);
+    assert!(
+        !after.contains("S-1-15-2-"),
+        "orphan ACE survived prune: {after}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn appcontainer_run_reclaims_expired_profile() {
+    let root = root("ttl");
+    let (code, text) = run(&root, "echo one");
+    assert_eq!(code, Some(0), "{text}");
+    let list = root.join(".agent/appcontainer-profiles");
+    let recorded = fs::read_to_string(&list).unwrap();
+    let name = recorded
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .next()
+        .unwrap()
+        .to_owned();
+    // 把时间戳推到过期：下一次运行应先回收再重建。
+    fs::write(&list, format!("{name}\t1\n")).unwrap();
+    let (code, text) = run(&root, "echo two");
+    assert_eq!(code, Some(0), "{text}");
+    let refreshed = fs::read_to_string(&list).unwrap();
+    let stamp = refreshed
+        .lines()
+        .next()
+        .unwrap()
+        .split('\t')
+        .nth(1)
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(stamp > 1, "profile timestamp not refreshed: {refreshed}");
+    assert_eq!(refreshed.lines().count(), 1, "{refreshed}");
+    let _ = fs::remove_dir_all(root);
+}
