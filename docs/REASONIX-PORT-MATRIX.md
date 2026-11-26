@@ -42,7 +42,7 @@
 | 4 | 工具契约 / 注册表 / schema 规范化 | `TOOL_CONTRACT.md`、`SPEC §3.2` | 部分 | `ToolSpec` 已有，缺 schema 规范化、契约对照测试、工具家族 | B7.1/B7.2 |
 | 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（投影+prompt+迁移） | `ContextProjection` 进入 prompt、迁移 bundle 携带投影；缺跨设备/跨存储实际落盘 | B7.3 |
 | 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+恢复+Plan 联动） | 完成裁决要求当前 epoch + freshness True；新证据恢复、Manual 策略、Plan/Observation epoch 已联动；缺跨设备落盘与多任务图迁移 | B7.3 |
-| 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；缺 sidecar 布局、byte parity、重建投影 | B7.7 |
+| 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；三类 JSONL 的布局矩阵与 byte parity 已落地（`JSONL-COMPAT.md`），缺 sidecar 布局与重建投影 | B7.7 |
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 均已接持久 rewind journal、pre-rewind 备份与自动恢复；缺 operation lease 恢复边界 | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分（首版） | `PermissionGate` 已有 ask/auto/yolo、deny 优先、无 approver fail-closed；缺交互审批 UI 与 MCP 策略映射 | B7.4 |
 | 10 | Write claim / 路径范围强制 | `SPEC §3.12`、`OPAQUE_WRITE_ADMISSION_SECURITY.md` | 部分（首版） | `WriteClaim` + `ClaimingTools` 限制 write_file 路径子树，shell 写入 fail-closed；缺 move 双端、mutation journal 对账 | B7.4 |
@@ -205,7 +205,15 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   `run --write-journal-rollback` 在回滚前重新获取同一把锁，锁仍被活进程持有时
   `blocked`（CLI 退出 1 / run 拒绝启动），不会踩掉对方正在写的文件；旧记录只有
   `lease_epoch`、缺锁路径时不再自动回滚，无租约的旧记录行为不变。
-- 仍待补：JSONL 布局兼容矩阵；SQLite 投影重建；备份保留/清理策略
+- 已落地（第五刀，JSONL 布局兼容矩阵）：`docs/JSONL-COMPAT.md` 与
+  `crates/trit-host/src/jsonl_layout.rs` 共同固定 mutation journal / rewind journal /
+  session log 的 schema、必填字段、后加可选字段默认值与崩溃尾行策略；读取规则为
+  “同 schema 向后兼容、更大 schema fail-closed”。六份 golden fixture
+  （三类账本各一份 legacy 与一份 future schema）放在
+  `crates/trit-host/tests/fixtures/jsonl/`，`tests/jsonl_compat.rs` 断言老文件可读、
+  追加不重写既有字节、future schema 在库内与 CLI 两条路径都被拒，并校验文档矩阵
+  与代码逐行一致。
+- 仍待补：SQLite 投影重建；备份保留/清理策略
   （files 成功后删除、失败保留；git backup commit 目前不主动回收，等 `gc`）。
 - 依赖：B7.3；与 B7.4 联动。
 

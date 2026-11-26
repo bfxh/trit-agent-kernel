@@ -1379,6 +1379,7 @@ pub mod frontend_compat;
 pub mod git_checkpoint;
 mod http_read;
 pub mod journal;
+pub mod jsonl_layout;
 pub mod lease;
 pub mod mcp_tools;
 pub mod memory;
