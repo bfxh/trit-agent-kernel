@@ -1400,6 +1400,7 @@ pub mod sampling;
 pub mod separation;
 pub mod serve;
 pub mod session;
+pub mod session_index;
 pub mod session_migration;
 pub mod state_layer;
 pub mod subagent_process;
@@ -1506,6 +1507,7 @@ pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
     SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
 };
+pub use session_index::{INDEX_SCHEMA, IndexSummary, RebuildReport, SessionIndex, VerifyReport};
 pub use session_migration::{
     CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,
     MigrationPolicy, MigrationReport, MigrationTarget, SESSION_MIGRATION_SCHEMA,

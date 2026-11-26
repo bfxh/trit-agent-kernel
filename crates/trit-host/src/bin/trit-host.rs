@@ -44,6 +44,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-status" {
         return run_session_status(args);
     }
+    if command == "session-index" {
+        return run_session_index(args);
+    }
     if command == "journal-status" {
         return run_journal_status(args);
     }
@@ -1353,6 +1356,11 @@ fn usage() {
          roots automatically and changes emit roots/list_changed.\n\n\
          session-status: trit-host session-status --session <jsonl>\n\
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
+         session-index: trit-host session-index --session <jsonl> --db <path>\n\
+         [--rebuild|--verify]\n\
+         maintains the SQLite projection of a session log; --rebuild deletes the old\n\
+         projection and rebuilds it from JSONL, --verify rebuilds into a scratch db and\n\
+         compares rows (exits 1 when the projection is missing or differs).\n\
          journal-status: trit-host journal-status --workspace <dir> [--rollback] [--prune]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes\n\
          only after reacquiring their recorded lease locks (a live holder blocks it);\n\
@@ -1437,6 +1445,66 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if blocked {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `session-index --session <jsonl> --db <path> [--rebuild|--verify]`：
+/// 维护会话日志的 SQLite 投影。JSONL 是权威，投影可随时删掉重建。
+fn run_session_index(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut session = None;
+    let mut db = None;
+    let mut rebuild = false;
+    let mut verify = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
+            "--db" => db = Some(PathBuf::from(next(&mut args, "--db")?)),
+            "--rebuild" => rebuild = true,
+            "--verify" => verify = true,
+            other => return Err(fail(format!("unknown session-index argument: {other}"))),
+        }
+    }
+    let session = session.ok_or_else(|| fail("session-index requires --session"))?;
+    let db = db.ok_or_else(|| fail("session-index requires --db"))?;
+    if rebuild && verify {
+        return Err(fail("--rebuild and --verify are mutually exclusive"));
+    }
+    if rebuild {
+        let report = trit_host::SessionIndex::rebuild(&session, &db)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session": session.display().to_string(),
+                "db": report.path,
+                "replaced": report.replaced,
+                "summary": report.summary,
+            }))
+            .map_err(|error| fail(error.to_string()))?
+        );
+        return Ok(());
+    }
+    if verify {
+        let report = trit_host::SessionIndex::verify(&session, &db)?;
+        let matches = report.matches;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+        );
+        if !matches {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let summary = trit_host::SessionIndex::open(&db).summary()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "session": session.display().to_string(),
+            "db": db.display().to_string(),
+            "summary": summary,
+        }))
+        .map_err(|error| fail(error.to_string()))?
+    );
     Ok(())
 }
 
