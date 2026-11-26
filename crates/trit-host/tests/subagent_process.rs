@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use trit_host::{AgentError, SubagentProcessConfig, run_subagent, run_subagent_reply_cancellable};
 use trit_orch::{
-    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, SubagentProfile,
-    SubagentRequest, Task, TaskSpec,
+    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, MAX_FRAME_BYTES,
+    SubagentProfile, SubagentRequest, Task, TaskSpec,
 };
 
 fn request() -> SubagentRequest {
@@ -77,6 +77,23 @@ fn silent_exit_without_response_is_never_completed() {
         result.status
     );
     assert!(!result.reusable());
+}
+
+#[test]
+fn oversized_stdout_is_bounded_and_rejected() {
+    let mut config = config();
+    config
+        .args
+        .extend(["--output-bytes".into(), (MAX_FRAME_BYTES + 5).to_string()]);
+    let started = Instant::now();
+    let error = run_subagent(&config, &request()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("stdout exceeds"), "{message}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "bounded read must fail promptly, took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]

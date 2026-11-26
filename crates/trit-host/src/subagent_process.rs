@@ -4,11 +4,12 @@
 //!
 //! 1. spawn 子进程（stdin/stdout 管道，stderr 丢弃）；
 //! 2. 写入请求帧并关闭 stdin（子进程看到 EOF）；
-//! 3. 读线程收集 stdout，主线程 `recv_timeout` 等待；
+//! 3. 读线程有界收集 stdout，主线程 `recv_timeout` 等待；
 //! 4. 超时 → `kill` + `wait`，返回 [`DelegationStatus::Aborted`]；
 //! 5. 收到响应 → 强制校验 `task + epoch`，不匹配按协议错误拒绝；
 //! 6. 无响应 → 用 [`trit_orch::exit_status`] 映射进程结局，绝不产生 `Completed`；
-//! 7. 取消令牌置位 → kill 直接子进程并回 `Aborted`，不等到超时。
+//! 7. 取消令牌置位 → kill 直接子进程并回 `Aborted`，不等到超时；
+//! 8. stdout 超过 [`MAX_FRAME_BYTES`] + 4 → kill 子进程并返回 I/O 错误，不无限读。
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -17,14 +18,24 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use trit_orch::{
-    CancelToken, DelegationResult, DelegationStatus, SubagentRequest, SubagentResponse,
-    decode_frame, digest_hex, encode_frame, exit_status,
+    CancelToken, DelegationResult, DelegationStatus, MAX_FRAME_BYTES, SubagentRequest,
+    SubagentResponse, decode_frame, digest_hex, encode_frame, exit_status,
 };
 
 use crate::AgentError;
 
 /// 取消轮询步长：保证 `kill` 不会等到整个超时才发生。
 const CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// 子进程 stdout 最多读「4 字节长度 + 最大负载」再多 1 字节用于判定超限；
+/// 更多字节不再读入。
+const MAX_SUBAGENT_STDOUT_BYTES: usize = MAX_FRAME_BYTES + 4;
+
+/// 读线程的结果：合法上限内的原始 stdout，或已超过帧上限。
+enum StdoutRead {
+    Frame(Vec<u8>),
+    TooLarge,
+}
 
 /// 子 agent 进程配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,22 +123,28 @@ fn run_subagent_reply_with_cancel(
         // stdin 在此 drop：子进程读到 EOF，知道请求结束。
     }
 
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| AgentError::Io("subagent stdout unavailable".into()))?;
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout.read_to_end(&mut buffer);
-        let _ = sender.send(buffer);
+        let mut buffer = Vec::with_capacity(64 * 1024);
+        let mut limited = stdout.take((MAX_SUBAGENT_STDOUT_BYTES + 1) as u64);
+        let _ = limited.read_to_end(&mut buffer);
+        let outcome = if buffer.len() > MAX_SUBAGENT_STDOUT_BYTES {
+            StdoutRead::TooLarge
+        } else {
+            StdoutRead::Frame(buffer)
+        };
+        let _ = sender.send(outcome);
     });
 
     let deadline = Instant::now() + config.timeout;
     let poll = config.timeout.min(CANCEL_POLL);
-    let buffer = loop {
+    let stdout = loop {
         match receiver.recv_timeout(poll) {
-            Ok(buffer) => break buffer,
+            Ok(stdout) => break stdout,
             Err(RecvTimeoutError::Timeout) => {
                 if cancel.is_some_and(CancelToken::is_cancelled) || Instant::now() >= deadline {
                     let _ = child.kill();
@@ -140,6 +157,16 @@ fn run_subagent_reply_with_cancel(
                 let _ = child.wait();
                 return Ok(aborted_reply(request));
             }
+        }
+    };
+    let buffer = match stdout {
+        StdoutRead::Frame(buffer) => buffer,
+        StdoutRead::TooLarge => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AgentError::Io(format!(
+                "subagent stdout exceeds {MAX_SUBAGENT_STDOUT_BYTES} bytes"
+            )));
         }
     };
     let exit = child.wait().ok().and_then(|status| status.code());

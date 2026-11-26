@@ -157,12 +157,13 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 `trit_host::subagent_process`：
 
 - `SubagentProcessConfig { program, args, timeout }`（默认 30s）；
-- `run_subagent`：spawn → 写请求帧并关 stdin（子进程看到 EOF）→ 读线程收集
-  stdout、主线程 `recv_timeout`；超时 `kill` + `wait` 并返回 `Aborted`；收到响应
-  强制 `validate_for`；无响应走 `exit_status`；
-- `trit-host subagent-echo`（`--fail` / `--silent` / `--sleep-ms` / `--task`）是
-  可执行的真实子 agent 替身，用于端到端回归（真实 spawn、超时 kill、无响应、
-  引用不匹配四类）。
+- `run_subagent`：spawn → 写请求帧并关 stdin（子进程看到 EOF）→ 读线程**有界**收集
+  stdout（最多 `MAX_FRAME_BYTES + 4`，再多 1 字节只用于判定超限）、主线程
+  `recv_timeout`；超时 `kill` + `wait` 并返回 `Aborted`；stdout 超限即 kill 并返回
+  I/O 错误，不无限读；收到响应强制 `validate_for`；无响应走 `exit_status`；
+- `trit-host subagent-echo`（`--fail` / `--silent` / `--sleep-ms` / `--task` /
+  `--output-bytes`）是可执行的真实子 agent 替身，用于端到端回归（真实 spawn、
+  超时 kill、无响应、引用不匹配、超大 stdout 五类）。
 
 ## 8. 跨机器执行（`trit_orch::RemoteEndpoint` + `trit_host` 远程 runner）
 
@@ -367,7 +368,7 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 preflight 探测重新放行隔离节点并返回 `probes`）、
 `crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、同键并发只执行
 一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
-`crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
+`crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程、stdout 超帧上限有界拒绝）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
 文件跨运行隔离、计划写回保留节点表外的健康条目、`--probe` 成功放行/失败保持隔离、
 `--probe-interval-ms` 演练期间恢复节点、重复节点 ID 与非法 scope 拒绝）、

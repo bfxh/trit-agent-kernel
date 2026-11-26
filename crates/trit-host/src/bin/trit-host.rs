@@ -1585,18 +1585,22 @@ fn run_rewind(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Erro
 /// `subagent-echo`：测试/演示用子 agent。读一个请求帧，回一个响应帧。
 ///
 /// 选项：`--fail` 回 Failed；`--silent` 不回响应直接退出；`--sleep-ms N` 延迟
-/// N 毫秒；`--task <id>` 用指定任务 ID 回显（用于构造引用不匹配）。
+/// N 毫秒；`--task <id>` 用指定任务 ID 回显（用于构造引用不匹配）；
+/// `--output-bytes N` 读完请求帧后不回应，直接写 N 个原始字节，用于验证宿主的
+/// 有界读。
 fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut fail_mode = false;
     let mut silent = false;
     let mut sleep_ms = 0u64;
     let mut task_override: Option<String> = None;
+    let mut output_bytes = 0usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fail" => fail_mode = true,
             "--silent" => silent = true,
             "--sleep-ms" => sleep_ms = next(&mut args, "--sleep-ms")?.parse()?,
             "--task" => task_override = Some(next(&mut args, "--task")?),
+            "--output-bytes" => output_bytes = next(&mut args, "--output-bytes")?.parse()?,
             other => return Err(fail(format!("unknown subagent-echo argument: {other}"))),
         }
     }
@@ -1604,6 +1608,18 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     std::io::stdin().read_to_end(&mut input)?;
     let request: trit_orch::SubagentRequest = trit_orch::decode_frame(&mut input)?
         .ok_or_else(|| fail("subagent-echo: no request frame"))?;
+    if output_bytes > 0 {
+        let mut output = std::io::stdout().lock();
+        let chunk = [b'x'; 1024];
+        let mut remaining = output_bytes;
+        while remaining > 0 {
+            let take = remaining.min(chunk.len());
+            output.write_all(&chunk[..take])?;
+            remaining -= take;
+        }
+        output.flush()?;
+        return Ok(());
+    }
     if sleep_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
     }
