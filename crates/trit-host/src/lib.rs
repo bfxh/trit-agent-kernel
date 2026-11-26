@@ -984,6 +984,7 @@ pub mod extensions;
 pub mod fleet_runner;
 pub mod frontend_compat;
 pub mod git_checkpoint;
+mod http_read;
 pub mod journal;
 pub mod lease;
 pub mod mcp_tools;

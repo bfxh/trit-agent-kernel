@@ -747,6 +747,70 @@ fn oversized_header_block_is_rejected_with_431() {
 }
 
 #[test]
+fn request_read_deadline_aborts_slow_header_trickle() {
+    let (url, mut child) = spawn_echo(&["--once", "--request-read-timeout-ms", "400"]);
+    let origin = url.strip_suffix("/run").unwrap();
+    let address = origin.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        writer
+            .write_all(b"POST /run HTTP/1.1\r\nHost: test\r\nX-Slow: ")
+            .unwrap();
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(150));
+            if writer.write_all(b"a").is_err() {
+                break;
+            }
+        }
+    });
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    let _ = writer.join();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "slow headers must hit the total read deadline, got {response}"
+    );
+}
+
+#[test]
+fn request_read_deadline_aborts_slow_body_upload() {
+    let (url, mut child) = spawn_echo(&["--once", "--request-read-timeout-ms", "400"]);
+    let origin = url.strip_suffix("/run").unwrap();
+    let address = origin.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let writer = std::thread::spawn(move || {
+        writer
+            .write_all(b"POST /run HTTP/1.1\r\nHost: test\r\nContent-Length: 10\r\n\r\n")
+            .unwrap();
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(150));
+            if writer.write_all(b"a").is_err() {
+                break;
+            }
+        }
+    });
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    let _ = writer.join();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "slow body upload must hit the total read deadline, got {response}"
+    );
+}
+
+#[test]
 fn echo_server_rejects_mismatched_idempotency_key() {
     // 头里的 key 与帧里的 task@epoch 不一致：400，不解帧执行。
     let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();

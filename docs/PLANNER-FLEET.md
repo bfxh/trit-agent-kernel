@@ -190,7 +190,8 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `GET /health` 是只读存活探针：配置 token 时沿用同一 Bearer，鉴权通过即回
   `200` 空体；不读任务帧、不触碰缓存/账本、不执行任务。请求行与头部有界：
   单行 8 KiB、总计 64 KiB、最多 64 个，超限直接 431、不继续缓冲；头部读取仍受
-  30s socket 读写超时约束。
+  30s socket 读写超时约束。请求行 + 头部 + 请求体另共享总读取时限（默认 60s，
+  `--request-read-timeout-ms`，0 关闭），慢速滴流到点回 408、不进入执行。
   `RemoteMode::Exec` / `trit-host remote-exec (--workspace <dir> | --workspace-root <dir>) --script <json>`：
   每个请求 spawn 一个 `subagent-run` 子进程，请求帧走 stdin、响应帧走 stdout；
   只有子进程判定完成才回 `Completed`，进程错误按 `Failed` 回帧。权限仍由请求
@@ -226,10 +227,13 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   执行。未配 `--state` 时占位只在内存，账本重启仍会丢失在途令牌；状态文件含完成
   帧与租约令牌，应按敏感数据保护。连接并发默认 64（`--max-connections`），超额
   连接直接 503、不排队不 spawn；账本是跨机协调单点，不能由慢客户端耗尽线程。
+  请求读取有界：请求行/头单行 8 KiB、总计 64 KiB、最多 64 个，超限 431；请求行 +
+  头部 + 请求体共享总读取时限（默认 60s，`--request-read-timeout-ms`，0 关闭），
+  慢速滴流到点回 408、不进入协议处理。
   服务端单请求执行时限：`RemoteServerConfig::exec_timeout` /
   `remote-echo|remote-exec --request-timeout-ms`（0 表示不限制）。deadline 从
   请求体解码完成后启动，覆盖账本 claim 等待、`sleep_ms` 与 `Exec` 子进程；请求行/
-  头部读取与请求体上传阶段由 30s socket 读写超时和上述头/体长度上限约束，不计入
+  头部读取与请求体上传阶段由请求读取总时限、30s socket 读写超时和上述头/体长度上限约束，不计入
   `exec_timeout`。到点先置
   `timed_out` 再取消与请求共用的令牌，最终强制 `Aborted`、清空内容，并跳过账本
   complete 与本地缓存（占位保留到 TTL）。响应带 `X-Trit-Deadline-Exceeded: 1`，
@@ -244,9 +248,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 回归在 `crates/trit-host/tests/remote_subagent.rs`：loopback 服务端与真实
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
-503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
+503、请求行/头长度超限 431、慢头/慢体触发请求读取总时限 408。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
 慢执行期间不被接管、租约丢失中止在途执行、完成帧已由别人写入时旧执行者回 Aborted 而非旧结果、租约被接管不隔离节点且换机重试回放完成、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
-时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩、账本连接上限 503；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
+时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩、账本连接上限 503、账本慢请求总读取时限 408；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
 

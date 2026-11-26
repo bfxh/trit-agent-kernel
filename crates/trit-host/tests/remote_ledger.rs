@@ -1,7 +1,8 @@
 //! 共享幂等账本：claim/renew/complete 协议，以及两台远端共享账本时的单次执行。
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -99,6 +100,53 @@ fn ledger_limits_connections_with_503() {
 
     drop(first);
     drop(ledger);
+}
+
+#[test]
+fn ledger_bounds_request_read_time_with_408() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-ledger")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--once")
+        .arg("--request-read-timeout-ms")
+        .arg("400")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let address = value["bind"].as_str().unwrap();
+
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let writer = thread::spawn(move || {
+        writer
+            .write_all(b"POST /claim HTTP/1.1\r\nHost: test\r\nX-Trit-Idempotency: a@1\r\nX-Slow: ")
+            .unwrap();
+        for _ in 0..5 {
+            thread::sleep(Duration::from_millis(150));
+            if writer.write_all(b"a").is_err() {
+                break;
+            }
+        }
+    });
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut response).unwrap();
+    let _ = writer.join();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "slow ledger request must hit the total read deadline, got {response}"
+    );
 }
 
 #[test]

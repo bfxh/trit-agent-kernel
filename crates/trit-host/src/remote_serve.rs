@@ -46,16 +46,19 @@
 //!     `Aborted`，绝不把本机旧结果当成获胜帧返回。网络分区导致心跳请求完全无法
 //!     送达时，旧执行者仍可能在本地跑完，这部分需任务幂等兜底。
 //! 11. **执行阶段墙钟有界**：配置 `exec_timeout` 后，deadline 从请求体解码完成
-//!     后启动，覆盖账本等待、`sleep_ms` 与 Exec 子进程；头/体上传由 30s socket
-//!     读写超时和长度上限约束，不计入该 deadline。到点先标记 `timed_out` 再取消同一令牌，最终强制 `Aborted`、
+//!     后启动，覆盖账本等待、`sleep_ms` 与 Exec 子进程；头/体上传由请求读取总时限、
+//!     30s socket 空闲超时和长度上限共同约束，不计入该 deadline。到点先标记 `timed_out` 再取消同一令牌，最终强制 `Aborted`、
 //!     跳过 complete 与本地缓存，并带 `X-Trit-Deadline-Exceeded: 1` 让调度层
 //!     区分“节点失联”与“节点健康但请求超预算”。
 //! 12. **健康探测只读**：`GET /health` 沿用同一 Bearer 鉴权，鉴权通过即回 200 空体；
 //!     不解析任务帧、不读写幂等缓存/账本、不执行任务，供 `remote-plan --probe`
 //!     在重新放行隔离节点前做一次轻量可达性检查。
+//! 13. **请求读取总时限**：请求行 + 头部 + 请求体共享 `request_read_timeout`
+//!     （默认 60s；`--request-read-timeout-ms`，0 关闭）。慢速滴流即使每次
+//!     socket 读取都没超时，也会在总截止点回 `408`，不进入派发/执行阶段。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,6 +71,10 @@ use trit_orch::{
 };
 
 use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
+use crate::http_read::{
+    DEFAULT_REQUEST_READ_TIMEOUT, DeadlineStream, HeaderReadError, IO_TIMEOUT, MAX_HEADER_BYTES,
+    MAX_HEADER_LINE_BYTES, MAX_HEADERS, is_timeout, read_http_line,
+};
 use crate::remote_ledger::{self, Claim};
 use crate::remote_subagent::{
     CANCEL_PATH, DEADLINE_EXCEEDED_HEADER, HEALTH_PATH, LEASE_LOST_HEADER, idempotency_scope,
@@ -82,18 +89,6 @@ const MAX_PRE_CANCELLED: usize = 1024;
 
 /// 账本占位租约的默认续约间隔；应小于账本 `pending_ttl`。
 const DEFAULT_LEDGER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
-
-/// 连接上的读写超时：防止半开的客户端长期占住服务线程。
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// HTTP 请求行/单个头部的字节上限；超限直接 431，不继续缓冲。
-const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
-
-/// 整个请求行 + 头部块的总字节上限。
-const MAX_HEADER_BYTES: usize = 64 * 1024;
-
-/// 头部字段数量上限（含请求行之外的空行）。
-const MAX_HEADERS: usize = 64;
 
 /// 幂等缓存条数上限：按写入顺序 FIFO 淘汰，不做 LRU。
 const MAX_CACHED_RESPONSES: usize = 1024;
@@ -491,6 +486,9 @@ pub struct RemoteServerConfig {
     /// 单次请求的墙钟执行上限；含账本等待、`sleep_ms` 与 `Exec` 子进程。
     /// `None` 不限制；超过后取消在途执行并回 `Aborted`，且不登记完成。
     pub exec_timeout: Option<Duration>,
+    /// 请求行 + 头部 + 请求体的总读取时限；`None` 不限制。
+    /// 到点回 `408`，不进入执行阶段；执行阶段另受 `exec_timeout` 约束。
+    pub request_read_timeout: Option<Duration>,
 }
 
 impl RemoteServerConfig {
@@ -507,6 +505,7 @@ impl RemoteServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             exec_timeout: None,
+            request_read_timeout: Some(DEFAULT_REQUEST_READ_TIMEOUT),
         }
     }
 
@@ -554,6 +553,12 @@ impl RemoteServerConfig {
     /// 设置单次请求的墙钟上限；`Duration::ZERO` 表示不限制。
     pub fn with_exec_timeout(mut self, timeout: Duration) -> Self {
         self.exec_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// 设置请求行 + 头部 + 请求体的总读取时限；`Duration::ZERO` 表示不限制。
+    pub fn with_request_read_timeout(mut self, timeout: Duration) -> Self {
+        self.request_read_timeout = (!timeout.is_zero()).then_some(timeout);
         self
     }
 
@@ -710,46 +715,6 @@ impl RemoteServer {
     }
 }
 
-#[derive(Debug)]
-enum HeaderReadError {
-    Io(std::io::Error),
-    TooLarge,
-    Invalid,
-}
-
-/// 有界读取一行 HTTP 头：逐块从 `BufReader` 取，不先分配整行。
-fn read_http_line<R: BufRead>(
-    reader: &mut R,
-    limit: usize,
-) -> Result<Option<String>, HeaderReadError> {
-    let mut bytes = Vec::new();
-    loop {
-        let available = reader.fill_buf().map_err(HeaderReadError::Io)?;
-        if available.is_empty() {
-            return if bytes.is_empty() {
-                Ok(None)
-            } else {
-                String::from_utf8(bytes)
-                    .map(Some)
-                    .map_err(|_| HeaderReadError::Invalid)
-            };
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.map_or(available.len(), |position| position + 1);
-        if bytes.len().saturating_add(take) > limit {
-            reader.consume(take);
-            return Err(HeaderReadError::TooLarge);
-        }
-        bytes.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            return String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|_| HeaderReadError::Invalid);
-        }
-    }
-}
-
 /// 处理一个连接：解析请求头 → 鉴权 → 读一帧 → 幂等查缓存/执行 → 回一帧 → 关闭。
 fn handle(
     mut stream: TcpStream,
@@ -761,7 +726,10 @@ fn handle(
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(DeadlineStream::new(
+        stream.try_clone()?,
+        config.request_read_timeout,
+    )?);
 
     let request_line = match read_http_line(&mut reader, MAX_HEADER_LINE_BYTES) {
         Ok(Some(line)) => line,
@@ -770,6 +738,9 @@ fn handle(
         }
         Err(HeaderReadError::TooLarge) => {
             return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+        }
+        Err(HeaderReadError::Io(error)) if is_timeout(&error) => {
+            return respond(&mut stream, 408, "Request Timeout", b"");
         }
         Err(HeaderReadError::Io(error)) => return Err(error),
     };
@@ -797,6 +768,9 @@ fn handle(
             }
             Err(HeaderReadError::TooLarge) => {
                 return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+            }
+            Err(HeaderReadError::Io(error)) if is_timeout(&error) => {
+                return respond(&mut stream, 408, "Request Timeout", b"");
             }
             Err(HeaderReadError::Io(error)) => return Err(error),
         };
@@ -860,6 +834,9 @@ fn handle(
     if let Err(error) = reader.read_exact(&mut body) {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
             return respond(&mut stream, 400, "Bad Request", b"");
+        }
+        if is_timeout(&error) {
+            return respond(&mut stream, 408, "Request Timeout", b"");
         }
         return Err(error);
     }

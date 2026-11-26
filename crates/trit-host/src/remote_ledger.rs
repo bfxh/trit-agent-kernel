@@ -30,6 +30,9 @@
 //!
 //! 连接并发默认 64（`with_max_connections` / `--max-connections`），超额连接直接
 //! `503`、不排队也不创建线程；账本是跨机协调的单点，不能让慢客户端耗尽线程。
+//! 请求读取同样有界：请求行/头单行 8 KiB、总计 64 KiB、最多 64 个，超限 `431`；
+//! 请求行 + 头部 + 请求体共享总读取时限（默认 60s，`with_request_read_timeout` /
+//! `--request-read-timeout-ms`，0 关闭），慢速滴流到点回 `408`。
 //!
 //! 安全边界：账本默认只应绑定 loopback 或置于内网；配置 token 后所有请求都要
 //! `Authorization: Bearer <token>`。状态文件同时包含完成帧与租约令牌，应按敏感
@@ -50,10 +53,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
 
 use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
+use crate::http_read::{
+    DEFAULT_REQUEST_READ_TIMEOUT, DeadlineStream, HeaderReadError, IO_TIMEOUT, MAX_HEADER_BYTES,
+    MAX_HEADER_LINE_BYTES, MAX_HEADERS, is_timeout, read_http_line,
+};
 use crate::remote_subagent::idempotency_scope;
-
-/// 连接上的读写超时：防止半开的客户端长期占住服务线程。
-const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 默认占位 TTL：执行者崩溃后，多久允许其他节点接管。
 const DEFAULT_PENDING_TTL: Duration = Duration::from_secs(60);
@@ -98,6 +102,9 @@ pub struct LedgerServerConfig {
     pub state_path: Option<PathBuf>,
     /// 同时在处理的连接上限；超限直接回 503，避免单点账本被慢连接拖垮。
     pub max_connections: usize,
+    /// 请求行 + 头部 + 请求体的总读取时限；`None` 不限制。
+    /// 到点回 `408`，避免慢速滴流客户端长期占住连接。
+    pub request_read_timeout: Option<Duration>,
 }
 
 impl LedgerServerConfig {
@@ -110,6 +117,7 @@ impl LedgerServerConfig {
             max_state_bytes: DEFAULT_MAX_STATE_BYTES,
             state_path: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            request_read_timeout: Some(DEFAULT_REQUEST_READ_TIMEOUT),
         }
     }
 
@@ -140,6 +148,12 @@ impl LedgerServerConfig {
 
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections.max(1);
+        self
+    }
+
+    /// 设置请求行 + 头部 + 请求体的总读取时限；`Duration::ZERO` 表示不限制。
+    pub fn with_request_read_timeout(mut self, timeout: Duration) -> Self {
+        self.request_read_timeout = (!timeout.is_zero()).then_some(timeout);
         self
     }
 }
@@ -321,12 +335,25 @@ fn handle(
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(DeadlineStream::new(
+        stream.try_clone()?,
+        config.request_read_timeout,
+    )?);
 
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        return respond(&mut stream, 400, "Bad Request", b"");
-    }
+    let request_line = match read_http_line(&mut reader, MAX_HEADER_LINE_BYTES) {
+        Ok(Some(line)) => line,
+        Ok(None) | Err(HeaderReadError::Invalid) => {
+            return respond(&mut stream, 400, "Bad Request", b"");
+        }
+        Err(HeaderReadError::TooLarge) => {
+            return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+        }
+        Err(HeaderReadError::Io(error)) if is_timeout(&error) => {
+            return respond(&mut stream, 408, "Request Timeout", b"");
+        }
+        Err(HeaderReadError::Io(error)) => return Err(error),
+    };
+    let mut header_bytes = request_line.len();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let path = parts
@@ -343,9 +370,26 @@ fn handle(
     let mut authorization: Option<String> = None;
     let mut idempotency: Option<String> = None;
     let mut lease_header: Option<String> = None;
+    let mut header_count = 0;
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = match read_http_line(&mut reader, MAX_HEADER_LINE_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(HeaderReadError::Invalid) => {
+                return respond(&mut stream, 400, "Bad Request", b"");
+            }
+            Err(HeaderReadError::TooLarge) => {
+                return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+            }
+            Err(HeaderReadError::Io(error)) if is_timeout(&error) => {
+                return respond(&mut stream, 408, "Request Timeout", b"");
+            }
+            Err(HeaderReadError::Io(error)) => return Err(error),
+        };
+        header_count += 1;
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_count > MAX_HEADERS || header_bytes > MAX_HEADER_BYTES {
+            return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
@@ -379,6 +423,9 @@ fn handle(
     if let Err(error) = reader.read_exact(&mut body) {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
             return respond(&mut stream, 400, "Bad Request", b"");
+        }
+        if is_timeout(&error) {
+            return respond(&mut stream, 408, "Request Timeout", b"");
         }
         return Err(error);
     }
