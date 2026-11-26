@@ -189,6 +189,16 @@ pub struct RemoteProbeEvent {
     pub error: Option<String>,
 }
 
+/// 一次独立健康扫描的范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteHealthScope {
+    /// 只探测已隔离节点（默认，与旧的 `remote-health` 行为一致）。
+    #[default]
+    IsolatedOnly,
+    /// 连健康节点一起探测：成功刷新时间戳，失败就地隔离。
+    All,
+}
+
 /// 一次独立健康扫描的结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemoteHealthReport {
@@ -535,6 +545,24 @@ pub fn probe_remote_health_file_with_concurrency(
     health_path: impl AsRef<Path>,
     concurrency: usize,
 ) -> Result<RemoteHealthReport, AgentError> {
+    probe_remote_health_file_scoped(
+        nodes,
+        health_path,
+        concurrency,
+        RemoteHealthScope::IsolatedOnly,
+    )
+}
+
+/// 同 [`probe_remote_health_file_with_concurrency`]，但可以指定巡检范围。
+///
+/// [`RemoteHealthScope::All`] 会连健康节点一起探测：成功只刷新时间戳与观测时间，
+/// 失败则把原本健康的节点就地隔离——覆盖「看起来健康但已经死了」的快照。
+pub fn probe_remote_health_file_scoped(
+    nodes: &[RemoteNode],
+    health_path: impl AsRef<Path>,
+    concurrency: usize,
+    scope: RemoteHealthScope,
+) -> Result<RemoteHealthReport, AgentError> {
     if concurrency == 0 {
         return Err(AgentError::Io(
             "remote health probe concurrency must be positive".into(),
@@ -577,7 +605,10 @@ pub fn probe_remote_health_file_with_concurrency(
     let mut targets: Vec<(usize, &RemoteNode)> = nodes
         .iter()
         .enumerate()
-        .filter(|(index, _)| !snapshots[*index].healthy)
+        .filter(|(index, _)| match scope {
+            RemoteHealthScope::All => true,
+            RemoteHealthScope::IsolatedOnly => !snapshots[*index].healthy,
+        })
         .collect();
     targets.sort_by(|left, right| left.1.id.cmp(&right.1.id));
     let outcomes = Mutex::new(vec![None; targets.len()]);
@@ -608,19 +639,24 @@ pub fn probe_remote_health_file_with_concurrency(
         snapshot.updated_at_ms = observed_timestamp(snapshot.updated_at_ms, observed_at);
         match outcome {
             Ok(()) => {
+                let was_isolated = !snapshot.healthy;
                 snapshot.healthy = true;
-                readmitted += 1;
+                if was_isolated {
+                    readmitted += 1;
+                }
                 if events.len() < MAX_PROBE_EVENTS {
                     events.push(RemoteProbeEvent {
                         node: node.id.clone(),
                         phase: RemoteProbePhase::Monitor,
                         ok: true,
-                        readmitted: true,
+                        readmitted: was_isolated,
                         error: None,
                     });
                 }
             }
             Err(error) => {
+                // 主动巡检发现「健康」节点其实不可达时，就地隔离。
+                snapshot.healthy = false;
                 still_isolated += 1;
                 if events.len() < MAX_PROBE_EVENTS {
                     events.push(RemoteProbeEvent {

@@ -366,10 +366,13 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   因时钟回拨被误隔离，`Duration::ZERO` 关闭该策略。计划内的
   监控随计划结束退出；跨进程常驻恢复由 `trit-host remote-health` 承担：
   `--nodes <json> --health <path> [--interval-ms N] [--once]
-  [--probe-concurrency N]` 每轮重读同一节点表与
-  健康文件（`Vec<NodeSnapshot>`，条目含 `updated_at_ms`），只探已隔离节点，
+  [--probe-concurrency N] [--probe-all]` 每轮重读同一节点表与
+  健康文件（`Vec<NodeSnapshot>`，条目含 `updated_at_ms`），默认只探已隔离节点，
   `GET /health` 成功即写回
   `healthy`（保留 `attempts/failures`、清零 `in_flight`），失败保持隔离并记录原因；
+  `--probe-all` 让本轮把健康节点也探一遍：成功只刷新 `updated_at_ms`（不算重新入列），
+  失败则就地隔离——覆盖「快照写着健康、机器其实已经死了」的情况，也让
+  `--health-max-age-ms` 的超龄隔离不必靠自然过期来发现。
   默认常驻、每轮输出一行 JSON，`--once` 适合 cron / 任务计划程序。`--probe-concurrency`
   默认 4、上限 64，只并行探测、不改变单次写回；事件与快照仍按节点 id
   升序，`1` 为串行。节点增删或 token
