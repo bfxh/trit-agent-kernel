@@ -1108,29 +1108,10 @@ fn back_claim(claim: &ClaimRequest, task: &str, receipts: &[ToolOutcome]) -> Com
             .map(|criterion| {
                 let (backed, passed) = match &criterion.kind {
                     CriterionKind::Manual => (false, false),
-                    CriterionKind::Verification { command } => receipts
-                        .iter()
-                        .find(|outcome| {
-                            !outcome.in_doubt
-                                && outcome.command.as_deref() == Some(command.as_str())
-                        })
-                        .map_or((false, false), |outcome| (true, outcome.passed)),
-                    CriterionKind::Diff { paths } => {
-                        let in_doubt = receipts.iter().any(|outcome| {
-                            outcome.in_doubt
-                                && outcome
-                                    .written_paths
-                                    .iter()
-                                    .any(|path| paths.contains(path))
-                        });
-                        let backed = !in_doubt
-                            && paths.iter().all(|path| {
-                                receipts
-                                    .iter()
-                                    .any(|outcome| outcome.written_paths.contains(path))
-                            });
-                        (backed, backed)
+                    CriterionKind::Verification { command } => {
+                        verification_backing(command, receipts)
                     }
+                    CriterionKind::Diff { paths } => diff_backing(paths, receipts),
                 };
                 CriterionClaim {
                     id: criterion.id.clone(),
@@ -1141,6 +1122,46 @@ fn back_claim(claim: &ClaimRequest, task: &str, receipts: &[ToolOutcome]) -> Com
             })
             .collect(),
     }
+}
+
+/// 同一条命令可能被执行多次：任一次真实失败即否证；任一次存疑或零断言都不足以背书。
+fn verification_backing(command: &str, receipts: &[ToolOutcome]) -> (bool, bool) {
+    let matches: Vec<&ToolOutcome> = receipts
+        .iter()
+        .filter(|outcome| outcome.command.as_deref() == Some(command))
+        .collect();
+    if matches
+        .iter()
+        .any(|outcome| !outcome.in_doubt && !outcome.passed)
+    {
+        return (true, false);
+    }
+    let proved = !matches.is_empty()
+        && matches
+            .iter()
+            .all(|outcome| outcome.passed && !outcome.in_doubt && outcome.assertions > 0);
+    (proved, proved)
+}
+
+/// 路径清单必须非空且全部被写入；空清单不能自证，存疑写入一律降为未定。
+fn diff_backing(paths: &[String], receipts: &[ToolOutcome]) -> (bool, bool) {
+    if paths.is_empty() {
+        return (false, false);
+    }
+    let in_doubt = receipts.iter().any(|outcome| {
+        outcome.in_doubt
+            && outcome
+                .written_paths
+                .iter()
+                .any(|path| paths.contains(path))
+    });
+    let backed = !in_doubt
+        && paths.iter().all(|path| {
+            receipts
+                .iter()
+                .any(|outcome| outcome.written_paths.contains(path))
+        });
+    (backed, backed)
 }
 
 fn declare_effect(
@@ -1391,3 +1412,6 @@ pub use supervisor::{
     SamplingHandler, SupervisorConfig, SupervisorError, SupervisorLoop, SupervisorRuntime,
     SupervisorStatus,
 };
+
+#[cfg(test)]
+mod claim_backing_tests;

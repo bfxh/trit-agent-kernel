@@ -214,8 +214,18 @@ fn ledger_bounds_request_read_time_with_408() {
             }
         }
     });
-    let mut response = String::new();
-    std::io::Read::read_to_string(&mut stream, &mut response).unwrap();
+    let mut response = Vec::new();
+    // macOS 可能在服务端超时关闭连接时把已排队的 408 变成 RST；已读到的字节仍然有效。
+    match std::io::Read::read_to_end(&mut stream, &mut response) {
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
+        Err(error) => panic!("ledger response read failed: {error}"),
+    }
+    let response = String::from_utf8(response).unwrap();
     let _ = writer.join();
     let _ = child.kill();
     let _ = child.wait();
