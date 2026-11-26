@@ -53,6 +53,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
 
+use crate::lease::SingleInstanceLock;
+
 use crate::auth::{AUTH_DIGEST_LEN, authorization_matches, bearer_digest};
 use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
 use crate::http_read::{
@@ -233,6 +235,8 @@ pub struct LedgerServer {
     state: Arc<Mutex<LedgerState>>,
     completions: Arc<AtomicU64>,
     slots: Arc<ConnectionSlots>,
+    /// 持有状态文件旁的 `<state>.lock`；保证同一日志只有一个回放/追加/压缩者。
+    _state_lock: Option<SingleInstanceLock>,
 }
 
 impl LedgerServer {
@@ -266,6 +270,32 @@ impl LedgerServer {
             ));
         }
         let auth = config.token.as_deref().map(bearer_digest);
+        // 状态文件是单写者日志：回放、追加与压缩都假定没有第二个进程改动它。
+        // 在绑定端口前拿锁，重复启动直接失败，而不是两个实例互相覆盖记录。
+        let state_lock = match config.state_path.as_deref() {
+            Some(path) => {
+                let lock_path = state_lock_path(path);
+                Some(
+                    SingleInstanceLock::acquire(&lock_path)
+                        .map_err(|error| {
+                            std::io::Error::other(format!(
+                                "lock ledger state {}: {error}",
+                                lock_path.display()
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::AddrInUse,
+                                format!(
+                                    "another remote-ledger server holds {}",
+                                    lock_path.display()
+                                ),
+                            )
+                        })?,
+                )
+            }
+            None => None,
+        };
         let listener = TcpListener::bind(config.bind.as_str())?;
         let state = match config.state_path.as_deref() {
             Some(path) => {
@@ -293,6 +323,7 @@ impl LedgerServer {
             state,
             completions: Arc::default(),
             slots,
+            _state_lock: state_lock,
         })
     }
 
@@ -1000,6 +1031,14 @@ fn append_line(path: &Path, record: &StoredRecord) -> std::io::Result<()> {
 fn compaction_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".compact");
+    PathBuf::from(name)
+}
+
+/// 状态文件锁路径：始终追加 `.lock`，与 `remote-health` 的 `<health>.lock`
+/// 保持同一约定。
+fn state_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
     PathBuf::from(name)
 }
 

@@ -73,6 +73,31 @@ fn state_file(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn state_file_is_single_writer() {
+    let path = state_file("single-writer");
+    let lock_path = std::path::PathBuf::from(format!("{}.lock", path.display()));
+    let _ = std::fs::remove_file(&lock_path);
+
+    let first =
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_state_path(&path)).unwrap();
+    let error =
+        match LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_state_path(&path)) {
+            Ok(_) => panic!("a second ledger must not share the same state file"),
+            Err(error) => error,
+        };
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
+    assert!(error.to_string().contains(".lock"), "{error}");
+
+    // 进程退出（这里是 drop）后锁必须释放，重启才能接回同一份日志。
+    drop(first);
+    let restarted =
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_state_path(&path)).unwrap();
+    drop(restarted);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&lock_path);
+}
+
+#[test]
 fn ledger_limits_connections_with_503() {
     let ledger = Arc::new(
         LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_max_connections(1)).unwrap(),
