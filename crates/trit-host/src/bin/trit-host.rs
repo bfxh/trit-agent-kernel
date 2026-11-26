@@ -1348,9 +1348,11 @@ fn usage() {
          journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes;\n\
          exits 1 on remaining doubt or rollback failure.\n\
-         rewind-status: trit-host rewind-status --checkpoint-dir <dir> [--recover --workspace <root>]\n\
+         rewind-status: trit-host rewind-status --checkpoint-dir <dir> [--checkpoint-backend files|git]\n\
+         [--recover] [--workspace <root>]\n\
          prints the checkpoint rewind journal; --recover restores the pre-rewind state from\n\
-         backups. exits 1 when a rewind is still unfinished or rollback/recovery failed\n\
+         backups (git backend uses the whole-tree backup commit). git requires --workspace.\n\
+         exits 1 when a rewind is still unfinished or rollback/recovery failed\n\
          (a new rewind will refuse until this is resolved).\n\
          appcontainer-prune: trit-host appcontainer-prune --workspace <dir>\n\
          deletes AppContainer profiles recorded for the workspace.\n\n\
@@ -1554,11 +1556,20 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
 fn run_rewind_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut checkpoint_dir: Option<PathBuf> = None;
     let mut workspace: Option<PathBuf> = None;
+    let mut backend = "files".to_owned();
     let mut recover = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--checkpoint-dir" => {
                 checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
+            }
+            "--checkpoint-backend" => {
+                backend = next(&mut args, "--checkpoint-backend")?;
+                if backend != "files" && backend != "git" {
+                    return Err(fail(format!(
+                        "unknown rewind-status backend: {backend} (expected files or git)"
+                    )));
+                }
             }
             "--workspace" => {
                 workspace = Some(PathBuf::from(next(&mut args, "--workspace")?));
@@ -1568,10 +1579,45 @@ fn run_rewind_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         }
     }
     let dir = checkpoint_dir.ok_or_else(|| fail("rewind-status requires --checkpoint-dir"))?;
+    let workspace = match workspace {
+        Some(path) => path,
+        None if backend == "git" => {
+            return Err(fail(
+                "rewind-status --checkpoint-backend git requires --workspace",
+            ));
+        }
+        None if recover => {
+            return Err(fail("rewind-status --recover requires --workspace"));
+        }
+        None => PathBuf::from("."),
+    };
+    if backend == "git" {
+        let store = GitCheckpointStore::open(dir, workspace)?;
+        if recover {
+            let recovery = store.recover_rewind()?;
+            let status = store.rewind_status()?;
+            let payload = serde_json::json!({ "recovery": recovery, "status": status });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).map_err(|error| fail(error.to_string()))?
+            );
+            if status.has_in_doubt() {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        let report = store.rewind_status()?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+        );
+        if report.has_in_doubt() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let store = CheckpointStore::open(dir)?;
     if recover {
-        let workspace =
-            workspace.ok_or_else(|| fail("rewind-status --recover requires --workspace"))?;
         let recovery = store.recover_rewind(&workspace)?;
         let status = store.rewind_status()?;
         let payload = serde_json::json!({ "recovery": recovery, "status": status });

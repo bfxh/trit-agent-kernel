@@ -140,6 +140,12 @@ impl CheckpointStore {
     pub fn recover_rewind(&self, root: &Path) -> Result<RewindRecoveryReport, AgentError> {
         let mut journal = RewindJournal::open(&self.dir)?;
         let status = journal.report()?;
+        if status.in_doubt.iter().any(|doubt| doubt.backend == "git") {
+            return Err(AgentError::SessionState(
+                "rewind journal contains git-backend operation(s); use rewind-status --checkpoint-backend git"
+                    .into(),
+            ));
+        }
         let mut report = RewindRecoveryReport::default();
         for doubt in status.in_doubt {
             report.attempted += 1;
@@ -148,7 +154,7 @@ impl CheckpointStore {
             } else {
                 restore_rewind_backups(&journal, root, &doubt)
             };
-            journal.recover(doubt.op_id, doubt.turn, &failures)?;
+            journal.recover(doubt.op_id, doubt.turn, "files", "", &failures)?;
             if failures.is_empty() {
                 journal.cleanup(doubt.op_id);
                 report.recovered += 1;
@@ -396,6 +402,12 @@ pub struct RewindRecord {
     /// `begin`：每个路径的 pre-rewind 快照。
     #[serde(default)]
     pub backups: Vec<RewindBackup>,
+    /// 后端标识：`files`（逐路径备份）或 `git`（整树 backup commit）。
+    #[serde(default)]
+    pub backend: String,
+    /// `git` 后端的整树 pre-rewind commit；`files` 为空。
+    #[serde(default)]
+    pub backup: String,
     /// `applying`：即将（或可能已经）被改写的单个路径。
     #[serde(default)]
     pub path: String,
@@ -423,6 +435,12 @@ pub struct RewindDoubt {
     /// 恢复所需的 pre-rewind 快照。
     #[serde(default)]
     pub backups: Vec<RewindBackup>,
+    /// 后端标识；旧记录为空时按 `files` 处理。
+    #[serde(default)]
+    pub backend: String,
+    /// `git` 后端的整树 pre-rewind commit。
+    #[serde(default)]
+    pub backup: String,
     pub at: u64,
 }
 
@@ -468,14 +486,14 @@ impl RewindRecoveryReport {
     }
 }
 
-struct RewindJournal {
+pub(crate) struct RewindJournal {
     dir: PathBuf,
     path: PathBuf,
     seq: u64,
 }
 
 impl RewindJournal {
-    fn open(dir: &Path) -> Result<Self, AgentError> {
+    pub(crate) fn open(dir: &Path) -> Result<Self, AgentError> {
         std::fs::create_dir_all(dir)
             .map_err(|error| AgentError::Io(format!("rewind journal dir: {error}")))?;
         let path = dir.join(REWIND_JOURNAL);
@@ -528,6 +546,8 @@ impl RewindJournal {
             turn,
             paths: entries.iter().map(|(path, _)| path.clone()).collect(),
             backups,
+            backend: "files".into(),
+            backup: String::new(),
             path: String::new(),
             restored: Vec::new(),
             deleted: Vec::new(),
@@ -537,7 +557,35 @@ impl RewindJournal {
         Ok(op_id)
     }
 
-    fn applying(&mut self, op_id: u64, turn: usize, path: &str) -> Result<(), AgentError> {
+    /// git 后端的 `begin`：整树 backup commit 已在工作区改写前创建。
+    pub(crate) fn begin_git(&mut self, turn: usize, backup: &str) -> Result<u64, AgentError> {
+        self.seq = self.seq.saturating_add(1);
+        let op_id = self.seq;
+        self.append(RewindRecord {
+            schema: REWIND_SCHEMA,
+            seq: op_id,
+            op_id,
+            phase: RewindPhase::Begin,
+            turn,
+            paths: Vec::new(),
+            backups: Vec::new(),
+            backend: "git".into(),
+            backup: backup.to_owned(),
+            path: String::new(),
+            restored: Vec::new(),
+            deleted: Vec::new(),
+            failures: Vec::new(),
+            at: now_secs(),
+        })?;
+        Ok(op_id)
+    }
+
+    pub(crate) fn applying(
+        &mut self,
+        op_id: u64,
+        turn: usize,
+        path: &str,
+    ) -> Result<(), AgentError> {
         self.seq = self.seq.saturating_add(1);
         let seq = self.seq;
         self.append(RewindRecord {
@@ -548,6 +596,8 @@ impl RewindJournal {
             turn,
             paths: Vec::new(),
             backups: Vec::new(),
+            backend: String::new(),
+            backup: String::new(),
             path: path.to_owned(),
             restored: Vec::new(),
             deleted: Vec::new(),
@@ -556,7 +606,7 @@ impl RewindJournal {
         })
     }
 
-    fn finish(
+    pub(crate) fn finish(
         &mut self,
         op_id: u64,
         turn: usize,
@@ -573,6 +623,8 @@ impl RewindJournal {
             turn,
             paths: Vec::new(),
             backups: Vec::new(),
+            backend: String::new(),
+            backup: String::new(),
             path: String::new(),
             restored: restored.to_vec(),
             deleted: deleted.to_vec(),
@@ -581,7 +633,12 @@ impl RewindJournal {
         })
     }
 
-    fn rollback(&mut self, op_id: u64, turn: usize, failures: &[String]) -> Result<(), AgentError> {
+    pub(crate) fn rollback(
+        &mut self,
+        op_id: u64,
+        turn: usize,
+        failures: &[String],
+    ) -> Result<(), AgentError> {
         self.seq = self.seq.saturating_add(1);
         let seq = self.seq;
         self.append(RewindRecord {
@@ -592,6 +649,8 @@ impl RewindJournal {
             turn,
             paths: Vec::new(),
             backups: Vec::new(),
+            backend: String::new(),
+            backup: String::new(),
             path: String::new(),
             restored: Vec::new(),
             deleted: Vec::new(),
@@ -600,7 +659,14 @@ impl RewindJournal {
         })
     }
 
-    fn recover(&mut self, op_id: u64, turn: usize, failures: &[String]) -> Result<(), AgentError> {
+    pub(crate) fn recover(
+        &mut self,
+        op_id: u64,
+        turn: usize,
+        backend: &str,
+        backup: &str,
+        failures: &[String],
+    ) -> Result<(), AgentError> {
         self.seq = self.seq.saturating_add(1);
         let seq = self.seq;
         self.append(RewindRecord {
@@ -611,6 +677,8 @@ impl RewindJournal {
             turn,
             paths: Vec::new(),
             backups: Vec::new(),
+            backend: backend.to_owned(),
+            backup: backup.to_owned(),
             path: String::new(),
             restored: Vec::new(),
             deleted: Vec::new(),
@@ -627,7 +695,7 @@ impl RewindJournal {
         let _ = std::fs::remove_dir_all(self.backup_dir(op_id));
     }
 
-    fn report(&self) -> Result<RewindJournalReport, AgentError> {
+    pub(crate) fn report(&self) -> Result<RewindJournalReport, AgentError> {
         rewind_report(read_rewind_records(&self.path)?)
     }
 
@@ -697,6 +765,8 @@ struct OpenRewind {
     planned: Vec<String>,
     applied: Vec<String>,
     backups: Vec<RewindBackup>,
+    backend: String,
+    backup: String,
     at: u64,
 }
 
@@ -714,6 +784,8 @@ fn rewind_report(records: Vec<RewindRecord>) -> Result<RewindJournalReport, Agen
                         planned: record.paths,
                         applied: Vec::new(),
                         backups: record.backups,
+                        backend: record.backend,
+                        backup: record.backup,
                         at: record.at,
                     },
                 );
@@ -741,6 +813,8 @@ fn rewind_report(records: Vec<RewindRecord>) -> Result<RewindJournalReport, Agen
                         applied: entry.applied,
                         rollback_failures: record.failures,
                         backups: entry.backups,
+                        backend: entry.backend,
+                        backup: entry.backup,
                         at: entry.at,
                     });
                 }
@@ -757,6 +831,8 @@ fn rewind_report(records: Vec<RewindRecord>) -> Result<RewindJournalReport, Agen
                         applied: entry.applied,
                         rollback_failures: record.failures,
                         backups: entry.backups,
+                        backend: entry.backend,
+                        backup: entry.backup,
                         at: entry.at,
                     });
                 }
@@ -771,6 +847,8 @@ fn rewind_report(records: Vec<RewindRecord>) -> Result<RewindJournalReport, Agen
             applied: entry.applied,
             rollback_failures: Vec::new(),
             backups: entry.backups,
+            backend: entry.backend,
+            backup: entry.backup,
             at: entry.at,
         });
     }
