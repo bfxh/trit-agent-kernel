@@ -974,6 +974,7 @@ pub fn run_headless<M: Model>(
 
 #[cfg(windows)]
 pub mod appcontainer;
+mod auth;
 pub mod checkpoint;
 mod connection_limit;
 pub mod context;

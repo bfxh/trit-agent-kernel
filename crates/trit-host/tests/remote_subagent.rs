@@ -153,6 +153,50 @@ fn cancel(url: &str, key: &str) {
     );
 }
 
+fn health_status(address: &str, authorization: Option<&str>) -> String {
+    let auth = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: test\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response.lines().next().unwrap_or_default().to_string()
+}
+
+#[test]
+fn bearer_token_requires_an_exact_header() {
+    let server =
+        RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_token("secret")).unwrap();
+    let address = server.addr().unwrap().to_string();
+    let handle = std::thread::spawn(move || server.serve_connections(5).unwrap());
+
+    assert_eq!(
+        health_status(&address, Some("Bearer secret")),
+        "HTTP/1.1 200 OK"
+    );
+    for header in [
+        Some("Bearer secre"),
+        Some("Bearer secretx"),
+        Some("bearer secret"),
+        None,
+    ] {
+        let status = health_status(&address, header);
+        assert!(
+            status.starts_with("HTTP/1.1 401"),
+            "near-match header {header:?} must be rejected, got {status}"
+        );
+    }
+    handle.join().unwrap();
+}
+
 #[test]
 fn remote_round_trip_over_loopback() {
     let request = request();

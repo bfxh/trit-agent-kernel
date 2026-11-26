@@ -8,7 +8,8 @@
 //! 1. **有界读**：`Content-Length` 缺失、超过 [`MAX_FRAME_BYTES`] + 4、或实际
 //!    字节数不足，一律拒绝，绝不无限读；
 //! 2. **鉴权先于执行**：配置了 token 时，缺 `Authorization: Bearer <token>`
-//!    直接 401，帧不解码；
+//!    直接 401，帧不解码；期望头在启动时转成 SHA-256 摘要，实际头也摘要后
+//!    用固定长度常量时间比较，不逐字节泄漏 token 前缀；
 //! 3. **只回合法帧**：响应体永远是 `trit_orch::encode_frame` 的产物；
 //!    失败模式回 `Failed` 帧，而不是让宿主把错误当成完成；
 //! 4. **一连接一请求**：读满一帧即回包并关闭，便于宿主侧超时语义保持简单；
@@ -70,6 +71,7 @@ use trit_orch::{
     SubagentResponse, decode_frame, encode_frame,
 };
 
+use crate::auth::{AUTH_DIGEST_LEN, authorization_matches, bearer_digest};
 use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
 use crate::http_read::{
     DEFAULT_REQUEST_READ_TIMEOUT, DeadlineStream, HeaderReadError, IO_TIMEOUT, MAX_HEADER_BYTES,
@@ -573,6 +575,7 @@ impl RemoteServerConfig {
 pub struct RemoteServer {
     listener: TcpListener,
     config: RemoteServerConfig,
+    auth: Option<[u8; AUTH_DIGEST_LEN]>,
     cache: ResponseCache,
     cancels: Arc<ActiveCancels>,
     gates: Arc<KeyGates>,
@@ -624,11 +627,13 @@ impl RemoteServer {
                 "exec args use {workspace} but exec workspace root is not configured",
             ));
         }
+        let auth = config.token.as_deref().map(bearer_digest);
         let listener = TcpListener::bind(config.bind.as_str())?;
         let slots = ConnectionSlots::new(config.max_connections);
         Ok(Self {
             listener,
             config,
+            auth,
             cache: Arc::default(),
             cancels: Arc::default(),
             gates: Arc::default(),
@@ -656,6 +661,7 @@ impl RemoteServer {
         handle(
             stream,
             &self.config,
+            self.auth.as_ref(),
             &self.cache,
             &self.cancels,
             &self.gates,
@@ -673,13 +679,22 @@ impl RemoteServer {
                 continue;
             };
             let config = self.config.clone();
+            let auth = self.auth;
             let cache = Arc::clone(&self.cache);
             let cancels = Arc::clone(&self.cancels);
             let gates = Arc::clone(&self.gates);
             let executions = Arc::clone(&self.executions);
             workers.push(std::thread::spawn(move || {
                 let _slot = slot;
-                let _ = handle(stream, &config, &cache, &cancels, &gates, &executions);
+                let _ = handle(
+                    stream,
+                    &config,
+                    auth.as_ref(),
+                    &cache,
+                    &cancels,
+                    &gates,
+                    &executions,
+                );
             }));
         }
         for worker in workers {
@@ -703,13 +718,22 @@ impl RemoteServer {
                 continue;
             };
             let config = self.config.clone();
+            let auth = self.auth;
             let cache = Arc::clone(&self.cache);
             let cancels = Arc::clone(&self.cancels);
             let gates = Arc::clone(&self.gates);
             let executions = Arc::clone(&self.executions);
             std::thread::spawn(move || {
                 let _slot = slot;
-                let _ = handle(stream, &config, &cache, &cancels, &gates, &executions);
+                let _ = handle(
+                    stream,
+                    &config,
+                    auth.as_ref(),
+                    &cache,
+                    &cancels,
+                    &gates,
+                    &executions,
+                );
             });
         }
     }
@@ -719,6 +743,7 @@ impl RemoteServer {
 fn handle(
     mut stream: TcpStream,
     config: &RemoteServerConfig,
+    auth: Option<&[u8; AUTH_DIGEST_LEN]>,
     cache: &ResponseCache,
     cancels: &ActiveCancels,
     gates: &KeyGates,
@@ -799,9 +824,9 @@ fn handle(
         }
     }
 
-    if let Some(token) = config.token.as_deref() {
-        // 参考实现：按字节相等比较；旁路/时序防护不在本层。
-        if authorization.as_deref() != Some(&format!("Bearer {token}")) {
+    if let Some(expected) = auth {
+        // 启动时缓存期望头的 SHA-256 摘要；比较固定长度摘要，避免逐字节提前返回。
+        if !authorization_matches(authorization.as_deref(), expected) {
             return respond(&mut stream, 401, "Unauthorized", b"");
         }
     }

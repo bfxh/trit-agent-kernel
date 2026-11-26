@@ -179,7 +179,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `Failed`；解帧失败或 `task + epoch` 不匹配返回协议错误。以上都不产生
   `Completed`；跨机重试由 §9 的调度层显式开启。
 - 参考服务端 `trit_host::remote_serve` 与 CLI `trit-host remote-echo`：一次
-  连接一个 `POST`，`Content-Length` 有界（≤ 8 MiB + 4），可选 Bearer 校验，
+  连接一个 `POST`，`Content-Length` 有界（≤ 8 MiB + 4），可选 Bearer 校验
+  （期望头启动时转 SHA-256 摘要，实际头摘要后用固定长度常量时间比较，不逐字节
+  泄漏 token 前缀），
   `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；带
   `X-Trit-Idempotency` 且与帧的 `task@epoch` 后缀一致时，按完整键（可带
   `<scope>|` 前缀）缓存首次响应（重试直接回缓存、不再执行），缓存同时限制 1024
@@ -242,11 +244,12 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   租约丢失与超时同时发生时以租约丢失优先。deadline 线程 spawn 失败时该请求不受
   时限约束；超时 `Aborted` 仍不代表远端一定没有产生副作用。
   `remote-echo --ledger <url>` 接入后，带键请求以账本为权威：账本不可达回 503
-  且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权，
+  且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权
+  （同样把期望头转 SHA-256 摘要后做常量时间比较），
   `--ledger-renew-ms` 调整续约间隔（必须小于账本 TTL）。
 
 回归在 `crates/trit-host/tests/remote_subagent.rs`：loopback 服务端与真实
-`remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
+`remote-echo` 子进程覆盖鉴权（精确 token 通过，前缀/后缀/大小写/缺失均拒绝）、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
 503、请求行/头长度超限 431、慢头/慢体触发请求读取总时限 408。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
 慢执行期间不被接管、租约丢失中止在途执行、完成帧已由别人写入时旧执行者回 Aborted 而非旧结果、租约被接管不隔离节点且换机重试回放完成、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达

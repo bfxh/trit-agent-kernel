@@ -35,7 +35,8 @@
 //! `--request-read-timeout-ms`，0 关闭），慢速滴流到点回 `408`。
 //!
 //! 安全边界：账本默认只应绑定 loopback 或置于内网；配置 token 后所有请求都要
-//! `Authorization: Bearer <token>`。状态文件同时包含完成帧与租约令牌，应按敏感
+//! `Authorization: Bearer <token>`，比较走 SHA-256 摘要 + 固定长度常量时间，
+//! 不逐字节泄漏 token 前缀。状态文件同时包含完成帧与租约令牌，应按敏感
 //! 数据保护。账本不校验任务内容，只校验 `complete` 的帧与幂等键一致，并要求
 //! `/renew`、`/complete` 携带当前持有者的租约令牌。
 
@@ -52,6 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
 
+use crate::auth::{AUTH_DIGEST_LEN, authorization_matches, bearer_digest};
 use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
 use crate::http_read::{
     DEFAULT_REQUEST_READ_TIMEOUT, DeadlineStream, HeaderReadError, IO_TIMEOUT, MAX_HEADER_BYTES,
@@ -227,6 +229,7 @@ struct LedgerState {
 pub struct LedgerServer {
     listener: TcpListener,
     config: LedgerServerConfig,
+    auth: Option<[u8; AUTH_DIGEST_LEN]>,
     state: Arc<Mutex<LedgerState>>,
     completions: Arc<AtomicU64>,
     slots: Arc<ConnectionSlots>,
@@ -262,6 +265,7 @@ impl LedgerServer {
                 "ledger pending_ttl must be positive",
             ));
         }
+        let auth = config.token.as_deref().map(bearer_digest);
         let listener = TcpListener::bind(config.bind.as_str())?;
         let state = match config.state_path.as_deref() {
             Some(path) => {
@@ -285,6 +289,7 @@ impl LedgerServer {
         Ok(Self {
             listener,
             config,
+            auth,
             state,
             completions: Arc::default(),
             slots,
@@ -305,7 +310,13 @@ impl LedgerServer {
         let Some(_slot) = self.slots.try_acquire() else {
             return respond(&mut stream, 503, "Service Unavailable", b"");
         };
-        handle(stream, &self.config, &self.state, &self.completions)
+        handle(
+            stream,
+            &self.config,
+            self.auth.as_ref(),
+            &self.state,
+            &self.completions,
+        )
     }
 
     /// 每个连接一个线程，但受 `max_connections` 限制；超额连接直接 503。
@@ -317,11 +328,12 @@ impl LedgerServer {
                 continue;
             };
             let config = self.config.clone();
+            let auth = self.auth;
             let state = Arc::clone(&self.state);
             let completions = Arc::clone(&self.completions);
             std::thread::spawn(move || {
                 let _slot = slot;
-                let _ = handle(stream, &config, &state, &completions);
+                let _ = handle(stream, &config, auth.as_ref(), &state, &completions);
             });
         }
     }
@@ -330,6 +342,7 @@ impl LedgerServer {
 fn handle(
     mut stream: TcpStream,
     config: &LedgerServerConfig,
+    auth: Option<&[u8; AUTH_DIGEST_LEN]>,
     state: &Arc<Mutex<LedgerState>>,
     completions: &Arc<AtomicU64>,
 ) -> std::io::Result<()> {
@@ -413,8 +426,8 @@ fn handle(
     if content_length > MAX_LEDGER_BODY {
         return respond(&mut stream, 413, "Payload Too Large", b"");
     }
-    if let Some(token) = config.token.as_deref()
-        && authorization.as_deref() != Some(&format!("Bearer {token}"))
+    if let Some(expected) = auth
+        && !authorization_matches(authorization.as_deref(), expected)
     {
         return respond(&mut stream, 401, "Unauthorized", b"");
     }
