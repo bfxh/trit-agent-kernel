@@ -35,7 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -416,6 +416,9 @@ where
     })
 }
 
+/// 单次健康扫描最多并行探测多少个节点；避免一个超大节点表瞬间打满连接/线程。
+pub const MAX_HEALTH_PROBE_CONCURRENCY: usize = 64;
+
 /// 对节点健康文件做一次独立扫描：只探测已隔离节点，成功即写回 `healthy`。
 ///
 /// 与演练内的周期监控不同，本函数不依赖 `remote-plan` 进程：调用方可以按
@@ -423,10 +426,36 @@ where
 /// 健康文件是 `Vec<NodeSnapshot>`；文件不存在时按“全部健康”初始化并写出。
 /// 表里不存在的旧节点保留原快照、不再探测，并在 [`RemoteHealthReport::ignored`]
 /// 中报告，避免监控器缩减节点表时抹掉其他节点的健康状态。
+///
+/// 本函数串行探测；需要限制并发时用
+/// [`probe_remote_health_file_with_concurrency`]。
 pub fn probe_remote_health_file(
     nodes: &[RemoteNode],
     health_path: impl AsRef<Path>,
 ) -> Result<RemoteHealthReport, AgentError> {
+    probe_remote_health_file_with_concurrency(nodes, health_path, 1)
+}
+
+/// 同 [`probe_remote_health_file`]，但最多 `concurrency` 个探测并行。
+///
+/// 只并行 `GET /health` 与结果回填；健康文件仍然只写一次，事件与快照按节点
+/// id 升序输出，因此同样的输入得到同样的报告。`concurrency` 必须在
+/// `1..=MAX_HEALTH_PROBE_CONCURRENCY`。
+pub fn probe_remote_health_file_with_concurrency(
+    nodes: &[RemoteNode],
+    health_path: impl AsRef<Path>,
+    concurrency: usize,
+) -> Result<RemoteHealthReport, AgentError> {
+    if concurrency == 0 {
+        return Err(AgentError::Io(
+            "remote health probe concurrency must be positive".into(),
+        ));
+    }
+    if concurrency > MAX_HEALTH_PROBE_CONCURRENCY {
+        return Err(AgentError::Io(format!(
+            "remote health probe concurrency {concurrency} exceeds {MAX_HEALTH_PROBE_CONCURRENCY}"
+        )));
+    }
     let path = health_path.as_ref();
     NodeTable::new(nodes.to_vec())
         .map_err(|error| AgentError::Io(format!("remote health nodes: {error}")))?;
@@ -441,12 +470,7 @@ pub fn probe_remote_health_file(
         }
     }
 
-    let mut events = Vec::new();
     let mut snapshots = Vec::with_capacity(nodes.len());
-    let mut checked = 0usize;
-    let mut readmitted = 0usize;
-    let mut still_isolated = 0usize;
-
     for node in nodes {
         let mut snapshot = stored.remove(&node.id).unwrap_or_else(|| NodeSnapshot {
             id: node.id.clone(),
@@ -457,37 +481,81 @@ pub fn probe_remote_health_file(
         });
         // 健康文件跨运行保存，不应携带某一时刻的在途计数。
         snapshot.in_flight = 0;
-        if !snapshot.healthy {
-            checked += 1;
-            match probe_remote_health(&node.endpoint) {
-                Ok(()) => {
-                    snapshot.healthy = true;
-                    readmitted += 1;
-                    if events.len() < MAX_PROBE_EVENTS {
-                        events.push(RemoteProbeEvent {
-                            node: node.id.clone(),
-                            phase: RemoteProbePhase::Monitor,
-                            ok: true,
-                            readmitted: true,
-                            error: None,
-                        });
+        snapshots.push(snapshot);
+    }
+
+    let mut targets: Vec<(usize, &RemoteNode)> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !snapshots[*index].healthy)
+        .collect();
+    targets.sort_by(|left, right| left.1.id.cmp(&right.1.id));
+    let outcomes = Mutex::new(vec![None; targets.len()]);
+    let next = AtomicUsize::new(0);
+    let workers = concurrency.min(targets.len());
+    if workers > 0 {
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((_, node)) = targets.get(index) else {
+                            break;
+                        };
+                        let outcome = probe_remote_health(&node.endpoint);
+                        outcomes
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
+                            Some(outcome);
                     }
+                });
+            }
+        });
+    }
+    let outcomes = outcomes
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut events = Vec::new();
+    let mut checked = 0usize;
+    let mut readmitted = 0usize;
+    let mut still_isolated = 0usize;
+    for ((snapshot_index, node), outcome) in targets.into_iter().zip(outcomes) {
+        let Some(outcome) = outcome else {
+            return Err(AgentError::Io(format!(
+                "health probe for node {} produced no result",
+                node.id
+            )));
+        };
+        checked += 1;
+        match outcome {
+            Ok(()) => {
+                let snapshot = &mut snapshots[snapshot_index];
+                snapshot.healthy = true;
+                readmitted += 1;
+                if events.len() < MAX_PROBE_EVENTS {
+                    events.push(RemoteProbeEvent {
+                        node: node.id.clone(),
+                        phase: RemoteProbePhase::Monitor,
+                        ok: true,
+                        readmitted: true,
+                        error: None,
+                    });
                 }
-                Err(error) => {
-                    still_isolated += 1;
-                    if events.len() < MAX_PROBE_EVENTS {
-                        events.push(RemoteProbeEvent {
-                            node: node.id.clone(),
-                            phase: RemoteProbePhase::Monitor,
-                            ok: false,
-                            readmitted: false,
-                            error: Some(error),
-                        });
-                    }
+            }
+            Err(error) => {
+                still_isolated += 1;
+                if events.len() < MAX_PROBE_EVENTS {
+                    events.push(RemoteProbeEvent {
+                        node: node.id.clone(),
+                        phase: RemoteProbePhase::Monitor,
+                        ok: false,
+                        readmitted: false,
+                        error: Some(error),
+                    });
                 }
             }
         }
-        snapshots.push(snapshot);
     }
 
     let ignored: Vec<String> = stored.keys().cloned().collect();

@@ -351,10 +351,13 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   崩溃最多丢最近一个周期的健康变化。库级调用方可直接用
   `spawn_remote_health_flusher(table, path, interval)` 获得同一能力。计划内的
   监控随计划结束退出；跨进程常驻恢复由 `trit-host remote-health` 承担：
-  `--nodes <json> --health <path> [--interval-ms N] [--once]` 每轮重读同一节点表与
+  `--nodes <json> --health <path> [--interval-ms N] [--once]
+  [--probe-concurrency N]` 每轮重读同一节点表与
   健康文件（`Vec<NodeSnapshot>`），只探已隔离节点，`GET /health` 成功即写回
   `healthy`（保留 `attempts/failures`、清零 `in_flight`），失败保持隔离并记录原因；
-  默认常驻、每轮输出一行 JSON，`--once` 适合 cron / 任务计划程序。节点增删或 token
+  默认常驻、每轮输出一行 JSON，`--once` 适合 cron / 任务计划程序。`--probe-concurrency`
+  默认 4、上限 64，只并行探测、不改变单次写回；事件与快照仍按节点 id
+  升序，`1` 为串行。节点增删或 token
   轮换无需重启守护，但节点文件应完整落盘：读取或解析失败会让守护 fail-closed 退出。
   文件不存在时按全部健康初始化；表里不存在的旧节点保留原快照但
   不再探测，并在输出的 `ignored` 中列出。守护持有 `<health>.lock` 上的 OS 排他锁，
@@ -381,7 +384,8 @@ preflight 探测重新放行隔离节点并返回 `probes`）、
 重复节点 ID 与非法 scope 拒绝）、
 `crates/trit-host/tests/remote_health.rs`（独立守护成功放行并保留累计计数、探测
 失败保持隔离、未知节点保留原快照、保存时合并未提及条目、并发写者不丢条目、周期
-写回线程持久化隔离与放行且清零 `in_flight`、缺失文件
+写回线程持久化隔离与放行且清零 `in_flight`、有界并发探测且事件按 id 有序、
+非法并发值拒绝、缺失文件
 初始化、节点表热加载与单实例锁、`--once` CLI 输出）与 `crates/trit-host/tests/remote_ledger.rs`
 （共享账本下双节点单次执行、scope 隔离）。
 

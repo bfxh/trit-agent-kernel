@@ -1,12 +1,17 @@
 //! 独立节点健康守护：一次扫描只探已隔离节点，成功写回，失败保持隔离。
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use trit_host::{probe_remote_health_file, save_remote_health_file, spawn_remote_health_flusher};
+use trit_host::{
+    probe_remote_health_file, probe_remote_health_file_with_concurrency, save_remote_health_file,
+    spawn_remote_health_flusher,
+};
 use trit_orch::{CancelToken, NodeOutcome, NodeSnapshot, NodeTable, RemoteEndpoint, RemoteNode};
 
 struct TestNode {
@@ -70,6 +75,22 @@ fn node(id: &str, url: String) -> RemoteNode {
             timeout_secs: 2,
         },
     )
+}
+
+/// 只接受一次请求、延迟后回 200 的 `/health` 服务端；用于测并行探测。
+fn delayed_health_server(delay: Duration) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        std::thread::sleep(delay);
+        let _ =
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    });
+    (base, handle)
 }
 
 fn write_health(path: &Path, snapshots: &[NodeSnapshot]) {
@@ -196,6 +217,48 @@ fn health_flusher_persists_changes_between_intervals() {
 
     flusher.stop_and_join();
     assert_eq!(flusher.last_error(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn monitor_probes_isolated_nodes_with_bounded_concurrency() {
+    let dir = temp_dir("probe-concurrency");
+    let health = dir.join("health.json");
+    let delay = Duration::from_millis(250);
+    let servers: Vec<(String, JoinHandle<()>)> =
+        (0..4).map(|_| delayed_health_server(delay)).collect();
+    let nodes: Vec<RemoteNode> = servers
+        .iter()
+        .enumerate()
+        .map(|(index, (base, _))| node(&format!("n{index}"), format!("{base}/run")))
+        .collect();
+    let stored: Vec<NodeSnapshot> = nodes.iter().map(|node| isolated(&node.id)).collect();
+    write_health(&health, &stored);
+
+    let started = Instant::now();
+    let report = probe_remote_health_file_with_concurrency(&nodes, &health, nodes.len()).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(report.checked, nodes.len());
+    assert_eq!(report.readmitted, nodes.len());
+    assert_eq!(report.still_isolated, 0);
+    let event_nodes: Vec<&str> = report
+        .events
+        .iter()
+        .map(|event| event.node.as_str())
+        .collect();
+    assert_eq!(
+        event_nodes,
+        ["n0", "n1", "n2", "n3"],
+        "并发探测的事件仍按节点 id 升序"
+    );
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "4 个 250ms 探测串行需 1s；并发应明显更快，实际 {elapsed:?}"
+    );
+    for (_, handle) in servers {
+        handle.join().unwrap();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -397,4 +460,19 @@ fn remote_health_once_cli_readmits_and_reports_json() {
     assert!(read_health(&health)[0].healthy);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn remote_health_cli_rejects_invalid_probe_concurrency() {
+    for (value, expected) in [("0", "must be positive"), ("65", "must be <= 64")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+            .arg("remote-health")
+            .arg("--probe-concurrency")
+            .arg(value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{value}: {stderr}");
+    }
 }
