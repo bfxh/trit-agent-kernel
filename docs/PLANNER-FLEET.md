@@ -185,10 +185,13 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   回缓存、不再执行），缓存上限 1024、FIFO 淘汰；头与帧不一致回 400。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口；
   `--max-connections` 默认 64，超额连接直接回 503、不再 spawn 线程。
-  `RemoteMode::Exec` / `trit-host remote-exec --workspace <dir> --script <json>`：
+  `RemoteMode::Exec` / `trit-host remote-exec (--workspace <dir> | --workspace-root <dir>) --script <json>`：
   每个请求 spawn 一个 `subagent-run` 子进程，请求帧走 stdin、响应帧走 stdout；
   只有子进程判定完成才回 `Completed`，进程错误按 `Failed` 回帧。权限仍由请求
-  profile 与固定 workspace 决定（`ReadOnly` 拒绝写）。
+  profile 与 workspace 决定（`ReadOnly` 拒绝写）。`--workspace-root` 按任务 ID
+  建 `<root>/<task>` 独立目录，`--script` 与 args 里的 `{task}`/`{workspace}`
+  按请求展开；任务 ID 只允许 ASCII 字母数字、`-`、`_`、`.`，含路径分隔符或为
+  `.`/`..` 时直接回 `Failed`、不创建目录。
 - 共享幂等账本 `trit_host::remote_ledger`（CLI `trit-host remote-ledger`）：
   `POST /claim` + `POST /complete`，键仍是 `X-Trit-Idempotency: <task>@<epoch>`。
   claim 返回 `200` 空体 = 获得执行权，`200` + 帧 = 已完成、直接回放，`409` = 他人
@@ -203,8 +206,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
 503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、共享账本下双节点只执行一次、账本不可达
-时 fail-closed，以及落盘账本重启后回放；`tests/remote_exec.rs` 覆盖 `remote-exec` 真实写文件与
-`run_remote_plan` 派发到真实执行器。
+时 fail-closed，以及落盘账本重启后回放；`tests/remote_exec.rs` 覆盖 `remote-exec`
+真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
+派发到真实执行器。
 
 **仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）。
 静态节点表、派发与有界换机重试见 §9。

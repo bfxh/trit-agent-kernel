@@ -1325,7 +1325,8 @@ fn usage() {
          shared idempotency ledger: POST /claim and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
-         --workspace <dir> --script <proposals.json> [--max-steps N] [--exec-timeout-secs N] \\\n\
+         (--workspace <dir> | --workspace-root <dir>) --script <proposals.json> \\\n\
+         [--max-steps N] [--exec-timeout-secs N] \\\n\
          [--once] [--max-connections N] [--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>]\n\
@@ -1835,13 +1836,16 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     Ok(())
 }
 
-/// `remote-exec [--bind <addr>] [--token <t>] --workspace <dir> --script <proposals.json>`
-/// `[--max-steps N] [--exec-timeout-secs N] [--once] [--ledger <url> ...]`：
-/// 可执行的远程端点。每个请求 spawn 一个 `subagent-run` 子进程，帧走 stdin/stdout。
+/// `remote-exec [--bind <addr>] [--token <t>] (--workspace <dir> | --workspace-root <dir>)`
+/// `--script <proposals.json>` `[--max-steps N] [--exec-timeout-secs N] [--once]`
+/// `[--ledger <url> ...]`：可执行的远程端点。每个请求 spawn 一个 `subagent-run`
+/// 子进程，帧走 stdin/stdout。`--workspace-root` 会按任务 ID 建独立子目录；
+/// args/`--script` 中的 `{task}` 与 `{workspace}` 在每次请求前展开。
 fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut config = trit_host::RemoteServerConfig::new("127.0.0.1:0");
     let mut once = false;
-    let mut workspace = PathBuf::from(".");
+    let mut workspace: Option<PathBuf> = None;
+    let mut workspace_root: Option<PathBuf> = None;
     let mut script: Option<PathBuf> = None;
     let mut max_steps = 20usize;
     let mut exec_timeout_secs = 30u64;
@@ -1853,7 +1857,10 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             "--bind" => config.bind = next(&mut args, "--bind")?,
             "--token" => config.token = Some(next(&mut args, "--token")?),
             "--once" => once = true,
-            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--workspace-root" => {
+                workspace_root = Some(PathBuf::from(next(&mut args, "--workspace-root")?))
+            }
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => max_steps = next(&mut args, "--max-steps")?.parse()?,
             "--max-connections" => {
@@ -1870,6 +1877,20 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             other => return Err(fail(format!("unknown remote-exec argument: {other}"))),
         }
     }
+    let (workspace, workspace_root) = match (workspace, workspace_root) {
+        (Some(workspace), None) => (workspace, None),
+        (None, Some(root)) => (PathBuf::from("{workspace}"), Some(root)),
+        (Some(_), Some(_)) => {
+            return Err(fail(
+                "--workspace and --workspace-root are mutually exclusive",
+            ));
+        }
+        (None, None) => {
+            return Err(fail(
+                "remote-exec requires --workspace <dir> or --workspace-root <dir>",
+            ));
+        }
+    };
     let script = script.ok_or_else(|| fail("remote-exec requires --script <proposals.json>"))?;
     let program = std::env::current_exe()
         .map_err(|error| fail(format!("resolve current executable: {error}")))?;
@@ -1884,6 +1905,9 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             max_steps.to_string(),
         ])
         .with_timeout(std::time::Duration::from_secs(exec_timeout_secs));
+    if let Some(root) = workspace_root {
+        config.exec_workspace_root = Some(root);
+    }
     config = config.with_exec(exec);
     if let Some(url) = ledger_url {
         config.ledger = Some(trit_orch::RemoteEndpoint {

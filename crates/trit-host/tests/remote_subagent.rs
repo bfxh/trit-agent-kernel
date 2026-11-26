@@ -555,14 +555,8 @@ fn connection_limit_rejects_excess_with_503() {
     // 等第一个连接被 accept 并占住唯一槽位。
     std::thread::sleep(Duration::from_millis(150));
 
-    let mut second = TcpStream::connect(address).unwrap();
-    let _ = write!(
-        second,
-        "POST /run HTTP/1.1\r\nHost: test\r\nContent-Type: {FRAME_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        frame.len()
-    );
-    let _ = second.write_all(&frame);
-    let _ = second.flush();
+    // 连接上限在读取请求前判定；不发请求也能观察 503，且避免未读数据触发 RST。
+    let second = TcpStream::connect(address).unwrap();
     let mut reader = BufReader::new(second);
     let mut status = String::new();
     reader.read_line(&mut status).unwrap();

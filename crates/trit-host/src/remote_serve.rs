@@ -21,7 +21,9 @@
 //!    响应帧，无法登记完成，账本占位会留到 TTL 过期；
 //! 7. **Exec 模式真实执行**：spawn `subagent-run`（或等价命令），请求帧走 stdin、
 //!    响应帧走 stdout；只有子进程判定完成才回 `Completed`，进程错误/超时按
-//!    `Failed`/`Aborted` 回帧，不误报完成；
+//!    `Failed`/`Aborted` 回帧，不误报完成。配 `exec_workspace_root` 时按任务 ID
+//!    建 `<root>/<task>` 并展开 args 里的 `{workspace}` / `{task}`；任务 ID 含
+//!    路径分隔符或为 `.`/`..` 时直接回 `Failed`，不落盘；
 //! 8. **取消传播**：`POST /cancel`（origin 上的固定路径）+ `X-Trit-Idempotency`
 //!    按幂等键置位在途请求；等待账本、`sleep_ms` 与执行前都会检查，Exec 用可
 //!    取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
@@ -32,6 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -203,6 +206,9 @@ pub struct RemoteServerConfig {
     pub ledger: Option<RemoteEndpoint>,
     /// `Exec` 模式下的子 agent 进程配置；其他模式必须为空。
     pub exec: Option<SubagentProcessConfig>,
+    /// `Exec` 模式下按任务隔离的 workspace 根：请求的任务 ID 作为子目录，
+    /// args 里的 `{workspace}` 会在执行前替换成该目录。
+    pub exec_workspace_root: Option<PathBuf>,
     /// 同时在处理的连接上限；超限直接回 503，不再 spawn 线程。
     pub max_connections: usize,
 }
@@ -216,6 +222,7 @@ impl RemoteServerConfig {
             sleep_ms: 0,
             ledger: None,
             exec: None,
+            exec_workspace_root: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
@@ -248,6 +255,12 @@ impl RemoteServerConfig {
 
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections.max(1);
+        self
+    }
+
+    /// 按任务隔离 workspace：`<root>/<sanitized task id>`。
+    pub fn with_exec_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.exec_workspace_root = Some(root.into());
         self
     }
 }
@@ -283,6 +296,21 @@ impl RemoteServer {
                 ));
             }
             _ => {}
+        }
+        if config.exec_workspace_root.is_some() && config.mode != RemoteMode::Exec {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exec workspace root is only valid in exec mode",
+            ));
+        }
+        if let Some(exec) = config.exec.as_ref()
+            && exec.args.iter().any(|arg| arg.contains("{workspace}"))
+            && config.exec_workspace_root.is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "exec args use {workspace} but exec workspace root is not configured",
+            ));
         }
         let listener = TcpListener::bind(config.bind.as_str())?;
         let slots = ConnectionSlots::new(config.max_connections);
@@ -489,19 +517,24 @@ fn handle(
                 let Some(exec) = config.exec.as_ref() else {
                     return respond(&mut stream, 500, "Internal Server Error", b"");
                 };
-                let reply = match token {
-                    Some(token) => run_subagent_reply_cancellable(exec, &request, token),
-                    None => run_subagent_reply(exec, &request),
-                };
-                match reply {
-                    Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
-                    Err(error) => (
-                        DelegationStatus::Failed {
-                            message: error.to_string(),
-                        },
-                        Vec::new(),
-                        0,
-                    ),
+                match exec_for_request(exec, config.exec_workspace_root.as_deref(), &request.task) {
+                    Ok(exec) => {
+                        let reply = match token {
+                            Some(token) => run_subagent_reply_cancellable(&exec, &request, token),
+                            None => run_subagent_reply(&exec, &request),
+                        };
+                        match reply {
+                            Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
+                            Err(error) => (
+                                DelegationStatus::Failed {
+                                    message: error.to_string(),
+                                },
+                                Vec::new(),
+                                0,
+                            ),
+                        }
+                    }
+                    Err(message) => (DelegationStatus::Failed { message }, Vec::new(), 0),
                 }
             }
         }
@@ -535,6 +568,60 @@ fn handle(
         guard.insert(key, response);
     }
     respond(&mut stream, 200, "OK", &frame)
+}
+
+/// 把 `{task}` / `{workspace}` 占位符按请求展开；配了 workspace 根时先建目录。
+fn exec_for_request(
+    config: &SubagentProcessConfig,
+    workspace_root: Option<&Path>,
+    task: &str,
+) -> Result<SubagentProcessConfig, String> {
+    let uses_task = config.args.iter().any(|arg| arg.contains("{task}"));
+    let uses_workspace = config.args.iter().any(|arg| arg.contains("{workspace}"));
+    if !uses_task && !uses_workspace && workspace_root.is_none() {
+        return Ok(config.clone());
+    }
+    let component = safe_task_component(task)?;
+    let workspace = workspace_root.map(|root| root.join(&component));
+    if uses_workspace && workspace.is_none() {
+        return Err("exec args use {workspace} but no workspace root is configured".into());
+    }
+    if let Some(workspace) = workspace.as_deref() {
+        std::fs::create_dir_all(workspace).map_err(|error| {
+            format!("create per-task workspace {}: {error}", workspace.display())
+        })?;
+    }
+    let mut materialized = config.clone();
+    materialized.args = config
+        .args
+        .iter()
+        .map(|arg| {
+            let mut arg = arg.replace("{task}", &component);
+            if let Some(workspace) = workspace.as_deref() {
+                arg = arg.replace("{workspace}", &workspace.to_string_lossy());
+            }
+            arg
+        })
+        .collect();
+    Ok(materialized)
+}
+
+/// 只允许单段、无路径分隔符的任务 ID 作为目录名，拒绝 `.` / `..`。
+fn safe_task_component(task: &str) -> Result<String, String> {
+    if task.is_empty() || task == "." || task == ".." {
+        return Err(format!(
+            "task id {task:?} is not a safe workspace directory"
+        ));
+    }
+    if !task
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(format!(
+            "task id {task:?} contains characters unsafe for a workspace directory"
+        ));
+    }
+    Ok(task.to_string())
 }
 
 /// 分片睡眠，取消置位时立即返回 `true`。

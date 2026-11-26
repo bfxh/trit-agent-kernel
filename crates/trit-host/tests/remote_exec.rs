@@ -117,6 +117,84 @@ fn spawn_exec(workspace: &Path, script: &Path, once: bool) -> TestNode {
     }
 }
 
+fn spawn_task_exec(root: &Path, script: &Path, once: bool) -> TestNode {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trit-host"));
+    command
+        .arg("remote-exec")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--workspace-root")
+        .arg(root)
+        .arg("--script")
+        .arg(script)
+        .arg("--exec-timeout-secs")
+        .arg("10")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if once {
+        command.arg("--once");
+    }
+    let mut child = command.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    TestNode {
+        base: format!("http://{}", value["bind"].as_str().unwrap()),
+        child,
+    }
+}
+
+#[test]
+fn remote_exec_isolates_workspace_per_task() {
+    let root = temp_dir("root");
+    let scripts = temp_dir("scripts-task");
+    let base = script(&scripts);
+    std::fs::copy(&base, scripts.join("t1.json")).unwrap();
+    let node = spawn_task_exec(&root, &scripts.join("{task}.json"), true);
+    let endpoint = RemoteEndpoint {
+        url: format!("{}/run", node.base),
+        auth_token: None,
+        timeout_secs: 30,
+    };
+    let result = run_remote_subagent(&endpoint, &request_for(&task("t1"))).unwrap();
+    assert!(result.reusable(), "{:?}", result.status);
+    assert_eq!(
+        std::fs::read_to_string(root.join("t1").join("a.txt")).unwrap(),
+        "hello-remote"
+    );
+
+    let mut node = node;
+    assert!(node.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&scripts);
+}
+
+#[test]
+fn remote_exec_rejects_unsafe_task_id_in_per_task_mode() {
+    let root = temp_dir("root-unsafe");
+    let scripts = temp_dir("scripts-unsafe");
+    let node = spawn_task_exec(&root, &scripts.join("{task}.json"), true);
+    let endpoint = RemoteEndpoint {
+        url: format!("{}/run", node.base),
+        auth_token: None,
+        timeout_secs: 30,
+    };
+    let result = run_remote_subagent(&endpoint, &request_for(&task("../escape"))).unwrap();
+    assert!(
+        matches!(result.status, trit_orch::DelegationStatus::Failed { .. }),
+        "{:?}",
+        result.status
+    );
+
+    let mut node = node;
+    assert!(node.child.wait().unwrap().success());
+    assert!(!root.parent().unwrap().join("escape").exists());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&scripts);
+}
+
 #[test]
 fn remote_exec_runs_subagent_and_writes_file() {
     let workspace = temp_dir("ws");
