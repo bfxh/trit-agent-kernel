@@ -884,10 +884,8 @@ impl ProcessSupervisor {
             std::thread::sleep(self.policy.backoff(self.restarts));
         }
         let mut command = Command::new(&self.spec.program);
+        crate::child_env::sanitize_with(&mut command, self.spec.env.iter().cloned());
         command.args(&self.spec.args);
-        for (key, value) in &self.spec.env {
-            command.env(key, value);
-        }
         if let Some(dir) = &self.spec.current_dir {
             command.current_dir(dir);
         }
@@ -1067,10 +1065,8 @@ impl McpConnection {
         notifications: Arc<McpNotificationState>,
     ) -> Result<Self, SupervisorError> {
         let mut command = Command::new(&spec.program);
+        crate::child_env::sanitize_with(&mut command, spec.env.iter().cloned());
         command.args(&spec.args);
-        for (key, value) in &spec.env {
-            command.env(key, value);
-        }
         if let Some(dir) = &spec.current_dir {
             command.current_dir(dir);
         }

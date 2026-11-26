@@ -44,6 +44,8 @@ pub struct SubagentProcessConfig {
     pub program: PathBuf,
     /// 传给可执行文件的参数。
     pub args: Vec<String>,
+    /// 显式传给子进程的额外环境变量；其余宿主环境（含 provider key）不继承。
+    pub env: Vec<(String, String)>,
     /// 等待响应的上限；超时即 kill。
     pub timeout: Duration,
 }
@@ -53,12 +55,19 @@ impl SubagentProcessConfig {
         Self {
             program: program.into(),
             args: Vec::new(),
+            env: Vec::new(),
             timeout: Duration::from_secs(30),
         }
     }
 
     pub fn with_args(mut self, args: impl IntoIterator<Item = String>) -> Self {
         self.args = args.into_iter().collect();
+        self
+    }
+
+    /// 显式追加环境变量；不调用时子进程只拿到 [`crate::child_env`] 白名单。
+    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
         self
     }
 
@@ -107,7 +116,9 @@ fn run_subagent_reply_with_cancel(
     request: &SubagentRequest,
     cancel: Option<&CancelToken>,
 ) -> Result<SubagentReply, AgentError> {
-    let mut child = Command::new(&config.program)
+    let mut command = Command::new(&config.program);
+    crate::child_env::sanitize_with(&mut command, config.env.iter().cloned());
+    let mut child = command
         .args(&config.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

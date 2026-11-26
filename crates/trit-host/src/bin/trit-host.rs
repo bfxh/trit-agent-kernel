@@ -1031,6 +1031,7 @@ fn null_device() -> &'static str {
 /// 这里用命令行配置与环境变量覆盖这两点，仓库配置仍会被读，但不能改变执行面。
 fn git_base_command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
+    trit_host::child_env::sanitize(&mut command);
     command
         .arg("-C")
         .arg(root)

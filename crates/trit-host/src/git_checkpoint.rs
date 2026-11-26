@@ -104,7 +104,9 @@ impl GitCheckpointStore {
         }
         let store = Self { dir, root };
         if !store.dir.join("HEAD").exists() {
-            let output = Command::new("git")
+            let mut init = Command::new("git");
+            crate::child_env::sanitize(&mut init);
+            let output = init
                 .args(["init", "--bare", "-q"])
                 .arg(command_path(&store.dir))
                 .output()
@@ -556,7 +558,9 @@ impl GitCheckpointStore {
     }
 
     fn git_output(&self, args: &[&str]) -> Result<std::process::Output, AgentError> {
-        Command::new("git")
+        let mut command = Command::new("git");
+        crate::child_env::sanitize(&mut command);
+        command
             .arg("--git-dir")
             .arg(command_path(&self.dir))
             .arg("--work-tree")

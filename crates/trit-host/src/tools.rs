@@ -208,6 +208,7 @@ impl ShellSession {
         let mut last_error = None;
         for (program, args) in persistent_shell_candidates() {
             let mut command = Command::new(&program);
+            crate::child_env::sanitize(&mut command);
             command
                 .args(args)
                 .current_dir(root)
@@ -784,6 +785,7 @@ impl LocalTools {
                 let (program, args) = sandbox.argv(command);
                 let mut process = Command::new(program);
                 process.args(args);
+                crate::child_env::sanitize(&mut process);
                 process
             }
             None if self.allow_unsandboxed_shell => shell_command(command),
@@ -848,12 +850,14 @@ fn shell_command(command: &str) -> Command {
     {
         let mut process = Command::new("cmd");
         process.args(["/C", command]);
+        crate::child_env::sanitize(&mut process);
         process
     }
     #[cfg(not(windows))]
     {
         let mut process = Command::new("sh");
         process.args(["-c", command]);
+        crate::child_env::sanitize(&mut process);
         process
     }
 }
