@@ -155,6 +155,54 @@ fn readmit_revives_only_known_isolated_nodes() {
 }
 
 #[test]
+fn stale_healthy_snapshots_are_isolated_until_readmitted() {
+    let table = NodeTable::new(vec![node("a", 1), node("b", 1), node("c", 1)])
+        .unwrap()
+        .with_snapshots(&[
+            NodeSnapshot {
+                id: "a".into(),
+                healthy: true,
+                in_flight: 0,
+                attempts: 2,
+                failures: 1,
+                updated_at_ms: 1_000,
+            },
+            NodeSnapshot {
+                id: "b".into(),
+                healthy: true,
+                in_flight: 0,
+                attempts: 0,
+                failures: 0,
+                updated_at_ms: 9_000,
+            },
+            NodeSnapshot {
+                id: "c".into(),
+                healthy: false,
+                in_flight: 0,
+                attempts: 0,
+                failures: 0,
+                updated_at_ms: 9_500,
+            },
+        ]);
+
+    let isolated = table.isolate_stale_healthy(10_000, 1_000);
+    assert_eq!(isolated, vec!["a"], "只隔离超过阈值的健康节点");
+    let snapshots = table.snapshot();
+    assert!(!snapshots[0].healthy);
+    assert_eq!(snapshots[0].attempts, 2, "新鲜度隔离不改写历史尝试数");
+    assert_eq!(snapshots[0].failures, 1, "新鲜度隔离不改写历史失败数");
+    assert!(
+        snapshots[0].updated_at_ms > 1_000,
+        "隔离本身必须推进节点更新时间"
+    );
+    assert!(snapshots[1].healthy, "恰好等于阈值的节点仍然新鲜");
+    assert!(!snapshots[2].healthy, "已隔离节点保持原状");
+
+    assert!(table.readmit("a"));
+    assert!(table.snapshot()[0].healthy);
+}
+
+#[test]
 fn snapshots_restore_quarantine_and_counts() {
     let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
     let cancel = CancelToken::new();

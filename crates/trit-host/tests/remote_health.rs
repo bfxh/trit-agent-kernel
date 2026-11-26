@@ -9,7 +9,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use trit_host::{
-    probe_remote_health_file, probe_remote_health_file_with_concurrency, save_remote_health_file,
+    RemoteHealthScope, probe_remote_health_file, probe_remote_health_file_scoped,
+    probe_remote_health_file_with_concurrency, save_remote_health_file,
     spawn_remote_health_flusher,
 };
 use trit_orch::{CancelToken, NodeOutcome, NodeSnapshot, NodeTable, RemoteEndpoint, RemoteNode};
@@ -384,6 +385,77 @@ fn monitor_keeps_node_isolated_when_probe_fails() {
     assert!(!stored[0].healthy);
     assert_eq!(stored[0].attempts, 3);
     assert_eq!(stored[0].failures, 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn probe_all_refreshes_healthy_nodes_without_counting_them_as_readmitted() {
+    let dir = temp_dir("probe-all-refresh");
+    let server = spawn_node();
+    let health = dir.join("health.json");
+    let initial = NodeSnapshot {
+        id: "n1".into(),
+        healthy: true,
+        in_flight: 0,
+        attempts: 1,
+        failures: 0,
+        updated_at_ms: 1,
+    };
+    write_health(&health, std::slice::from_ref(&initial));
+
+    let report = probe_remote_health_file_scoped(
+        &[node("n1", format!("{}/run", server.base))],
+        &health,
+        1,
+        RemoteHealthScope::All,
+    )
+    .unwrap();
+    assert_eq!(report.checked, 1, "健康节点也要真的探一次");
+    assert_eq!(report.readmitted, 0, "本来健康的节点不算重新入列");
+    assert_eq!(report.still_isolated, 0);
+    assert!(report.events[0].ok);
+    assert!(!report.events[0].readmitted, "事件同样不标记为重新入列");
+
+    let stored = read_health(&health);
+    assert!(stored[0].healthy);
+    assert!(
+        stored[0].updated_at_ms > initial.updated_at_ms,
+        "巡检成功必须刷新观测时间"
+    );
+    assert_eq!(stored[0].attempts, 1, "累计尝试数必须保留");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn probe_all_isolates_healthy_node_that_stops_answering() {
+    let dir = temp_dir("probe-all-isolate");
+    let health = dir.join("health.json");
+    let initial = NodeSnapshot {
+        id: "n1".into(),
+        healthy: true,
+        in_flight: 0,
+        attempts: 0,
+        failures: 0,
+        updated_at_ms: 1,
+    };
+    write_health(&health, std::slice::from_ref(&initial));
+
+    let report = probe_remote_health_file_scoped(
+        &[node("n1", "http://127.0.0.1:1/run".into())],
+        &health,
+        1,
+        RemoteHealthScope::All,
+    )
+    .unwrap();
+    assert_eq!(report.checked, 1);
+    assert_eq!(report.readmitted, 0);
+    assert_eq!(report.still_isolated, 1);
+    assert!(!report.events[0].ok);
+
+    let stored = read_health(&health);
+    assert!(!stored[0].healthy, "主动巡检发现健康节点不可达时应就地隔离");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
