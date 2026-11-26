@@ -108,6 +108,7 @@ fn isolated(id: &str) -> NodeSnapshot {
         in_flight: 0,
         attempts: 3,
         failures: 2,
+        updated_at_ms: 0,
     }
 }
 
@@ -138,6 +139,31 @@ fn save_merges_unmentioned_entries_and_replaces_known() {
     assert!(update.healthy);
     assert_eq!(update.attempts, 4);
     assert_eq!(update.failures, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn save_keeps_newer_existing_state_over_a_stale_writer() {
+    let dir = temp_dir("save-merge-freshness");
+    let health = dir.join("health.json");
+    let mut fresh = isolated("a");
+    fresh.healthy = true;
+    fresh.updated_at_ms = 200;
+    write_health(&health, std::slice::from_ref(&fresh));
+
+    let mut stale = isolated("a");
+    stale.updated_at_ms = 100;
+    save_remote_health_file(&health, std::slice::from_ref(&stale)).unwrap();
+    let stored = read_health(&health);
+    assert!(stored[0].healthy, "旧写回不得覆盖更新鲜的放行状态");
+    assert_eq!(stored[0].updated_at_ms, 200);
+
+    let mut newer = isolated("a");
+    newer.updated_at_ms = 300;
+    save_remote_health_file(&health, std::slice::from_ref(&newer)).unwrap();
+    let stored = read_health(&health);
+    assert!(!stored[0].healthy, "更新鲜的写回必须生效");
+    assert_eq!(stored[0].updated_at_ms, 300);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -221,6 +247,52 @@ fn health_flusher_persists_changes_between_intervals() {
 }
 
 #[test]
+fn flusher_does_not_revert_a_newer_external_readmit() {
+    let dir = temp_dir("flusher-freshness");
+    let health = dir.join("health.json");
+    let mut initial = isolated("n1");
+    initial.updated_at_ms = 1;
+    let table = Arc::new(
+        NodeTable::new(vec![node("n1", "http://127.0.0.1:1/run".into())])
+            .unwrap()
+            .with_snapshots(std::slice::from_ref(&initial)),
+    );
+    let mut flusher =
+        spawn_remote_health_flusher(Arc::clone(&table), &health, Duration::from_millis(20))
+            .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Ok(stored) = std::fs::read_to_string(&health)
+            && let Ok(snapshots) = serde_json::from_str::<Vec<NodeSnapshot>>(&stored)
+            && snapshots
+                .iter()
+                .any(|snapshot| snapshot.id == "n1" && !snapshot.healthy)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "health flusher did not persist the isolated snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut external = isolated("n1");
+    external.healthy = true;
+    external.updated_at_ms = u64::MAX / 2;
+    save_remote_health_file(&health, std::slice::from_ref(&external)).unwrap();
+    // 至少再跑几轮后台写回：旧快照时间戳更小，不得把外部放行改回隔离。
+    std::thread::sleep(Duration::from_millis(100));
+    flusher.stop_and_join();
+    assert_eq!(flusher.last_error(), None);
+
+    let stored = read_health(&health);
+    assert!(stored[0].healthy, "旧快照不得覆盖更新的外部放行");
+    assert_eq!(stored[0].updated_at_ms, external.updated_at_ms);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn monitor_probes_isolated_nodes_with_bounded_concurrency() {
     let dir = temp_dir("probe-concurrency");
     let health = dir.join("health.json");
@@ -267,7 +339,9 @@ fn monitor_readmits_isolated_node_and_persists_snapshot() {
     let dir = temp_dir("readmit");
     let server = spawn_node();
     let health = dir.join("health.json");
-    write_health(&health, &[isolated("n1")]);
+    let mut initial = isolated("n1");
+    initial.updated_at_ms = 1;
+    write_health(&health, std::slice::from_ref(&initial));
 
     let report =
         probe_remote_health_file(&[node("n1", format!("{}/run", server.base))], &health).unwrap();
@@ -284,6 +358,10 @@ fn monitor_readmits_isolated_node_and_persists_snapshot() {
     assert_eq!(stored[0].attempts, 3, "累计尝试数必须保留");
     assert_eq!(stored[0].failures, 2, "累计失败数必须保留");
     assert_eq!(stored[0].in_flight, 0);
+    assert!(
+        stored[0].updated_at_ms > initial.updated_at_ms,
+        "成功探测必须推进节点更新时间"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

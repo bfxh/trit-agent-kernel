@@ -181,6 +181,7 @@ fn snapshots_restore_quarantine_and_counts() {
         in_flight: 0,
         attempts: 9,
         failures: 9,
+        updated_at_ms: 0,
     };
     let table = NodeTable::new(vec![node("a", 1), node("b", 1)])
         .unwrap()
@@ -335,6 +336,32 @@ fn dropping_a_lease_releases_capacity_as_node_failure() {
     assert_eq!(snapshot.attempts, 1);
     assert_eq!(snapshot.failures, 1);
     assert!(!snapshot.healthy);
+}
+
+#[test]
+fn snapshot_timestamps_track_state_changes_and_restore() {
+    let table = NodeTable::new(vec![node("a", 1)]).unwrap();
+    let initial = table.snapshot()[0].updated_at_ms;
+    let lease = table.acquire(&CancelToken::new()).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    let failed = table.snapshot();
+    assert!(
+        failed[0].updated_at_ms > initial,
+        "隔离必须推进节点更新时间"
+    );
+
+    let restored = NodeTable::new(vec![node("a", 1)])
+        .unwrap()
+        .with_snapshots(&failed);
+    assert_eq!(
+        restored.snapshot()[0].updated_at_ms,
+        failed[0].updated_at_ms
+    );
+    assert!(restored.readmit("a"));
+    assert!(
+        restored.snapshot()[0].updated_at_ms > failed[0].updated_at_ms,
+        "readmit 必须推进节点更新时间"
+    );
 }
 
 #[test]

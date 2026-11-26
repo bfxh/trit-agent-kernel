@@ -154,6 +154,7 @@ fn library_preflight_readmits_an_isolated_node() {
             in_flight: 0,
             attempts: 0,
             failures: 1,
+            updated_at_ms: 0,
         }]);
 
     let report = run_remote_plan_with_table(
@@ -194,6 +195,7 @@ fn library_preflight_probes_isolated_nodes_with_bounded_concurrency() {
             in_flight: 0,
             attempts: 2,
             failures: 1,
+            updated_at_ms: 0,
         })
         .collect();
     let table = NodeTable::new(nodes).unwrap().with_snapshots(&snapshots);
@@ -250,6 +252,7 @@ fn library_preflight_readmits_a_recovered_node_before_the_slowest_probe() {
         in_flight: 0,
         attempts: 1,
         failures: 1,
+        updated_at_ms: 0,
     };
     let table = Arc::new(
         NodeTable::new(vec![fast, slow])

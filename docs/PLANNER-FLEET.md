@@ -358,7 +358,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   监控随计划结束退出；跨进程常驻恢复由 `trit-host remote-health` 承担：
   `--nodes <json> --health <path> [--interval-ms N] [--once]
   [--probe-concurrency N]` 每轮重读同一节点表与
-  健康文件（`Vec<NodeSnapshot>`），只探已隔离节点，`GET /health` 成功即写回
+  健康文件（`Vec<NodeSnapshot>`，条目含 `updated_at_ms`），只探已隔离节点，
+  `GET /health` 成功即写回
   `healthy`（保留 `attempts/failures`、清零 `in_flight`），失败保持隔离并记录原因；
   默认常驻、每轮输出一行 JSON，`--once` 适合 cron / 任务计划程序。`--probe-concurrency`
   默认 4、上限 64，只并行探测、不改变单次写回；事件与快照仍按节点 id
@@ -369,14 +370,17 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   同一健康文件只允许一个实例，进程退出（包括崩溃）自动释放；所有写者
   （`remote-health` 与 `remote-plan`）先在 `<health>.write.lock` 上取短临界区，读回旧
   文件并合并本次未覆盖的节点（表外条目保留，按 id 升序），再写进程唯一临时文件并
-  直接替换，避免整份覆盖别家节点、半截文件或读者看到目标短暂缺失；同一节点的并发
-  更新仍以最后写入者为准。守护只复用现有判定标准，不自动拉起计划进程，也不替代 `remote-plan`
+  直接替换，避免整份覆盖别家节点、半截文件或读者看到目标短暂缺失。健康条目带节点级
+  `updated_at_ms`（旧文件缺省 0，节点状态变化与探测结果都会推进它）：同一节点只有
+  本次时间戳不旧于磁盘时才覆盖，时间戳相同按后写覆盖；因此慢的 `remote-plan` 写回
+  不会用旧快照把 `remote-health` 刚恢复的节点改回隔离，反之亦然。时钟回拨时
+  `NodeTable` 至少把时间戳推进 1ms。守护只复用现有判定标准，不自动拉起计划进程，也不替代 `remote-plan`
   的派发前 preflight。全隔离启动时周期监控来不及在首个 acquire 前放行，仍需先用
   `--probe` 做一次 preflight，否则派发会因没有健康节点立即失败。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
 隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、`OverBudget` 健康语义、
-快照恢复、显式 `readmit`、JSON 默认值）、
+快照恢复、更新时间随状态变更推进并在恢复时保留、显式 `readmit`、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表、库级
 preflight 探测重新放行隔离节点并返回 `probes`、preflight 有界并发探测且事件有序、
@@ -389,8 +393,10 @@ preflight 探测重新放行隔离节点并返回 `probes`、preflight 有界并
 写回健康、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间恢复节点、
 `--probe-concurrency` 参数校验、重复节点 ID 与非法 scope 拒绝）、
 `crates/trit-host/tests/remote_health.rs`（独立守护成功放行并保留累计计数、探测
-失败保持隔离、未知节点保留原快照、保存时合并未提及条目、并发写者不丢条目、周期
-写回线程持久化隔离与放行且清零 `in_flight`、有界并发探测且事件按 id 有序、
+失败保持隔离、未知节点保留原快照、保存时合并未提及条目并按 `updated_at_ms`
+保留更新鲜状态、并发写者不丢条目、周期
+写回线程持久化隔离与放行且清零 `in_flight`、后台写回不覆盖更新的外部放行、
+有界并发探测且事件按 id 有序、
 非法并发值拒绝、缺失文件
 初始化、节点表热加载与单实例锁、`--once` CLI 输出）与 `crates/trit-host/tests/remote_ledger.rs`
 （共享账本下双节点单次执行、scope 隔离）。

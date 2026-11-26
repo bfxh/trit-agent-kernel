@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -436,6 +436,18 @@ where
 /// 单次健康扫描最多并行探测多少个节点；避免一个超大节点表瞬间打满连接/线程。
 pub const MAX_HEALTH_PROBE_CONCURRENCY: usize = 64;
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 健康探测观测时间：至少比旧条目大 1ms，防止时钟回拨让新结果看起来更旧。
+fn observed_timestamp(previous: u64, observed_at: u64) -> u64 {
+    observed_at.max(previous.saturating_add(1))
+}
+
 /// 在目标集合上执行有界并行探测，最多 `concurrency` 个线程。
 ///
 /// 这是 `remote-health` 与演练内监控共用的调度器：只负责按索引取任务、限制
@@ -528,6 +540,7 @@ pub fn probe_remote_health_file_with_concurrency(
             in_flight: 0,
             attempts: 0,
             failures: 0,
+            updated_at_ms: now_millis(),
         });
         // 健康文件跨运行保存，不应携带某一时刻的在途计数。
         snapshot.in_flight = 0;
@@ -542,10 +555,11 @@ pub fn probe_remote_health_file_with_concurrency(
     targets.sort_by(|left, right| left.1.id.cmp(&right.1.id));
     let outcomes = Mutex::new(vec![None; targets.len()]);
     probe_targets_in_parallel(&targets, concurrency, |index, (_, node)| {
+        let outcome = probe_remote_health(&node.endpoint);
         outcomes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
-            Some(probe_remote_health(&node.endpoint));
+            Some((outcome, now_millis()));
     });
     let outcomes = outcomes
         .into_inner()
@@ -556,16 +570,17 @@ pub fn probe_remote_health_file_with_concurrency(
     let mut readmitted = 0usize;
     let mut still_isolated = 0usize;
     for ((snapshot_index, node), outcome) in targets.into_iter().zip(outcomes) {
-        let Some(outcome) = outcome else {
+        let Some((outcome, observed_at)) = outcome else {
             return Err(AgentError::Io(format!(
                 "health probe for node {} produced no result",
                 node.id
             )));
         };
         checked += 1;
+        let snapshot = &mut snapshots[snapshot_index];
+        snapshot.updated_at_ms = observed_timestamp(snapshot.updated_at_ms, observed_at);
         match outcome {
             Ok(()) => {
-                let snapshot = &mut snapshots[snapshot_index];
                 snapshot.healthy = true;
                 readmitted += 1;
                 if events.len() < MAX_PROBE_EVENTS {
@@ -718,8 +733,9 @@ fn load_remote_health_file(path: &Path) -> Result<Vec<NodeSnapshot>, AgentError>
 /// 快照，再合并本次传入的节点；本次未覆盖的旧节点（包括节点表外的监控对象）
 /// 按原快照保留，最终按 id 升序写临时文件并替换。
 ///
-/// 传空切片不会清空已有条目；要重置健康文件请删除它。同一节点的并发写仍按
-/// “最后写入者覆盖”，写锁只保证没有半截文件或丢失未覆盖的节点。
+/// 同一节点按 `updated_at_ms` 合并：磁盘条目的时间戳更大时保留磁盘状态，避免
+/// 慢写回用旧快照覆盖别处刚恢复/刚隔离的节点；时间戳相同则后写覆盖。旧健康
+/// 文件缺少时间戳时按 0 处理。传空切片不会清空已有条目；要重置健康文件请删除它。
 pub fn save_remote_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentError> {
     let _lock = acquire_health_write_lock(path)?;
     let mut merged = BTreeMap::new();
@@ -732,7 +748,12 @@ pub fn save_remote_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<()
         }
     }
     for snapshot in nodes {
-        merged.insert(snapshot.id.clone(), snapshot.clone());
+        let keep_existing = merged
+            .get(&snapshot.id)
+            .is_some_and(|existing| existing.updated_at_ms > snapshot.updated_at_ms);
+        if !keep_existing {
+            merged.insert(snapshot.id.clone(), snapshot.clone());
+        }
     }
     let snapshots: Vec<NodeSnapshot> = merged.into_values().collect();
     write_health_file(path, &snapshots)

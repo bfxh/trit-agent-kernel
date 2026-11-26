@@ -18,7 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +77,7 @@ pub enum NodeOutcome {
     OverBudget,
 }
 
-/// 节点状态快照（用于报告与测试断言）。
+/// 节点状态快照（用于报告、跨运行健康文件与测试断言）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSnapshot {
     pub id: String,
@@ -85,6 +85,12 @@ pub struct NodeSnapshot {
     pub in_flight: usize,
     pub attempts: u64,
     pub failures: u64,
+    /// 最近一次节点状态变更的 UNIX 毫秒时间戳；旧健康文件缺省为 0。
+    ///
+    /// 写回健康文件时用它比较新鲜度：磁盘上时间戳更大的条目优先保留，
+    /// 避免慢写回用旧快照覆盖别处刚放行/刚隔离的状态。
+    #[serde(default)]
+    pub updated_at_ms: u64,
 }
 
 struct Slot {
@@ -94,6 +100,23 @@ struct Slot {
     failures: u64,
     consecutive_failures: u32,
     healthy: bool,
+    updated_at_ms: u64,
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 状态变更时间戳：正常取当前时间；若时钟回拨，至少比上一次大 1ms。
+fn next_state_timestamp(previous: u64) -> u64 {
+    now_millis().max(previous.saturating_add(1))
+}
+
+fn touch_state(slot: &mut Slot) {
+    slot.updated_at_ms = next_state_timestamp(slot.updated_at_ms);
 }
 
 /// 静态节点表：准入 + 故障隔离。
@@ -145,6 +168,7 @@ impl NodeTable {
                         failures: 0,
                         consecutive_failures: 0,
                         healthy: true,
+                        updated_at_ms: now_millis(),
                     })
                     .collect(),
             ),
@@ -163,7 +187,8 @@ impl NodeTable {
     ///
     /// 只恢复同 id 的节点，未知 id 忽略；`in_flight` 不恢复（新表从 0 开始）。
     /// 隔离节点的连续失败数按当前阈值补齐，因此应在
-    /// [`NodeTable::with_failure_threshold`] 之后调用。
+    /// [`NodeTable::with_failure_threshold`] 之后调用。`updated_at_ms` 一并恢复，
+    /// 让后续健康文件写回能判断快照是否已经落后于磁盘上的其他写者。
     pub fn with_snapshots(self, snapshots: &[NodeSnapshot]) -> Self {
         let threshold = self.failure_threshold;
         let mut slots = self.lock();
@@ -173,6 +198,7 @@ impl NodeTable {
                 slot.failures = snapshot.failures;
                 slot.healthy = snapshot.healthy;
                 slot.consecutive_failures = if snapshot.healthy { 0 } else { threshold };
+                slot.updated_at_ms = snapshot.updated_at_ms;
             }
         }
         drop(slots);
@@ -248,6 +274,7 @@ impl NodeTable {
                 in_flight: slot.in_flight,
                 attempts: slot.attempts,
                 failures: slot.failures,
+                updated_at_ms: slot.updated_at_ms,
             })
             .collect();
         snapshots.sort_by(|left, right| left.id.cmp(&right.id));
@@ -279,6 +306,7 @@ impl NodeTable {
             Some(slot) if !slot.healthy => {
                 slot.healthy = true;
                 slot.consecutive_failures = 0;
+                touch_state(slot);
                 true
             }
             _ => false,
@@ -322,6 +350,7 @@ impl NodeTable {
             }
             NodeOutcome::Abandoned => {}
         }
+        touch_state(slot);
         self.cond.notify_all();
     }
 }
