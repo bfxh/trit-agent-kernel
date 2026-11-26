@@ -428,6 +428,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             journal,
         })
     };
+    // guard 会随工具一起装箱；完成裁决需要同一份范围做校验，因此先留一份克隆。
+    let write_claim = write_guard.as_ref().map(|guard| guard.claim.clone());
     let identity_path = workspace_root.join(trit_orch::repo::DEFAULT_PATH);
     let gate_chain_requested = gate_chain
         || handoff_packet.is_some()
@@ -720,6 +722,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let mut session = Session::open(model, tools, &path)?
             .with_max_steps(max_steps)
             .with_context(context)
+            .with_write_claim(write_claim.clone())
             .with_cache_ledger(Arc::clone(&shared_cache_ledger));
         let outcome = session.run_turn(&turn)?;
         let ledger = session.cache_ledger();
@@ -746,6 +749,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut session = Session::open(model, tools, path)?
                 .with_max_steps(max_steps)
                 .with_context(context)
+                .with_write_claim(write_claim.clone())
                 .with_cache_ledger(Arc::clone(&shared_cache_ledger));
             let outcome = session.run_turn(&turn)?;
             let ledger = session.cache_ledger();
@@ -754,6 +758,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let mut host = AgentHost::new(model, tools)
                 .with_max_steps(max_steps)
                 .with_context(context)
+                .with_write_claim(write_claim.clone())
                 .with_cache_ledger(Arc::clone(&shared_cache_ledger));
             let outcome = host.run_turn(&turn)?;
             let ledger = host.cache_ledger().clone();
@@ -777,6 +782,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let mut session = Session::open(model, tools, path)?
                     .with_max_steps(max_steps)
                     .with_context(context)
+                    .with_write_claim(write_claim.clone())
                     .with_cache_ledger(Arc::clone(&shared_cache_ledger));
                 let outcome = session.run_turn(&turn)?;
                 let ledger = session.cache_ledger();
@@ -785,6 +791,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let mut host = AgentHost::new(model, tools)
                     .with_max_steps(max_steps)
                     .with_context(context)
+                    .with_write_claim(write_claim.clone())
                     .with_cache_ledger(Arc::clone(&shared_cache_ledger));
                 let outcome = host.run_turn(&turn)?;
                 let ledger = host.cache_ledger().clone();

@@ -478,6 +478,12 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
         self
     }
 
+    /// 把任务级写入范围透传给宿主的完成裁决。
+    pub fn with_write_claim(mut self, claim: Option<crate::permissions::WriteClaim>) -> Self {
+        self.host = self.host.with_write_claim(claim);
+        self
+    }
+
     pub fn state(&self) -> &SessionState {
         &self.state
     }

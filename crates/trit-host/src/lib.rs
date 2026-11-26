@@ -617,6 +617,7 @@ pub struct AgentHost<M, T> {
     context_projection: crate::context_projection::ContextProjection,
     receipt_epochs: BTreeMap<String, u64>,
     freshness_recovery: crate::context_projection::FreshnessRecovery,
+    write_claim: Option<crate::permissions::WriteClaim>,
 }
 
 impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
@@ -631,7 +632,15 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             context_projection: crate::context_projection::ContextProjection::new(),
             receipt_epochs: BTreeMap::new(),
             freshness_recovery: crate::context_projection::FreshnessRecovery::default(),
+            write_claim: None,
         }
+    }
+
+    /// 把任务级写入范围接到完成裁决：声明的 diff 路径与回执里的实际写入都必须落在
+    /// claim 内，越界按冲突处理（`backed=true, passed=false`），不会默认通过。
+    pub fn with_write_claim(mut self, claim: Option<crate::permissions::WriteClaim>) -> Self {
+        self.write_claim = claim;
+        self
     }
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
@@ -1027,7 +1036,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                             .cloned()
                             .collect()
                     };
-                let backed = back_claim(claim, &turn.task, &evidence);
+                let backed = back_claim(claim, &turn.task, &evidence, self.write_claim.as_ref());
                 let judgment = judge_completion(&brief, &backed)?;
                 let complete = judgment.is_complete();
                 let metrics = TurnMetrics::capture(
@@ -1099,7 +1108,12 @@ fn merge_usage(into: &mut TokenUsage, other: TokenUsage) {
 }
 
 /// 宿主用回执给 criterion 背书；模型不能自己声明 backed/passed。
-fn back_claim(claim: &ClaimRequest, task: &str, receipts: &[ToolOutcome]) -> CompletionClaim {
+fn back_claim(
+    claim: &ClaimRequest,
+    task: &str,
+    receipts: &[ToolOutcome],
+    scope: Option<&crate::permissions::WriteClaim>,
+) -> CompletionClaim {
     CompletionClaim {
         task: task.to_owned(),
         criteria: claim
@@ -1111,7 +1125,7 @@ fn back_claim(claim: &ClaimRequest, task: &str, receipts: &[ToolOutcome]) -> Com
                     CriterionKind::Verification { command } => {
                         verification_backing(command, receipts)
                     }
-                    CriterionKind::Diff { paths } => diff_backing(paths, receipts),
+                    CriterionKind::Diff { paths } => diff_backing(paths, receipts, scope),
                 };
                 CriterionClaim {
                     id: criterion.id.clone(),
@@ -1144,9 +1158,29 @@ fn verification_backing(command: &str, receipts: &[ToolOutcome]) -> (bool, bool)
 }
 
 /// 路径清单必须非空且全部被写入；空清单不能自证，存疑写入一律降为未定。
-fn diff_backing(paths: &[String], receipts: &[ToolOutcome]) -> (bool, bool) {
+///
+/// 有写入范围（`--write-claim` 等）时，声明的路径与回执里的实际写入都必须落在
+/// claim 内：越界不是「证据不足」，而是声明与授权冲突，按 `(true, false)` 否定，
+/// 避免任务把范围外的改动写进完成声明。
+fn diff_backing(
+    paths: &[String],
+    receipts: &[ToolOutcome],
+    scope: Option<&crate::permissions::WriteClaim>,
+) -> (bool, bool) {
     if paths.is_empty() {
         return (false, false);
+    }
+    if let Some(scope) = scope {
+        let out_of_scope = paths.iter().any(|path| !scope.allows_path(path))
+            || receipts.iter().any(|outcome| {
+                outcome
+                    .written_paths
+                    .iter()
+                    .any(|path| !scope.allows_path(path))
+            });
+        if out_of_scope {
+            return (true, false);
+        }
     }
     let in_doubt = receipts.iter().any(|outcome| {
         outcome.in_doubt
@@ -1245,11 +1279,13 @@ pub fn run_headless<M: Model>(
     model: M,
     config: HeadlessConfig,
 ) -> Result<TurnOutcome, AgentError> {
+    let claim = config.write_guard.as_ref().map(|guard| guard.claim.clone());
     let tools = crate::tools::LocalTools::new(config.workspace)?;
     let tools = crate::permissions::wrap_claim(tools, config.write_guard);
     let mut host = AgentHost::new(model, tools)
         .with_max_steps(config.max_steps)
-        .with_context(config.context);
+        .with_context(config.context)
+        .with_write_claim(claim);
     if let Some(path) = config.session {
         let mut log = SessionLog::open(path)?;
         host.run_turn_with_session(&turn, &mut log)

@@ -32,13 +32,22 @@ fn write(call: &str, path: &str, in_doubt: bool) -> ToolOutcome {
 }
 
 fn judged(id: &str, kind: CriterionKind, receipts: &[ToolOutcome]) -> CriterionClaim {
+    judged_scoped(id, kind, receipts, None)
+}
+
+fn judged_scoped(
+    id: &str,
+    kind: CriterionKind,
+    receipts: &[ToolOutcome],
+    scope: Option<&crate::permissions::WriteClaim>,
+) -> CriterionClaim {
     let request = ClaimRequest {
         criteria: vec![CriterionRequest {
             id: id.to_owned(),
             kind,
         }],
     };
-    back_claim(&request, "task", receipts)
+    back_claim(&request, "task", receipts, scope)
         .criteria
         .into_iter()
         .next()
@@ -160,4 +169,69 @@ fn in_doubt_write_keeps_diff_unknown() {
     );
     assert!(!claim.backed);
     assert!(!claim.passed);
+}
+
+fn scope(paths: &[&str]) -> crate::permissions::WriteClaim {
+    crate::permissions::WriteClaim::new(
+        env!("CARGO_MANIFEST_DIR"),
+        paths
+            .iter()
+            .map(|path| std::path::PathBuf::from(*path))
+            .collect(),
+    )
+    .expect("write claim")
+}
+
+#[test]
+fn diff_inside_write_scope_still_passes() {
+    let write_scope = scope(&["src"]);
+    let receipts = vec![write("a", "src/lib.rs", false)];
+    let claim = judged_scoped(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["src/lib.rs".to_owned()],
+        },
+        &receipts,
+        Some(&write_scope),
+    );
+    assert!(claim.backed);
+    assert!(claim.passed);
+}
+
+#[test]
+fn diff_declared_outside_write_scope_is_refuted() {
+    let write_scope = scope(&["src"]);
+    let receipts = vec![write("a", "docs/x.md", false)];
+    let claim = judged_scoped(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["docs/x.md".to_owned()],
+        },
+        &receipts,
+        Some(&write_scope),
+    );
+    assert!(claim.backed, "文件确实被写过，不是证据不足");
+    assert!(!claim.passed, "声明路径越出授权范围时不能算通过");
+}
+
+#[test]
+fn out_of_scope_write_refutes_even_when_declared_paths_are_inside() {
+    let write_scope = scope(&["src"]);
+    let receipts = vec![
+        write("a", "src/lib.rs", false),
+        write("b", "docs/x.md", false),
+    ];
+    let claim = judged_scoped(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["src/lib.rs".to_owned()],
+        },
+        &receipts,
+        Some(&write_scope),
+    );
+    assert!(claim.backed);
+    assert!(
+        !claim.passed,
+        "回执里出现越界写入时，即使声明路径在范围内也不能通过"
+    );
 }
