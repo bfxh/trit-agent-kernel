@@ -9,7 +9,7 @@
 //! 崩溃可能丢掉最后一行；解析失败的行如果位于末尾会按“崩溃尾部”忽略，中间的坏行
 //! 仍然报错。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -211,7 +211,12 @@ impl MutationJournal {
             backups: Vec::new(),
             at: now_secs(),
         };
-        self.append(&record)
+        self.append(&record)?;
+        // 成功的写已经把新内容落盘，pre-image 不再需要；失败/存疑保留给人工复核或回滚。
+        if record.passed && !record.in_doubt {
+            self.discard_backups(entry.op_id);
+        }
+        Ok(())
     }
 
     /// 记录一次工具错误（执行器返回 `Err`，没有 `ToolOutcome`）。
@@ -275,19 +280,80 @@ impl MutationJournal {
             backups: Vec::new(),
             at: now_secs(),
         };
-        self.append(&record)
+        self.append(&record)?;
+        if outcome.ok() {
+            self.discard_backups(op_id);
+        }
+        Ok(())
     }
 
-    /// 用 `begin` 记录里的备份恢复文件。
+    fn backup_dir(&self, op_id: u64) -> PathBuf {
+        self.root
+            .join(".agent/journal-backups")
+            .join(op_id.to_string())
+    }
+
+    /// 尽力删除一次操作留下的 pre-image 备份；删不掉不影响主流程，
+    /// 后续可用 [`Self::prune_backups`] 再清。
+    fn discard_backups(&self, op_id: u64) {
+        let _ = std::fs::remove_dir_all(self.backup_dir(op_id));
+    }
+
+    /// 清理没有任何未闭合/失败操作引用的备份目录。
+    ///
+    /// 保留：仍未闭合的 `begin`、`finish` 失败、`rollback` 失败（这些是复核证据）。
+    /// 删除：成功闭合的操作、以及账本里完全没有记录的孤儿目录。
+    pub fn prune_backups(&self) -> Result<PruneReport, JournalError> {
+        let mut report = PruneReport::default();
+        let mut keep = BTreeSet::new();
+        for record in read_records(&self.path)? {
+            match record.phase {
+                JournalPhase::Begin => {
+                    keep.insert(record.op_id);
+                }
+                JournalPhase::Finish | JournalPhase::Rollback => {
+                    if record.passed {
+                        keep.remove(&record.op_id);
+                    } else {
+                        keep.insert(record.op_id);
+                    }
+                }
+            }
+        }
+        let dir = self.root.join(".agent/journal-backups");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+            Err(error) => {
+                return Err(JournalError::Io(format!("read {}: {error}", dir.display())));
+            }
+        };
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| JournalError::Io(format!("read {}: {error}", dir.display())))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(op_id) = name.parse::<u64>() else {
+                // 不认识的目录不动，交给人工处理。
+                report.kept += 1;
+                continue;
+            };
+            if keep.contains(&op_id) {
+                report.kept += 1;
+                continue;
+            }
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => report.removed += 1,
+                Err(error) => report.failures.push(format!("{name}: {error}")),
+            }
+        }
+        Ok(report)
+    }
     pub fn rollback(&self, record: &JournalRecord) -> RollbackOutcome {
         let mut outcome = RollbackOutcome {
             op_id: record.op_id,
             ..RollbackOutcome::default()
         };
-        let dir = self
-            .root
-            .join(".agent/journal-backups")
-            .join(record.op_id.to_string());
+        let dir = self.backup_dir(record.op_id);
         for entry in &record.backups {
             if entry.skipped {
                 outcome.skipped.push(entry.path.clone());
@@ -319,10 +385,7 @@ impl MutationJournal {
     }
 
     fn backup_paths(&self, op_id: u64, paths: &[String]) -> Result<Vec<BackupEntry>, JournalError> {
-        let dir = self
-            .root
-            .join(".agent/journal-backups")
-            .join(op_id.to_string());
+        let dir = self.backup_dir(op_id);
         let mut entries = Vec::with_capacity(paths.len());
         for (index, raw) in paths.iter().enumerate() {
             let Some(relative) = backup_relative(raw) else {
@@ -429,6 +492,14 @@ fn report_records(records: Vec<JournalRecord>) -> Result<JournalReport, JournalE
     }
     report.in_doubt = open.into_values().collect();
     Ok(report)
+}
+
+/// 备份目录清理结果。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PruneReport {
+    pub removed: usize,
+    pub kept: usize,
+    pub failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -672,6 +743,90 @@ mod tests {
         assert_eq!(outcome.removed, ["src/a.py"]);
         assert!(outcome.ok(), "{outcome:?}");
         assert!(!root.join("src/a.py").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_finish_discards_backups() {
+        let root = root("discard-ok");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "old").unwrap();
+        let mut journal = MutationJournal::open(&root).unwrap();
+        let entry = journal.record_begin(&request(), None).unwrap();
+        let backups = root
+            .join(".agent/journal-backups")
+            .join(entry.op_id.to_string());
+        assert!(backups.is_dir());
+
+        journal.record_finish(entry, &outcome(true)).unwrap();
+        assert!(!backups.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_finish_keeps_backups_and_prune_preserves_them() {
+        let root = root("keep-failed");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "old").unwrap();
+        let mut journal = MutationJournal::open(&root).unwrap();
+        let entry = journal.record_begin(&request(), None).unwrap();
+        let backups = root
+            .join(".agent/journal-backups")
+            .join(entry.op_id.to_string());
+
+        journal.record_finish(entry, &outcome(false)).unwrap();
+        assert!(backups.is_dir());
+
+        let pruned = journal.prune_backups().unwrap();
+        assert_eq!(pruned.removed, 0);
+        assert_eq!(pruned.kept, 1);
+        assert!(pruned.failures.is_empty());
+        assert!(backups.is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_removes_orphans_but_keeps_open_begins() {
+        let root = root("prune");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "old").unwrap();
+        let mut journal = MutationJournal::open(&root).unwrap();
+        let entry = journal.record_begin(&request(), None).unwrap();
+        let open_dir = root
+            .join(".agent/journal-backups")
+            .join(entry.op_id.to_string());
+        let orphan = root.join(".agent/journal-backups/99");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        let pruned = journal.prune_backups().unwrap();
+        assert_eq!(pruned.removed, 1);
+        assert_eq!(pruned.kept, 1);
+        assert!(open_dir.is_dir());
+        assert!(!orphan.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_rollback_discards_backups() {
+        let root = root("discard-rollback");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "old").unwrap();
+        let mut journal = MutationJournal::open(&root).unwrap();
+        let entry = journal.record_begin(&request(), None).unwrap();
+        let backups = root
+            .join(".agent/journal-backups")
+            .join(entry.op_id.to_string());
+        std::fs::write(root.join("src/a.py"), "new").unwrap();
+
+        let report = journal.report().unwrap();
+        let outcome = journal.rollback(&report.in_doubt[0]);
+        assert!(outcome.ok(), "{outcome:?}");
+        journal.record_rollback(entry.op_id, &outcome).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/a.py")).unwrap(),
+            "old"
+        );
+        assert!(!backups.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -69,6 +69,22 @@ fn journal_status(root: &Path) -> (Option<i32>, Value) {
     )
 }
 
+fn journal_status_prune(root: &Path) -> (Option<i32>, Value) {
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "journal-status",
+            "--workspace",
+            root.to_str().unwrap(),
+            "--prune",
+        ])
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
+
 fn run_with_journal(root: &Path, script_path: &Path) -> (Option<i32>, String) {
     host(
         root,
@@ -290,4 +306,34 @@ fn run_can_roll_back_in_doubt_writes_on_start() {
     assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn journal_status_prune_reclaims_closed_and_orphan_backups() {
+    let root = root("prune");
+    let journal = root.join(".agent/write-journal.jsonl");
+    fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    fs::write(
+        &journal,
+        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"at\":1}\n\
+         {\"schema\":1,\"seq\":2,\"op_id\":1,\"phase\":\"finish\",\"tool\":\"write_file\",\"passed\":true,\"at\":2}\n\
+         {\"schema\":1,\"seq\":3,\"op_id\":2,\"phase\":\"begin\",\"tool\":\"write_file\",\"at\":3}\n\
+         {\"schema\":1,\"seq\":4,\"op_id\":2,\"phase\":\"finish\",\"tool\":\"write_file\",\"passed\":false,\"at\":4}\n",
+    )
+    .unwrap();
+    let backups = root.join(".agent/journal-backups");
+    for op in ["1", "2", "99"] {
+        fs::create_dir_all(backups.join(op)).unwrap();
+    }
+
+    let (code, report) = journal_status_prune(&root);
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["prune"]["removed"], 2);
+    assert_eq!(report["prune"]["kept"], 1);
+    assert!(report["prune"]["failures"].as_array().unwrap().is_empty());
+    // 成功的 op1 与无记录的 99 被回收；失败的 op2 留作复核证据。
+    assert!(!backups.join("1").exists());
+    assert!(!backups.join("99").exists());
+    assert!(backups.join("2").is_dir());
+    let _ = fs::remove_dir_all(root);
 }
