@@ -63,7 +63,7 @@ Rust 三值（ternary）**智能体内核（Agent Kernel，含编排）**。**�
 - Git 影子仓库 checkpoint：每 turn 独立快照，`read-tree` 回退，忽略路径/嵌套仓库/路径碰撞 fail-closed。
 - 工具边界：`cap-std` 目录能力、symlink/硬链接拒绝、shell 默认拒绝并要求 OS 沙箱（`--sandbox <program>`，或 `--sandbox builtin` 使用内置 Linux bwrap / macOS sandbox-exec / Windows AppContainer）；原生 `search_code`/`glob` 使用 ripgrep 同源 ignore/regex/globset，尊重 `.gitignore`，无需 shell；无沙箱 shell 默认复用持久 bash 会话（cwd/env 保持），沙箱模式仍逐条执行。见 [docs/SANDBOX.md](docs/SANDBOX.md)。
 - 跨进程写租约 `OperationLease`：`.agent/write-lease` 上的 OS 排他锁 + `epoch` fencing；`ClaimingTools::with_lease` 在每次非只读调用前校验 token，失效 fail-closed，另一个持有者占用时返回 `LeaseError::Busy`；`trit-host run --write-claim <path>... [--write-lease <owner>]` 可直接启用（claim 支持文件/子树前缀与 glob）。见 [docs/LEASE.md](docs/LEASE.md)。
-- 写入账本 `MutationJournal`：`--write-journal` 记录每次写前后的 `begin`/`finish` 并备份原文件；`trit-host journal-status --workspace <dir> [--rollback]` 对账 `in_doubt`，`--rollback` 用备份恢复未闭合的写。见 [docs/LEASE.md](docs/LEASE.md)。
+- 写入账本 `MutationJournal`：`--write-journal` 记录每次写前后的 `begin`/`finish` 并备份原文件，成功闭合后立即回收 pre-image；`trit-host journal-status --workspace <dir> [--rollback] [--prune]` 对账 `in_doubt`，`--rollback` 用备份恢复未闭合的写，`--prune` 清理已成功闭合与无记录的备份目录（失败/未闭合保留）。见 [docs/LEASE.md](docs/LEASE.md)。
 
 ## 快速开始
 

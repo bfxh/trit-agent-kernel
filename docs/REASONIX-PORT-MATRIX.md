@@ -43,7 +43,7 @@
 | 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（投影+prompt+迁移） | `ContextProjection` 进入 prompt、迁移 bundle 携带投影；缺跨设备/跨存储实际落盘 | B7.3 |
 | 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+恢复+Plan 联动） | 完成裁决要求当前 epoch + freshness True；新证据恢复、Manual 策略、Plan/Observation epoch 已联动；缺跨设备落盘与多任务图迁移 | B7.3 |
 | 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；三类 JSONL 的布局矩阵与 byte parity 已落地（`JSONL-COMPAT.md`），缺 sidecar 布局与重建投影 | B7.7 |
-| 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 均已接持久 rewind journal、pre-rewind 备份与自动恢复；缺 operation lease 恢复边界 | B7.7 |
+| 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 均已接持久 rewind journal、pre-rewind 备份与自动恢复；files 备份在成功路径即时回收、失败保留，git backup commit 等 `gc` | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分（首版） | `PermissionGate` 已有 ask/auto/yolo、deny 优先、无 approver fail-closed；缺交互审批 UI 与 MCP 策略映射 | B7.4 |
 | 10 | Write claim / 路径范围强制 | `SPEC §3.12`、`OPAQUE_WRITE_ADMISSION_SECURITY.md` | 部分（首版） | `WriteClaim` + `ClaimingTools` 限制 write_file 路径子树，shell 写入 fail-closed；缺 move 双端、mutation journal 对账 | B7.4 |
 | 11 | Mutation journal / OS lease | `MUTATION_COORDINATOR_SECURITY.md`、`ISOLATION_OPERATION_LEASE_SECURITY.md` | 部分（对账 + 租约恢复边界） | mutation journal 记录 begin/finish/rollback 与 pre-image，`journal-status` 对账并回滚；begin 记录 lease 锁，回滚前重取锁，活租约持有者会 blocked；内核不复制文件锁 | B7.7 |
@@ -213,8 +213,15 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   `crates/trit-host/tests/fixtures/jsonl/`，`tests/jsonl_compat.rs` 断言老文件可读、
   追加不重写既有字节、future schema 在库内与 CLI 两条路径都被拒，并校验文档矩阵
   与代码逐行一致。
-- 仍待补：SQLite 投影重建；备份保留/清理策略
-  （files 成功后删除、失败保留；git backup commit 目前不主动回收，等 `gc`）。
+- 已落地（第六刀，备份保留与清理）：mutation journal 的 pre-image 目录在写操作成功
+  闭合（`finish` 的 `passed && !in_doubt`）或成功回滚后立即删除；失败/存疑保留，
+  作为人工复核与再次回滚的证据。新增 `MutationJournal::prune_backups` 与
+  `journal-status --prune`：只回收「已成功闭合」或「账本里完全没有记录」的目录，
+  未闭合 `begin`、失败 `finish`、失败 `rollback` 一律保留；输出
+  `prune{removed,kept,failures}`，清理出错退出 2，不掩盖 `in_doubt` 的退出 1。
+  files checkpoint 的 rewind 备份本就在成功回退/成功回滚/成功恢复后即时删除，
+  失败或 `in_doubt` 保留；git backup commit 仍不主动回收，等 `gc`。
+- 仍待补：SQLite 投影重建。
 - 依赖：B7.3；与 B7.4 联动。
 
 ### B7.8 宿主表面与诊断（P2）

@@ -110,11 +110,20 @@ trit-host journal-status --workspace . --rollback
 - 回滚会追加一条 `rollback` 记录闭合该 `begin`；有 `failed` / `skipped` 时退出 `1`；
 - 回滚是**显式动作**：默认 `journal-status` 只报告，不自动改文件。
 
+### 备份保留与清理
+
+- 写操作成功闭合（`finish` 的 `passed && !in_doubt`）或成功回滚后，该 op 的
+  `.agent/journal-backups/<op_id>/` 立即删除；失败/存疑保留，作为复核与再次回滚的证据。
+- `trit-host journal-status --workspace . --prune` 回收历史遗留目录：只删「已成功
+  闭合」与「账本里没有记录」的 op，未闭合 `begin`、失败 `finish`、失败 `rollback`
+  一律保留；不是数字命名的目录同样不动。
+- 输出新增 `prune{removed,kept,failures}`；清理出错退出 `2`，`in_doubt` 的退出 `1`
+  优先。
+
 ## 7. 诚实边界
 
 - **本地文件系统**的租约，不是跨机器写权威；分布式存储需要在存储端校验 token。
 - 只约束经过 `ClaimingTools` 的写入；绕过包装器直接写文件不在保护范围内。
 - `Unix` 上租约文件内容可以被外部改写（advisory lock），`check()` 能发现但不会
   自动回滚已经发生的写入。
-- 不包含：move 双端校验、mutation journal 对账、operation 级 lease（当前是 root 级）、
-  内置 OS 沙箱。这些仍是显式未落地的能力。
+- 不包含：move 双端校验、跨机器租约、内置 OS 沙箱。这些仍是显式未落地的能力。

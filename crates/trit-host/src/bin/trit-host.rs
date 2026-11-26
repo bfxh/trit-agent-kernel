@@ -1353,10 +1353,12 @@ fn usage() {
          roots automatically and changes emit roots/list_changed.\n\n\
          session-status: trit-host session-status --session <jsonl>\n\
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
-         journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
+         journal-status: trit-host journal-status --workspace <dir> [--rollback] [--prune]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes\n\
          only after reacquiring their recorded lease locks (a live holder blocks it);\n\
-         exits 1 on remaining doubt, blocked rollback or rollback failure.\n\
+         --prune deletes pre-image dirs whose operations closed successfully or have\n\
+         no journal record, keeping open begins and failed operations;\n\
+         exits 1 on remaining doubt, blocked rollback or rollback failure, 2 on prune errors.\n\
          rewind-status: trit-host rewind-status --checkpoint-dir <dir> [--checkpoint-backend files|git]\n\
          [--recover] [--workspace <root>]\n\
          prints the checkpoint rewind journal; --recover restores the pre-rewind state from\n\
@@ -1581,10 +1583,12 @@ fn lock_key(workspace: &Path, lock: &Path) -> String {
 fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut workspace = PathBuf::from(".");
     let mut rollback = false;
+    let mut prune = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
             "--rollback" => rollback = true,
+            "--prune" => prune = true,
             other => return Err(fail(format!("unknown journal-status argument: {other}"))),
         }
     }
@@ -1597,6 +1601,11 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
                 "report": trit_host::JournalReport::default(),
                 "rollbacks": [],
                 "blocked": [],
+                "prune": if prune {
+                    Some(serde_json::json!({"removed": 0, "kept": 0, "failures": []}))
+                } else {
+                    None
+                },
             }))
             .map_err(|error| fail(error.to_string()))?
         );
@@ -1614,10 +1623,20 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     } else {
         journal.report().map_err(|error| fail(error.to_string()))?
     };
+    let prune_report = if prune {
+        Some(
+            journal
+                .prune_backups()
+                .map_err(|error| fail(error.to_string()))?,
+        )
+    } else {
+        None
+    };
     let value = serde_json::json!({
         "report": after,
         "rollbacks": rollbacks,
         "blocked": blocked,
+        "prune": prune_report,
     });
     println!(
         "{}",
@@ -1626,6 +1645,12 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if after.has_in_doubt() || rollbacks.iter().any(|outcome| !outcome.ok()) || !blocked.is_empty()
     {
         std::process::exit(1);
+    }
+    if value["prune"]["failures"]
+        .as_array()
+        .is_some_and(|failures| !failures.is_empty())
+    {
+        std::process::exit(2);
     }
     Ok(())
 }
