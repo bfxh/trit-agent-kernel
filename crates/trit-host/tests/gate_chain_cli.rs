@@ -812,7 +812,8 @@ fn host_ignores_repo_configured_worktree() {
     let _ = fs::remove_dir_all(root);
 }
 
-#[cfg(unix)]
+// APFS 在 open 时就拒绝非 UTF-8 文件名（EILSEQ），无法构造该场景；Linux 可以。
+#[cfg(target_os = "linux")]
 #[test]
 fn host_gives_up_on_non_utf8_git_paths() {
     use std::os::unix::ffi::OsStrExt;
