@@ -1321,7 +1321,7 @@ fn usage() {
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
-         [--pending-ttl-ms N] [--max-entries N] [--state <path>] [--once]\n\
+         [--pending-ttl-ms N] [--max-entries N] [--max-state-bytes N] [--state <path>] [--once]\n\
          shared idempotency ledger: POST /claim and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
@@ -1812,8 +1812,9 @@ fn remote_request_for(task: &trit_orch::TaskSpec) -> trit_orch::SubagentRequest 
     trit_orch::SubagentRequest::new(task, capsule, profile)
 }
 
-/// `remote-ledger [--bind <addr>] [--token <t>] [--pending-ttl-ms N] [--max-entries N] [--once]`：
-/// 共享幂等账本服务端；协议见 `trit_host::remote_ledger`。
+/// `remote-ledger [--bind <addr>] [--token <t>] [--pending-ttl-ms N] [--max-entries N]`
+/// `[--max-state-bytes N] [--state <path>] [--once]`：共享幂等账本服务端；
+/// 协议见 `trit_host::remote_ledger`。
 fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut config = trit_host::LedgerServerConfig::new("127.0.0.1:0");
     let mut once = false;
@@ -1826,6 +1827,9 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                     std::time::Duration::from_millis(next(&mut args, "--pending-ttl-ms")?.parse()?);
             }
             "--max-entries" => config.max_entries = next(&mut args, "--max-entries")?.parse()?,
+            "--max-state-bytes" => {
+                config.max_state_bytes = next(&mut args, "--max-state-bytes")?.parse()?
+            }
             "--state" => config.state_path = Some(PathBuf::from(next(&mut args, "--state")?)),
             "--once" => once = true,
             other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),

@@ -13,13 +13,17 @@
 //! 占位有 TTL（默认 60s）：执行者崩溃后，过期占位可以被接管。账本只保存响应帧，
 //! 不执行任务；它是跨机重试的协调点，不是任务队列。
 //!
+//! 容量有键数与字节双重上限（默认 4096 / 64 MiB）：超出时按 key 顺序淘汰已完成
+//! 项。落盘每行是十六进制 JSONL，物理文件到逻辑上限的 1.5 倍时压缩为当前内存
+//! 快照（临时文件 + 原子替换）；启动时若目标缺失会从 `.compact` 临时文件恢复。
+//!
 //! 安全边界：账本默认只应绑定 loopback 或置于内网；配置 token 后所有请求都要
 //! `Authorization: Bearer <token>`。账本不校验任务内容，只校验 `complete` 的帧
 //! 与幂等键一致。
 
-use std::collections::BTreeMap;
-use std::fs::{OpenOptions, read_to_string};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,8 +43,14 @@ const DEFAULT_PENDING_TTL: Duration = Duration::from_secs(60);
 /// 默认账本容量上限。
 const DEFAULT_MAX_ENTRIES: usize = 4096;
 
+/// 默认状态字节上限（已完成帧的十六进制 JSONL 记录总量）。
+const DEFAULT_MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
+
 /// 单个响应体的上限（与远程 runner 一致）。
 const MAX_LEDGER_BODY: usize = MAX_FRAME_BYTES + 4;
+
+/// 状态文件单行上限：帧的十六进制编码再留 key 与 JSON 转义空间。
+const MAX_STATE_LINE_BYTES: usize = MAX_LEDGER_BODY * 2 + 16 * 1024;
 
 /// 账本服务端配置。
 #[derive(Debug, Clone)]
@@ -52,6 +62,8 @@ pub struct LedgerServerConfig {
     pub pending_ttl: Duration,
     /// 最多保存多少个键（含占位与完成）。
     pub max_entries: usize,
+    /// 已完成记录的逻辑字节上限；超出时按 key 顺序淘汰并压缩日志。
+    pub max_state_bytes: usize,
     /// 可选持久化文件：只追加“已完成”记录，重启时回放；占位不落盘。
     pub state_path: Option<PathBuf>,
 }
@@ -63,6 +75,7 @@ impl LedgerServerConfig {
             token: None,
             pending_ttl: DEFAULT_PENDING_TTL,
             max_entries: DEFAULT_MAX_ENTRIES,
+            max_state_bytes: DEFAULT_MAX_STATE_BYTES,
             state_path: None,
         }
     }
@@ -79,6 +92,11 @@ impl LedgerServerConfig {
 
     pub fn with_max_entries(mut self, max_entries: usize) -> Self {
         self.max_entries = max_entries.max(1);
+        self
+    }
+
+    pub fn with_max_state_bytes(mut self, max_state_bytes: usize) -> Self {
+        self.max_state_bytes = max_state_bytes.max(1);
         self
     }
 
@@ -107,6 +125,8 @@ enum Entry {
 #[derive(Default)]
 struct LedgerState {
     entries: BTreeMap<String, Entry>,
+    /// 所有 `Done` 记录的逻辑字节数（按保守估算，见 `record_bytes`）。
+    bytes: usize,
 }
 
 /// 已绑定的账本服务端。
@@ -135,6 +155,12 @@ impl LedgerServer {
                 "ledger max_entries must be positive",
             ));
         }
+        if config.max_state_bytes == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ledger max_state_bytes must be positive",
+            ));
+        }
         if config.pending_ttl.is_zero() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -143,9 +169,16 @@ impl LedgerServer {
         }
         let listener = TcpListener::bind(config.bind.as_str())?;
         let state = match config.state_path.as_deref() {
-            Some(path) => Arc::new(Mutex::new(LedgerState {
-                entries: load_entries(path, config.max_entries)?,
-            })),
+            Some(path) => {
+                recover_compaction(path)?;
+                let state = load_entries(path, config.max_entries, config.max_state_bytes)?;
+                if std::fs::metadata(path)
+                    .is_ok_and(|meta| meta.len() > config.max_state_bytes as u64)
+                {
+                    compact_state(path, &state.entries)?;
+                }
+                Arc::new(Mutex::new(state))
+            }
             None => Arc::default(),
         };
         Ok(Self {
@@ -341,25 +374,32 @@ impl LedgerServerView<'_> {
         if matches!(state.entries.get(key), Some(Entry::Done { .. })) {
             return true;
         }
-        if !state.entries.contains_key(key) && state.entries.len() >= self.config.max_entries {
-            let victim = state
-                .entries
-                .iter()
-                .find_map(|(key, entry)| matches!(entry, Entry::Done { .. }).then(|| key.clone()));
-            match victim {
-                Some(victim) => {
-                    state.entries.remove(&victim);
-                }
-                None => return false,
-            }
-        }
+        let new_bytes = record_bytes(key, &frame);
+        let Some(victims) = capacity_victims(
+            &state,
+            key,
+            new_bytes,
+            self.config.max_entries,
+            self.config.max_state_bytes,
+        ) else {
+            return false;
+        };
         if let Some(path) = self.config.state_path.as_deref()
             && append_record(path, key, &frame).is_err()
         {
             // 写盘失败就不承认完成，调用方拿到 5xx。
             return false;
         }
+        for victim in &victims {
+            if let Some(Entry::Done { frame }) = state.entries.remove(victim) {
+                state.bytes = state.bytes.saturating_sub(record_bytes(victim, &frame));
+            }
+        }
         state.entries.insert(key.to_string(), Entry::Done { frame });
+        state.bytes = state.bytes.saturating_add(new_bytes);
+        if let Some(path) = self.config.state_path.as_deref() {
+            compact_if_bloated(path, &state.entries, self.config.max_state_bytes);
+        }
         true
     }
 }
@@ -382,24 +422,57 @@ struct StoredRecord {
     frame: String,
 }
 
-/// 从追加日志加载已完成记录；只保留最后 `max_entries` 条。
-fn load_entries(path: &Path, max_entries: usize) -> std::io::Result<BTreeMap<String, Entry>> {
+/// 从追加日志加载已完成记录；只保留最后 `max_entries` 条，并按字节上限淘汰。
+fn load_entries(
+    path: &Path,
+    max_entries: usize,
+    max_state_bytes: usize,
+) -> std::io::Result<LedgerState> {
     if !path.exists() {
-        return Ok(BTreeMap::new());
+        return Ok(LedgerState::default());
     }
-    let text = read_to_string(path)?;
-    let mut records = Vec::new();
-    for (index, line) in text.lines().enumerate() {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut retained: VecDeque<(StoredRecord, usize)> = VecDeque::new();
+    let mut retained_bytes = 0usize;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| {
+            invalid_data(format!(
+                "{}:{}: read failed: {error}",
+                path.display(),
+                index + 1
+            ))
+        })?;
         if line.trim().is_empty() {
             continue;
         }
-        let record: StoredRecord = serde_json::from_str(line)
+        if line.len() > MAX_STATE_LINE_BYTES {
+            return Err(invalid_data(format!(
+                "{}:{}: state line exceeds {MAX_STATE_LINE_BYTES} bytes",
+                path.display(),
+                index + 1
+            )));
+        }
+        let record: StoredRecord = serde_json::from_str(&line)
             .map_err(|error| invalid_data(format!("{}:{}: {error}", path.display(), index + 1)))?;
-        records.push(record);
+        let line_bytes = record
+            .key
+            .len()
+            .saturating_mul(6)
+            .saturating_add(record.frame.len())
+            .saturating_add(32);
+        retained_bytes = retained_bytes.saturating_add(line_bytes);
+        retained.push_back((record, line_bytes));
+        while (retained.len() > max_entries || retained_bytes > max_state_bytes)
+            && !retained.is_empty()
+        {
+            if let Some((_, bytes)) = retained.pop_front() {
+                retained_bytes = retained_bytes.saturating_sub(bytes);
+            }
+        }
     }
-    let keep_from = records.len().saturating_sub(max_entries);
-    let mut entries = BTreeMap::new();
-    for record in records.into_iter().skip(keep_from) {
+    let mut state = LedgerState::default();
+    for (record, _) in retained {
         let frame = hex_decode(&record.frame)
             .ok_or_else(|| invalid_data(format!("{}: bad hex frame", path.display())))?;
         let mut buffer = frame.clone();
@@ -419,9 +492,66 @@ fn load_entries(path: &Path, max_entries: usize) -> std::io::Result<BTreeMap<Str
                 record.key
             )));
         }
-        entries.insert(record.key, Entry::Done { frame });
+        if let Some(Entry::Done { frame }) = state.entries.get(&record.key) {
+            state.bytes = state.bytes.saturating_sub(record_bytes(&record.key, frame));
+        }
+        state.bytes = state
+            .bytes
+            .saturating_add(record_bytes(&record.key, &frame));
+        state.entries.insert(record.key, Entry::Done { frame });
     }
-    Ok(entries)
+    while state.bytes > max_state_bytes {
+        let Some(victim) = first_done_key(&state.entries) else {
+            break;
+        };
+        if let Some(Entry::Done { frame }) = state.entries.remove(&victim) {
+            state.bytes = state.bytes.saturating_sub(record_bytes(&victim, &frame));
+        }
+    }
+    Ok(state)
+}
+
+/// 保守估算一条 JSONL 记录占用的字节数：帧按十六进制翻倍，key 预留转义空间。
+fn record_bytes(key: &str, frame: &[u8]) -> usize {
+    key.len()
+        .saturating_mul(6)
+        .saturating_add(frame.len().saturating_mul(2))
+        .saturating_add(32)
+}
+
+/// 按 key 顺序找第一个已完成项；`max_entries` 与字节淘汰共用这个顺序。
+fn first_done_key(entries: &BTreeMap<String, Entry>) -> Option<String> {
+    entries
+        .iter()
+        .find_map(|(key, entry)| matches!(entry, Entry::Done { .. }).then(|| key.clone()))
+}
+
+/// 预先计算完成 `key` 需要淘汰的已完成项；淘汰后仍装不下时返回 `None`。
+fn capacity_victims(
+    state: &LedgerState,
+    key: &str,
+    new_bytes: usize,
+    max_entries: usize,
+    max_state_bytes: usize,
+) -> Option<BTreeSet<String>> {
+    if new_bytes > max_state_bytes {
+        return None;
+    }
+    let mut victims = BTreeSet::new();
+    let mut projected_entries = state.entries.len() + usize::from(!state.entries.contains_key(key));
+    let mut projected_bytes = state.bytes.checked_add(new_bytes)?;
+    while projected_entries > max_entries || projected_bytes > max_state_bytes {
+        let victim = state.entries.iter().find_map(|(other, entry)| {
+            (other != key && !victims.contains(other) && matches!(entry, Entry::Done { .. }))
+                .then(|| other.clone())
+        })?;
+        if let Some(Entry::Done { frame }) = state.entries.get(&victim) {
+            projected_bytes = projected_bytes.saturating_sub(record_bytes(&victim, frame));
+        }
+        victims.insert(victim);
+        projected_entries = projected_entries.saturating_sub(1);
+    }
+    Some(victims)
 }
 
 /// 追加一条已完成记录并落盘。
@@ -431,15 +561,72 @@ fn append_record(path: &Path, key: &str, frame: &[u8]) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
+    let line = encode_record(key, frame)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
+    file.sync_all()
+}
+
+fn encode_record(key: &str, frame: &[u8]) -> std::io::Result<String> {
     let record = StoredRecord {
         key: key.to_string(),
         frame: hex_encode(frame),
     };
-    let line = serde_json::to_string(&record)
-        .map_err(|error| invalid_data(format!("serialize ledger record: {error}")))?;
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{line}")?;
-    file.sync_all()
+    serde_json::to_string(&record)
+        .map_err(|error| invalid_data(format!("serialize ledger record: {error}")))
+}
+
+/// 压缩临时文件路径：始终追加 `.compact`，避免覆盖 `state.compact` 这类原路径。
+fn compaction_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".compact");
+    PathBuf::from(name)
+}
+
+/// 压缩日志：只写入当前内存里的已完成项，临时文件落盘后原子替换。
+fn compact_state(path: &Path, entries: &BTreeMap<String, Entry>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = compaction_path(path);
+    if temporary.exists() {
+        std::fs::remove_file(&temporary)?;
+    }
+    let mut writer = BufWriter::new(std::fs::File::create(&temporary)?);
+    for (key, entry) in entries {
+        if let Entry::Done { frame } = entry {
+            writeln!(writer, "{}", encode_record(key, frame)?)?;
+        }
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    drop(writer);
+    std::fs::rename(&temporary, path)
+}
+
+/// 启动时处理上次压缩留下的临时文件：目标存在说明压缩未完成，删临时文件；
+/// 目标缺失说明替换前崩溃，用临时文件恢复。
+fn recover_compaction(path: &Path) -> std::io::Result<()> {
+    let temporary = compaction_path(path);
+    if !temporary.exists() {
+        return Ok(());
+    }
+    if path.exists() {
+        std::fs::remove_file(temporary)
+    } else {
+        std::fs::rename(temporary, path)
+    }
+}
+
+/// 物理日志超过逻辑上限的 1.5 倍时压缩一次，避免每次完成都重写大文件。
+fn compact_if_bloated(path: &Path, entries: &BTreeMap<String, Entry>, max_state_bytes: usize) {
+    let threshold = max_state_bytes.saturating_mul(3).saturating_div(2) as u64;
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > threshold) {
+        // 压缩是物理文件治理；失败时保留追加日志，不把已确认的完成判成失败。
+        let _ = compact_state(path, entries);
+    }
 }
 
 fn invalid_data(message: String) -> std::io::Error {

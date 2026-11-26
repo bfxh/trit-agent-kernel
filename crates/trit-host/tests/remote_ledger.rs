@@ -272,6 +272,81 @@ fn scoped_ledger_keys_isolate_plans() {
 }
 
 #[test]
+fn state_file_respects_byte_budget_and_compacts() {
+    let path = state_file("bounded");
+    let config = LedgerServerConfig::new("127.0.0.1:0")
+        .with_max_state_bytes(1024)
+        .with_state_path(&path);
+    let ledger = Arc::new(LedgerServer::bind(config).unwrap());
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let running = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        for _ in 0..16 {
+            running.serve_once().unwrap();
+        }
+    });
+    for epoch in 0..8 {
+        let key = format!("plan|t1@{epoch}");
+        assert_eq!(
+            remote_ledger::claim(&ledger_endpoint, &key).unwrap(),
+            Claim::New
+        );
+        let frame = encode_frame(&SubagentResponse {
+            task: "t1".into(),
+            epoch,
+            status: DelegationStatus::Completed,
+            content: vec![b'x'; 80],
+            tokens: 0,
+        })
+        .unwrap();
+        remote_ledger::complete(&ledger_endpoint, &key, &frame).unwrap();
+    }
+    handle.join().unwrap();
+    drop(ledger);
+
+    let physical = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        physical <= 1900,
+        "compaction must bound the physical log near the cap, got {physical} bytes"
+    );
+
+    // 重启触发压缩并回放：最旧键已被字节上限淘汰，最新键仍可回放。
+    let restarted = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_max_state_bytes(1024)
+                .with_state_path(&path),
+        )
+        .unwrap(),
+    );
+    let address = restarted.addr().unwrap();
+    let restarted_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+    assert!(matches!(
+        remote_ledger::claim(&restarted_endpoint, "plan|t1@7").unwrap(),
+        Claim::Done(_)
+    ));
+    assert_eq!(
+        remote_ledger::claim(&restarted_endpoint, "plan|t1@0").unwrap(),
+        Claim::New,
+        "the byte cap must have evicted the oldest record"
+    );
+    handle.join().unwrap();
+    assert_eq!(restarted.completions(), 0);
+    let physical = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        physical <= 1024,
+        "startup compaction must bring the log under the cap, got {physical} bytes"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn unreachable_ledger_fails_closed_without_executing() {
     let dead_port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
