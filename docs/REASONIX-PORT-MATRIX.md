@@ -187,8 +187,15 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   `begin / applying / finish / rollback`；未闭合或回滚失败的操作在 `rewind-status`
   报 `in_doubt`（含 planned 与 applied 路径），并让新的 rewind fail-closed。崩溃点
   矩阵覆盖「未 applying」「已 applying 首条」「已完成」三类状态。
-- 仍待补：journal 的自动恢复/继续回退（当前只解释与拦截）；git checkpoint 后端；
-  JSONL 布局兼容矩阵；SQLite 投影重建；租约恢复边界。
+- 已落地（第二刀，pre-rewind 备份与自动恢复）：`begin` 前把每个目标路径的
+  pre-rewind 内容写入 `<checkpoint>/rewind-backups/<op_id>/<index>`（原本不存在记
+  `existed=false`），`RewindRecord.backups` 随 `begin` 落账；`CheckpointStore::recover_rewind`
+  按 `applied` 逆序写回备份或删除新文件，成功后补 `recover` 记录并清理备份目录，
+  失败明细保留在原操作上、继续 `in_doubt`。CLI 为
+  `rewind-status --checkpoint-dir <dir> --recover --workspace <root>`，恢复后仍有
+  未闭合操作退出 1；恢复失败不会假报成功，也不会被下一次 rewind 放过。
+- 仍待补：git checkpoint 后端的 rewind journal；JSONL 布局兼容矩阵；SQLite
+  投影重建；租约恢复边界；备份保留/清理策略（当前成功后删除，失败保留）。
 - 依赖：B7.3；与 B7.4 联动。
 
 ### B7.8 宿主表面与诊断（P2）
