@@ -250,4 +250,5 @@ B7.3 首版已落地：
 2. 补模型别名、超时分级、可重试错误分类，以及可选的 provider 健康接线。
 3. B7.3 剩余：跨设备/跨存储实际落盘、多任务 Plan 的批量 rebase。
 4. B7.4 继续：交互审批 UI、MCP 工具策略映射、move 双端与 mutation journal 对账。
-5. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。
+5. B7.5 首版（`fix(host): 完成声明背书 fail-closed`）：同一 criterion 的全部回执聚合裁决，任一次真实失败即否证，零断言 / 存疑（超时、断流）不再背书，空 `Diff` 路径清单不能自证；`Manual` 仍只进 `Inconclusive`。写作用域（write claim / path claim）与完成裁决的联动尚未接入，留作下一刀。
+6. 每批合并后更新本文状态列和 [MERGE-POLICY.md](MERGE-POLICY.md) 队列。
