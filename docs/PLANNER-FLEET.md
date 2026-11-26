@@ -259,7 +259,8 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 派发到真实执行器。
 
 **仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS）与跨进程常驻周期
-探测；单轮演练内的 `remote-plan --probe` / `--probe-interval-ms` 已提供。静态
+探测；单轮演练内的库级 `health_probe_on_start` / `health_probe_interval`
+（CLI `remote-plan --probe` / `--probe-interval-ms`）已提供。静态
 节点表、派发与有界换机重试见 §9。
 
 ## 9. 跨机器调度（`trit_orch::NodeTable` + `trit_host::run_remote_plan`）
@@ -329,16 +330,20 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   不计 attempt/failure。`--probe-interval-ms`（需配 `--health`）会在本次
   `remote-plan` 运行期间启动周期监控：只探当前已隔离节点，成功后调用
   `NodeTable::readmit` 并唤醒等待容量的任务，失败保持隔离；事件带
-  `phase: periodic` 写入 `probes`，最多保留 1024 条。监控随计划结束退出，不做
-  跨进程常驻：计划结束后的恢复仍需下次显式 `--probe` 或 `--probe-interval-ms`。
-  全隔离启动时周期监控来不及在首个 acquire 前放行，仍需先用 `--probe` 做一次
-  preflight，否则派发会因没有健康节点立即失败。
+  `phase: periodic` 写入 `probes`，最多保留 1024 条。这两项能力已下沉到库级：
+  `RemotePlanConfig::with_health_probe_on_start` / `with_health_probe_interval`
+  让 `run_remote_plan_with_table` 自己探测并把 `RemoteProbeEvent` 写入
+  `RemotePlanReport::probes`；CLI 只负责把 flag 映射成配置、读写 `--health`
+  文件。监控随计划结束退出，不做跨进程常驻：计划结束后的恢复仍需下次显式
+  `--probe` 或 `--probe-interval-ms`。全隔离启动时周期监控来不及在首个 acquire
+  前放行，仍需先用 `--probe` 做一次 preflight，否则派发会因没有健康节点立即失败。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
 隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、`OverBudget` 健康语义、
 快照恢复、显式 `readmit`、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
-任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表）、
+任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表、库级
+preflight 探测重新放行隔离节点并返回 `probes`）、
 `crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、同键并发只执行
 一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、

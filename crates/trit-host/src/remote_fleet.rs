@@ -22,9 +22,15 @@
 //!   同一个幂等键 `X-Trit-Idempotency: task@epoch`，因此要求服务端去重；任务级
 //!   失败与 `Deferred` 不重试。每次尝试（节点 + 结局）记进
 //!   [`RemotePlanReport::attempts`]。
+//! - 健康恢复由本层配置：`health_probe_on_start` 在派发前探测一次，
+//!   `health_probe_interval` 在派发期间周期探测；只探已隔离节点，`GET /health`
+//!   成功才调用 [`NodeTable::readmit`] 放行。事件写入 [`RemotePlanReport::probes`]，
+//!   最多保留 1024 条；周期监控随本次派发结束而退出，不做常驻后台恢复。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -35,8 +41,14 @@ use trit_orch::{
 
 use crate::AgentError;
 use crate::remote_subagent::{
-    run_remote_subagent_reply_cancellable_scoped, validate_idempotency_scope,
+    probe_remote_health, run_remote_subagent_reply_cancellable_scoped, validate_idempotency_scope,
 };
+
+/// 周期探测的轮询步长；停止标志置位后最多等一个步长。
+const HEALTH_MONITOR_STEP: Duration = Duration::from_millis(25);
+
+/// 单次演练最多保留的探测事件；周期探测不能把报告变成无界日志。
+const MAX_PROBE_EVENTS: usize = 1024;
 
 /// 一次派发尝试。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +75,11 @@ pub struct RemotePlanConfig {
     /// 计划作用域：不同计划用不同值，避免同名任务在共享账本/workspace 中碰撞。
     /// `None` 保持旧的 `task@epoch` 键与 `<root>/<task>` 目录。
     pub scope: Option<String>,
+    /// 派发前先对已隔离节点做一次 `GET /health`，成功才放行。
+    pub health_probe_on_start: bool,
+    /// 派发期间周期探测已隔离节点的间隔；`None` 不启动周期监控。
+    /// 周期监控随本次派发结束而退出，不做常驻后台恢复。
+    pub health_probe_interval: Option<Duration>,
 }
 
 impl RemotePlanConfig {
@@ -72,6 +89,8 @@ impl RemotePlanConfig {
             failure_threshold: 1,
             retry_limit: 0,
             scope: None,
+            health_probe_on_start: false,
+            health_probe_interval: None,
         }
     }
 
@@ -90,6 +109,42 @@ impl RemotePlanConfig {
         self.scope = Some(scope.into());
         self
     }
+
+    /// 派发前对已隔离节点做一次健康探测。
+    pub fn with_health_probe_on_start(mut self) -> Self {
+        self.health_probe_on_start = true;
+        self
+    }
+
+    /// 派发期间周期探测已隔离节点；`Duration::ZERO` 关闭周期监控。
+    pub fn with_health_probe_interval(mut self, interval: Duration) -> Self {
+        self.health_probe_interval = (!interval.is_zero()).then_some(interval);
+        self
+    }
+}
+
+/// 一次健康探测发生在哪个阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RemoteProbePhase {
+    /// 派发开始前的一次性探测。
+    Preflight,
+    /// 派发期间的周期探测。
+    Periodic,
+}
+
+/// 一次节点健康探测事件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteProbeEvent {
+    pub node: String,
+    pub phase: RemoteProbePhase,
+    /// `GET /health` 是否成功。
+    pub ok: bool,
+    /// 本次探测是否真的把节点从隔离状态放行；本来就健康时为 `false`。
+    pub readmitted: bool,
+    /// 探测失败的原因；成功时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// 一次跨机执行的报告。
@@ -105,6 +160,8 @@ pub struct RemotePlanReport {
     pub attempts: BTreeMap<String, Vec<RemoteAttempt>>,
     /// 节点状态快照（按 id 升序）。
     pub nodes: Vec<NodeSnapshot>,
+    /// 健康探测事件（preflight 在前，periodic 随后）；最多保留 1024 条。
+    pub probes: Vec<RemoteProbeEvent>,
 }
 
 impl RemotePlanReport {
@@ -150,7 +207,9 @@ where
 /// 同 [`run_remote_plan`]，但使用调用方预建的节点表。
 ///
 /// 典型用途：先 [`NodeTable::with_snapshots`] 恢复上一次运行的节点健康状态，再派发。
-/// 调用方负责按 `config.failure_threshold` 配置该表；本函数不再重建。
+/// 调用方负责按 `config.failure_threshold` 配置该表；本函数不再重建。配置了
+/// `health_probe_on_start` / `health_probe_interval` 时，只探测表中当前已隔离的
+/// 节点，成功才放行；探测事件随报告返回。
 pub fn run_remote_plan_with_table<F>(
     plan: &Plan,
     table: Arc<NodeTable>,
@@ -285,7 +344,23 @@ where
         }
     };
 
-    let report = execute(plan, FleetConfig::new(config.workers), cancel, runner)?;
+    let probes = Arc::new(Mutex::new(Vec::new()));
+    if config.health_probe_on_start {
+        probe_isolated_nodes(&table, &probes, RemoteProbePhase::Preflight);
+    }
+    let monitor = match config.health_probe_interval {
+        Some(interval) => Some(spawn_health_monitor(
+            Arc::clone(&table),
+            interval,
+            Arc::clone(&probes),
+        )?),
+        None => None,
+    };
+    let result = execute(plan, FleetConfig::new(config.workers), cancel, runner);
+    if let Some(monitor) = monitor {
+        monitor.stop();
+    }
+    let report = result?;
 
     let remote = replies.lock().map(|map| map.clone()).unwrap_or_default();
     let mut results = report.results.clone();
@@ -299,7 +374,111 @@ where
             .unwrap_or_default(),
         attempts: attempts.lock().map(|map| map.clone()).unwrap_or_default(),
         nodes: table.snapshot(),
+        probes: probes
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default(),
         report,
+    })
+}
+
+/// 探测当前所有已隔离节点；成功才放行，失败保持隔离并记录原因。
+fn probe_isolated_nodes(
+    table: &NodeTable,
+    probes: &Mutex<Vec<RemoteProbeEvent>>,
+    phase: RemoteProbePhase,
+) {
+    let mut events = Vec::new();
+    for snapshot in table
+        .snapshot()
+        .into_iter()
+        .filter(|snapshot| !snapshot.healthy)
+    {
+        let Some(node) = table.node(&snapshot.id) else {
+            continue;
+        };
+        match probe_remote_health(&node.endpoint) {
+            Ok(()) => {
+                let readmitted = table.readmit(&node.id);
+                events.push(RemoteProbeEvent {
+                    node: node.id,
+                    phase,
+                    ok: true,
+                    readmitted,
+                    error: None,
+                });
+            }
+            Err(error) => events.push(RemoteProbeEvent {
+                node: node.id,
+                phase,
+                ok: false,
+                readmitted: false,
+                error: Some(error),
+            }),
+        }
+    }
+    let mut guard = probes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for event in events {
+        if guard.len() >= MAX_PROBE_EVENTS {
+            guard.remove(0);
+        }
+        guard.push(event);
+    }
+}
+
+/// 演练期间的周期健康监控：只处理已隔离节点，停止标志置位后尽快退出。
+struct HealthMonitor {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HealthMonitor {
+    fn stop(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for HealthMonitor {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn spawn_health_monitor(
+    table: Arc<NodeTable>,
+    interval: Duration,
+    probes: Arc<Mutex<Vec<RemoteProbeEvent>>>,
+) -> Result<HealthMonitor, AgentError> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = std::thread::Builder::new()
+        .name("trit-health-monitor".into())
+        .spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(Ordering::SeqCst) {
+                    probe_isolated_nodes(&table, &probes, RemoteProbePhase::Periodic);
+                    let mut remaining = interval;
+                    while !stop.load(Ordering::SeqCst) && !remaining.is_zero() {
+                        let wait = remaining.min(HEALTH_MONITOR_STEP);
+                        std::thread::sleep(wait);
+                        remaining = remaining.saturating_sub(wait);
+                    }
+                }
+            }
+        })
+        .map_err(|error| AgentError::Io(format!("spawn health monitor: {error}")))?;
+    Ok(HealthMonitor {
+        stop,
+        handle: Some(handle),
     })
 }
 

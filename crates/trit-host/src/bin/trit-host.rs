@@ -2,7 +2,6 @@ use std::error::Error;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use trit_host::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
@@ -1698,87 +1697,6 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     Ok(())
 }
 
-/// 单个演练最多保留的探测事件；周期探测不能把报告变成无界日志。
-const MAX_PROBE_EVENTS: usize = 1024;
-
-fn push_probe_event(
-    probes: &mut Vec<serde_json::Value>,
-    node: &str,
-    phase: &str,
-    ok: bool,
-    readmitted: bool,
-    error: Option<String>,
-) {
-    if probes.len() >= MAX_PROBE_EVENTS {
-        probes.remove(0);
-    }
-    let mut event = serde_json::json!({
-        "node": node,
-        "phase": phase,
-        "ok": ok,
-        "readmitted": readmitted,
-    });
-    if let Some(error) = error {
-        event["error"] = serde_json::Value::String(error);
-    }
-    probes.push(event);
-}
-
-/// 只探当前已隔离节点；成功才放行，失败保持隔离并记录原因。
-fn probe_isolated_nodes(
-    table: &trit_orch::NodeTable,
-    nodes: &[trit_orch::RemoteNode],
-    probes: &mut Vec<serde_json::Value>,
-    phase: &str,
-) {
-    for snapshot in table
-        .snapshot()
-        .into_iter()
-        .filter(|snapshot| !snapshot.healthy)
-    {
-        let Some(node) = nodes.iter().find(|node| node.id == snapshot.id) else {
-            continue;
-        };
-        match trit_host::probe_remote_health(&node.endpoint) {
-            Ok(()) => {
-                let readmitted = table.readmit(&node.id);
-                push_probe_event(probes, &snapshot.id, phase, true, readmitted, None);
-            }
-            Err(error) => {
-                push_probe_event(probes, &snapshot.id, phase, false, false, Some(error));
-            }
-        }
-    }
-}
-
-/// 演练期间的周期健康监控：只处理已隔离节点，停止标志置位后尽快退出。
-fn spawn_health_monitor(
-    table: Arc<trit_orch::NodeTable>,
-    nodes: Vec<trit_orch::RemoteNode>,
-    interval: std::time::Duration,
-    probes: Arc<Mutex<Vec<serde_json::Value>>>,
-    stop: Arc<AtomicBool>,
-) -> std::io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("trit-health-monitor".into())
-        .spawn(move || {
-            while !stop.load(Ordering::SeqCst) {
-                {
-                    let mut events = probes
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    probe_isolated_nodes(&table, &nodes, &mut events, "periodic");
-                }
-                let mut remaining = interval;
-                while !stop.load(Ordering::SeqCst) && !remaining.is_zero() {
-                    let wait = remaining.min(std::time::Duration::from_millis(25));
-                    std::thread::sleep(wait);
-                    remaining = remaining.saturating_sub(wait);
-                }
-            }
-        })
-}
-
 /// `remote-plan [--input <json|->]`：跨机演练。
 ///
 /// 输入是一个 JSON 文档：`{revision, tasks, nodes, workers?, failure_threshold?,
@@ -1789,6 +1707,8 @@ fn spawn_health_monitor(
 /// `--probe` 会在加载健康文件后对已隔离节点做一次 `GET /health`，成功才重新放行。
 /// `--probe-interval-ms` 会在本次演练运行期间周期探测已隔离节点，成功后重新放行；
 /// 它要求 `--health <path>`，且只在本进程内有效，不做常驻后台监控。
+/// 两种探测都映射到库级 `RemotePlanConfig::with_health_probe_*`，事件来自报告的
+/// `probes`；库级调用方不依赖 `--health` 文件也能使用同一能力。
 /// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
 fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut input_path: Option<String> = None;
@@ -1836,9 +1756,14 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     if let Some(scope) = input.scope {
         config = config.with_scope(scope);
     }
-    let nodes = input.nodes;
+    if probe {
+        config = config.with_health_probe_on_start();
+    }
+    if let Some(interval) = probe_interval {
+        config = config.with_health_probe_interval(interval);
+    }
     let mut table =
-        trit_orch::NodeTable::new(nodes.clone())?.with_failure_threshold(input.failure_threshold);
+        trit_orch::NodeTable::new(input.nodes)?.with_failure_threshold(input.failure_threshold);
     if let Some(path) = health_path.as_deref()
         && Path::new(path).exists()
     {
@@ -1848,44 +1773,13 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
             .map_err(|error| fail(format!("parse health file {path}: {error}")))?;
         table = table.with_snapshots(&snapshots);
     }
-    let table = Arc::new(table);
-    let probes = Arc::new(Mutex::new(Vec::new()));
-    if probe {
-        let mut events = probes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        probe_isolated_nodes(&table, &nodes, &mut events, "preflight");
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let monitor = if let Some(interval) = probe_interval {
-        Some(spawn_health_monitor(
-            Arc::clone(&table),
-            nodes.clone(),
-            interval,
-            Arc::clone(&probes),
-            Arc::clone(&stop),
-        )?)
-    } else {
-        None
-    };
-    let result = trit_host::run_remote_plan_with_table(
+    let report = trit_host::run_remote_plan_with_table(
         &plan,
-        table,
+        Arc::new(table),
         config,
         trit_orch::CancelToken::new(),
         remote_request_for,
-    );
-    stop.store(true, Ordering::SeqCst);
-    if let Some(monitor) = monitor {
-        let _ = monitor.join();
-    }
-    let report = result?;
-    let probes = {
-        let mut guard = probes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *guard)
-    };
+    )?;
     if let Some(path) = health_path.as_deref() {
         save_health(path, &report.nodes)?;
     }
@@ -1905,7 +1799,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
         "assignments": report.assignments,
         "attempts": report.attempts,
         "nodes": report.nodes,
-        "probes": probes,
+        "probes": report.probes,
         "metrics": report.report.metrics,
     });
     println!("{}", serde_json::to_string_pretty(&value)?);

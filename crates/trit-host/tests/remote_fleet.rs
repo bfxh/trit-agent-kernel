@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use trit_host::{RemotePlanConfig, run_remote_plan};
+use trit_host::{RemotePlanConfig, RemoteProbePhase, run_remote_plan, run_remote_plan_with_table};
 use trit_orch::{
-    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, Dependency, Plan,
-    RemoteEndpoint, RemoteNode, SubagentProfile, SubagentRequest, SubagentResponse, Task, TaskSpec,
-    Ternary, decode_frame, encode_frame,
+    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, Dependency,
+    NodeSnapshot, NodeTable, Plan, RemoteEndpoint, RemoteNode, SubagentProfile, SubagentRequest,
+    SubagentResponse, Task, TaskSpec, Ternary, decode_frame, encode_frame,
 };
 
 struct TestNode {
@@ -116,6 +116,40 @@ fn request_for(task: &TaskSpec) -> SubagentRequest {
         max_tokens: 100,
     };
     SubagentRequest::new(task, capsule, profile)
+}
+
+#[test]
+fn library_preflight_readmits_an_isolated_node() {
+    let node = spawn_node("recovered", 1, &[]);
+    let table = NodeTable::new(vec![node.remote()])
+        .unwrap()
+        .with_snapshots(&[NodeSnapshot {
+            id: "recovered".into(),
+            healthy: false,
+            in_flight: 0,
+            attempts: 0,
+            failures: 1,
+        }]);
+
+    let report = run_remote_plan_with_table(
+        &plan(vec![task("t1", &[])]),
+        Arc::new(table),
+        RemotePlanConfig::new(1).with_health_probe_on_start(),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert_eq!(report.report.completed.len(), 1, "{:?}", report.report);
+    assert!(report.reusable("t1"), "{:?}", report.result("t1"));
+    assert_eq!(report.probes.len(), 1, "{:?}", report.probes);
+    let probe = &report.probes[0];
+    assert_eq!(probe.node, "recovered");
+    assert_eq!(probe.phase, RemoteProbePhase::Preflight);
+    assert!(probe.ok);
+    assert!(probe.readmitted);
+    assert!(probe.error.is_none(), "{probe:?}");
+    assert!(report.nodes[0].healthy, "{:?}", report.nodes);
 }
 
 #[test]

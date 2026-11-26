@@ -259,6 +259,16 @@ impl NodeTable {
         self.lock().iter().filter(|slot| slot.healthy).count()
     }
 
+    /// 按 id 读取节点定义（含端点），供宿主做健康探测等只读检查。
+    ///
+    /// 返回克隆而不是引用，避免把内部锁暴露给 I/O 调用方。
+    pub fn node(&self, id: &str) -> Option<RemoteNode> {
+        self.lock()
+            .iter()
+            .find(|slot| slot.node.id == id)
+            .map(|slot| slot.node.clone())
+    }
+
     /// 显式健康探测成功后重新放行一个已隔离节点。
     ///
     /// 保留累计 `attempts/failures` 作为历史，只清零连续失败计数并恢复 `healthy`。
