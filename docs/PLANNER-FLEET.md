@@ -325,7 +325,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   边界：对端未实现 `/cancel` 时，客户端仍会在 2s 后返回，但远端请求会继续到
   端点超时，可能已经写盘；`Aborted` 不等于“远端一定没执行”。
 - CLI `trit-host remote-plan [--input <json|->] [--health <path>] [--probe]
-  [--probe-interval-ms N] [--probe-concurrency N] [--health-flush-ms N]`：输入
+  [--probe-interval-ms N] [--probe-concurrency N] [--health-flush-ms N]
+  [--health-max-age-ms N]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?, scope?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
   含 `completed/failed/deferred/results/assignments/attempts/nodes/probes/metrics` 的
@@ -354,13 +355,24 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   正常结束才落盘：写回线程每次先把 `in_flight` 清零，再走同一 `.write.lock`
   合并协议；CLI 在计划结束后先停止并 join 写回线程，再做最终原子写回，因此
   崩溃最多丢最近一个周期的健康变化。库级调用方可直接用
-  `spawn_remote_health_flusher(table, path, interval)` 获得同一能力。计划内的
+  `spawn_remote_health_flusher(table, path, interval)` 获得同一能力。
+  `--health-max-age-ms N`（需配 preflight 或周期探测）会把健康文件里
+  `healthy=true`、但 `updated_at_ms` 超过 N ms 未更新的节点先按未知隔离，
+  并在报告 `stale` 中列出；这些节点只有经 preflight / 周期探测成功后才重新
+  参与派发。隔离本身推进 `updated_at_ms`（但不增加 `attempts/failures`），
+  因此健康文件会记录这次由新鲜度触发的隔离。该策略也下沉为
+  `RemotePlanConfig::with_health_max_age(Duration)` 和
+  `NodeTable::isolate_stale_healthy(now_ms, max_age_ms)`；时间戳在未来的条目不会
+  因时钟回拨被误隔离，`Duration::ZERO` 关闭该策略。计划内的
   监控随计划结束退出；跨进程常驻恢复由 `trit-host remote-health` 承担：
   `--nodes <json> --health <path> [--interval-ms N] [--once]
-  [--probe-concurrency N]` 每轮重读同一节点表与
-  健康文件（`Vec<NodeSnapshot>`，条目含 `updated_at_ms`），只探已隔离节点，
+  [--probe-concurrency N] [--probe-all]` 每轮重读同一节点表与
+  健康文件（`Vec<NodeSnapshot>`，条目含 `updated_at_ms`），默认只探已隔离节点，
   `GET /health` 成功即写回
   `healthy`（保留 `attempts/failures`、清零 `in_flight`），失败保持隔离并记录原因；
+  `--probe-all` 让本轮把健康节点也探一遍：成功只刷新 `updated_at_ms`（不算重新入列），
+  失败则就地隔离——覆盖「快照写着健康、机器其实已经死了」的情况，也让
+  `--health-max-age-ms` 的超龄隔离不必靠自然过期来发现。
   默认常驻、每轮输出一行 JSON，`--once` 适合 cron / 任务计划程序。`--probe-concurrency`
   默认 4、上限 64，只并行探测、不改变单次写回；事件与快照仍按节点 id
   升序，`1` 为串行。节点增删或 token
@@ -380,10 +392,12 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
 隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、`OverBudget` 健康语义、
-快照恢复、更新时间随状态变更推进并在恢复时保留、显式 `readmit`、JSON 默认值）、
+快照恢复、更新时间随状态变更推进并在恢复时保留、显式 `readmit`、陈旧健康快照
+按最大年龄隔离且保留累计计数、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表、库级
-preflight 探测重新放行隔离节点并返回 `probes`、preflight 有界并发探测且事件有序、
+preflight 探测重新放行隔离节点并返回 `probes`、超龄健康快照未探测时不派发且
+探测成功后放行、preflight 有界并发探测且事件有序、
 单节点恢复即放行不被最慢探测阻塞）、
 `crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、同键并发只执行
 一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
@@ -391,6 +405,7 @@ preflight 探测重新放行隔离节点并返回 `probes`、preflight 有界并
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
 文件跨运行隔离、计划写回保留节点表外的健康条目、运行期间用 `--health-flush-ms`
 写回健康、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间恢复节点、
+`--health-max-age-ms` 把超龄健康条目先隔离并在探测后放行、参数校验、
 `--probe-concurrency` 参数校验、重复节点 ID 与非法 scope 拒绝）、
 `crates/trit-host/tests/remote_health.rs`（独立守护成功放行并保留累计计数、探测
 失败保持隔离、未知节点保留原快照、保存时合并未提及条目并按 `updated_at_ms`

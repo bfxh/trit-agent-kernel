@@ -1349,11 +1349,13 @@ fn usage() {
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>] [--probe]\n\
          [--probe-interval-ms N] [--probe-concurrency N] [--health-flush-ms N]\n\
+         [--health-max-age-ms N]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?,scope?}},\n\
          dispatches tasks as read-only subagent requests to the static node table, prints JSON.\n\
          --probe-concurrency bounds parallel GET /health inside one scan (1..64, needs a probe mode).\n\
-         --health-flush-ms defaults to 30000 when --health is set; 0 disables periodic rewrite.\n\n\
-         remote-health: trit-host remote-health --nodes <json> --health <path> [--interval-ms N] [--once]\n\
+         --health-flush-ms defaults to 30000 when --health is set; 0 disables periodic rewrite.\n\
+         --health-max-age-ms isolates healthy entries older than N ms until a probe readmits them.\n\n\
+         remote-health: trit-host remote-health --nodes <json> --health <path> [--interval-ms N] [--once] [--probe-all]\n\
          [--probe-concurrency N]\n\
          standalone health monitor: reloads --nodes each sweep, probes isolated nodes,\n\
          rewrites the health file via temp+rename, takes an OS lock on <health>.lock;\n\
@@ -1755,6 +1757,9 @@ const DEFAULT_HEALTH_FLUSH_MS: u64 = 30_000;
 /// 需配合 `--probe` 或 `--probe-interval-ms`；未指定时沿用库级默认的串行探测）。
 /// `--health` 还存在时默认每 30s 把当前节点健康写回文件（`--health-flush-ms` 可调，
 /// 0 关闭），避免长演练中途崩溃只在正常结束才落盘；停止写回线程后才做最终写回。
+/// `--health-max-age-ms N` 把健康文件里超过 N ms 未更新的 `healthy=true` 条目
+/// 先按未知隔离，报告中列入 `stale`；它们只有经 `--probe` / `--probe-interval-ms`
+/// 探测成功才会重新参与派发。
 /// 两种探测都映射到库级 `RemotePlanConfig::with_health_probe_*`，事件来自报告的
 /// `probes`；库级调用方不依赖 `--health` 文件也能使用同一能力。
 /// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
@@ -1765,6 +1770,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut probe_interval_ms: Option<u64> = None;
     let mut probe_concurrency: Option<usize> = None;
     let mut health_flush_ms: Option<u64> = None;
+    let mut health_max_age_ms: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--input" => input_path = Some(next(&mut args, "--input")?),
@@ -1779,6 +1785,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
             "--health-flush-ms" => {
                 health_flush_ms = Some(next(&mut args, "--health-flush-ms")?.parse()?)
             }
+            "--health-max-age-ms" => {
+                health_max_age_ms = Some(next(&mut args, "--health-max-age-ms")?.parse()?)
+            }
             other => return Err(fail(format!("unknown remote-plan argument: {other}"))),
         }
     }
@@ -1790,6 +1799,17 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     }
     if health_flush_ms.is_some() && health_path.is_none() {
         return Err(fail("--health-flush-ms requires --health <path>"));
+    }
+    if health_max_age_ms.is_some() && health_path.is_none() {
+        return Err(fail("--health-max-age-ms requires --health <path>"));
+    }
+    if health_max_age_ms == Some(0) {
+        return Err(fail("--health-max-age-ms must be positive"));
+    }
+    if health_max_age_ms.is_some() && !probe && probe_interval_ms.is_none() {
+        return Err(fail(
+            "--health-max-age-ms requires --probe or --probe-interval-ms",
+        ));
     }
     if probe_concurrency.is_some() && !probe && probe_interval_ms.is_none() {
         return Err(fail(
@@ -1841,6 +1861,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     }
     if let Some(concurrency) = probe_concurrency {
         config = config.with_health_probe_concurrency(concurrency);
+    }
+    if let Some(max_age_ms) = health_max_age_ms {
+        config = config.with_health_max_age(std::time::Duration::from_millis(max_age_ms));
     }
     let mut table =
         trit_orch::NodeTable::new(input.nodes)?.with_failure_threshold(input.failure_threshold);
@@ -1897,6 +1920,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
         "assignments": report.assignments,
         "attempts": report.attempts,
         "nodes": report.nodes,
+        "stale": report.stale_nodes,
         "probes": report.probes,
         "metrics": report.report.metrics,
     });
@@ -1908,8 +1932,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
 const DEFAULT_HEALTH_PROBE_CONCURRENCY: usize = 4;
 
 /// `remote-health --nodes <path> --health <path> [--interval-ms N] [--once]
-/// [--probe-concurrency N]`：
-/// 独立健康守护。每轮重读节点表，只探已隔离节点，成功即写回健康文件；
+/// [--probe-concurrency N] [--probe-all]`：
+/// 独立健康守护。每轮重读节点表，默认只探已隔离节点，成功即写回健康文件；
+/// `--probe-all` 连健康节点一起探，成功刷新时间戳、失败就地隔离。
 /// 默认常驻，`--once` 适合 cron / 任务计划程序。持有 `<health>.lock` 的单实例
 /// OS 锁，进程退出（包括崩溃）时自动释放。探测按 `--probe-concurrency` 并行，
 /// 默认 4、上限 64；事件与快照仍按节点 id 升序输出。
@@ -1919,6 +1944,7 @@ fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     let mut interval_ms: u64 = 30_000;
     let mut probe_concurrency = DEFAULT_HEALTH_PROBE_CONCURRENCY;
     let mut once = false;
+    let mut scope = trit_host::RemoteHealthScope::IsolatedOnly;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--nodes" => nodes_path = Some(next(&mut args, "--nodes")?),
@@ -1933,6 +1959,7 @@ fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                 probe_concurrency = next(&mut args, "--probe-concurrency")?.parse()?
             }
             "--once" => once = true,
+            "--probe-all" => scope = trit_host::RemoteHealthScope::All,
             other => return Err(fail(format!("unknown remote-health argument: {other}"))),
         }
     }
@@ -1961,10 +1988,11 @@ fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     loop {
         // 每轮重读节点表：增删节点或轮换 token 不需要重启守护。
         let nodes = load_remote_nodes(&nodes_path)?;
-        let report = trit_host::probe_remote_health_file_with_concurrency(
+        let report = trit_host::probe_remote_health_file_scoped(
             &nodes,
             Path::new(&health_path),
             probe_concurrency,
+            scope,
         )?;
         writeln!(
             stdout,

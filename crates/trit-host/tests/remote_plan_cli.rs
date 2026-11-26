@@ -162,6 +162,8 @@ fn remote_plan_cli_probe_readmits_a_recovered_node() {
         .arg("--health")
         .arg(&health)
         .arg("--probe")
+        .arg("--health-max-age-ms")
+        .arg("1000")
         .output()
         .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -172,6 +174,12 @@ fn remote_plan_cli_probe_readmits_a_recovered_node() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["stale"], serde_json::json!(["node-b"]), "{report}");
+    assert_eq!(
+        report["probes"].as_array().unwrap().len(),
+        2,
+        "超龄健康节点也必须先探测: {report}"
+    );
     assert_eq!(report["probes"][0]["node"], "node-a", "{report}");
     assert_eq!(report["probes"][0]["ok"], true, "{report}");
     assert_eq!(report["probes"][0]["readmitted"], true, "{report}");
@@ -587,6 +595,52 @@ fn remote_plan_cli_requires_health_for_health_flush() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--health-flush-ms requires --health"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn remote_plan_cli_validates_health_max_age() {
+    let orphan = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--health-max-age-ms")
+        .arg("1000")
+        .output()
+        .unwrap();
+    assert_eq!(orphan.status.code(), Some(2), "{orphan:?}");
+    let stderr = String::from_utf8_lossy(&orphan.stderr);
+    assert!(
+        stderr.contains("--health-max-age-ms requires --health"),
+        "{stderr}"
+    );
+
+    let unprobed = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--health")
+        .arg("unused-health.json")
+        .arg("--health-max-age-ms")
+        .arg("1000")
+        .output()
+        .unwrap();
+    assert_eq!(unprobed.status.code(), Some(2), "{unprobed:?}");
+    let stderr = String::from_utf8_lossy(&unprobed.stderr);
+    assert!(
+        stderr.contains("--health-max-age-ms requires --probe or --probe-interval-ms"),
+        "{stderr}"
+    );
+
+    let zero = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--health")
+        .arg("unused-health.json")
+        .arg("--health-max-age-ms")
+        .arg("0")
+        .output()
+        .unwrap();
+    assert_eq!(zero.status.code(), Some(2), "{zero:?}");
+    let stderr = String::from_utf8_lossy(&zero.stderr);
+    assert!(
+        stderr.contains("--health-max-age-ms must be positive"),
         "{stderr}"
     );
 }

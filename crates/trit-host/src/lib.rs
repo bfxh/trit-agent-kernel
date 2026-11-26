@@ -1367,9 +1367,10 @@ pub use reasonix_wire::{
 };
 pub use remote_fleet::{
     MAX_HEALTH_PROBE_CONCURRENCY, RemoteAttempt, RemoteHealthFlusher, RemoteHealthReport,
-    RemotePlanConfig, RemotePlanReport, RemoteProbeEvent, RemoteProbePhase,
-    probe_remote_health_file, probe_remote_health_file_with_concurrency, run_remote_plan,
-    run_remote_plan_with_table, save_remote_health_file, spawn_remote_health_flusher,
+    RemoteHealthScope, RemotePlanConfig, RemotePlanReport, RemoteProbeEvent, RemoteProbePhase,
+    probe_remote_health_file, probe_remote_health_file_scoped,
+    probe_remote_health_file_with_concurrency, run_remote_plan, run_remote_plan_with_table,
+    save_remote_health_file, spawn_remote_health_flusher,
 };
 pub use remote_ledger::{Claim, LedgerServer, LedgerServerConfig};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
