@@ -167,8 +167,10 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
 - 已落地（第三刀）：`run_plan_then_execute` 把 planner 与 executor 串成两阶段——planner 在
   只读工具上产出 `PlanHandoff`，executor 在**独立 `AgentHost` + 独立 `CacheLedger`** 中执行，
   批准的计划 JSON 注入执行目标；planner 的缓存命中不会计入执行侧。
-- 仍待补：CLI 侧 plan-exec 一键入口（当前为库级编排，调用方负责把
-  `plan.profile.write_roots` 接成 executor 的 `WriteClaim`）。
+- 已落地（第四刀）：`plan-exec` CLI 一键入口——planner 通过后，用 `plan.profile.write_roots`
+  现场构造 executor 的 `WriteClaim`（工具执行与完成裁决共用同一份），`--write-journal`
+  同时接上 mutation journal；`run_plan_then_execute_with` 提供「先拿计划、再建工具」的
+  回调接口，脚本化与 openai provider 都能跑。
 - 依赖：B7.5。
 
 ### B7.7 持久化、恢复与租约（P1）

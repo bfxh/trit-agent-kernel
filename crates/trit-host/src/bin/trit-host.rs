@@ -8,13 +8,15 @@ use trit_host::tools::{LocalTools, SandboxCommand, WorkspaceConfig};
 use trit_host::{
     AgentContext, AgentContextPlanner, AgentContextTools, AgentHost, CacheLedger,
     CachePressurePolicy, CacheWindow, CheckpointStore, CheckpointingTools, ClaimingTools,
-    ContextPolicy, ContextRequest, GitCheckpointStore, GitCheckpointingTools, HeadlessConfig,
-    InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile, MutationJournal,
-    OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler, OperationLease, Proposal, ProviderModel,
-    ReasoningEffort, RecoveryContext, ResolvedContext, RewindScope, SamplingHandler, ScriptedModel,
-    SearchOrder, SelectionPressure, Session, SupervisorConfig, SupervisorRuntime, ToolCatalog,
-    ToolExecutor, WriteClaim, WriteGuard, default_tools, recovery_context_for_session,
+    ContextPolicy, ContextRequest, ExecutorSetup, GitCheckpointStore, GitCheckpointingTools,
+    HeadlessConfig, InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile,
+    MutationJournal, OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler, OperationLease,
+    PlanExecuteConfig, Proposal, ProviderModel, ReasoningEffort, RecoveryContext, ResolvedContext,
+    RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure, Session,
+    SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, ToolSpec, WriteClaim,
+    WriteGuard, default_tools, planner_catalog_specs, recovery_context_for_session,
     rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
+    run_plan_then_execute_with,
 };
 use trit_orch::alignment::AlignmentOptions;
 use trit_orch::gate_chain::{
@@ -56,6 +58,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if command == "subagent-run" {
         return run_subagent_run(args);
+    }
+    if command == "plan-exec" {
+        return run_plan_exec(args);
     }
     if command == "remote-echo" {
         return run_remote_echo(args);
@@ -981,6 +986,9 @@ fn apply_write_guard(
             if let Some(lease) = guard.lease {
                 claiming = claiming.with_lease(lease);
             }
+            if let Some(journal) = guard.journal {
+                claiming = claiming.with_journal(journal);
+            }
             Box::new(claiming)
         }
         None => tools,
@@ -1282,6 +1290,11 @@ fn usage() {
          [--cache-search-order keep|dynamic-first] \\\n    \
          [--cache-task-selection normal|low-cost] [--cache-ledger <json>] \\\n    \
          [--supervisor-config <json>] [--mcp-sampling [--mcp-sampling-model <name>]]]\n\n\
+         trit-host plan-exec --task <text> --workspace <dir> \\\n    \
+         --planner-script <proposals.json> --script <proposals.json> \\\n    \
+         [--allow-write [--write-journal]] \\\n    \
+         [--max-plan-steps N] [--max-exec-steps N] [--capsule-budget N] \\\n    \
+         [--output-format md|json]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
@@ -2260,6 +2273,204 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     }
     server.serve_forever()?;
     Ok(())
+}
+
+/// `plan-exec --task <t> --workspace <dir> (--planner-script P --script E | --provider openai)`：
+///
+/// 一键跑 planner → executor 两阶段。planner 只读产出 `PlanHandoff`；executor 的工具与
+/// `WriteClaim` 在计划校验通过后才按 `plan.profile.write_roots` 构造，计划和缓存都不跨阶段共享。
+fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut task: Option<String> = None;
+    let mut workspace = PathBuf::from(".");
+    let mut planner_script: Option<PathBuf> = None;
+    let mut executor_script: Option<PathBuf> = None;
+    let mut provider = "scripted".to_owned();
+    let mut planner_model_name: Option<String> = None;
+    let mut executor_model_name: Option<String> = None;
+    let mut allow_write = false;
+    let mut write_journal = false;
+    let mut plan_max_steps = 8usize;
+    let mut exec_max_steps = 8usize;
+    let mut capsule_budget = 4096usize;
+    let mut output_format = String::from("md");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--task" => task = Some(next(&mut args, "--task")?),
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--planner-script" => {
+                planner_script = Some(PathBuf::from(next(&mut args, "--planner-script")?));
+            }
+            "--script" | "--executor-script" => {
+                executor_script = Some(PathBuf::from(next(&mut args, "--script")?));
+            }
+            "--provider" => provider = next(&mut args, "--provider")?,
+            "--planner-model" => planner_model_name = Some(next(&mut args, "--planner-model")?),
+            "--executor-model" => executor_model_name = Some(next(&mut args, "--executor-model")?),
+            "--allow-write" => allow_write = true,
+            "--write-journal" => write_journal = true,
+            "--max-plan-steps" => {
+                plan_max_steps = next(&mut args, "--max-plan-steps")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --max-plan-steps: {error}")))?;
+            }
+            "--max-exec-steps" => {
+                exec_max_steps = next(&mut args, "--max-exec-steps")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --max-exec-steps: {error}")))?;
+            }
+            "--capsule-budget" => {
+                capsule_budget = next(&mut args, "--capsule-budget")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --capsule-budget: {error}")))?;
+            }
+            "--output-format" => {
+                output_format = match next(&mut args, "--output-format")?.as_str() {
+                    "md" | "markdown" => "md".into(),
+                    "json" => "json".into(),
+                    other => return Err(fail(format!("bad --output-format: {other}"))),
+                };
+            }
+            other => return Err(fail(format!("plan-exec: unknown argument {other}"))),
+        }
+    }
+    let task = task.ok_or_else(|| fail("plan-exec requires --task"))?;
+    if provider != "scripted" && provider != "openai" {
+        return Err(fail(format!("plan-exec: bad --provider {provider}")));
+    }
+
+    // planner 侧只读：即便脚本里塞了写调用，也会被 ReadOnlyTools 拒绝。
+    let mut planner_config = WorkspaceConfig::new(&workspace);
+    planner_config.allow_write = false;
+    let planner_tools = trit_host::ReadOnlyTools::new(LocalTools::new(planner_config)?);
+
+    let planner_model = plan_exec_model(
+        &provider,
+        planner_script.as_deref(),
+        "--planner-script",
+        planner_model_name.as_deref(),
+        planner_catalog_specs(),
+    )?;
+    let executor_model = plan_exec_model(
+        &provider,
+        executor_script.as_deref(),
+        "--script",
+        executor_model_name.as_deref(),
+        default_tools(),
+    )?;
+
+    let workspace_for_exec = workspace.clone();
+    let executor =
+        move |plan: &trit_orch::PlanHandoff| -> Result<ExecutorSetup<Box<dyn ToolExecutor>>, trit_host::AgentError> {
+            let mut config = WorkspaceConfig::new(&workspace_for_exec);
+            config.allow_write = allow_write;
+            let local = LocalTools::new(config)?;
+            let tools: Box<dyn ToolExecutor> = if allow_write {
+                Box::new(local)
+            } else {
+                Box::new(trit_host::ReadOnlyTools::new(local))
+            };
+            if !allow_write {
+                return Ok(ExecutorSetup {
+                    tools,
+                    write_claim: None,
+                });
+            }
+            // 计划里写哪里，执行侧就只能写哪里；同一份 claim 也交给完成裁决。
+            let claim = WriteClaim::new(
+                &workspace_for_exec,
+                plan.profile
+                    .write_roots
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect(),
+            )?;
+            let journal = if write_journal {
+                Some(
+                    MutationJournal::open(&workspace_for_exec)
+                        .map_err(|error| trit_host::AgentError::Io(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let claim_for_host = claim.clone();
+            Ok(ExecutorSetup {
+                tools: apply_write_guard(
+                    tools,
+                    Some(WriteGuard {
+                        claim,
+                        lease: None,
+                        journal,
+                    }),
+                ),
+                write_claim: Some(claim_for_host),
+            })
+        };
+
+    let turn = TurnSpec {
+        task: task.clone(),
+        objective: task,
+        constraints: Vec::new(),
+        stop_when: Vec::new(),
+        min_assertions: 0,
+        max_tokens: 0,
+    };
+    let config = PlanExecuteConfig {
+        plan_max_steps,
+        exec_max_steps,
+        capsule_allowed: vec!["goal".to_owned()],
+        capsule_budget,
+    };
+    let outcome = run_plan_then_execute_with(
+        planner_model,
+        planner_tools,
+        executor_model,
+        executor,
+        &turn,
+        &config,
+    )?;
+
+    let complete = outcome.execution.judgment.is_complete();
+    let plan_ref = outcome.plan.reference();
+    if output_format == "json" {
+        let value = serde_json::json!({
+            "plan": outcome.plan,
+            "plan_ref": plan_ref,
+            "complete": complete,
+            "execution": outcome.execution,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("plan: {plan_ref}");
+        print!("{}", outcome.execution.render_markdown());
+    }
+    if !complete {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn plan_exec_model(
+    provider: &str,
+    script: Option<&Path>,
+    flag: &str,
+    model_name: Option<&str>,
+    tools: Vec<ToolSpec>,
+) -> Result<Box<dyn Model>, Box<dyn Error>> {
+    if provider == "scripted" {
+        let path = script.ok_or_else(|| fail(format!("plan-exec requires {flag}")))?;
+        let text = std::fs::read_to_string(path)?;
+        let proposals: Vec<Proposal> = serde_json::from_str(&text)?;
+        return Ok(Box::new(ScriptedModel::new(proposals)));
+    }
+    let mut config = OpenAiConfig::from_env().map_err(|error| fail(error.to_string()))?;
+    if let Some(model) = model_name {
+        config.model = model.to_owned();
+    }
+    Ok(Box::new(ProviderModel::with_tools(
+        OpenAiProvider::new(config),
+        tools,
+    )))
 }
 
 /// `subagent-run --workspace <dir> --script <proposals.json> [--max-steps N]`：
