@@ -98,6 +98,11 @@ pub struct RemotePlanConfig {
     pub health_probe_interval: Option<Duration>,
     /// 一次 preflight / 周期扫描内最多并行探测多少个已隔离节点；默认 1（串行）。
     pub health_probe_concurrency: usize,
+    /// 健康快照允许的最大年龄；超过后 `healthy=true` 视为未知并先隔离。
+    ///
+    /// `None` 完全信任传入快照（保持旧行为）。配置后仍需 preflight / 周期探测
+    /// 才能把超龄节点重新放行；未配探测时超龄节点不会参与派发。
+    pub health_max_age: Option<Duration>,
 }
 
 impl RemotePlanConfig {
@@ -110,6 +115,7 @@ impl RemotePlanConfig {
             health_probe_on_start: false,
             health_probe_interval: None,
             health_probe_concurrency: 1,
+            health_max_age: None,
         }
     }
 
@@ -144,6 +150,15 @@ impl RemotePlanConfig {
     /// 一次健康扫描最多并行探测多少个节点；0 与超上限都夹到合法区间。
     pub fn with_health_probe_concurrency(mut self, concurrency: usize) -> Self {
         self.health_probe_concurrency = concurrency.clamp(1, MAX_HEALTH_PROBE_CONCURRENCY);
+        self
+    }
+
+    /// 健康快照超过 `max_age` 后视为未知并先隔离；`Duration::ZERO` 关闭该策略。
+    ///
+    /// 超龄节点只有在健康探测成功后才重新放行；未配置 `with_health_probe_on_start`
+    /// 或 `with_health_probe_interval` 时，它们不会参与本轮派发。
+    pub fn with_health_max_age(mut self, max_age: Duration) -> Self {
+        self.health_max_age = (!max_age.is_zero()).then_some(max_age);
         self
     }
 }
@@ -205,6 +220,8 @@ pub struct RemotePlanReport {
     pub attempts: BTreeMap<String, Vec<RemoteAttempt>>,
     /// 节点状态快照（按 id 升序）。
     pub nodes: Vec<NodeSnapshot>,
+    /// 因健康快照超龄、在本轮派发前被隔离的节点 id（按 id 升序）。
+    pub stale_nodes: Vec<String>,
     /// 健康探测事件（preflight 在前，periodic 随后）；最多保留 1024 条。
     pub probes: Vec<RemoteProbeEvent>,
 }
@@ -389,6 +406,11 @@ where
         }
     };
 
+    let stale_nodes = match config.health_max_age {
+        Some(max_age) => table.isolate_stale_healthy(now_millis(), duration_millis(max_age)),
+        None => Vec::new(),
+    };
+
     let probes = Arc::new(Mutex::new(Vec::new()));
     if config.health_probe_on_start {
         probe_isolated_nodes(
@@ -425,6 +447,7 @@ where
             .unwrap_or_default(),
         attempts: attempts.lock().map(|map| map.clone()).unwrap_or_default(),
         nodes: table.snapshot(),
+        stale_nodes,
         probes: probes
             .lock()
             .map(|events| events.clone())
@@ -441,6 +464,10 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// 健康探测观测时间：至少比旧条目大 1ms，防止时钟回拨让新结果看起来更旧。

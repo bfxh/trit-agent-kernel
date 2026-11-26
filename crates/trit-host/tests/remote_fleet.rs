@@ -179,6 +179,60 @@ fn library_preflight_readmits_an_isolated_node() {
 }
 
 #[test]
+fn library_stale_healthy_snapshot_requires_a_probe() {
+    let node = spawn_node("stale", 1, &[]);
+    let stale = NodeSnapshot {
+        id: "stale".into(),
+        healthy: true,
+        in_flight: 0,
+        attempts: 3,
+        failures: 1,
+        updated_at_ms: 0,
+    };
+
+    let table = NodeTable::new(vec![node.remote()])
+        .unwrap()
+        .with_snapshots(std::slice::from_ref(&stale));
+    let report = run_remote_plan_with_table(
+        &plan(vec![task("t1", &[])]),
+        Arc::new(table),
+        RemotePlanConfig::new(1).with_health_max_age(Duration::from_millis(1_000)),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert_eq!(report.stale_nodes, vec!["stale"], "{:?}", report.nodes);
+    assert!(!report.nodes[0].healthy, "{:?}", report.nodes);
+    assert_eq!(report.nodes[0].attempts, 3, "新鲜度隔离保留累计尝试数");
+    assert_eq!(report.nodes[0].failures, 1, "新鲜度隔离保留累计失败数");
+    assert!(report.report.completed.is_empty(), "{:?}", report.report);
+    assert!(report.probes.is_empty(), "未配探测时不应自行发请求");
+
+    // 同一份超龄快照在 preflight 探测成功后重新放行并完成任务。
+    let table = NodeTable::new(vec![node.remote()])
+        .unwrap()
+        .with_snapshots(&[stale]);
+    let report = run_remote_plan_with_table(
+        &plan(vec![task("t1", &[])]),
+        Arc::new(table),
+        RemotePlanConfig::new(1)
+            .with_health_max_age(Duration::from_millis(1_000))
+            .with_health_probe_on_start(),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert_eq!(report.stale_nodes, vec!["stale"], "{:?}", report.nodes);
+    assert_eq!(report.report.completed.len(), 1, "{:?}", report.report);
+    assert!(report.reusable("t1"), "{:?}", report.result("t1"));
+    assert_eq!(report.probes.len(), 1, "{:?}", report.probes);
+    assert!(report.probes[0].readmitted, "{:?}", report.probes);
+    assert!(report.nodes[0].healthy, "{:?}", report.nodes);
+}
+
+#[test]
 fn library_preflight_probes_isolated_nodes_with_bounded_concurrency() {
     let worker = spawn_node("a-worker", 1, &[]);
     let delay = Duration::from_millis(250);
