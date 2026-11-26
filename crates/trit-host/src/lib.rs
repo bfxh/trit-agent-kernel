@@ -1455,7 +1455,10 @@ pub use permissions::{
     ClaimingTools, PermissionApprover, PermissionDecision, PermissionGate, PermissionMode,
     PermissionPolicy, PermissionRule, ToolWhitelist, WriteClaim, WriteGuard, wrap_claim,
 };
-pub use plan_exec::{PlanExecuteConfig, PlanExecuteOutcome, run_plan_then_execute};
+pub use plan_exec::{
+    ExecutorSetup, PlanExecuteConfig, PlanExecuteOutcome, run_plan_then_execute,
+    run_plan_then_execute_with,
+};
 pub use planner::{PlanCollectingTools, plan_from_capture, planner_catalog_specs, planner_tools};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
