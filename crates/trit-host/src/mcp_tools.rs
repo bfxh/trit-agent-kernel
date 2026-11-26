@@ -19,7 +19,7 @@ pub struct McpToolRoute {
     pub tool: String,
     pub description: String,
     pub input_schema: Value,
-    pub read_only: bool,
+    pub declared_read_only: bool,
     supervisor: usize,
 }
 
@@ -71,7 +71,9 @@ impl McpToolClient {
                     tool: tool.name.clone(),
                     description,
                     input_schema,
-                    read_only: tool
+                    // `readOnlyHint` 是 MCP 服务端自报，不可作为授权依据。
+                    // 仅保留在 route 上供展示/诊断，绝不进入 ToolSpec.read_only。
+                    declared_read_only: tool
                         .annotations
                         .as_ref()
                         .is_some_and(|annotations| annotations.read_only_hint),
@@ -126,7 +128,7 @@ impl ToolCatalog for McpToolClient {
                     "{} (MCP {} / {})",
                     route.description, route.server, route.tool
                 ),
-                read_only: route.read_only,
+                read_only: false,
                 input_schema: Some(route.input_schema),
             })
             .collect()

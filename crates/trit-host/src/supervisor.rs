@@ -2226,6 +2226,7 @@ impl Drop for SupervisorRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ToolCatalog;
 
     fn exit_spec() -> ProcessSpec {
         if cfg!(windows) {
@@ -3189,13 +3190,22 @@ done
             .into_iter()
             .find(|route| route.exposed_name == "mcp__dyn__echo")
             .unwrap();
-        assert!(echo.read_only);
+        assert!(echo.declared_read_only, "server hint is display-only");
+        let catalog = client.tools();
+        let echo_spec = catalog
+            .iter()
+            .find(|spec| spec.name == "mcp__dyn__echo")
+            .unwrap();
+        assert!(
+            !echo_spec.read_only,
+            "MCP readOnlyHint must not become authorization metadata"
+        );
         let fail = client
             .routes()
             .into_iter()
             .find(|route| route.exposed_name == "mcp__dyn__fail")
             .unwrap();
-        assert!(!fail.read_only);
+        assert!(!fail.declared_read_only);
 
         let mut executor = McpToolExecutor::new(Arc::clone(&client), ScriptedTools::new(vec![]));
         let request = |name: &str| ToolRequest {

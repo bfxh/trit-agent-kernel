@@ -57,7 +57,7 @@ fn planner_rejects_mislabelled_read_only_requests() {
 #[test]
 fn read_only_whitelist_is_explicit() {
     assert!(is_read_only_tool("read_file"));
-    assert!(is_read_only_tool("grep"));
+    assert!(is_read_only_tool("search_code"));
     // submit_plan 是 planner 的输出通道，不写工作区。
     assert!(is_read_only_tool("submit_plan"));
     for write_tool in ["write_file", "move_path", "bash", "shell", "checkpoint"] {
@@ -134,7 +134,7 @@ fn planner_catalog_drops_write_tools() {
     let specs = vec![
         tool_spec("read_file", true),
         tool_spec("write_file", false),
-        tool_spec("grep", true),
+        tool_spec("search_code", true),
         tool_spec("bash", false),
         tool_spec("move_path", false),
         tool_spec("glob", true),
@@ -145,7 +145,7 @@ fn planner_catalog_drops_write_tools() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["read_file", "grep", "glob"]
+        vec!["read_file", "search_code", "glob"]
     );
 
     struct Catalog(Vec<ToolSpec>);
@@ -156,7 +156,7 @@ fn planner_catalog_drops_write_tools() {
     }
     let catalog = ReadOnlyCatalog::new(Catalog(specs));
     let names: Vec<String> = catalog.tools().into_iter().map(|tool| tool.name).collect();
-    assert_eq!(names, vec!["read_file", "grep", "glob"]);
+    assert_eq!(names, vec!["read_file", "search_code", "glob"]);
 }
 
 #[test]

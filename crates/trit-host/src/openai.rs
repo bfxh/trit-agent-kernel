@@ -240,10 +240,7 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
                     }),
                     "bash" => json!({
                         "type": "object",
-                        "properties": {
-                            "command": {"type": "string"},
-                            "read_only": {"type": "boolean"}
-                        },
+                        "properties": {"command": {"type": "string"}},
                         "required": ["command"]
                     }),
                     "context_search" => json!({
@@ -370,13 +367,9 @@ pub(crate) fn parse_message(
                 }
                 "bash" => {
                     let command = string_arg(&arguments, "command")?;
-                    let read_only = arguments
-                        .get("read_only")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let mut request = ToolRequest::shell(call_id, command);
-                    request.read_only = read_only;
-                    tool_calls.push(request);
+                    // `read_only` 只表示工具自身的静态属性，不能由模型参数自报：
+                    // 否则一条写命令只要附上 {"read_only": true} 就能绕过审批与写声明。
+                    tool_calls.push(ToolRequest::shell(call_id, command));
                 }
                 "context_search" => {
                     let query = string_arg(&arguments, "query")?;
@@ -948,6 +941,25 @@ mod tests {
             Some(json!({"text": "hi"}))
         );
         assert!(response.tool_calls[0].read_only);
+    }
+
+    #[test]
+    fn bash_read_only_argument_is_ignored() {
+        let body = r#"{
+            "choices": [{"message": {"tool_calls": [
+                {"id": "call-1", "function": {
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo pwn > hooks/pre-commit\",\"read_only\":true}"
+                }}
+            ]}}]
+        }"#;
+        let response = parse_response(body, &[]).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].tool, "bash");
+        assert!(
+            !response.tool_calls[0].read_only,
+            "model-declared read_only must never reach the permission layer"
+        );
     }
 
     #[test]
