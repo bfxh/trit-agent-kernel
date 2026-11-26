@@ -1341,6 +1341,7 @@ pub mod mcp_tools;
 pub mod memory;
 pub mod openai;
 pub mod permissions;
+pub mod plan_exec;
 pub mod planner;
 pub mod port_bridge;
 pub mod provider;
@@ -1411,6 +1412,7 @@ pub use permissions::{
     ClaimingTools, PermissionApprover, PermissionDecision, PermissionGate, PermissionMode,
     PermissionPolicy, PermissionRule, WriteClaim, WriteGuard, wrap_claim,
 };
+pub use plan_exec::{PlanExecuteConfig, PlanExecuteOutcome, run_plan_then_execute};
 pub use planner::{PlanCollectingTools, plan_from_capture, planner_catalog_specs, planner_tools};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
 pub use provider::{
