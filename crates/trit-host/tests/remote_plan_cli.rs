@@ -420,6 +420,58 @@ fn remote_plan_cli_persists_node_health() {
 }
 
 #[test]
+fn remote_plan_preserves_health_entries_outside_node_table() {
+    let node = spawn_node("node-a", &[]);
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-health-unknown-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&health);
+    let snapshots = serde_json::json!([
+        {"id": "ghost", "healthy": false, "in_flight": 0, "attempts": 7, "failures": 4}
+    ]);
+    std::fs::write(&health, serde_json::to_vec(&snapshots).unwrap()).unwrap();
+
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 1,
+        "failure_threshold": 1,
+        "retry_limit": 0,
+        "tasks": [task("t1")],
+        "nodes": [node_json(&node, 1)],
+    });
+    let path = input_file("health-unknown", &input);
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        output.status.success(),
+        "remote-plan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 本次演练的节点表只含 node-a；ghost 的隔离状态不能被整份覆盖抹掉。
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&health).unwrap()).unwrap();
+    let ghost = saved
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|snapshot| snapshot["id"] == "ghost")
+        .expect("ghost health entry must survive the plan");
+    assert_eq!(ghost["healthy"], false, "{saved}");
+    assert_eq!(ghost["attempts"], 7, "{saved}");
+    assert_eq!(ghost["failures"], 4, "{saved}");
+    let _ = std::fs::remove_file(&health);
+}
+
+#[test]
 fn remote_plan_cli_requires_health_and_positive_interval_for_periodic_probe() {
     let missing_health = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .arg("remote-plan")

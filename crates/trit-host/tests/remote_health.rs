@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use trit_host::probe_remote_health_file;
+use trit_host::{probe_remote_health_file, save_remote_health_file};
 use trit_orch::{NodeSnapshot, RemoteEndpoint, RemoteNode};
 
 struct TestNode {
@@ -86,6 +86,63 @@ fn isolated(id: &str) -> NodeSnapshot {
         attempts: 3,
         failures: 2,
     }
+}
+
+#[test]
+fn save_merges_unmentioned_entries_and_replaces_known() {
+    let dir = temp_dir("save-merge");
+    let health = dir.join("health.json");
+    write_health(&health, &[isolated("keep"), isolated("update")]);
+
+    let mut updated = isolated("update");
+    updated.healthy = true;
+    updated.attempts = 4;
+    updated.failures = 0;
+    save_remote_health_file(&health, std::slice::from_ref(&updated)).unwrap();
+
+    let stored = read_health(&health);
+    assert_eq!(stored.len(), 2, "未提及的旧节点必须保留");
+    let keep = stored
+        .iter()
+        .find(|snapshot| snapshot.id == "keep")
+        .unwrap();
+    assert!(!keep.healthy);
+    assert_eq!(keep.attempts, 3);
+    let update = stored
+        .iter()
+        .find(|snapshot| snapshot.id == "update")
+        .unwrap();
+    assert!(update.healthy);
+    assert_eq!(update.attempts, 4);
+    assert_eq!(update.failures, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_health_writers_merge_instead_of_losing_entries() {
+    let dir = temp_dir("save-merge-concurrent");
+    let health = dir.join("health.json");
+    let mut handles = Vec::new();
+    for index in 0..8 {
+        let path = health.clone();
+        handles.push(std::thread::spawn(move || {
+            let snapshot = isolated(&format!("n{index}"));
+            save_remote_health_file(&path, std::slice::from_ref(&snapshot))
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    let stored = read_health(&health);
+    let mut ids: Vec<&str> = stored.iter().map(|snapshot| snapshot.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        ["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"],
+        "并发写者必须串行合并，而不是互相覆盖"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

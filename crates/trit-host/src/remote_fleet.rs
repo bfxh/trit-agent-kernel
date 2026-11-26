@@ -31,10 +31,10 @@
 //!   `<health>.lock` 上持单实例 OS 锁。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -44,6 +44,7 @@ use trit_orch::{
 };
 
 use crate::AgentError;
+use crate::lease::SingleInstanceLock;
 use crate::remote_subagent::{
     probe_remote_health, run_remote_subagent_reply_cancellable_scoped, validate_idempotency_scope,
 };
@@ -53,6 +54,12 @@ const HEALTH_MONITOR_STEP: Duration = Duration::from_millis(25);
 
 /// 单次演练最多保留的探测事件；周期探测不能把报告变成无界日志。
 const MAX_PROBE_EVENTS: usize = 1024;
+
+/// 健康文件写锁的最长等待；写者只做一次读-合并-替换，正常远低于该上限。
+const HEALTH_WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 健康文件写锁的轮询步长。
+const HEALTH_WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
 
 /// 一次派发尝试。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -508,8 +515,64 @@ fn load_remote_health_file(path: &Path) -> Result<Vec<NodeSnapshot>, AgentError>
     }
 }
 
-/// 写回节点健康文件（`Vec<NodeSnapshot>`，按调用方给定顺序）；先写临时文件再替换。
+/// 写回节点健康文件：在 `<path>.write.lock` 上取短临界区，先读取磁盘上的旧
+/// 快照，再合并本次传入的节点；本次未覆盖的旧节点（包括节点表外的监控对象）
+/// 按原快照保留，最终按 id 升序写临时文件并替换。
+///
+/// 传空切片不会清空已有条目；要重置健康文件请删除它。同一节点的并发写仍按
+/// “最后写入者覆盖”，写锁只保证没有半截文件或丢失未覆盖的节点。
 pub fn save_remote_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentError> {
+    let _lock = acquire_health_write_lock(path)?;
+    let mut merged = BTreeMap::new();
+    for snapshot in load_remote_health_file(path)? {
+        if merged.insert(snapshot.id.clone(), snapshot).is_some() {
+            return Err(AgentError::Io(format!(
+                "health file {} has duplicate node ids",
+                path.display()
+            )));
+        }
+    }
+    for snapshot in nodes {
+        merged.insert(snapshot.id.clone(), snapshot.clone());
+    }
+    let snapshots: Vec<NodeSnapshot> = merged.into_values().collect();
+    write_health_file(path, &snapshots)
+}
+
+/// 健康文件写锁路径：与 `remote-health` 的实例锁分开，写者只短时持有。
+fn health_write_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".write.lock");
+    PathBuf::from(name)
+}
+
+fn acquire_health_write_lock(path: &Path) -> Result<SingleInstanceLock, AgentError> {
+    let lock_path = health_write_lock_path(path);
+    let deadline = Instant::now() + HEALTH_WRITE_LOCK_TIMEOUT;
+    loop {
+        match SingleInstanceLock::acquire(&lock_path) {
+            Ok(Some(lock)) => return Ok(lock),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return Err(AgentError::Io(format!(
+                        "timed out waiting for health write lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(HEALTH_WRITE_LOCK_POLL);
+            }
+            Err(error) => {
+                return Err(AgentError::Io(format!(
+                    "lock health write {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+/// 直接把给定快照写成健康文件；调用方负责持有写锁与合并旧条目。
+fn write_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentError> {
     let text = serde_json::to_string_pretty(nodes)
         .map_err(|error| AgentError::Io(format!("encode health file: {error}")))?;
     if let Some(parent) = path.parent()
@@ -525,10 +588,7 @@ pub fn save_remote_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<()
     let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     std::fs::write(&temporary, text)
         .map_err(|error| AgentError::Io(format!("write health file: {error}")))?;
-    if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|error| AgentError::Io(format!("replace health file: {error}")))?;
-    }
+    // 直接 rename 覆盖目标；不要再先 remove，否则读者可能看到文件短暂缺失。
     std::fs::rename(&temporary, path)
         .map_err(|error| AgentError::Io(format!("rename health file: {error}")))
 }

@@ -351,8 +351,11 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   轮换无需重启守护，但节点文件应完整落盘：读取或解析失败会让守护 fail-closed 退出。
   文件不存在时按全部健康初始化；表里不存在的旧节点保留原快照但
   不再探测，并在输出的 `ignored` 中列出。守护持有 `<health>.lock` 上的 OS 排他锁，
-  同一健康文件只允许一个实例，进程退出（包括崩溃）自动释放；写回先写进程唯一临时
-  文件再替换。守护只复用现有判定标准，不自动拉起计划进程，也不替代 `remote-plan`
+  同一健康文件只允许一个实例，进程退出（包括崩溃）自动释放；所有写者
+  （`remote-health` 与 `remote-plan`）先在 `<health>.write.lock` 上取短临界区，读回旧
+  文件并合并本次未覆盖的节点（表外条目保留，按 id 升序），再写进程唯一临时文件并
+  直接替换，避免整份覆盖别家节点、半截文件或读者看到目标短暂缺失；同一节点的并发
+  更新仍以最后写入者为准。守护只复用现有判定标准，不自动拉起计划进程，也不替代 `remote-plan`
   的派发前 preflight。全隔离启动时周期监控来不及在首个 acquire 前放行，仍需先用
   `--probe` 做一次 preflight，否则派发会因没有健康节点立即失败。
 
@@ -366,9 +369,10 @@ preflight 探测重新放行隔离节点并返回 `probes`）、
 一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
-文件跨运行隔离、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间
-恢复节点、重复节点 ID 与非法 scope 拒绝）、`crates/trit-host/tests/remote_health.rs`
-（独立守护成功放行并保留累计计数、探测失败保持隔离、未知节点保留原快照、缺失文件
+文件跨运行隔离、计划写回保留节点表外的健康条目、`--probe` 成功放行/失败保持隔离、
+`--probe-interval-ms` 演练期间恢复节点、重复节点 ID 与非法 scope 拒绝）、
+`crates/trit-host/tests/remote_health.rs`（独立守护成功放行并保留累计计数、探测
+失败保持隔离、未知节点保留原快照、保存时合并未提及条目、并发写者不丢条目、缺失文件
 初始化、节点表热加载与单实例锁、`--once` CLI 输出）与 `crates/trit-host/tests/remote_ledger.rs`
 （共享账本下双节点单次执行、scope 隔离）。
 
