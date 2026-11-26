@@ -166,8 +166,18 @@ fn health_status(address: &str, authorization: Option<&str>) -> String {
         "GET /health HTTP/1.1\r\nHost: test\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
+    // Windows 可能在服务端关闭连接时把已排队的响应变成 RST；已读到的字节仍然有效。
+    let mut response = Vec::new();
+    match stream.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) => {}
+        Err(error) => panic!("health response read failed: {error}"),
+    }
+    let response = String::from_utf8(response).unwrap();
     response.lines().next().unwrap_or_default().to_string()
 }
 
