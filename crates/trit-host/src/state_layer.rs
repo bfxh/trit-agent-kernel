@@ -360,6 +360,8 @@ pub fn state_layer(records: &[SessionRecord]) -> StateLayer {
                 layer.projection_epoch = Some(*epoch);
                 layer.projection_freshness = Some(*freshness);
             }
+            // 门链结论不改变 turn 状态机；它只作为审计事件留在日志里。
+            SessionEvent::GateChain { .. } => {}
         }
     }
 
@@ -502,6 +504,7 @@ mod tests {
                 SessionEvent::TurnFinished {
                     steps: 2,
                     complete: true,
+                    metrics: None,
                 },
             ),
         ];
@@ -690,6 +693,7 @@ mod tests {
                 SessionEvent::TurnFinished {
                     steps: 0,
                     complete: true,
+                    metrics: None,
                 },
             ),
             started(4),
@@ -780,6 +784,7 @@ mod tests {
             SessionEvent::TurnFinished {
                 steps: 0,
                 complete: true,
+                metrics: None,
             },
         )]);
         assert_eq!(orphan.validation.verdict, Ternary::False);
@@ -808,6 +813,7 @@ mod tests {
                 SessionEvent::TurnFinished {
                     steps: 0,
                     complete: false,
+                    metrics: None,
                 },
             ),
         ];

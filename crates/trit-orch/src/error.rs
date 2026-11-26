@@ -225,6 +225,34 @@ pub enum Error {
     AlignmentScaffold { reason: String },
     #[error("alignment scaffold io at {path}: {message}")]
     AlignmentScaffoldIo { path: String, message: String },
+    #[error("subagent profile {profile} has blank {field}")]
+    DelegateBlankField { profile: String, field: String },
+    #[error("read-only subagent {profile} declares write roots")]
+    DelegateReadOnlyWrites { profile: String },
+    #[error("subagent {profile} write root is not a normalized relative subtree: {root:?}")]
+    DelegateWriteRoot { profile: String, root: String },
+    #[error("subagent {profile} lists tool {tool:?} more than once")]
+    DelegateDuplicateTool { profile: String, tool: String },
+    #[error("subagent {profile} exceeds parent {parent} on {field}")]
+    DelegatePrivilegeEscalation {
+        profile: String,
+        parent: String,
+        field: String,
+    },
+    #[error("context capsule key {key:?} is not in the explicit allow list")]
+    DelegateCapsuleKey { key: String },
+    #[error("context capsule key {key:?} appears more than once")]
+    DelegateCapsuleDuplicate { key: String },
+    #[error("context capsule is {bytes} bytes, exceeding budget {max}")]
+    DelegateCapsuleTooLarge { bytes: usize, max: usize },
+    #[error("fleet runtime failed: {message}")]
+    FleetRuntime { message: String },
+    #[error("remote nodes: {message}")]
+    RemoteNodes { message: String },
+    #[error("plan handoff schema: {message}")]
+    PlanHandoffSchema { message: String },
+    #[error("subagent protocol: {message}")]
+    SubagentProtocol { message: String },
 }
 
 pub(crate) fn add_tokens(left: u64, right: u64, task: Option<&str>) -> Result<u64, Error> {
@@ -321,6 +349,18 @@ impl Error {
             Error::RepoScopeRejected { .. } => "repo_scope_rejected",
             Error::AlignmentScaffold { .. } => "alignment_scaffold_rejected",
             Error::AlignmentScaffoldIo { .. } => "alignment_scaffold_io",
+            Error::DelegateBlankField { .. } => "delegate_blank_field",
+            Error::DelegateReadOnlyWrites { .. } => "delegate_read_only_writes",
+            Error::DelegateWriteRoot { .. } => "delegate_write_root",
+            Error::DelegateDuplicateTool { .. } => "delegate_duplicate_tool",
+            Error::DelegatePrivilegeEscalation { .. } => "delegate_privilege_escalation",
+            Error::DelegateCapsuleKey { .. } => "delegate_capsule_key",
+            Error::DelegateCapsuleDuplicate { .. } => "delegate_capsule_duplicate",
+            Error::DelegateCapsuleTooLarge { .. } => "delegate_capsule_too_large",
+            Error::FleetRuntime { .. } => "fleet_runtime",
+            Error::RemoteNodes { .. } => "remote_nodes",
+            Error::PlanHandoffSchema { .. } => "plan_handoff_schema",
+            Error::SubagentProtocol { .. } => "subagent_protocol",
         }
     }
 }

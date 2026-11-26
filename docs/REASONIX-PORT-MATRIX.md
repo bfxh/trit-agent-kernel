@@ -49,18 +49,18 @@
 | 11 | Mutation journal / OS lease | `MUTATION_COORDINATOR_SECURITY.md`、`ISOLATION_OPERATION_LEASE_SECURITY.md` | 缺口 | 宿主 mutation record 作为外部事实；内核不复制文件锁 | B7.4/B7.7 |
 | 12 | 沙箱 / isolation runner | `ISOLATION_*`、`SPEC §3.7` | 部分 | 已有外部 sandbox wrapper；缺 runner 生命周期、fail-closed 矩阵 | B7.4 |
 | 13 | 宿主裁决完成声明 | `SPEC §3.11`、`complete_subtask` | 已有 | 已有 EvidenceRails/义务；需补齐“criterion → 回执”逐条降级与 write scope | B7.5 |
-| 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 缺口 | 独立 session、只读 planner、计划交接、缓存前缀不互相污染 | B7.6 |
-| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 缺口 | 显式继承、上下文胶囊、只读/写入子 agent、结果引用 | B7.6 |
-| 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 缺口 | `depends_on`、并发上限、失败传播、稳定子结果引用 | B7.6 |
-| 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 缺口 | 技能索引、命令解析、hook 匹配与检查点/失效联动 | B7.9 |
-| 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 缺口 | 记忆 CRUD、BM25 历史检索、归档与隐私边界 | B7.9 |
-| 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分 | 当前只有 `PortBridge`；缺 loopback 认证、SSE、golden 路由 | B7.8 |
-| 20 | CLI / TUI / ACP | `CLI.md`、`ACP.md` | 部分 | 无头 CLI 已有；缺 TUI、ACP 编辑器、结构化 JSON 输出 | B7.8 |
+| 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 部分（原语 + 协议） | `ReadOnlyTools` + `ReadOnlyCatalog` + `SessionPaths` + 独立 `CacheLedger` + `PlanHandoff` + `submit_plan` 协议解析已实现；缺 provider 侧真实模型调用接线 | B7.6 |
+| 15 | 子 agent / context capsule | `SUBAGENT_PROFILES.md`、`SPEC §3.10/3.13` | 部分（契约 + IPC + 进程 + 远程传输） | `SubagentProfile` 权限单调、`ContextCapsule` 显式继承、`DelegationResult` 稳定引用、IPC 帧契约（半包/粘包、引用校验、结局映射）、真实 spawn/超时 kill（`subagent_process` + `subagent-echo` + `subagent-run`）已实现；跨机器已有 `RemoteEndpoint` 准入 + 宿主侧 ureq 单帧 POST（`run_remote_subagent`，携带 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`）与参考服务端（`remote_serve` + `remote-echo`，按完整键（可带 scope 前缀）去重（缓存 1024 条 / 64 MiB / 默认 1h，FIFO 淘汰、同键并发端点内串行回放）、`/cancel` 取消同键全部在途请求（含并发）、Bearer 校验走 SHA-256 摘要 + 常量时间比较、请求行/头有界（单行 8 KiB、总计 64 KiB、最多 64 个，超限 431）、请求读取总时限默认 60s（`--request-read-timeout-ms`，慢速滴流 408））及真实执行端点（`remote-exec`，spawn `subagent-run`，`--workspace-root` 按 `<scope>/<task>` 隔离目录，子进程 stdout 有界读取、超 8 MiB + 4 即 kill）；节点发现仍不在范围，跨机调度与有界失败恢复见第 16 行 | B7.6 |
+| 16 | Fleet 小依赖图 | `SPEC §3.14`、`fleet` | 部分（执行层 + CLI + 宿主接线 + 跨机派发） | `fleet::execute` 接 `trit-schedule` runtime：并发上限、失败传播、Aborted/Deferred 归类、稳定引用；`fleet-run` CLI 导出 JSON + Prometheus；`HeadlessFleetRunner` 每任务独立 headless session 已实现；跨机派发已有 `NodeTable`（静态节点、最轻负载、容量准入、故障隔离、排除集合）+ `run_remote_plan`（每任务节点归属、每次尝试记录、精确状态）；节点级失败可按 `retry_limit`（默认 0）换节点重试并复用同一 scope 的幂等键，用户取消会传播到远端并以 `Aborted` 结束且不误判节点故障，`remote-plan` CLI 可跑跨机演练、用 `--health` 跨运行保存节点健康并导出 JSON，`remote-ledger` 提供跨节点、按 scope 隔离的 claim/complete 严格去重，落盘状态有键数与字节双重上限并会压缩、同一状态文件由 `<path>.lock` 限制为单进程，连接并发也有上限（默认 64，超额 503）、Bearer 校验走 SHA-256 摘要 + 常量时间比较、另有无状态的 `GET /health` 只读探针，两个服务端请求读取总时限默认 60s（`--request-read-timeout-ms`，行/头 8 KiB/64 KiB/64 个，慢速滴流 408），占位租约连同持有者令牌和到期时间一起落盘、重启后未过期租约仍有效，执行期间 `/renew` 续租避免长任务被接管，claim 返回的 `X-Trit-Lease` 令牌使过期接管后的旧持有者无法续租或写完成，完成帧记录写入者令牌、异主 complete 返回 403 并转为带 `X-Trit-Lease-Lost` 的 `Aborted`，心跳收到 403/404 或已完成标记会中止在途执行，调度层以 `Superseded` 记账且不隔离该节点、重试等待新持有者回放完成帧，服务端 `exec_timeout` 从请求体解码后限制执行墙钟（头/体上传由请求读取总时限、30s socket 超时与长度上限约束）并以 `X-Trit-Deadline-Exceeded` 标记超时，调度层记 `OverBudget`（不隔离节点、可换机重试），服务端 `GET /health`、`remote-plan --probe` 与 `--probe-interval-ms` 可显式或在本轮演练期间探测并重新放行已隔离节点，`--probe-concurrency`（默认串行、上限 64，需配探测模式）让一次扫描并行 `GET /health` 且事件按 id 升序，库级 `RemotePlanConfig::with_health_probe_on_start` / `with_health_probe_interval` / `with_health_probe_concurrency` 与报告 `probes` 已对齐，独立 `remote-health` 守护每轮重读节点表、持 `<health>.lock` 单实例并跨运行恢复隔离节点，支持有界并发探测（`--probe-concurrency` 默认 4、上限 64，事件与快照按 id 升序），健康文件写回在 `<health>.write.lock` 下合并节点表外条目并保留节点级 `updated_at_ms`，旧时间戳不能覆盖更新鲜的外部状态，`remote-plan` 运行期间按 `--health-flush-ms`（默认 30s、0 关闭）由后台线程周期写回快照并清零 `in_flight`；动态节点发现、跨机抢占与无限自动重试仍缺 | B7.6 |
+| 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 部分（注册表） | `SkillIndex`（最长触发词优先）、`CommandRegistry`（斜杠命令解析、参数数量 fail-closed）、`HookRegistry`（事件 + 工具匹配、`*` 通配、`invalidate_on` 失效联动）已实现；缺技能目录发现与 hook 动作执行 | B7.9 |
+| 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 部分（内存索引） | `MemoryStore` CRUD + BM25（k1=1.2、b=0.75，分数降序、同分按 id 升序）+ `Sensitivity::Secret` 默认排除已实现；缺持久化/归档与 history 目录投影 | B7.9 |
+| 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分（准入 + 路由） | `ServeConfig::validate`（仅 loopback、token 非空）、`authorize`（Host / Origin / bearer）、`route`（golden 路由表，405 / 404）已实现；缺真实 HTTP/SSE 传输与响应编码 | B7.8 |
+| 20 | CLI / TUI / ACP | `CLI.md`、`ACP.md` | 部分 | 无头 CLI 已有；默认输出 Markdown 报告（`--output-format json` 保留 `TurnOutcome` JSON）；缺 TUI、ACP 编辑器 | B7.8 |
 | 21 | Tauri / 桌面 host | `desktop-tauri` | 阶段外 | 不进入本仓；只保留 `FeatureGate` 与宿主契约 | B7.8 |
 | 22 | Capability diagnostics | `CAPABILITY_DIAGNOSTICS.md` | 缺口 | 静态/实时能力报告、MCP 启动阶段、脱敏 stderr tail | B7.8 |
 | 23 | Remote SSH / worktree | `remote/*`、`SESSION_WORKTREES.md` | 阶段外 | 先不移植；等本地 host 稳定后单独立项 | — |
 | 24 | Golden fixture / wire parity | `RUST_MIGRATION.md` | 缺口 | 录制、回放、字段双向对齐、拒绝也是契约 | B7.1 |
-| 25 | Metrics / usage catalog | `USAGE_CATALOG.md`、`SPEC §3.17` | 部分 | 已有 orch metrics；缺 catalog、成本、委派收益 counter | B7.1/B7.9 |
+| 25 | Metrics / usage catalog | `USAGE_CATALOG.md`、`SPEC §3.17` | 部分 | 已有 orch metrics 与单轮 `TurnOutcome.metrics`（步数预算、工具成功/失败/不确定、token/步、缓存命中、耗时；分母为 0 输出 `null`）；缺 catalog、成本、委派收益 counter | B7.1/B7.9 |
 | 26 | 许可 / 署名 / 移植记录 | MIT 仓库与文档 | 已有流程 | 每批记录来源提交、修改点、NOTICE | 全程 |
 
 ## 3. 批次依赖图
@@ -148,7 +148,7 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   - subagent profile、context capsule、结果引用、只读/写入权限；
   - fleet `depends_on`、并发上限、失败传播；
   - 用指标判断是否值得委派，不凭感觉并行。
-- 不做：把 fleet 图硬塞进 `TaskSpec`；跨机器调度。
+- 不做：把 fleet 图硬塞进 `TaskSpec`；动态节点发现与跨机抢占（静态节点表的派发、隔离与有界重试已补，见第 16 行）。
 - 验收：前缀缓存不被 planner 污染；子 agent 无隐式继承；越权写被拒绝；失败/中断结果可恢复；并发/成本有基线。
 - 依赖：B7.5。
 

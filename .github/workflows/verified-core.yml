@@ -29,8 +29,6 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --filter=blob:none https://github.com/bfxh/trit.git /tmp/trit
-          rm -rf verus
-          cp -r /tmp/trit/verus ./verus
 
       - name: Install Verus (pinned + SHA-256)
         run: python3 /tmp/trit/scripts/verify.py --install
@@ -38,8 +36,12 @@ jobs:
       - name: Verify embedded trit-core K3 specs
         run: |
           set -euo pipefail
+          # 在上游锚点的独立 workspace 内用本仓的 trit-core 替换同名包，
+          # 这样 verus 新增的 trit-belnap 等路径依赖也能按主库布局解析。
+          rm -rf /tmp/trit/crates/trit-core
+          cp -r "$GITHUB_WORKSPACE/crates/trit-core" /tmp/trit/crates/trit-core
           export PATH="$HOME/tools/verus-x86-linux:$HOME/tools/z3-4.16.0-x64-glibc-2.39/bin:$HOME/.cargo/bin:$PATH"
           export RUSTUP_TOOLCHAIN=1.100.0-x86_64-unknown-linux-gnu
-          cd verus
+          cd /tmp/trit/verus
           cargo-verus verify
           cargo test

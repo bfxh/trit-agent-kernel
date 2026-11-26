@@ -11,7 +11,7 @@
 | 上层组件开发者 | [LIBRARY-STACK.md](LIBRARY-STACK.md) | [RIGHTS.md](RIGHTS.md) | 引入哪些库？三进制原生库怎么用？哪些 API 不能碰？ |
 | 维护者 / 仓库所有者 | [RESPONSIBILITY.md](RESPONSIBILITY.md) | [RIGHTS.md](RIGHTS.md)、[MERGE-POLICY.md](MERGE-POLICY.md) | 五类问题谁负责？批次怎么合？权益怎么分层？ |
 | 智能体 / 模型 / 插件接入 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | [FRONTEND-CONTRACT.md](FRONTEND-CONTRACT.md) | 谁负责哪一层？哪些是后端、前端、内核各自的义务？人类面板与智能体清单怎么分开？ |
-| 交接 / 交付 | [DELIVERY.md](DELIVERY.md) | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 谁在什么时候收到、读到、动过手？账本能不能续？ |
+| 交接 / 交付 | [DELIVERY.md](DELIVERY.md) | [GATE-CHAIN.md](GATE-CHAIN.md)、[AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 谁在什么时候收到、读到、动过手？账本能不能续？派发前的三道门是否同时通过？ |
 | 参与移植 / 合并的人 | [REASONIX-PORT-MATRIX.md](REASONIX-PORT-MATRIX.md) | [MERGE-POLICY.md](MERGE-POLICY.md)、[LIBRARY-STACK.md](LIBRARY-STACK.md)、[RIGHTS.md](RIGHTS.md) | Reasonix 哪些能力先移？每批验收什么？ |
 
 ## 最小引入集
@@ -34,6 +34,9 @@
 | [REPO-BOUNDARY.md](REPO-BOUNDARY.md) | 已实现 | `.agent/repo.json`、`trit-orch repo-gate`、`trit-host --repo-identity` |
 | [ALIGNMENT.md](ALIGNMENT.md) | v1/v2/v3 与 scaffold 已实现；self-test/stress 契约由 Rust 测试承接 | `trit-orch::alignment`、`trit-orch alignment` / `alignment-scaffold` CLI |
 | [DELIVERY.md](DELIVERY.md) | 已实现 | `trit-orch::delivery`、`trit-orch delivery` CLI、`.agent/delivery/` 账本 |
+| [LEASE.md](LEASE.md) | 已实现（lease + claim + journal） | `trit-host::lease` / `::journal`、`trit-host run --write-claim/--write-lease/--write-journal`、`journal-status` |
+| [SANDBOX.md](SANDBOX.md) | Linux bwrap / macOS sandbox-exec / Windows AppContainer | `SandboxCommand::builtin`、`--sandbox builtin`、`appcontainer-run` |
+| [GATE-CHAIN.md](GATE-CHAIN.md) | 已实现 | `trit-orch::gate_chain`、`trit-orch gate-chain` CLI |
 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 契约草案，清单为模板 | [`agent-model-manifest.json`](agent-model-manifest.json)；运行时门禁仍归 `FeatureGate` |
 
 ## 维护规则
@@ -42,3 +45,4 @@
 2. 能力 id、`api_level`、许可层级、责任归属属于契约字段，改动需要所有者签核。
 3. 文档里的时间目标是最佳努力，不是对外 SLA；真正承诺写进单独的支持协议。
 4. 任何“自动清理 / 自动关闭 / 自动合并”都必须有 dry-run、清单和回退路径，不能以“默认应该没问题”为理由跳过。
+5. 任何智能体或维护者写文档时必须先建立项目整体视图：至少对齐根 `README.md` 的对外概览、本文件的文档地图与状态表、对应设计文档和能力矩阵。同一行为不能在不同文档里留下互相矛盾的边界表述，不接受只改当前命中的那一段。

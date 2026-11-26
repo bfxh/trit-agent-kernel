@@ -247,6 +247,12 @@ Reasonix 的四种表面（TUI / Studio / Web / ACP）都不是 Rust 内核的�
   （工具名、失败/in-doubt 计数、写入路径数）；全量回执仍在 `TurnOutcome` / session，
   压缩只影响模型上下文；session 记 `ContextCompacted`。CLI 可调
   `--context-receipts / --context-chars / --context-output`。
+- **单轮效率报告**：`TurnOutcome.metrics` 记录实际步数 / 预算、模型与工具调用数、
+  工具成功 / 失败 / 不确定数、token 总量与每步 token、缓存命中、墙钟耗时和是否完成；
+  比率用 basis point，分母为 0 时输出 `null`。指标只用于复盘与运维，不参与完成裁决。
+  `trit-host run` 默认打印 Markdown 报告（`--output-format json` 可切回 JSON），
+  子 agent 与 fleet 的 `content` 也写成 Markdown；`session-status` 输出
+  `latest_metrics`。
 - Session 日志可能含工具输出，宿主必须按敏感数据管理（脱敏/保留策略不在本层）。
 
 **无头模式的边界（诚实版）：**

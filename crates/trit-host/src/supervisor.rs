@@ -697,6 +697,9 @@ pub struct RecoveryContext {
     pub hooks: Vec<HookDescriptor>,
     #[serde(default)]
     pub cache: Option<CacheLedger>,
+    /// 门链结论历史（与 session 事件一致）；旧恢复包缺省为空。
+    #[serde(default)]
+    pub gate_chains: Vec<crate::session::GateChainRecord>,
 }
 
 impl RecoveryContext {
@@ -710,6 +713,17 @@ impl RecoveryContext {
             ));
         }
         Ok(())
+    }
+
+    /// 最近一条门链结论；没有记录时为 `None`。
+    pub fn latest_gate_chain(&self) -> Option<&crate::session::GateChainRecord> {
+        self.gate_chains.last()
+    }
+
+    /// 最近一条门链结论是否阻塞；没有记录时不阻塞（旧恢复包 / 未启用门链）。
+    pub fn gate_chain_blocked(&self) -> bool {
+        self.latest_gate_chain()
+            .is_some_and(|record| !record.passed())
     }
 }
 
@@ -2301,6 +2315,47 @@ mod tests {
     }
 
     #[test]
+    fn gate_chain_blocked_tracks_the_latest_record() {
+        let mut recovery = RecoveryContext::default();
+        assert!(recovery.latest_gate_chain().is_none());
+        assert!(!recovery.gate_chain_blocked());
+
+        recovery.gate_chains.push(crate::session::GateChainRecord {
+            phase: crate::session::GateChainPhase::Pre,
+            status: "blocked".into(),
+            exit: 1,
+            failed_at: Some("repo".into()),
+            failures: 1,
+            passed: 0,
+            blocked: 1,
+            unknown: 0,
+            skipped: 2,
+            report: None,
+        });
+        assert!(recovery.gate_chain_blocked());
+
+        recovery.gate_chains.push(crate::session::GateChainRecord {
+            phase: crate::session::GateChainPhase::Post,
+            status: "aligned".into(),
+            exit: 0,
+            failed_at: None,
+            failures: 0,
+            passed: 0,
+            blocked: 0,
+            unknown: 0,
+            skipped: 0,
+            report: None,
+        });
+        assert!(!recovery.gate_chain_blocked());
+        assert_eq!(
+            recovery
+                .latest_gate_chain()
+                .map(|record| record.status.as_str()),
+            Some("aligned")
+        );
+    }
+
+    #[test]
     fn parallel_prefetch_bounds_workers_and_keeps_every_result() {
         let items: Vec<usize> = (0..24).collect();
         let active = AtomicUsize::new(0);
@@ -3325,6 +3380,7 @@ done
                 enabled: true,
             }],
             cache: Some(CacheLedger::default()),
+            gate_chains: Vec::new(),
         };
         assert_eq!(
             supervisor.ensure_connected(&recovery).unwrap(),

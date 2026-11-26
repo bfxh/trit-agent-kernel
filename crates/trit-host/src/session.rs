@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentError, AgentHost, Model, ToolExecutor, ToolOutcome, ToolRequest, TurnOutcome};
+use crate::{
+    AgentError, AgentHost, Model, ToolExecutor, ToolOutcome, ToolRequest, TurnMetrics, TurnOutcome,
+};
 use trit_orch::{EvidenceVerdict, Ternary, TokenUsage};
 use trit_reasonix::{CriterionRequest, HostUsage, TurnSpec};
 
@@ -91,7 +93,40 @@ pub enum SessionEvent {
     TurnFinished {
         steps: usize,
         complete: bool,
+        /// 单轮效率指标；旧日志没有该字段时为 `None`。
+        #[serde(default)]
+        metrics: Option<TurnMetrics>,
     },
+    /// 门链结论：派发前（`pre`）或 run 后复核（`post`）。
+    ///
+    /// 事件刻意只带判定摘要，不带完整报告；完整报告用 `report` 指向落盘路径。
+    GateChain {
+        phase: GateChainPhase,
+        status: String,
+        exit: i32,
+        #[serde(default)]
+        failed_at: Option<String>,
+        #[serde(default)]
+        failures: usize,
+        #[serde(default)]
+        passed: usize,
+        #[serde(default)]
+        blocked: usize,
+        #[serde(default)]
+        unknown: usize,
+        #[serde(default)]
+        skipped: usize,
+        #[serde(default)]
+        report: Option<String>,
+    },
+}
+
+/// 门链在 run 前后两个阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateChainPhase {
+    Pre,
+    Post,
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +234,45 @@ pub fn recovery_context_for_session(
         state: Some(crate::state_layer::state_layer(&records)),
         hooks: Vec::new(),
         cache: Some(cache_ledger_from_records(&records)),
+        gate_chains: gate_chains_from_records(&records),
     })
+}
+
+/// 从事件里提取门链历史；不校验 turn 状态，供恢复包使用。
+pub fn gate_chains_from_records(records: &[SessionRecord]) -> Vec<GateChainRecord> {
+    records
+        .iter()
+        .filter_map(|record| gate_chain_record(&record.event))
+        .collect()
+}
+
+fn gate_chain_record(event: &SessionEvent) -> Option<GateChainRecord> {
+    match event {
+        SessionEvent::GateChain {
+            phase,
+            status,
+            exit,
+            failed_at,
+            failures,
+            passed,
+            blocked,
+            unknown,
+            skipped,
+            report,
+        } => Some(GateChainRecord {
+            phase: *phase,
+            status: status.clone(),
+            exit: *exit,
+            failed_at: failed_at.clone(),
+            failures: *failures,
+            passed: *passed,
+            blocked: *blocked,
+            unknown: *unknown,
+            skipped: *skipped,
+            report: report.clone(),
+        }),
+        _ => None,
+    }
 }
 
 fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
@@ -251,6 +324,30 @@ fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
 pub struct SessionState {
     pub turns: Vec<TurnRecord>,
     pub usage: TokenUsage,
+    /// 门链结论历史（按出现顺序）；`recover` 从 `GateChain` 事件填充。
+    pub gate_chains: Vec<GateChainRecord>,
+}
+
+/// 一条门链结论，字段与 `SessionEvent::GateChain` 对应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateChainRecord {
+    pub phase: GateChainPhase,
+    pub status: String,
+    pub exit: i32,
+    pub failed_at: Option<String>,
+    pub failures: usize,
+    pub passed: usize,
+    pub blocked: usize,
+    pub unknown: usize,
+    pub skipped: usize,
+    pub report: Option<String>,
+}
+
+impl GateChainRecord {
+    /// 这一条门链结论是否放行：`exit == 0` 且 `status` 是 `passed` / `aligned`。
+    pub fn passed(&self) -> bool {
+        self.exit == 0 && matches!(self.status.as_str(), "passed" | "aligned")
+    }
 }
 
 impl SessionState {
@@ -271,6 +368,7 @@ pub struct TurnRecord {
     pub usage: TokenUsage,
     pub tool_calls: usize,
     pub criteria: usize,
+    pub metrics: Option<TurnMetrics>,
 }
 
 /// 从 JSONL 事件重建会话；未收到 `TurnFinished` 的 turn 标记为未完成。
@@ -319,7 +417,11 @@ pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
                     turn.complete = *complete;
                 }
             }
-            SessionEvent::TurnFinished { steps, complete } => {
+            SessionEvent::TurnFinished {
+                steps,
+                complete,
+                metrics,
+            } => {
                 let Some(mut turn) = current.take() else {
                     return Err(AgentError::SessionState(
                         "turn finished without a start".into(),
@@ -328,7 +430,13 @@ pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
                 turn.steps = *steps;
                 turn.complete = *complete;
                 turn.finished = true;
+                turn.metrics = metrics.clone();
                 state.turns.push(turn);
+            }
+            SessionEvent::GateChain { .. } => {
+                if let Some(record) = gate_chain_record(&record.event) {
+                    state.gate_chains.push(record);
+                }
             }
             _ => {}
         }
@@ -399,6 +507,7 @@ impl<M: Model, T: ToolExecutor> Session<M, T> {
             state: Some(self.state_layer()?),
             hooks: Vec::new(),
             cache,
+            gate_chains: self.state().gate_chains.clone(),
         })
     }
 

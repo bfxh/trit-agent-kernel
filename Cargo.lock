@@ -1069,8 +1069,10 @@ dependencies = [
  "libc",
  "notify",
  "regex",
+ "ring",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror",
  "trit-orch",
  "trit-reasonix",
@@ -1107,6 +1109,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "trit-core",
+]
+
+[[package]]
+name = "trit-subagent"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "trit-host",
+ "trit-orch",
+ "trit-reasonix",
 ]
 
 [[package]]

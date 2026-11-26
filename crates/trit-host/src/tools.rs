@@ -32,6 +32,79 @@ impl SandboxCommand {
         append_shell(&mut args, command);
         (self.program.clone(), args)
     }
+
+    /// 内置 Linux 后端：用 `bwrap` 构造只读系统 + 可写 workspace 的沙箱。
+    ///
+    /// 仍要求系统安装了 `bubblewrap`；内核负责参数构造与 fail-closed。
+    /// 非 Linux 平台直接返回错误，不回退到无沙箱。
+    pub fn builtin(root: &std::path::Path) -> Result<Self, AgentError> {
+        #[cfg(target_os = "linux")]
+        {
+            let root = std::fs::canonicalize(root)
+                .map_err(|error| AgentError::Io(format!("sandbox root: {error}")))?;
+            let root_text = root.to_string_lossy().to_string();
+            Ok(Self {
+                program: PathBuf::from("bwrap"),
+                args: vec![
+                    "--ro-bind".into(),
+                    "/".into(),
+                    "/".into(),
+                    "--dev".into(),
+                    "/dev".into(),
+                    "--proc".into(),
+                    "/proc".into(),
+                    "--tmpfs".into(),
+                    "/tmp".into(),
+                    "--bind".into(),
+                    root_text.clone(),
+                    root_text.clone(),
+                    "--chdir".into(),
+                    root_text,
+                    "--unshare-all".into(),
+                    "--unshare-net".into(),
+                    "--die-with-parent".into(),
+                    "--".into(),
+                ],
+            })
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let root = std::fs::canonicalize(root)
+                .map_err(|error| AgentError::Io(format!("sandbox root: {error}")))?;
+            let root_text = root.to_string_lossy();
+            let profile = format!(
+                "(version 1)\n(deny default)\n(allow process*)\n(allow file-read*)\n\
+                 (allow file-write* (subpath \"{root_text}\") (subpath \"/tmp\") (subpath \"/private/tmp\"))\n"
+            );
+            Ok(Self {
+                program: PathBuf::from("sandbox-exec"),
+                args: vec!["-p".into(), profile],
+            })
+        }
+        #[cfg(windows)]
+        {
+            let root = std::fs::canonicalize(root)
+                .map_err(|error| AgentError::Io(format!("sandbox root: {error}")))?;
+            let exe = std::env::current_exe()
+                .map_err(|error| AgentError::Io(format!("current exe: {error}")))?;
+            Ok(Self {
+                program: exe,
+                args: vec![
+                    "appcontainer-run".into(),
+                    "--workspace".into(),
+                    root.to_string_lossy().to_string(),
+                    "--".into(),
+                ],
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            let _ = root;
+            Err(AgentError::Tool(
+                "builtin sandbox is only available on Linux/macOS; pass --sandbox <program>".into(),
+            ))
+        }
+    }
 }
 
 fn append_shell(args: &mut Vec<String>, command: &str) {
@@ -608,6 +681,74 @@ impl LocalTools {
         })
     }
 
+    fn move_path(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        if !self.allow_write {
+            return Err(AgentError::Tool("move_path is not allowed".into()));
+        }
+        if request.paths.len() != 2 {
+            return Err(AgentError::Tool(
+                "move_path requires exactly two paths (from, to)".into(),
+            ));
+        }
+        let from_raw = &request.paths[0];
+        let to_raw = &request.paths[1];
+        let from = self.resolve_relative(from_raw)?;
+        let to = self.resolve_relative(to_raw)?;
+        self.reject_symlink(&from, from_raw)?;
+        self.reject_symlink(&to, to_raw)?;
+        let metadata = self
+            .dir
+            .symlink_metadata(&from)
+            .map_err(|error| AgentError::Io(format!("stat {from_raw}: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(AgentError::Tool(format!("refusing symlink: {from_raw}")));
+        }
+        if !metadata.is_file() {
+            return Err(AgentError::Tool(format!("not a regular file: {from_raw}")));
+        }
+        if let Some(parent) = to.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|error| AgentError::Io(format!("mkdir {}: {error}", parent.display())))?;
+        }
+        match self.dir.rename(&from, &self.dir, &to) {
+            Ok(()) => {}
+            Err(error) if is_cross_device(&error) => {
+                self.copy_then_remove(&from, &to).map_err(|error| {
+                    AgentError::Io(format!("move {from_raw} -> {to_raw}: {error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(AgentError::Io(format!(
+                    "move {from_raw} -> {to_raw}: {error}"
+                )));
+            }
+        }
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed: true,
+            assertions: 0,
+            written_paths: vec![from_raw.clone(), to_raw.clone()],
+            in_doubt: false,
+            output: format!("moved {from_raw} -> {to_raw}"),
+        })
+    }
+
+    fn copy_then_remove(&self, from: &Path, to: &Path) -> Result<(), AgentError> {
+        let source = self.root.join(from);
+        let target = self.root.join(to);
+        std::fs::copy(&source, &target)
+            .map_err(|error| AgentError::Io(format!("copy {}: {error}", source.display())))?;
+        self.dir
+            .remove_file(from)
+            .map_err(|error| AgentError::Io(format!("remove {}: {error}", source.display())))?;
+        Ok(())
+    }
+
     fn bash(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
         if !self.allow_shell {
             return Err(AgentError::Tool("bash is not allowed".into()));
@@ -677,11 +818,28 @@ impl ToolExecutor for LocalTools {
         match request.tool.as_str() {
             "read_file" => self.read_file(request),
             "write_file" => self.write_file(request),
+            "move_path" => self.move_path(request),
             "search_code" => self.search_code(request),
             "glob" => self.glob(request),
             "bash" => self.bash(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
+    }
+}
+
+fn is_cross_device(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        error.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -782,4 +940,51 @@ fn truncate(mut text: String, max: usize) -> String {
     text.truncate(end);
     text.push_str("...(truncated)");
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "trit-tools-unit-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn copy_then_remove_moves_file() {
+        let root = temp("copy");
+        let mut config = WorkspaceConfig::new(&root);
+        config.allow_write = true;
+        let tools = LocalTools::new(config).unwrap();
+        std::fs::write(root.join("a.txt"), "hello").unwrap();
+        tools
+            .copy_then_remove(Path::new("a.txt"), Path::new("b.txt"))
+            .unwrap();
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "hello"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cross_device_detection_uses_platform_error() {
+        #[cfg(windows)]
+        assert!(is_cross_device(&std::io::Error::from_raw_os_error(17)));
+        #[cfg(unix)]
+        {
+            assert!(is_cross_device(&std::io::Error::from_raw_os_error(
+                libc::EXDEV
+            )));
+            assert!(!is_cross_device(&std::io::Error::from_raw_os_error(17)));
+        }
+    }
 }

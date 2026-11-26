@@ -1057,7 +1057,7 @@ fn validate(
                 .any(|req| glob_match(path, &req.changes));
             let hit_art = doc.artifacts.iter().any(|artifact| {
                 safe_rel(root, &artifact.path)
-                    .map(|(norm, _)| norm == *path)
+                    .map(|(norm, _)| path_eq(&norm, path))
                     .unwrap_or(false)
             });
             if hit_req || hit_art {
@@ -1684,10 +1684,26 @@ fn glob_match(path: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         GlobBuilder::new(&pattern.replace('\\', "/"))
             .literal_separator(false)
+            .case_insensitive(cfg!(windows))
             .build()
             .map(|glob| glob.compile_matcher().is_match(path))
             .unwrap_or(false)
     })
+}
+
+/// 路径字面比较：Windows 文件系统不区分大小写，Linux 区分。
+///
+/// Windows 下按 Unicode 小写折叠比较（`Ä` 与 `ä` 视为同一路径）；不实现完整的
+/// Windows 大小写表（例如 `ß` / `SS` 的折叠不做）。
+fn path_eq(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    if cfg!(windows) {
+        left.to_lowercase() == right.to_lowercase()
+    } else {
+        false
+    }
 }
 
 fn has_glob(pattern: &str) -> bool {
@@ -1699,7 +1715,8 @@ fn scope_overlap(pattern: &str, ng_paths: &[String]) -> bool {
     if has_glob(&pattern) {
         return ng_paths.iter().any(|p| {
             let p = p.replace('\\', "/");
-            pattern == p || (!has_glob(&p) && glob_match(&p, std::slice::from_ref(&pattern)))
+            path_eq(&pattern, &p)
+                || (!has_glob(&p) && glob_match(&p, std::slice::from_ref(&pattern)))
         });
     }
     ng_paths

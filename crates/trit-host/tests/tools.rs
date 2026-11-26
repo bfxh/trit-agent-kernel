@@ -281,6 +281,7 @@ fn headless_run_writes_and_proves_from_local_receipts() {
             max_steps: 2,
             session: None,
             context: trit_host::ContextPolicy::default(),
+            write_guard: None,
         },
     )
     .unwrap();
@@ -316,6 +317,7 @@ fn headless_run_rejects_escape_before_writing() {
             max_steps: 2,
             session: None,
             context: trit_host::ContextPolicy::default(),
+            write_guard: None,
         },
     )
     .unwrap_err();
@@ -480,4 +482,114 @@ fn writes_through_symlinks_and_symlinked_dirs_are_rejected() {
     assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "original");
     let _ = std::fs::remove_dir_all(&outside_dir);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn local_tools_move_path_moves_file() {
+    let root = temp_workspace("move");
+    let mut tools = make_tools(&root, true, false);
+    std::fs::write(root.join("a.txt"), "hello").unwrap();
+    let outcome = tools
+        .execute(&ToolRequest::move_path("m1", "a.txt", "sub/b.txt"))
+        .unwrap();
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(outcome.written_paths, ["a.txt", "sub/b.txt"]);
+    assert!(!root.join("a.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("sub/b.txt")).unwrap(),
+        "hello"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_tools_move_path_requires_two_paths_and_write() {
+    let root = temp_workspace("move-args");
+    let mut tools = make_tools(&root, true, false);
+    let error = tools
+        .execute(&ToolRequest::write("m1", "move_path", "a.txt", ""))
+        .unwrap_err();
+    assert!(error.to_string().contains("two paths"), "{error}");
+
+    let mut readonly = make_tools(&root, false, false);
+    let error = readonly
+        .execute(&ToolRequest::move_path("m1", "a.txt", "b.txt"))
+        .unwrap_err();
+    assert!(error.to_string().contains("not allowed"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn builtin_sandbox_wraps_workspace_with_bwrap() {
+    let root = temp_workspace("builtin-sandbox");
+    let sandbox = SandboxCommand::builtin(&root).unwrap();
+    let (program, args) = sandbox.argv("echo hi");
+    assert_eq!(program, PathBuf::from("bwrap"));
+    let root_text = std::fs::canonicalize(&root)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        args.windows(3)
+            .any(|w| w[0] == "--bind" && w[1] == root_text && w[2] == root_text)
+    );
+    assert!(args.iter().any(|arg| arg == "--unshare-all"));
+    assert!(args.iter().any(|arg| arg == "--unshare-net"));
+    assert!(args.iter().any(|arg| arg == "--die-with-parent"));
+    let tail: Vec<&String> = args.iter().rev().take(3).collect();
+    assert_eq!(tail[2], "sh");
+    assert_eq!(tail[1], "-c");
+    assert_eq!(tail[0], "echo hi");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn builtin_sandbox_wraps_workspace_with_sandbox_exec() {
+    let root = temp_workspace("builtin-sandbox-macos");
+    let sandbox = SandboxCommand::builtin(&root).unwrap();
+    let (program, args) = sandbox.argv("echo hi");
+    assert_eq!(program, PathBuf::from("sandbox-exec"));
+    assert_eq!(args[0], "-p");
+    let root_text = std::fs::canonicalize(&root)
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(args[1].contains(&root_text), "{}", args[1]);
+    assert!(!args[1].contains("allow network"), "{}", args[1]);
+    let tail: Vec<&String> = args.iter().rev().take(3).collect();
+    assert_eq!(tail[2], "sh");
+    assert_eq!(tail[1], "-c");
+    assert_eq!(tail[0], "echo hi");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+#[test]
+fn builtin_sandbox_is_rejected_off_unix() {
+    let root = temp_workspace("builtin-sandbox-off");
+    let error = SandboxCommand::builtin(&root).unwrap_err();
+    assert!(
+        error.to_string().contains("only available on Linux"),
+        "{error}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(windows)]
+#[test]
+fn builtin_sandbox_uses_appcontainer_run() {
+    let root = temp_workspace("builtin-sandbox-win");
+    let sandbox = SandboxCommand::builtin(&root).unwrap();
+    let (program, args) = sandbox.argv("echo hi");
+    assert_eq!(program, std::env::current_exe().unwrap());
+    assert_eq!(args[0], "appcontainer-run");
+    assert_eq!(args[1], "--workspace");
+    assert_eq!(args[3], "--");
+    let tail: Vec<&String> = args.iter().rev().take(3).collect();
+    assert_eq!(tail[2], "cmd");
+    assert_eq!(tail[1], "/C");
+    assert_eq!(tail[0], "echo hi");
+    let _ = std::fs::remove_dir_all(root);
 }

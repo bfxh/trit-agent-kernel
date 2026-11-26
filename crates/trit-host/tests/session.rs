@@ -86,6 +86,7 @@ fn config(root: &std::path::Path, session: Option<PathBuf>) -> HeadlessConfig {
         max_steps: 2,
         session,
         context: trit_host::ContextPolicy::default(),
+        write_guard: None,
     }
 }
 

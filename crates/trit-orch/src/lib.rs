@@ -8,6 +8,7 @@ mod budget;
 mod budget_book;
 mod claim;
 mod context;
+mod delegation;
 pub mod delivery;
 mod digest;
 mod effects;
@@ -15,7 +16,9 @@ mod error;
 mod evidence;
 mod evidence_rails;
 mod evidence_writeback;
+mod fleet;
 mod flip_rates;
+pub mod gate_chain;
 mod guidance;
 mod intervention;
 mod lanes;
@@ -26,14 +29,17 @@ mod obligation_guard;
 mod obligation_plan;
 mod orch_metrics;
 mod plan;
+mod plan_handoff;
 mod policy;
 mod progress;
 mod receipt;
+mod remote;
 pub mod repo;
 mod selection;
 mod shadow;
 mod shadow_learn;
 mod status;
+mod subagent;
 mod tick;
 mod trace;
 mod trace_invariants;
@@ -59,6 +65,10 @@ pub use context::{
     CompactionBlock, CompactionDecision, ContextFacts, DEFAULT_THRESHOLD_BP, MAX_THRESHOLD_BP,
     MIN_THRESHOLD_BP, Obligation, Overflow, Tier, compaction_gate,
 };
+pub use delegation::{
+    AccessMode, CapsuleEntry, ContextCapsule, DelegationDecision, DelegationInput,
+    DelegationResult, DelegationStatus, SubagentProfile, digest_hex, should_delegate,
+};
 pub use effects::{
     Attempt, Effect, EffectSpec, Ledger, LedgerStore, Reconcile, Recovery, dispatch_ready,
     effect_operations, prepare_effects,
@@ -70,6 +80,7 @@ pub use evidence_writeback::{
     DeferredWriteback, EvidenceWritebackDeferReason, EvidenceWritebackReport,
     writeback_obligation_evidence,
 };
+pub use fleet::{FleetConfig, FleetOutput, FleetReport, execute};
 pub use flip_rates::{FlipPrior, FlipRates, ScorePolicy};
 pub use guidance::guidance_from_text;
 pub use intervention::{
@@ -95,6 +106,7 @@ pub use obligation_plan::{
 };
 pub use orch_metrics::OrchestrationMetrics;
 pub use plan::Plan;
+pub use plan_handoff::PlanHandoff;
 pub use policy::{
     Baseline, CriticalPath, Eager, LongestFirst, Proposal, ShadowContext, ShadowPolicy,
     bottom_levels, builtin,
@@ -104,6 +116,7 @@ pub use receipt::{
     DeliveryReceipt, HandoffPacket, ReceiptFailure, ReceiptLedger, ReceiptState, handoff_gate,
     handoff_obligation, receipt_obligation,
 };
+pub use remote::{NodeLease, NodeOutcome, NodeSnapshot, NodeTable, RemoteNode};
 pub use repo::{RepoIdentity, RepoRole, ScopeDecision, gate as repo_gate};
 pub use shadow::{ShadowReport, TraceStep, TraceStore, replay};
 pub use shadow_learn::{
@@ -112,6 +125,10 @@ pub use shadow_learn::{
     learn_policy,
 };
 pub use status::Counts;
+pub use subagent::{
+    MAX_FRAME_BYTES, RemoteEndpoint, SubagentRequest, SubagentResponse, decode_frame, encode_frame,
+    exit_status,
+};
 pub use tick::{Tick, TickInput, tick};
 pub use trace::{
     Actor, AppendOutcome, CausalChain, ClaimAction, ClaimRecord, CoordinationFold, EffectRecord,
@@ -125,6 +142,7 @@ pub use trace_merge::merge_logs;
 pub use trace_store::{TraceEventStore, events_from_step};
 pub use trit_core::tristate::TriState;
 pub use trit_core::value::Ternary;
+pub use trit_schedule::runtime::CancelToken;
 pub use trit_schedule::{Dependency, MAX_TASKS, Resources, Task};
 
 #[cfg(test)]

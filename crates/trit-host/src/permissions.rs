@@ -5,8 +5,11 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use globset::{GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
+use crate::journal::MutationJournal;
+use crate::lease::OperationLease;
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,11 +171,12 @@ impl<T: ToolExecutor> ToolExecutor for PermissionGate<T> {
     }
 }
 
-/// 任务级写入范围；只允许已声明路径（文件或目录子树）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 任务级写入范围：已声明路径（文件/子树）或 glob 模式。
+#[derive(Debug, Clone)]
 pub struct WriteClaim {
     root: PathBuf,
     allowed: Vec<PathBuf>,
+    patterns: Vec<GlobMatcher>,
 }
 
 impl WriteClaim {
@@ -180,7 +184,23 @@ impl WriteClaim {
         let root = std::fs::canonicalize(root.into())
             .map_err(|error| AgentError::Io(format!("write claim root: {error}")))?;
         let mut allowed = Vec::with_capacity(paths.len());
+        let mut patterns = Vec::new();
         for path in paths {
+            let text = path.to_string_lossy().replace('\\', "/");
+            if has_glob(&text) {
+                let normalized = normalize_relative(&text)?;
+                let matcher = GlobBuilder::new(&normalized)
+                    // `*` 不跨目录，跨目录必须显式 `**`。
+                    .literal_separator(true)
+                    .case_insensitive(cfg!(windows))
+                    .build()
+                    .map_err(|error| {
+                        AgentError::Tool(format!("write claim glob {text:?}: {error}"))
+                    })?
+                    .compile_matcher();
+                patterns.push(matcher);
+                continue;
+            }
             let absolute = if path.is_absolute() {
                 path
             } else {
@@ -197,7 +217,11 @@ impl WriteClaim {
         }
         allowed.sort();
         allowed.dedup();
-        Ok(Self { root, allowed })
+        Ok(Self {
+            root,
+            allowed,
+            patterns,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -208,13 +232,30 @@ impl WriteClaim {
         &self.allowed
     }
 
+    /// 声明的 glob 模式数（字面路径不计入）。
+    pub fn pattern_count(&self) -> usize {
+        self.patterns.len()
+    }
+
     pub fn allows_path(&self, raw: &str) -> bool {
         if raw.trim().is_empty() {
             return false;
         }
         let path = self.root.join(raw);
         let path = normalize_absolute(&path);
-        path.starts_with(&self.root) && self.allowed.iter().any(|allowed| path.starts_with(allowed))
+        if !path.starts_with(&self.root) {
+            return false;
+        }
+        if self.allowed.iter().any(|allowed| path.starts_with(allowed)) {
+            return true;
+        }
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        self.patterns
+            .iter()
+            .any(|pattern| pattern.is_match(&relative))
     }
 
     pub fn allows_request(&self, request: &ToolRequest) -> bool {
@@ -224,6 +265,10 @@ impl WriteClaim {
         match request.tool.as_str() {
             "write_file" => {
                 !request.paths.is_empty() && request.paths.iter().all(|path| self.allows_path(path))
+            }
+            // move 的两端都必须被 claim 覆盖：源可读、目标可写。
+            "move_path" => {
+                request.paths.len() == 2 && request.paths.iter().all(|path| self.allows_path(path))
             }
             // shell 无法从命令文本证明路径范围；claim 存在时 fail-closed。
             "bash" => false,
@@ -235,11 +280,66 @@ impl WriteClaim {
 pub struct ClaimingTools<T> {
     inner: T,
     claim: WriteClaim,
+    lease: Option<OperationLease>,
+    journal: Option<MutationJournal>,
+}
+
+/// 写入守卫：路径 claim + 可选跨进程租约 + 可选 mutation journal。
+#[derive(Debug)]
+pub struct WriteGuard {
+    pub claim: WriteClaim,
+    pub lease: Option<OperationLease>,
+    pub journal: Option<MutationJournal>,
+}
+
+/// 把 guard 包到工具外层；没有 guard 时原样装箱。
+pub fn wrap_claim<T: ToolExecutor + 'static>(
+    tools: T,
+    guard: Option<WriteGuard>,
+) -> Box<dyn ToolExecutor> {
+    match guard {
+        Some(guard) => {
+            let mut claiming = ClaimingTools::new(tools, guard.claim);
+            if let Some(lease) = guard.lease {
+                claiming = claiming.with_lease(lease);
+            }
+            if let Some(journal) = guard.journal {
+                claiming = claiming.with_journal(journal);
+            }
+            Box::new(claiming)
+        }
+        None => Box::new(tools),
+    }
 }
 
 impl<T> ClaimingTools<T> {
     pub fn new(inner: T, claim: WriteClaim) -> Self {
-        Self { inner, claim }
+        Self {
+            inner,
+            claim,
+            lease: None,
+            journal: None,
+        }
+    }
+
+    /// 绑定跨进程写租约：每次非只读调用前校验 fencing token，失效即 fail-closed。
+    pub fn with_lease(mut self, lease: OperationLease) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    /// 绑定 mutation journal：每次非只读调用前后各追加一条记录。
+    pub fn with_journal(mut self, journal: MutationJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    pub fn lease(&self) -> Option<&OperationLease> {
+        self.lease.as_ref()
+    }
+
+    pub fn journal(&self) -> Option<&MutationJournal> {
+        self.journal.as_ref()
     }
 
     pub fn claim(&self) -> &WriteClaim {
@@ -257,13 +357,48 @@ impl<T> ClaimingTools<T> {
 
 impl<T: ToolExecutor> ToolExecutor for ClaimingTools<T> {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
-        if self.claim.allows_request(request) {
-            self.inner.execute(request)
-        } else {
-            Ok(blocked(
+        if !request.read_only
+            && let Some(lease) = self.lease.as_ref()
+            && !lease.check()
+        {
+            return Ok(blocked(request, "write lease is no longer valid"));
+        }
+        if !self.claim.allows_request(request) {
+            return Ok(blocked(
                 request,
                 "write claim does not allow this path or shell command",
-            ))
+            ));
+        }
+        let entry = if request.read_only {
+            None
+        } else {
+            match self.journal.as_mut() {
+                Some(journal) => {
+                    let epoch = self.lease.as_ref().map(|lease| lease.epoch());
+                    Some(
+                        journal
+                            .record_begin(request, epoch)
+                            .map_err(|error| AgentError::Io(format!("write journal: {error}")))?,
+                    )
+                }
+                None => None,
+            }
+        };
+        match self.inner.execute(request) {
+            Ok(outcome) => {
+                if let (Some(journal), Some(entry)) = (self.journal.as_mut(), entry) {
+                    journal
+                        .record_finish(entry, &outcome)
+                        .map_err(|error| AgentError::Io(format!("write journal: {error}")))?;
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                if let (Some(journal), Some(entry)) = (self.journal.as_mut(), entry) {
+                    let _ = journal.record_error(entry, request, &error.to_string());
+                }
+                Err(error)
+            }
         }
     }
 
@@ -303,6 +438,39 @@ fn normalize_absolute(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+fn has_glob(text: &str) -> bool {
+    text.contains(['*', '?', '['])
+}
+
+/// 把 glob 模式折成 workspace 相对、`/` 分隔的形式；拒绝绝对路径与 `..` 逃逸。
+fn normalize_relative(raw: &str) -> Result<String, AgentError> {
+    let mut parts: Vec<String> = Vec::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() {
+                    return Err(AgentError::Tool(format!(
+                        "write claim pattern escapes root: {raw}"
+                    )));
+                }
+            }
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            _ => {
+                return Err(AgentError::Tool(format!(
+                    "write claim pattern must be workspace relative: {raw}"
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(AgentError::Tool(format!(
+            "write claim pattern must name a file: {raw}"
+        )));
+    }
+    Ok(parts.join("/"))
 }
 
 #[cfg(test)]
@@ -486,6 +654,67 @@ mod tests {
                 .unwrap()
                 .passed
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_claim_accepts_glob_patterns() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-glob-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src/*.py")]).unwrap();
+        assert_eq!(claim.pattern_count(), 1);
+        assert!(claim.allows_path("src/a.py"));
+        assert!(!claim.allows_path("src/sub/b.py"));
+        assert!(!claim.allows_path("other/a.py"));
+
+        let recursive = WriteClaim::new(&root, vec![PathBuf::from("src/**/*.py")]).unwrap();
+        assert!(recursive.allows_path("src/a.py"));
+        assert!(recursive.allows_path("src/sub/b.py"));
+        assert!(!recursive.allows_path("tests/a.py"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_claim_glob_rejects_escape() {
+        let root =
+            std::env::temp_dir().join(format!("trit-claim-glob-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let error = WriteClaim::new(&root, vec![PathBuf::from("../*.py")]).unwrap_err();
+        assert!(error.to_string().contains("escapes root"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_claim_glob_is_case_insensitive_on_windows() {
+        let root =
+            std::env::temp_dir().join(format!("trit-claim-glob-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("SRC/*.PY")]).unwrap();
+        assert!(claim.allows_path("src/a.py"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_claim_requires_both_move_endpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-move-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src")]).unwrap();
+        assert!(claim.allows_request(&ToolRequest::move_path("m1", "src/a.txt", "src/b.txt")));
+        assert!(!claim.allows_request(&ToolRequest::move_path("m1", "src/a.txt", "other/b.txt")));
+        assert!(!claim.allows_request(&ToolRequest::move_path("m1", "other/a.txt", "src/b.txt")));
         let _ = std::fs::remove_dir_all(&root);
     }
 }
