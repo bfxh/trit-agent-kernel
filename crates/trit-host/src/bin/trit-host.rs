@@ -405,19 +405,27 @@ fn run() -> Result<(), Box<dyn Error>> {
             let report = journal.report().map_err(|error| fail(error.to_string()))?;
             if report.has_in_doubt() {
                 if write_journal_rollback {
-                    for record in &report.in_doubt {
-                        let outcome = journal.rollback(record);
-                        journal
-                            .record_rollback(record.op_id, &outcome)
-                            .map_err(|error| fail(error.to_string()))?;
+                    let (outcomes, blocked) = rollback_in_doubt(
+                        &mut journal,
+                        &workspace_root,
+                        &report.in_doubt,
+                        lease.as_ref(),
+                    )?;
+                    for outcome in &outcomes {
                         eprintln!(
                             "write journal: rolled back op {} (restored={} removed={} skipped={} failed={})",
-                            record.op_id,
+                            outcome.op_id,
                             outcome.restored.len(),
                             outcome.removed.len(),
                             outcome.skipped.len(),
                             outcome.failed.len()
                         );
+                    }
+                    if !blocked.is_empty() {
+                        return Err(fail(format!(
+                            "write journal: {} operation(s) still protected by a live lease; refusing rollback",
+                            blocked.len()
+                        )));
                     }
                 } else {
                     eprintln!(
@@ -1346,8 +1354,9 @@ fn usage() {
          session-status: trit-host session-status --session <jsonl>\n\
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
          journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
-         prints the write-journal reconciliation; --rollback restores in-doubt writes;\n\
-         exits 1 on remaining doubt or rollback failure.\n\
+         prints the write-journal reconciliation; --rollback restores in-doubt writes\n\
+         only after reacquiring their recorded lease locks (a live holder blocks it);\n\
+         exits 1 on remaining doubt, blocked rollback or rollback failure.\n\
          rewind-status: trit-host rewind-status --checkpoint-dir <dir> [--checkpoint-backend files|git]\n\
          [--recover] [--workspace <root>]\n\
          prints the checkpoint rewind journal; --recover restores the pre-rewind state from\n\
@@ -1493,6 +1502,79 @@ fn run_appcontainer_prune(mut args: impl Iterator<Item = String>) -> Result<(), 
     }
 }
 
+/// 回滚 in-doubt 写操作；有租约记录时先拿到同一把锁。
+///
+/// `owned` 是当前进程已持有的租约：它覆盖的锁不必重复获取。仍被其他活进程
+/// 占着的操作不会回滚，而是进入 `blocked`，由调用方决定退出或中止启动。
+fn rollback_in_doubt(
+    journal: &mut MutationJournal,
+    workspace: &Path,
+    records: &[trit_host::JournalRecord],
+    owned: Option<&OperationLease>,
+) -> Result<(Vec<trit_host::RollbackOutcome>, Vec<serde_json::Value>), Box<dyn Error>> {
+    let owned_keys: Vec<String> = owned
+        .map(|lease| {
+            lease
+                .lock_paths()
+                .into_iter()
+                .map(|path| lock_key(workspace, path))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut outcomes = Vec::new();
+    let mut blocked = Vec::new();
+    for record in records {
+        let mut guard: Option<OperationLease> = None;
+        if record.lease_locks.is_empty() {
+            if record.lease_epoch.is_some() {
+                blocked.push(serde_json::json!({
+                    "op_id": record.op_id,
+                    "reason": "lease epoch recorded without lock paths; refuse automatic rollback",
+                }));
+                continue;
+            }
+        } else {
+            let missing: Vec<PathBuf> = record
+                .lease_locks
+                .iter()
+                .filter(|lock| !owned_keys.contains(&lock_key(workspace, Path::new(lock))))
+                .map(PathBuf::from)
+                .collect();
+            if !missing.is_empty() {
+                match OperationLease::acquire_lock_files(workspace, "journal-rollback", &missing) {
+                    Ok(lease) => guard = Some(lease),
+                    Err(trit_host::LeaseError::Busy { owner, epoch }) => {
+                        blocked.push(serde_json::json!({
+                            "op_id": record.op_id,
+                            "reason": format!("lease still held: owner={owner} epoch={epoch}"),
+                        }));
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(fail(format!("journal rollback lease: {error}")));
+                    }
+                }
+            }
+        }
+        let outcome = journal.rollback(record);
+        journal
+            .record_rollback(record.op_id, &outcome)
+            .map_err(|error| fail(error.to_string()))?;
+        drop(guard);
+        outcomes.push(outcome);
+    }
+    Ok((outcomes, blocked))
+}
+
+fn lock_key(workspace: &Path, lock: &Path) -> String {
+    let full = if lock.is_absolute() {
+        lock.to_path_buf()
+    } else {
+        workspace.join(lock)
+    };
+    full.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
 /// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。
 ///
 /// 退出码：`0` 没有未闭合写，`1` 有 `in_doubt`，`2` 参数/读取错误。
@@ -1514,6 +1596,7 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
             serde_json::to_string_pretty(&serde_json::json!({
                 "report": trit_host::JournalReport::default(),
                 "rollbacks": [],
+                "blocked": [],
             }))
             .map_err(|error| fail(error.to_string()))?
         );
@@ -1521,16 +1604,11 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     }
     let mut journal = MutationJournal::open(&workspace).map_err(|error| fail(error.to_string()))?;
     let report = journal.report().map_err(|error| fail(error.to_string()))?;
-    let mut rollbacks = Vec::new();
-    if rollback {
-        for record in &report.in_doubt {
-            let outcome = journal.rollback(record);
-            journal
-                .record_rollback(record.op_id, &outcome)
-                .map_err(|error| fail(error.to_string()))?;
-            rollbacks.push(outcome);
-        }
-    }
+    let (rollbacks, blocked) = if rollback {
+        rollback_in_doubt(&mut journal, &workspace, &report.in_doubt, None)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let after = if rollbacks.is_empty() {
         report
     } else {
@@ -1539,12 +1617,14 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     let value = serde_json::json!({
         "report": after,
         "rollbacks": rollbacks,
+        "blocked": blocked,
     });
     println!(
         "{}",
         serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
     );
-    if after.has_in_doubt() || rollbacks.iter().any(|outcome| !outcome.ok()) {
+    if after.has_in_doubt() || rollbacks.iter().any(|outcome| !outcome.ok()) || !blocked.is_empty()
+    {
         std::process::exit(1);
     }
     Ok(())

@@ -81,6 +81,9 @@ pub struct JournalRecord {
     pub paths: Vec<String>,
     #[serde(default)]
     pub lease_epoch: Option<u64>,
+    /// `begin` 时实际持有的锁文件（相对 workspace）；恢复者据此判断租约是否仍被占。
+    #[serde(default)]
+    pub lease_locks: Vec<String>,
     #[serde(default)]
     pub passed: bool,
     #[serde(default)]
@@ -152,6 +155,17 @@ impl MutationJournal {
         request: &ToolRequest,
         lease_epoch: Option<u64>,
     ) -> Result<JournalEntry, JournalError> {
+        self.record_begin_with_lease(request, lease_epoch, &[])
+    }
+
+    /// 同 [`Self::record_begin`]，额外记录本次实际持有的锁文件，供崩溃后判断
+    /// 是否可以安全回滚（租约仍被活进程持有时不能动工作区）。
+    pub fn record_begin_with_lease(
+        &mut self,
+        request: &ToolRequest,
+        lease_epoch: Option<u64>,
+        lease_locks: &[String],
+    ) -> Result<JournalEntry, JournalError> {
         self.seq = self.seq.saturating_add(1);
         let op_id = self.seq;
         let record = JournalRecord {
@@ -163,6 +177,7 @@ impl MutationJournal {
             call_id: request.call_id.clone(),
             paths: request.paths.clone(),
             lease_epoch,
+            lease_locks: lease_locks.to_vec(),
             passed: false,
             in_doubt: false,
             output: String::new(),
@@ -189,6 +204,7 @@ impl MutationJournal {
             call_id: outcome.call_id.clone(),
             paths: outcome.written_paths.clone(),
             lease_epoch: None,
+            lease_locks: Vec::new(),
             passed: outcome.passed,
             in_doubt: outcome.in_doubt,
             output: truncate(&outcome.output, MAX_OUTPUT),
@@ -215,6 +231,7 @@ impl MutationJournal {
             call_id: request.call_id.clone(),
             paths: request.paths.clone(),
             lease_epoch: None,
+            lease_locks: Vec::new(),
             passed: false,
             in_doubt: true,
             output: truncate(error, MAX_OUTPUT),
@@ -245,6 +262,7 @@ impl MutationJournal {
             call_id: String::new(),
             paths: Vec::new(),
             lease_epoch: None,
+            lease_locks: Vec::new(),
             passed: outcome.ok(),
             in_doubt: false,
             output: format!(
