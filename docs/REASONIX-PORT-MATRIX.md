@@ -140,6 +140,9 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
 - 已落地：首刀聚合 command/diff 证据并 fail-closed；第二刀把 `--write-claim` 的范围接进
   `AgentHost` / `Session` / `run_headless`——声明的 diff 路径与回执里的实际写入都必须落在
   claim 内，越界按 `Conflicted`（`backed=true, passed=false`）处理，不因「确实写了」而通过。
+  第三刀补「漏报」：所有 diff criterion 的并集必须覆盖本轮全部非 `move_path` 写入，
+  改了三个文件只声明一个时，原本可通过的 diff 降为冲突；`move_path` 是单一原子操作、
+  两端都被 claim 校验，不要求把源路径写进 diff。
 - 验收：伪完成、少断言、越界写、工具失败、超时未知五类测试；状态只降不升；回放一致。
 - 依赖：B7.3 + B7.4。
 

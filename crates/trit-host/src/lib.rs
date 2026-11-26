@@ -3,7 +3,7 @@
 //! 这是 Reasonix Rust 化的最小可运行内核：不绑定具体 provider / UI / 异步运行时，
 //! 宿主实现 [`Model`] 与 [`ToolExecutor`] 即可。内核仍是纯库，I/O 只发生在工具实现里。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1114,6 +1114,24 @@ fn back_claim(
     receipts: &[ToolOutcome],
     scope: Option<&crate::permissions::WriteClaim>,
 ) -> CompletionClaim {
+    // 所有 diff criterion 的并集就是任务愿意申报的写入面。回执里出现任何未被
+    // 申报的写入（例如改了三个文件只声明一个），说明完成声明漏报，不能让
+    // 剩下的 diff criterion 通过。move 是单一原子操作、两端都被 claim 校验过，
+    // 其变更面天然是双向的，不按「逐文件申报」要求，避免强行要求模型把源路径
+    // 也写进 diff。
+    let declared: BTreeSet<&str> = claim
+        .criteria
+        .iter()
+        .flat_map(|criterion| match &criterion.kind {
+            CriterionKind::Diff { paths } => paths.iter().map(String::as_str).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let has_unreported_write = receipts
+        .iter()
+        .filter(|outcome| outcome.tool != "move_path")
+        .flat_map(|outcome| outcome.written_paths.iter())
+        .any(|path| !declared.contains(path.as_str()));
     CompletionClaim {
         task: task.to_owned(),
         criteria: claim
@@ -1125,7 +1143,16 @@ fn back_claim(
                     CriterionKind::Verification { command } => {
                         verification_backing(command, receipts)
                     }
-                    CriterionKind::Diff { paths } => diff_backing(paths, receipts, scope),
+                    CriterionKind::Diff { paths } => {
+                        let (backed, passed) = diff_backing(paths, receipts, scope);
+                        // 漏报写入时，已经「通过」的 diff 降为冲突：文件确实写了，
+                        // 但完成声明不完整。
+                        if has_unreported_write && passed {
+                            (true, false)
+                        } else {
+                            (backed, passed)
+                        }
+                    }
                 };
                 CriterionClaim {
                     id: criterion.id.clone(),
