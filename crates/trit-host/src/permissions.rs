@@ -328,6 +328,7 @@ pub struct ClaimingTools<T> {
     lease: Option<OperationLease>,
     journal: Option<MutationJournal>,
 }
+
 /// 写入守卫：路径 claim + 可选跨进程租约 + 可选 mutation journal。
 #[derive(Debug)]
 pub struct WriteGuard {
@@ -419,9 +420,14 @@ impl<T: ToolExecutor> ToolExecutor for ClaimingTools<T> {
             match self.journal.as_mut() {
                 Some(journal) => {
                     let epoch = self.lease.as_ref().map(|lease| lease.epoch());
+                    let locks = self
+                        .lease
+                        .as_ref()
+                        .map(|lease| lease_lock_strings(lease, self.claim.root()))
+                        .unwrap_or_default();
                     Some(
                         journal
-                            .record_begin(request, epoch)
+                            .record_begin_with_lease(request, epoch, &locks)
                             .map_err(|error| AgentError::Io(format!("write journal: {error}")))?,
                     )
                 }
@@ -466,6 +472,18 @@ fn blocked(request: &ToolRequest, reason: &str) -> ToolOutcome {
         in_doubt: false,
         output: format!("blocked: {reason}"),
     }
+}
+
+/// 把租约锁文件转成 workspace 相对路径，供 journal 记录与恢复重放。
+fn lease_lock_strings(lease: &OperationLease, root: &Path) -> Vec<String> {
+    lease
+        .lock_paths()
+        .into_iter()
+        .map(|path| match path.strip_prefix(root) {
+            Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+            Err(_) => path.to_string_lossy().replace('\\', "/"),
+        })
+        .collect()
 }
 
 fn normalize_absolute(path: &Path) -> PathBuf {
