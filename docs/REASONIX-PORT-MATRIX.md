@@ -161,7 +161,11 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   完成裁决；`ReadWrite` 且 `write_roots` 为空的 profile 因此等价于禁止写入（fail-closed）。
 - 已落地（第二刀）：`SubagentProfile.tools` 白名单在 `subagent-run` 执行侧过滤——
   未列出的工具调用直接失败并留下回执，白名单不再只是元数据。
-- 仍待补：planner/executor 独立 session 的缓存隔离与 handoff 编排。
+- 已落地（第三刀）：`run_plan_then_execute` 把 planner 与 executor 串成两阶段——planner 在
+  只读工具上产出 `PlanHandoff`，executor 在**独立 `AgentHost` + 独立 `CacheLedger`** 中执行，
+  批准的计划 JSON 注入执行目标；planner 的缓存命中不会计入执行侧。
+- 仍待补：CLI 侧 plan-exec 一键入口（当前为库级编排，调用方负责把
+  `plan.profile.write_roots` 接成 executor 的 `WriteClaim`）。
 - 依赖：B7.5。
 
 ### B7.7 持久化、恢复与租约（P1）
