@@ -137,6 +137,9 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   - write scope / path claim 与完成裁决联动；
   - 冲突进 `Conflicted` / `Unknown`，不默认通过。
 - 不做：用模型自述替代回执；多数投票。
+- 已落地：首刀聚合 command/diff 证据并 fail-closed；第二刀把 `--write-claim` 的范围接进
+  `AgentHost` / `Session` / `run_headless`——声明的 diff 路径与回执里的实际写入都必须落在
+  claim 内，越界按 `Conflicted`（`backed=true, passed=false`）处理，不因「确实写了」而通过。
 - 验收：伪完成、少断言、越界写、工具失败、超时未知五类测试；状态只降不升；回放一致。
 - 依赖：B7.3 + B7.4。
 
