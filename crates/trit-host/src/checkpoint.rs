@@ -22,6 +22,8 @@ pub const CHECKPOINT_SCHEMA: u32 = 1;
 pub const REWIND_SCHEMA: u32 = 1;
 pub const REWIND_JOURNAL: &str = "rewind-journal.jsonl";
 pub const REWIND_BACKUP_DIR: &str = "rewind-backups";
+/// 单个文件快照上限；超过即 fail-closed，避免把大文件读进内存/检查点。
+const MAX_CHECKPOINT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +923,10 @@ pub struct CheckpointRecorder {
 
 impl CheckpointRecorder {
     /// 第一次触碰某个路径时记录 turn 开始前的内容。
+    ///
+    /// 快照必须按 workspace 内的真实路径读取：先逐段拒绝符号链接祖先，再用
+    /// cap-std `FollowSymlinks::No` 打开。否则一个 `link -> ~/.ssh` 的父目录就能
+    /// 把 workspace 外的文件内容读进 checkpoint（agent 可读）。
     pub fn snapshot(&mut self, root: &Path, raw: &str) -> Result<(), AgentError> {
         if self.checkpoint.files.contains_key(raw) {
             return Ok(());
@@ -928,8 +934,11 @@ impl CheckpointRecorder {
         let Some(relative) = normalize_relative(Path::new(raw)) else {
             return Ok(());
         };
-        let full = root.join(&relative);
-        let metadata = match std::fs::symlink_metadata(&full) {
+        let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority()).map_err(|error| {
+            AgentError::Io(format!("checkpoint root {}: {error}", root.display()))
+        })?;
+        check_ancestors(&dir, &relative, raw)?;
+        let metadata = match dir.symlink_metadata(&relative) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.checkpoint.files.insert(raw.to_owned(), None);
@@ -942,8 +951,29 @@ impl CheckpointRecorder {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Ok(());
         }
-        let content = std::fs::read_to_string(&full)
+        if metadata.len() > MAX_CHECKPOINT_FILE_BYTES {
+            return Err(AgentError::Tool(format!(
+                "checkpoint {raw}: file is {} bytes, over the {} byte limit",
+                metadata.len(),
+                MAX_CHECKPOINT_FILE_BYTES
+            )));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No);
+        let file = dir
+            .open_with(&relative, &options)
             .map_err(|error| AgentError::Io(format!("checkpoint read {raw}: {error}")))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_CHECKPOINT_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| AgentError::Io(format!("checkpoint read {raw}: {error}")))?;
+        if bytes.len() as u64 > MAX_CHECKPOINT_FILE_BYTES {
+            return Err(AgentError::Tool(format!(
+                "checkpoint {raw}: file grew over the {MAX_CHECKPOINT_FILE_BYTES} byte limit"
+            )));
+        }
+        let content = String::from_utf8(bytes)
+            .map_err(|_| AgentError::Io(format!("checkpoint read {raw}: not UTF-8")))?;
         self.checkpoint.files.insert(raw.to_owned(), Some(content));
         Ok(())
     }
@@ -1141,7 +1171,7 @@ fn capture_current(dir: &Dir, relative: &Path, raw: &str) -> Result<Option<Vec<u
     Ok(Some(bytes))
 }
 
-fn check_ancestors(dir: &Dir, relative: &Path, raw: &str) -> Result<(), AgentError> {
+pub(crate) fn check_ancestors(dir: &Dir, relative: &Path, raw: &str) -> Result<(), AgentError> {
     let Some(parent) = relative.parent() else {
         return Ok(());
     };
@@ -1150,13 +1180,11 @@ fn check_ancestors(dir: &Dir, relative: &Path, raw: &str) -> Result<(), AgentErr
         current.push(component);
         match dir.symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(AgentError::Tool(format!(
-                    "rewind refuses symlink in path: {raw}"
-                )));
+                return Err(AgentError::Tool(format!("refuses symlink in path: {raw}")));
             }
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(AgentError::Tool(format!(
-                    "rewind refuses non-directory parent: {raw}"
+                    "refuses non-directory parent: {raw}"
                 )));
             }
             Ok(_) => {}
@@ -1183,13 +1211,11 @@ fn ensure_parents(
         current.push(component);
         match dir.symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(AgentError::Tool(format!(
-                    "rewind refuses symlink in path: {raw}"
-                )));
+                return Err(AgentError::Tool(format!("refuses symlink in path: {raw}")));
             }
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(AgentError::Tool(format!(
-                    "rewind refuses non-directory parent: {raw}"
+                    "refuses non-directory parent: {raw}"
                 )));
             }
             Ok(_) => {}

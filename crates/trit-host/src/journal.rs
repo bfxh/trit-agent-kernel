@@ -15,8 +15,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::check_ancestors;
 use crate::{ToolOutcome, ToolRequest};
 
 /// 账本 schema。
@@ -353,7 +356,16 @@ impl MutationJournal {
             op_id: record.op_id,
             ..RollbackOutcome::default()
         };
-        let dir = self.backup_dir(record.op_id);
+        let dir = match workspace_dir(&self.root) {
+            Ok(dir) => dir,
+            Err(error) => {
+                outcome
+                    .failed
+                    .push(format!("open workspace {}: {error}", self.root.display()));
+                return outcome;
+            }
+        };
+        let backup_root = Path::new(".agent/journal-backups").join(record.op_id.to_string());
         for entry in &record.backups {
             if entry.skipped {
                 outcome.skipped.push(entry.path.clone());
@@ -363,18 +375,48 @@ impl MutationJournal {
                 outcome.skipped.push(entry.path.clone());
                 continue;
             };
-            let target = self.root.join(&relative);
+            if let Err(error) = check_ancestors(&dir, Path::new(&relative), &entry.path) {
+                outcome.failed.push(format!("{}: {error}", entry.path));
+                continue;
+            }
             if entry.existed {
-                let Some(name) = &entry.backup else {
+                let Some(name) = entry
+                    .backup
+                    .as_deref()
+                    .filter(|name| safe_backup_name(name))
+                else {
                     outcome.skipped.push(entry.path.clone());
                     continue;
                 };
-                match std::fs::copy(dir.join(name), &target) {
-                    Ok(_) => outcome.restored.push(entry.path.clone()),
+                let backup_rel = backup_root.join(name);
+                let restored = (|| -> Result<(), JournalError> {
+                    check_ancestors(&dir, &backup_rel, &entry.path)
+                        .map_err(|error| JournalError::Io(error.to_string()))?;
+                    let mut options = CapOpenOptions::new();
+                    options.read(true).follow(FollowSymlinks::No);
+                    let mut source = dir.open_with(&backup_rel, &options).map_err(|error| {
+                        JournalError::Io(format!("backup {}: {error}", backup_rel.display()))
+                    })?;
+                    let mut write = CapOpenOptions::new();
+                    write
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .follow(FollowSymlinks::No);
+                    let mut target = dir.open_with(&relative, &write).map_err(|error| {
+                        JournalError::Io(format!("restore {}: {error}", entry.path))
+                    })?;
+                    std::io::copy(&mut source, &mut target).map_err(|error| {
+                        JournalError::Io(format!("restore {}: {error}", entry.path))
+                    })?;
+                    Ok(())
+                })();
+                match restored {
+                    Ok(()) => outcome.restored.push(entry.path.clone()),
                     Err(error) => outcome.failed.push(format!("{}: {error}", entry.path)),
                 }
             } else {
-                match std::fs::remove_file(&target) {
+                match dir.remove_file(&relative) {
                     Ok(()) => outcome.removed.push(entry.path.clone()),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => outcome.failed.push(format!("{}: {error}", entry.path)),
@@ -385,7 +427,8 @@ impl MutationJournal {
     }
 
     fn backup_paths(&self, op_id: u64, paths: &[String]) -> Result<Vec<BackupEntry>, JournalError> {
-        let dir = self.backup_dir(op_id);
+        let dir = workspace_dir(&self.root)?;
+        let backup_rel = Path::new(".agent/journal-backups").join(op_id.to_string());
         let mut entries = Vec::with_capacity(paths.len());
         for (index, raw) in paths.iter().enumerate() {
             let Some(relative) = backup_relative(raw) else {
@@ -396,49 +439,93 @@ impl MutationJournal {
                 });
                 continue;
             };
-            let target = self.root.join(&relative);
-            match std::fs::metadata(&target) {
-                Ok(metadata) if metadata.is_file() => {
-                    if metadata.len() > MAX_BACKUP_BYTES {
-                        entries.push(BackupEntry {
-                            path: relative,
-                            existed: true,
-                            backup: None,
-                            skipped: true,
-                            bytes: metadata.len(),
-                        });
-                        continue;
-                    }
-                    std::fs::create_dir_all(&dir).map_err(|error| {
-                        JournalError::Io(format!("create {}: {error}", dir.display()))
-                    })?;
-                    let name = index.to_string();
-                    std::fs::copy(&target, dir.join(&name)).map_err(|error| {
-                        JournalError::Io(format!("backup {}: {error}", target.display()))
-                    })?;
-                    entries.push(BackupEntry {
-                        path: relative,
-                        existed: true,
-                        backup: Some(name),
-                        skipped: false,
-                        bytes: metadata.len(),
-                    });
-                }
-                Ok(_) => entries.push(BackupEntry {
+            // 符号链接祖先无法在 workspace 内安全定位；跳过快照，交给写工具自己拒绝/处理。
+            if check_ancestors(&dir, Path::new(&relative), raw).is_err() {
+                entries.push(BackupEntry {
                     path: relative,
                     existed: true,
                     backup: None,
                     skipped: true,
                     bytes: 0,
-                }),
-                Err(_) => entries.push(BackupEntry {
-                    path: relative,
-                    existed: false,
-                    backup: None,
-                    skipped: false,
-                    bytes: 0,
-                }),
+                });
+                continue;
             }
+            let metadata = match dir.symlink_metadata(&relative) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    entries.push(BackupEntry {
+                        path: relative,
+                        existed: false,
+                        backup: None,
+                        skipped: false,
+                        bytes: 0,
+                    });
+                    continue;
+                }
+                Err(_) => {
+                    entries.push(BackupEntry {
+                        path: relative,
+                        existed: true,
+                        backup: None,
+                        skipped: true,
+                        bytes: 0,
+                    });
+                    continue;
+                }
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                entries.push(BackupEntry {
+                    path: relative,
+                    existed: true,
+                    backup: None,
+                    skipped: true,
+                    bytes: 0,
+                });
+                continue;
+            }
+            if metadata.len() > MAX_BACKUP_BYTES {
+                entries.push(BackupEntry {
+                    path: relative,
+                    existed: true,
+                    backup: None,
+                    skipped: true,
+                    bytes: metadata.len(),
+                });
+                continue;
+            }
+            check_ancestors(&dir, &backup_rel, raw)
+                .map_err(|error| JournalError::Io(error.to_string()))?;
+            dir.create_dir_all(&backup_rel).map_err(|error| {
+                JournalError::Io(format!("create {}: {error}", backup_rel.display()))
+            })?;
+            let name = index.to_string();
+            let backup_file = backup_rel.join(&name);
+            let copied = (|| -> Result<(), JournalError> {
+                let mut read = CapOpenOptions::new();
+                read.read(true).follow(FollowSymlinks::No);
+                let mut source = dir
+                    .open_with(&relative, &read)
+                    .map_err(|error| JournalError::Io(format!("backup {relative}: {error}")))?;
+                let mut write = CapOpenOptions::new();
+                write
+                    .write(true)
+                    .create_new(true)
+                    .follow(FollowSymlinks::No);
+                let mut target = dir.open_with(&backup_file, &write).map_err(|error| {
+                    JournalError::Io(format!("create backup {}: {error}", backup_file.display()))
+                })?;
+                std::io::copy(&mut source, &mut target)
+                    .map_err(|error| JournalError::Io(format!("backup {relative}: {error}")))?;
+                Ok(())
+            })();
+            copied?;
+            entries.push(BackupEntry {
+                path: relative,
+                existed: true,
+                backup: Some(name),
+                skipped: false,
+                bytes: metadata.len(),
+            });
         }
         Ok(entries)
     }
@@ -537,6 +624,18 @@ fn backup_relative(raw: &str) -> Option<String> {
     } else {
         Some(parts.join("/"))
     }
+}
+
+/// 备份文件名只接受单段普通文件名；journal 是外部可读文本，不能让它做路径跳转。
+fn safe_backup_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
+}
+
+fn workspace_dir(root: &Path) -> Result<Dir, JournalError> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| JournalError::Io(format!("workspace {}: {error}", root.display())))?;
+    Dir::open_ambient_dir(&root, cap_std::ambient_authority())
+        .map_err(|error| JournalError::Io(format!("workspace {}: {error}", root.display())))
 }
 
 fn now_secs() -> u64 {

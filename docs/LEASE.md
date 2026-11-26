@@ -107,6 +107,9 @@ trit-host journal-status --workspace . --rollback
 
 - 操作前存在的文件 → 用备份恢复；操作前不存在 → 删除新建文件；
 - 超限 / 无法归一化 → 记入 `skipped`，不静默当成成功；
+- **符号链接边界**：备份与回滚都先逐段拒绝符号链接祖先；最终路径本身是符号链接时
+  备份记 `skipped`，回滚拒绝写入。备份文件名只接受单段普通文件名，journal 不能做
+  路径跳转；
 - 回滚会追加一条 `rollback` 记录闭合该 `begin`；有 `failed` / `skipped` 时退出 `1`；
 - 回滚是**显式动作**：默认 `journal-status` 只报告，不自动改文件。
 
