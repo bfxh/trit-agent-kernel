@@ -57,7 +57,7 @@
 | 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分（准入 + 路由） | `ServeConfig::validate`（仅 loopback、token 非空）、`authorize`（Host / Origin / bearer）、`route`（golden 路由表，405 / 404）已实现；缺真实 HTTP/SSE 传输与响应编码 | B7.8 |
 | 20 | CLI / TUI / ACP | `CLI.md`、`ACP.md` | 部分 | 无头 CLI 已有；默认输出 Markdown 报告（`--output-format json` 保留 `TurnOutcome` JSON）；缺 TUI、ACP 编辑器 | B7.8 |
 | 21 | Tauri / 桌面 host | `desktop-tauri` | 阶段外 | 不进入本仓；只保留 `FeatureGate` 与宿主契约 | B7.8 |
-| 22 | Capability diagnostics | `CAPABILITY_DIAGNOSTICS.md` | 缺口 | 静态/实时能力报告、MCP 启动阶段、脱敏 stderr tail | B7.8 |
+| 22 | Capability diagnostics | `CAPABILITY_DIAGNOSTICS.md` | 部分（静态） | 已有 `diagnostics` 只读 JSON（schema 版本、工具目录、journal 对账、会话/投影摘要）；缺 `--live` MCP 启动阶段与脱敏 stderr tail | B7.8 |
 | 23 | Remote SSH / worktree | `remote/*`、`SESSION_WORKTREES.md` | 阶段外 | 先不移植；等本地 host 稳定后单独立项 | — |
 | 24 | Golden fixture / wire parity | `RUST_MIGRATION.md` | 缺口 | 录制、回放、字段双向对齐、拒绝也是契约 | B7.1 |
 | 25 | Metrics / usage catalog | `USAGE_CATALOG.md`、`SPEC §3.17` | 部分 | 已有 orch metrics 与单轮 `TurnOutcome.metrics`（步数预算、工具成功/失败/不确定、token/步、缓存命中、耗时；分母为 0 输出 `null`）；缺 catalog、成本、委派收益 counter | B7.1/B7.9 |
@@ -241,6 +241,13 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   - ACP 适配（编辑器）；
   - capability diagnostics：静态默认、`--live` 显式启动 MCP、脱敏 stderr；
   - Tauri/桌面留给独立仓库，只消费本契约。
+- 已落地（首刀，静态能力诊断）：`trit-host diagnostics --workspace <dir> [--session <jsonl>]
+  [--db <path>]` 输出只读 JSON：kernel schema 版本、内置工具目录（`read_only` /
+  `writes` / `requires_sandbox`）、write journal 对账、可选会话与投影摘要、warnings。
+  命令不启动 MCP/gateway/子进程，也不创建目录或账本；所有探测都先看文件是否存在。
+  见 `docs/DIAGNOSTICS.md` 与 `tests/diagnostics_cli.rs`。
+- 仍待补：`--live`（显式启动 MCP、启动阶段与脱敏 stderr、超时与风险提示）；HTTP/SSE
+  `serve` 的 loopback 拒绝用例；ACP 适配。
 - 不做：主题、市场、窗口、Tauri 业务状态。
 - 验收：loopback 拒绝用例字节一致；SSE 断线重连；静态诊断不启动进程；`--live` 有风险提示与超时；桌面只读运行中 host。
 - 依赖：B7.5/B7.6。

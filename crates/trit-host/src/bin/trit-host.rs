@@ -47,6 +47,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-index" {
         return run_session_index(args);
     }
+    if command == "diagnostics" {
+        return run_diagnostics(args);
+    }
     if command == "journal-status" {
         return run_journal_status(args);
     }
@@ -1361,6 +1364,10 @@ fn usage() {
          maintains the SQLite projection of a session log; --rebuild deletes the old\n\
          projection and rebuilds it from JSONL, --verify rebuilds into a scratch db and\n\
          compares rows (exits 1 when the projection is missing or differs).\n\
+         diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
+         prints a static, read-only capability report (kernel schema versions, built-in\n\
+         tool catalog, write-journal reconciliation, optional session/projection summary).\n\
+         it starts no MCP/gateway/subprocess and creates no files.\n\
          journal-status: trit-host journal-status --workspace <dir> [--rollback] [--prune]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes\n\
          only after reacquiring their recorded lease locks (a live holder blocks it);\n\
@@ -1504,6 +1511,32 @@ fn run_session_index(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
             "summary": summary,
         }))
         .map_err(|error| fail(error.to_string()))?
+    );
+    Ok(())
+}
+
+/// `diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]`：
+/// 只读静态诊断。不启动 MCP / gateway / 子进程，也不创建目录或账本。
+fn run_diagnostics(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    let mut session = None;
+    let mut db = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
+            "--db" => db = Some(PathBuf::from(next(&mut args, "--db")?)),
+            other => return Err(fail(format!("unknown diagnostics argument: {other}"))),
+        }
+    }
+    let report = trit_host::diagnose(&trit_host::DiagnosticsOptions {
+        workspace: &workspace,
+        session: session.as_deref(),
+        projection: db.as_deref(),
+    })?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
     );
     Ok(())
 }
