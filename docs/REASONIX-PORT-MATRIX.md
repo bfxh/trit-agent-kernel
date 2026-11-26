@@ -156,6 +156,10 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   - 用指标判断是否值得委派，不凭感觉并行。
 - 不做：把 fleet 图硬塞进 `TaskSpec`；动态节点发现与跨机抢占（静态节点表的派发、隔离与有界重试已补，见第 16 行）。
 - 验收：前缀缓存不被 planner 污染；子 agent 无隐式继承；越权写被拒绝；失败/中断结果可恢复；并发/成本有基线。
+- 已落地（首刀）：`SubagentProfile.write_roots` 从「只校验形状」变成执行侧强制——
+  `subagent-run` 按 profile 构造 `WriteClaim` 并包住工具、同时把同一份 claim 交给
+  完成裁决；`ReadWrite` 且 `write_roots` 为空的 profile 因此等价于禁止写入（fail-closed）。
+  白名单 `tools` 的执行侧过滤与 planner/executor 独立 session 的缓存隔离仍待补。
 - 依赖：B7.5。
 
 ### B7.7 持久化、恢复与租约（P1）

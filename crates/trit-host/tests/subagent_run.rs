@@ -57,17 +57,21 @@ fn request(access: AccessMode) -> SubagentRequest {
 }
 
 fn script(dir: &Path) -> PathBuf {
+    script_for(dir, "a.txt")
+}
+
+fn script_for(dir: &Path, rel: &str) -> PathBuf {
     let path = dir.join("proposals.json");
     let proposals = serde_json::json!([{
         "tool_calls": [{
             "call_id": "w1",
             "tool": "write_file",
             "read_only": false,
-            "paths": ["a.txt"],
+            "paths": [rel],
             "content": "hello"
         }],
         "completion": {
-            "criteria": [{"id": "c1", "kind": {"kind": "diff", "paths": ["a.txt"]}}]
+            "criteria": [{"id": "c1", "kind": {"kind": "diff", "paths": [rel]}}]
         },
         "usage": {
             "prompt_tokens": 10,
@@ -79,6 +83,36 @@ fn script(dir: &Path) -> PathBuf {
     }]);
     std::fs::write(&path, proposals.to_string()).unwrap();
     path
+}
+
+fn request_with_roots(roots: Vec<String>) -> SubagentRequest {
+    let task = TaskSpec {
+        task: Task {
+            id: "a".into(),
+            duration: 1,
+            priority: 0,
+            deps: Vec::new(),
+        },
+        epoch: 0,
+        ..TaskSpec::default()
+    };
+    let capsule = ContextCapsule::inherit(
+        vec![CapsuleEntry {
+            key: "objective".into(),
+            value: "write a file".into(),
+        }],
+        &["objective"],
+        64,
+    )
+    .unwrap();
+    let profile = SubagentProfile {
+        name: "child".into(),
+        access: AccessMode::ReadWrite,
+        write_roots: roots,
+        tools: vec!["write_file".into(), "read_file".into()],
+        max_tokens: 1000,
+    };
+    SubagentRequest::new(&task, capsule, profile)
 }
 
 fn config(workspace: &Path, script: &Path) -> SubagentProcessConfig {
@@ -110,6 +144,51 @@ fn subagent_run_executes_with_write_profile() {
     assert!(content.contains("## 工具回执"), "{content}");
     // 真实执行：workspace 里出现文件。
     assert!(workspace.join("a.txt").is_file());
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&scripts);
+}
+
+#[test]
+fn subagent_run_rejects_writes_outside_profile_roots() {
+    let workspace = temp_dir("ws-roots");
+    let scripts = temp_dir("script-roots");
+    let result = run_subagent(
+        &config(&workspace, &script_for(&scripts, "docs/escape.txt")),
+        &request_with_roots(vec!["src".into()]),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(result.status, DelegationStatus::Failed { .. }),
+        "profile 只允许 src，写 docs 必须失败: {:?}",
+        result.status
+    );
+    assert!(
+        !workspace.join("docs/escape.txt").exists(),
+        "越界写入不能落盘"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&scripts);
+}
+
+#[test]
+fn subagent_run_allows_writes_inside_profile_roots() {
+    let workspace = temp_dir("ws-in-roots");
+    let scripts = temp_dir("script-in-roots");
+    let result = run_subagent(
+        &config(&workspace, &script_for(&scripts, "src/ok.txt")),
+        &request_with_roots(vec!["src".into()]),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(result.status, DelegationStatus::Completed),
+        "src 内的写入应通过: {:?}",
+        result.status
+    );
+    assert!(workspace.join("src/ok.txt").is_file());
 
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_dir_all(&scripts);
