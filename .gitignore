@@ -8,6 +8,9 @@
 __pycache__/
 *.jsonl
 
+# JSONL 布局兼容的 golden fixture 必须进树，否则兼容矩阵无法回归。
+!crates/trit-host/tests/fixtures/**/*.jsonl
+
 # DeliveryReceipt 四态账本是本机自报证据，不进公开树。
 .agent/delivery/
 
