@@ -60,6 +60,7 @@ use trit_orch::{
     SubagentResponse, decode_frame, encode_frame,
 };
 
+use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
 use crate::remote_ledger::{self, Claim};
 use crate::remote_subagent::{
     CANCEL_PATH, DEADLINE_EXCEEDED_HEADER, HEALTH_PATH, LEASE_LOST_HEADER, idempotency_scope,
@@ -71,9 +72,6 @@ const CANCEL_CHECK_STEP: Duration = Duration::from_millis(25);
 
 /// 预取消但尚未到达的键上限，防止 `/cancel` 被用来无限占用内存。
 const MAX_PRE_CANCELLED: usize = 1024;
-
-/// 同时在处理的连接上限（参考实现；可通过 `--max-connections` 调整）。
-const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
 /// 账本占位租约的默认续约间隔；应小于账本 `pending_ttl`。
 const DEFAULT_LEDGER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
@@ -151,50 +149,6 @@ impl Drop for CancelScope<'_> {
         if let Ok(mut registry) = self.registry.inner.lock() {
             registry.active.remove(&self.key);
         }
-    }
-}
-
-/// 连接并发上限：超额连接回 503，不再创建线程。
-struct ConnectionSlots {
-    limit: usize,
-    active: Mutex<usize>,
-}
-
-struct ConnectionSlot {
-    slots: Arc<ConnectionSlots>,
-}
-
-impl ConnectionSlots {
-    fn new(limit: usize) -> Arc<Self> {
-        Arc::new(Self {
-            limit: limit.max(1),
-            active: Mutex::new(0),
-        })
-    }
-
-    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionSlot> {
-        let mut active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *active >= self.limit {
-            return None;
-        }
-        *active += 1;
-        Some(ConnectionSlot {
-            slots: Arc::clone(self),
-        })
-    }
-}
-
-impl Drop for ConnectionSlot {
-    fn drop(&mut self) {
-        let mut active = self
-            .slots
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *active = active.saturating_sub(1);
     }
 }
 

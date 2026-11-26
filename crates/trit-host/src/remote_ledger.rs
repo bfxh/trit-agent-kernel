@@ -28,6 +28,9 @@
 //! 物理文件到逻辑上限的 1.5 倍时压缩为当前内存快照（完成项 + 未过期占位，
 //! 临时文件 + 原子替换）；启动时若目标缺失会从 `.compact` 临时文件恢复。
 //!
+//! 连接并发默认 64（`with_max_connections` / `--max-connections`），超额连接直接
+//! `503`、不排队也不创建线程；账本是跨机协调的单点，不能让慢客户端耗尽线程。
+//!
 //! 安全边界：账本默认只应绑定 loopback 或置于内网；配置 token 后所有请求都要
 //! `Authorization: Bearer <token>`。状态文件同时包含完成帧与租约令牌，应按敏感
 //! 数据保护。账本不校验任务内容，只校验 `complete` 的帧与幂等键一致，并要求
@@ -46,6 +49,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
 
+use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
 use crate::remote_subagent::idempotency_scope;
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
@@ -92,6 +96,8 @@ pub struct LedgerServerConfig {
     /// 可选持久化文件：追加完成帧与占位租约（含令牌/到期时间），重启时回放；
     /// 过期占位会被丢弃。
     pub state_path: Option<PathBuf>,
+    /// 同时在处理的连接上限；超限直接回 503，避免单点账本被慢连接拖垮。
+    pub max_connections: usize,
 }
 
 impl LedgerServerConfig {
@@ -103,6 +109,7 @@ impl LedgerServerConfig {
             max_entries: DEFAULT_MAX_ENTRIES,
             max_state_bytes: DEFAULT_MAX_STATE_BYTES,
             state_path: None,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -128,6 +135,11 @@ impl LedgerServerConfig {
 
     pub fn with_state_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.state_path = Some(path.into());
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
         self
     }
 }
@@ -203,6 +215,7 @@ pub struct LedgerServer {
     config: LedgerServerConfig,
     state: Arc<Mutex<LedgerState>>,
     completions: Arc<AtomicU64>,
+    slots: Arc<ConnectionSlots>,
 }
 
 impl LedgerServer {
@@ -254,11 +267,13 @@ impl LedgerServer {
             }
             None => Arc::default(),
         };
+        let slots = ConnectionSlots::new(config.max_connections);
         Ok(Self {
             listener,
             config,
             state,
             completions: Arc::default(),
+            slots,
         })
     }
 
@@ -272,18 +287,26 @@ impl LedgerServer {
     }
 
     pub fn serve_once(&self) -> std::io::Result<()> {
-        let (stream, _) = self.listener.accept()?;
+        let (mut stream, _) = self.listener.accept()?;
+        let Some(_slot) = self.slots.try_acquire() else {
+            return respond(&mut stream, 503, "Service Unavailable", b"");
+        };
         handle(stream, &self.config, &self.state, &self.completions)
     }
 
-    /// 每个连接一个线程；账本请求通常很短，但仍不阻塞其他连接。
+    /// 每个连接一个线程，但受 `max_connections` 限制；超额连接直接 503。
     pub fn serve_forever(&self) -> std::io::Result<()> {
         loop {
-            let (stream, _) = self.listener.accept()?;
+            let (mut stream, _) = self.listener.accept()?;
+            let Some(slot) = self.slots.try_acquire() else {
+                let _ = respond(&mut stream, 503, "Service Unavailable", b"");
+                continue;
+            };
             let config = self.config.clone();
             let state = Arc::clone(&self.state);
             let completions = Arc::clone(&self.completions);
             std::thread::spawn(move || {
+                let _slot = slot;
                 let _ = handle(stream, &config, &state, &completions);
             });
         }

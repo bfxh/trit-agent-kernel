@@ -221,7 +221,8 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   TTL 一并恢复，过期占位直接丢弃；物理日志超过逻辑上限 1.5 倍时压缩为当前快照（完成项 + 未过期
   占位，临时文件 + 原子替换，启动时从残留 `.compact` 恢复），已完成任务不会再
   执行。未配 `--state` 时占位只在内存，账本重启仍会丢失在途令牌；状态文件含完成
-  帧与租约令牌，应按敏感数据保护。
+  帧与租约令牌，应按敏感数据保护。连接并发默认 64（`--max-connections`），超额
+  连接直接 503、不排队不 spawn；账本是跨机协调单点，不能由慢客户端耗尽线程。
   服务端单请求执行时限：`RemoteServerConfig::exec_timeout` /
   `remote-echo|remote-exec --request-timeout-ms`（0 表示不限制）。deadline 从
   handler 入口启动，覆盖账本 claim 等待、`sleep_ms` 与 `Exec` 子进程；到点先置
@@ -240,12 +241,12 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
 503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
 慢执行期间不被接管、租约丢失中止在途执行、完成帧已由别人写入时旧执行者回 Aborted 而非旧结果、租约被接管不隔离节点且换机重试回放完成、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
-时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
+时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩、账本连接上限 503；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
 
-**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS / 主动健康探测）。
-静态节点表、派发与有界换机重试见 §9。
+**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS）与周期性自动探测；
+显式 `remote-plan --probe` 已提供。静态节点表、派发与有界换机重试见 §9。
 
 ## 9. 跨机器调度（`trit_orch::NodeTable` + `trit_host::run_remote_plan`）
 

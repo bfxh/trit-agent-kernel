@@ -1,6 +1,7 @@
 //! 共享幂等账本：claim/renew/complete 协议，以及两台远端共享账本时的单次执行。
 
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader};
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,6 +69,36 @@ fn state_file(tag: &str) -> std::path::PathBuf {
     ));
     let _ = std::fs::remove_file(&path);
     path
+}
+
+#[test]
+fn ledger_limits_connections_with_503() {
+    let ledger = Arc::new(
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_max_connections(1)).unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+
+    // 第一条连接不发请求，只占住唯一的槽位。
+    let first = TcpStream::connect(address).unwrap();
+    thread::sleep(Duration::from_millis(150));
+
+    // 超额连接在读取协议前就被拒绝，避免慢客户端拖住账本线程。
+    let second = TcpStream::connect(address).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut reader = BufReader::new(second);
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 503"),
+        "excess ledger connection must be rejected with 503, got {status}"
+    );
+
+    drop(first);
+    drop(ledger);
 }
 
 #[test]
