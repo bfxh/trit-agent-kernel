@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use trit_host::GitCheckpointStore;
 
 fn root(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -30,6 +31,36 @@ fn rewind_status(dir: &Path) -> (Option<i32>, Value) {
         output.status.code(),
         serde_json::from_slice(&output.stdout).unwrap(),
     )
+}
+
+fn rewind_status_git(dir: &Path, workspace: &Path, recover: bool) -> (Option<i32>, Value) {
+    let mut args = vec![
+        "rewind-status",
+        "--checkpoint-dir",
+        dir.to_str().unwrap(),
+        "--checkpoint-backend",
+        "git",
+        "--workspace",
+        workspace.to_str().unwrap(),
+    ];
+    if recover {
+        args.push("--recover");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
+
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn rewind_status_recover(dir: &Path, workspace: &Path) -> (Option<i32>, Value) {
@@ -125,4 +156,41 @@ fn recover_without_workspace_is_a_usage_error() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn git_backend_status_and_recover_are_wired() {
+    if !git_available() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    let workspace = root("git-workspace");
+    let dir = root("git-store");
+    let store = GitCheckpointStore::open(&dir, &workspace).unwrap();
+    store.snapshot(0, "empty").unwrap();
+
+    let (code, report) = rewind_status_git(&dir, &workspace, false);
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["total"], 0);
+    assert_eq!(report["in_doubt"].as_array().unwrap().len(), 0);
+
+    let (code, payload) = rewind_status_git(&dir, &workspace, true);
+    assert_eq!(code, Some(0), "{payload}");
+    assert_eq!(payload["recovery"]["attempted"], 0);
+    assert_eq!(payload["recovery"]["recovered"], 0);
+    assert_eq!(payload["status"]["in_doubt"].as_array().unwrap().len(), 0);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "rewind-status",
+            "--checkpoint-dir",
+            dir.to_str().unwrap(),
+            "--checkpoint-backend",
+            "git",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(workspace);
 }

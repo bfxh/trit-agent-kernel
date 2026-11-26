@@ -157,7 +157,85 @@ fn git_checkpoint_rewinds_workspace_changes() {
     let report = store.rewind(0).unwrap();
     assert!(report.deleted.contains(&"a.txt".into()), "{report:?}");
     assert!(!root.join("a.txt").exists());
+    let status = store.rewind_status().unwrap();
+    assert_eq!(status.completed, 2, "{status:?}");
+    assert!(!status.has_in_doubt(), "{status:?}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn git_rewind_journal_recovers_from_crash_and_blocks_until_recovered() {
+    if !git_available() {
+        eprintln!("git not available; skipping");
+        return;
+    }
+    let root = temp_dir("git-journal");
+    let store_dir = temp_dir("git-journal-store");
+    let store = GitCheckpointStore::open(&store_dir, &root).unwrap();
+    store.snapshot(0, "empty").unwrap();
+    std::fs::write(root.join("a.txt"), "v1").unwrap();
+    store.snapshot(1, "v1").unwrap();
+    // 模拟 rewind(0) 已建好整树 backup、尚未完成时崩溃：工作区停在半写状态。
+    let backup = git_in(&store_dir, &root, &["rev-parse", "refs/trit/turn-00000001"]);
+    std::fs::write(root.join("a.txt"), "half").unwrap();
+    let begin = serde_json::json!({
+        "schema": 1,
+        "seq": 1,
+        "op_id": 1,
+        "phase": "begin",
+        "turn": 0,
+        "paths": [],
+        "backups": [],
+        "backend": "git",
+        "backup": backup,
+        "path": "",
+        "restored": [],
+        "deleted": [],
+        "failures": [],
+        "at": 1
+    });
+    let applying = serde_json::json!({
+        "schema": 1,
+        "seq": 2,
+        "op_id": 1,
+        "phase": "applying",
+        "turn": 0,
+        "paths": [],
+        "backups": [],
+        "backend": "",
+        "backup": "",
+        "path": "",
+        "restored": [],
+        "deleted": [],
+        "failures": [],
+        "at": 2
+    });
+    std::fs::write(
+        store_dir.join("rewind-journal.jsonl"),
+        format!("{begin}\n{applying}\n"),
+    )
+    .unwrap();
+
+    let error = store.rewind(0).unwrap_err();
+    assert!(error.to_string().contains("unfinished"), "{error}");
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "half");
+    let status = store.rewind_status().unwrap();
+    assert_eq!(status.in_doubt.len(), 1, "{status:?}");
+    assert_eq!(status.in_doubt[0].backend, "git");
+    assert!(!status.in_doubt[0].backup.is_empty());
+
+    let recovery = store.recover_rewind().unwrap();
+    assert_eq!(recovery.attempted, 1, "{recovery:?}");
+    assert_eq!(recovery.recovered, 1, "{recovery:?}");
+    assert!(!recovery.has_failures(), "{recovery:?}");
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "v1");
+    assert!(!store.rewind_status().unwrap().has_in_doubt());
+
+    let report = store.rewind(0).unwrap();
+    assert!(report.deleted.contains(&"a.txt".into()), "{report:?}");
+    assert!(!root.join("a.txt").exists());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&store_dir);
 }
 
 #[test]

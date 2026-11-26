@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::{
-    RewindReport, RewindScope, commands_from_session, merge_commands, normalize_relative,
+    RewindJournal, RewindJournalReport, RewindRecoveryFailure, RewindRecoveryReport, RewindReport,
+    RewindScope, commands_from_session, merge_commands, normalize_relative,
 };
 use crate::{AgentError, SessionEvent, SessionLog, ToolExecutor, ToolRequest};
 
@@ -175,6 +176,14 @@ impl GitCheckpointStore {
     /// 先校验目标树与当前树，再暂存当前树作为回滚点；`read-tree` 失败时
     /// 用回滚点恢复，避免工作区停在半恢复状态。
     pub fn rewind(&self, turn: usize) -> Result<RewindReport, AgentError> {
+        let mut journal = RewindJournal::open(&self.dir)?;
+        let status = journal.report()?;
+        if status.has_in_doubt() {
+            return Err(AgentError::SessionState(format!(
+                "rewind journal has {} unfinished operation(s); inspect rewind-status before retrying",
+                status.in_doubt.len()
+            )));
+        }
         let turns = self.turns()?;
         if !turns.contains(&turn) {
             return Err(AgentError::SessionState(format!(
@@ -211,14 +220,64 @@ impl GitCheckpointStore {
                 _ => {}
             }
         }
+        // 工作区即将被 read-tree 改写：整树 backup commit 先落 journal。
+        let op_id = journal.begin_git(turn, &backup)?;
+        journal.applying(op_id, turn, "")?;
         if let Err(original) = self.git(&["read-tree", "--reset", "-u", &target]) {
-            return match self.git(&["read-tree", "--reset", "-u", &backup]) {
-                Ok(_) => Err(original),
-                Err(rollback) => Err(AgentError::RewindRollback {
-                    original: original.to_string(),
-                    failures: vec![format!("git rollback: {rollback}")],
-                }),
+            let failures = match self.git(&["read-tree", "--reset", "-u", &backup]) {
+                Ok(_) => Vec::new(),
+                Err(rollback) => vec![format!("git rollback: {rollback}")],
             };
+            journal.rollback(op_id, turn, &failures)?;
+            if failures.is_empty() {
+                return Err(original);
+            }
+            return Err(AgentError::RewindRollback {
+                original: original.to_string(),
+                failures,
+            });
+        }
+        journal.finish(op_id, turn, &report.restored, &report.deleted)?;
+        Ok(report)
+    }
+
+    /// 只读检查 git 后端回退 journal。
+    pub fn rewind_status(&self) -> Result<RewindJournalReport, AgentError> {
+        RewindJournal::open(&self.dir)?.report()
+    }
+
+    /// 用 `begin` 记录的整树 backup commit 恢复半写工作区。
+    ///
+    /// 只接受 git 后端的记录；文件后端应改用 `CheckpointStore::recover_rewind`。
+    pub fn recover_rewind(&self) -> Result<RewindRecoveryReport, AgentError> {
+        let mut journal = RewindJournal::open(&self.dir)?;
+        let status = journal.report()?;
+        if status.in_doubt.iter().any(|doubt| doubt.backend != "git") {
+            return Err(AgentError::SessionState(
+                "rewind journal contains files-backend operation(s); use the files checkpoint store"
+                    .into(),
+            ));
+        }
+        let mut report = RewindRecoveryReport::default();
+        for doubt in status.in_doubt {
+            report.attempted += 1;
+            let failures = if doubt.backup.is_empty() {
+                vec![format!("op {}: missing git backup commit", doubt.op_id)]
+            } else {
+                match self.git(&["read-tree", "--reset", "-u", &doubt.backup]) {
+                    Ok(_) => Vec::new(),
+                    Err(error) => vec![format!("git recover: {error}")],
+                }
+            };
+            journal.recover(doubt.op_id, doubt.turn, "git", &doubt.backup, &failures)?;
+            if failures.is_empty() {
+                report.recovered += 1;
+            } else {
+                report.failed.push(RewindRecoveryFailure {
+                    op_id: doubt.op_id,
+                    failures,
+                });
+            }
         }
         Ok(report)
     }
