@@ -318,6 +318,33 @@ impl NodeTable {
         changed
     }
 
+    /// 把超过 `max_age_ms` 没有状态更新的“健康”节点改为隔离，返回被隔离的 id。
+    ///
+    /// `now_ms.saturating_sub(updated_at_ms) > max_age_ms` 时视为陈旧；时间戳在
+    /// 未来的节点不会因时钟回拨被误隔离。陈旧不等于执行失败，不增加
+    /// `attempts/failures`，只把连续失败计数补到当前阈值。隔离本身会推进
+    /// `updated_at_ms`，因此健康文件会记录这次“由新鲜度触发的隔离”；探测成功
+    /// 后仍走 [`NodeTable::readmit`] 放行。
+    pub fn isolate_stale_healthy(&self, now_ms: u64, max_age_ms: u64) -> Vec<String> {
+        let mut slots = self.lock();
+        let mut isolated = Vec::new();
+        for slot in slots.iter_mut() {
+            if !slot.healthy || now_ms.saturating_sub(slot.updated_at_ms) <= max_age_ms {
+                continue;
+            }
+            slot.healthy = false;
+            slot.consecutive_failures = self.failure_threshold;
+            touch_state(slot);
+            isolated.push(slot.node.id.clone());
+        }
+        isolated.sort();
+        drop(slots);
+        if !isolated.is_empty() {
+            self.cond.notify_all();
+        }
+        isolated
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {
         self.inner
             .lock()
