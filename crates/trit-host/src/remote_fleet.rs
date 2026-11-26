@@ -29,7 +29,9 @@ use trit_orch::{
 };
 
 use crate::AgentError;
-use crate::remote_subagent::run_remote_subagent_reply_cancellable;
+use crate::remote_subagent::{
+    run_remote_subagent_reply_cancellable_scoped, validate_idempotency_scope,
+};
 
 /// 一次派发尝试。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -41,7 +43,7 @@ pub struct RemoteAttempt {
 }
 
 /// 跨机派发配置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePlanConfig {
     /// 并发 worker 上限（至少 1）。
     pub workers: usize,
@@ -49,9 +51,12 @@ pub struct RemotePlanConfig {
     pub failure_threshold: u32,
     /// 节点级失败后最多换节点重试几次（默认 0，即不重试）。
     ///
-    /// 只有在服务端按 `X-Trit-Idempotency: task@epoch` 去重时，重试才是安全的；
+    /// 只有在服务端按 `X-Trit-Idempotency: [scope|]task@epoch` 去重时，重试才是安全的；
     /// 参考实现 `remote-echo` 会去重。任务级 `Failed` 永远不重试。
     pub retry_limit: u32,
+    /// 计划作用域：不同计划用不同值，避免同名任务在共享账本/workspace 中碰撞。
+    /// `None` 保持旧的 `task@epoch` 键与 `<root>/<task>` 目录。
+    pub scope: Option<String>,
 }
 
 impl RemotePlanConfig {
@@ -60,6 +65,7 @@ impl RemotePlanConfig {
             workers,
             failure_threshold: 1,
             retry_limit: 0,
+            scope: None,
         }
     }
 
@@ -70,6 +76,12 @@ impl RemotePlanConfig {
 
     pub fn with_retry_limit(mut self, retry_limit: u32) -> Self {
         self.retry_limit = retry_limit;
+        self
+    }
+
+    /// 设置计划作用域；非法值会在派发开始时被拒绝。
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
         self
     }
 }
@@ -143,6 +155,11 @@ pub fn run_remote_plan_with_table<F>(
 where
     F: Fn(&TaskSpec) -> SubagentRequest + Send + Sync + 'static,
 {
+    if let Some(scope) = config.scope.as_deref() {
+        validate_idempotency_scope(scope)?;
+    }
+    let scope = config.scope.clone();
+    let retry_limit = config.retry_limit;
     let replies: Arc<Mutex<BTreeMap<String, DelegationResult>>> = Arc::default();
     let assignments: Arc<Mutex<BTreeMap<String, String>>> = Arc::default();
     let attempts: Arc<Mutex<BTreeMap<String, Vec<RemoteAttempt>>>> = Arc::default();
@@ -179,10 +196,11 @@ where
                     map.insert(task_id.clone(), node_id.clone());
                 }
 
-                match run_remote_subagent_reply_cancellable(
+                match run_remote_subagent_reply_cancellable_scoped(
                     &lease.node().endpoint,
                     &request,
                     cancel,
+                    scope.as_deref(),
                 ) {
                     Ok(reply) => {
                         if let Ok(mut map) = replies.lock() {
@@ -238,7 +256,7 @@ where
 
                 // 能走到这里只有节点级失败（Aborted / 传输错误）：隔离该节点后重试。
                 excluded.insert(node_id);
-                if retries_used >= config.retry_limit {
+                if retries_used >= retry_limit {
                     return Err(last_error.unwrap_or_else(|| "remote node failed".into()));
                 }
                 retries_used += 1;

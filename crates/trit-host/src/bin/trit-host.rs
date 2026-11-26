@@ -1659,7 +1659,8 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 /// `remote-plan [--input <json|->]`：跨机演练。
 ///
 /// 输入是一个 JSON 文档：`{revision, tasks, nodes, workers?, failure_threshold?,
-/// retry_limit?}`。任务按 `TaskSpec` 反序列化，节点按 `RemoteNode` 反序列化；
+/// retry_limit?, scope?}`。`scope` 是计划作用域，多个计划共享账本/workspace 根时应
+/// 使用不同值。任务按 `TaskSpec` 反序列化，节点按 `RemoteNode` 反序列化；
 /// 每个任务都映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），
 /// 由 `run_remote_plan` 复用 fleet 调度并输出 JSON 报告（含每次尝试与节点快照）。
 /// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
@@ -1687,9 +1688,12 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
 
     let plan = trit_orch::Plan::new(input.revision, input.tasks)
         .map_err(|error| fail(format!("invalid plan: {error}")))?;
-    let config = trit_host::RemotePlanConfig::new(input.workers)
+    let mut config = trit_host::RemotePlanConfig::new(input.workers)
         .with_failure_threshold(input.failure_threshold)
         .with_retry_limit(input.retry_limit);
+    if let Some(scope) = input.scope {
+        config = config.with_scope(scope);
+    }
     let mut table =
         trit_orch::NodeTable::new(input.nodes)?.with_failure_threshold(input.failure_threshold);
     if let Some(path) = health_path.as_deref()
@@ -1762,6 +1766,9 @@ struct RemotePlanInput {
     failure_threshold: u32,
     #[serde(default)]
     retry_limit: u32,
+    /// 计划作用域；不同计划应使用不同值，隔离共享账本与 workspace。
+    #[serde(default)]
+    scope: Option<String>,
     nodes: Vec<trit_orch::RemoteNode>,
 }
 

@@ -22,8 +22,8 @@
 //! 7. **Exec 模式真实执行**：spawn `subagent-run`（或等价命令），请求帧走 stdin、
 //!    响应帧走 stdout；只有子进程判定完成才回 `Completed`，进程错误/超时按
 //!    `Failed`/`Aborted` 回帧，不误报完成。配 `exec_workspace_root` 时按任务 ID
-//!    建 `<root>/<task>` 并展开 args 里的 `{workspace}` / `{task}`；任务 ID 含
-//!    路径分隔符或为 `.`/`..` 时直接回 `Failed`，不落盘；
+//!    建 `<root>[/<scope>]/<task>` 并展开 args 里的 `{workspace}` / `{task}`；任务
+//!    ID 含路径分隔符或为 `.`/`..` 时直接回 `Failed`，不落盘；
 //! 8. **取消传播**：`POST /cancel`（origin 上的固定路径）+ `X-Trit-Idempotency`
 //!    按幂等键置位在途请求；等待账本、`sleep_ms` 与执行前都会检查，Exec 用可
 //!    取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
@@ -44,7 +44,7 @@ use trit_orch::{
 };
 
 use crate::remote_ledger::{self, Claim};
-use crate::remote_subagent::CANCEL_PATH;
+use crate::remote_subagent::{CANCEL_PATH, idempotency_scope};
 use crate::subagent_process::{
     SubagentProcessConfig, run_subagent_reply, run_subagent_reply_cancellable,
 };
@@ -448,13 +448,16 @@ fn handle(
         Ok(None) | Err(_) => return respond(&mut stream, 400, "Bad Request", b""),
     };
 
-    // 幂等键必须与帧里的 task@epoch 一致；只有带键的请求才去重。
-    let key = format!("{}@{}", request.task, request.epoch);
-    let dedupe = match idempotency.as_deref() {
-        None => false,
-        Some(value) if value == key => true,
-        Some(_) => return respond(&mut stream, 400, "Bad Request", b""),
+    // 幂等键必须与帧里的 task@epoch 一致；可选 `<scope>|` 前缀用于隔离不同计划。
+    let frame_key = format!("{}@{}", request.task, request.epoch);
+    let (key, scope) = match idempotency.as_deref() {
+        None => (frame_key, None),
+        Some(value) => match idempotency_scope(value, &request.task, request.epoch) {
+            Ok(scope) => (value.to_string(), scope.map(str::to_string)),
+            Err(_) => return respond(&mut stream, 400, "Bad Request", b""),
+        },
     };
+    let dedupe = idempotency.is_some();
     let _cancel_scope = dedupe.then(|| cancels.scope(&key));
     let token = _cancel_scope.as_ref().map(|scope| scope.token());
     let mut ledger_owned = false;
@@ -517,7 +520,12 @@ fn handle(
                 let Some(exec) = config.exec.as_ref() else {
                     return respond(&mut stream, 500, "Internal Server Error", b"");
                 };
-                match exec_for_request(exec, config.exec_workspace_root.as_deref(), &request.task) {
+                match exec_for_request(
+                    exec,
+                    config.exec_workspace_root.as_deref(),
+                    &request.task,
+                    scope.as_deref(),
+                ) {
                     Ok(exec) => {
                         let reply = match token {
                             Some(token) => run_subagent_reply_cancellable(&exec, &request, token),
@@ -571,10 +579,12 @@ fn handle(
 }
 
 /// 把 `{task}` / `{workspace}` 占位符按请求展开；配了 workspace 根时先建目录。
+/// 有计划作用域时目录为 `<root>/<scope>/<task>`，否则保持 `<root>/<task>`。
 fn exec_for_request(
     config: &SubagentProcessConfig,
     workspace_root: Option<&Path>,
     task: &str,
+    scope: Option<&str>,
 ) -> Result<SubagentProcessConfig, String> {
     let uses_task = config.args.iter().any(|arg| arg.contains("{task}"));
     let uses_workspace = config.args.iter().any(|arg| arg.contains("{workspace}"));
@@ -582,7 +592,15 @@ fn exec_for_request(
         return Ok(config.clone());
     }
     let component = safe_task_component(task)?;
-    let workspace = workspace_root.map(|root| root.join(&component));
+    let scope_component = scope.map(safe_scope_component).transpose()?;
+    let workspace = workspace_root.map(|root| {
+        let mut path = root.to_path_buf();
+        if let Some(scope) = scope_component.as_deref() {
+            path.push(scope);
+        }
+        path.push(&component);
+        path
+    });
     if uses_workspace && workspace.is_none() {
         return Err("exec args use {workspace} but no workspace root is configured".into());
     }
@@ -622,6 +640,18 @@ fn safe_task_component(task: &str) -> Result<String, String> {
         ));
     }
     Ok(task.to_string())
+}
+
+/// 校验从幂等键里解析出的计划作用域，作为路径段使用。
+fn safe_scope_component(scope: &str) -> Result<String, String> {
+    if scope.len() > crate::remote_subagent::MAX_IDEMPOTENCY_SCOPE_LEN
+        || !crate::remote_subagent::is_safe_namespace_component(scope)
+    {
+        return Err(format!(
+            "idempotency scope {scope:?} is not a safe workspace directory"
+        ));
+    }
+    Ok(scope.to_string())
 }
 
 /// 分片睡眠，取消置位时立即返回 `true`。

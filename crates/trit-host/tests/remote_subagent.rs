@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use trit_host::{
     FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteServer, RemoteServerConfig,
-    run_remote_subagent, run_remote_subagent_reply_cancellable,
+    run_remote_subagent, run_remote_subagent_reply_cancellable, run_remote_subagent_reply_scoped,
 };
 use trit_orch::{
     AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint,
@@ -525,6 +525,58 @@ fn echo_server_rejects_mismatched_idempotency_key() {
         "unexpected response: {response}"
     );
     handle.join().unwrap();
+}
+
+#[test]
+fn scoped_idempotency_isolates_plans_and_dedupes_within_scope() {
+    // 不同计划即使 task@epoch 相同，也必须各自执行；同计划的重复请求才命中缓存。
+    let server =
+        RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_sleep_ms(500)).unwrap();
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+    let endpoint = endpoint(&url, None, 30);
+    let request = request();
+
+    let started = Instant::now();
+    let first = run_remote_subagent_reply_scoped(&endpoint, &request, Some("plan-a")).unwrap();
+    assert!(first.result.reusable(), "{:?}", first.result.status);
+    assert!(
+        started.elapsed() >= Duration::from_millis(450),
+        "first plan-a request should execute"
+    );
+
+    let started = Instant::now();
+    let other = run_remote_subagent_reply_scoped(&endpoint, &request, Some("plan-b")).unwrap();
+    assert!(other.result.reusable(), "{:?}", other.result.status);
+    assert!(
+        started.elapsed() >= Duration::from_millis(450),
+        "same task in another scope must not reuse plan-a's cached response"
+    );
+
+    let started = Instant::now();
+    let repeat = run_remote_subagent_reply_scoped(&endpoint, &request, Some("plan-a")).unwrap();
+    assert!(repeat.result.reusable(), "{:?}", repeat.result.status);
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "same scope must hit the cached response"
+    );
+    assert_eq!(repeat.result.reference(), first.result.reference());
+    handle.join().unwrap();
+}
+
+#[test]
+fn unsafe_idempotency_scope_is_rejected_before_network() {
+    let endpoint = endpoint("http://127.0.0.1:9/run", None, 1);
+    let error =
+        run_remote_subagent_reply_scoped(&endpoint, &request(), Some("../escape")).unwrap_err();
+    assert!(
+        error.to_string().contains("not a safe namespace"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

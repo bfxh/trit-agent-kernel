@@ -2,7 +2,8 @@
 //!
 //! 协议（HTTP/1.1，一连接一请求，路径固定 `/claim` 与 `/complete`）：
 //!
-//! - `POST /claim`，头 `X-Trit-Idempotency: <task>@<epoch>`：
+//! - `POST /claim`，头 `X-Trit-Idempotency: <task>@<epoch>` 或
+//!   `<scope>|<task>@<epoch>`：
 //!   - `200` + 空体：调用方获得执行权（[`Claim::New`]）；
 //!   - `200` + 一帧：已有完成响应（[`Claim::Done`]），直接复用；
 //!   - `409`：另一执行者持有该键（[`Claim::Pending`]）；
@@ -26,6 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
+
+use crate::remote_subagent::idempotency_scope;
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -269,7 +272,7 @@ fn handle(
                 Ok(Some(response)) => response,
                 _ => return respond(&mut stream, 400, "Bad Request", b""),
             };
-            if format!("{}@{}", response.task, response.epoch) != key {
+            if idempotency_scope(&key, &response.task, response.epoch).is_err() {
                 return respond(&mut stream, 400, "Bad Request", b"");
             }
             let frame = match encode_frame(&response) {
@@ -409,7 +412,7 @@ fn load_entries(path: &Path, max_entries: usize) -> std::io::Result<BTreeMap<Str
                 )));
             }
         };
-        if format!("{}@{}", response.task, response.epoch) != record.key {
+        if idempotency_scope(&record.key, &response.task, response.epoch).is_err() {
             return Err(invalid_data(format!(
                 "{}: stored frame does not match key {}",
                 path.display(),

@@ -236,6 +236,42 @@ fn completed_records_survive_restart() {
 }
 
 #[test]
+fn scoped_ledger_keys_isolate_plans() {
+    let ledger = Arc::new(LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0")).unwrap());
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"scoped".to_vec(),
+        tokens: 0,
+    })
+    .unwrap();
+
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "plan-a|t1@0").unwrap(),
+        Claim::New
+    );
+    remote_ledger::complete(&ledger_endpoint, "plan-a|t1@0", &frame).unwrap();
+    assert!(matches!(
+        remote_ledger::claim(&ledger_endpoint, "plan-a|t1@0").unwrap(),
+        Claim::Done(_)
+    ));
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "plan-b|t1@0").unwrap(),
+        Claim::New,
+        "same task in another scope must not see plan-a's completion"
+    );
+    assert!(
+        remote_ledger::complete(&ledger_endpoint, "plan-a|t2@0", &frame).is_err(),
+        "complete must still verify the task@epoch suffix"
+    );
+}
+
+#[test]
 fn unreachable_ledger_fails_closed_without_executing() {
     let dead_port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

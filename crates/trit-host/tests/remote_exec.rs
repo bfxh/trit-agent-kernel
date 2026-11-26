@@ -4,7 +4,9 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use trit_host::{RemotePlanConfig, run_remote_plan, run_remote_subagent};
+use trit_host::{
+    RemotePlanConfig, run_remote_plan, run_remote_subagent, run_remote_subagent_reply_scoped,
+};
 use trit_orch::{
     AccessMode, CancelToken, CapsuleEntry, ContextCapsule, Plan, RemoteEndpoint, RemoteNode,
     SubagentProfile, SubagentRequest, Task, TaskSpec,
@@ -167,6 +169,39 @@ fn remote_exec_isolates_workspace_per_task() {
 
     let mut node = node;
     assert!(node.child.wait().unwrap().success());
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&scripts);
+}
+
+#[test]
+fn per_task_workspace_separates_plan_scopes() {
+    let root = temp_dir("root-scope");
+    let scripts = temp_dir("scripts-scope");
+    let base = script(&scripts);
+    std::fs::copy(&base, scripts.join("t1.json")).unwrap();
+    let mut node = spawn_task_exec(&root, &scripts.join("{task}.json"), false);
+    let endpoint = RemoteEndpoint {
+        url: format!("{}/run", node.base),
+        auth_token: None,
+        timeout_secs: 30,
+    };
+    for scope in ["plan-a", "plan-b"] {
+        let reply =
+            run_remote_subagent_reply_scoped(&endpoint, &request_for(&task("t1")), Some(scope))
+                .unwrap();
+        assert!(reply.result.reusable(), "{:?}", reply.result.status);
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("plan-a").join("t1").join("a.txt")).unwrap(),
+        "hello-remote"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("plan-b").join("t1").join("a.txt")).unwrap(),
+        "hello-remote"
+    );
+
+    node.child.kill().unwrap();
+    assert!(node.child.wait().is_ok());
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&scripts);
 }

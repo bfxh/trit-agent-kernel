@@ -1082,9 +1082,11 @@ pub use remote_fleet::{
 pub use remote_ledger::{Claim, LedgerServer, LedgerServerConfig};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
 pub use remote_subagent::{
-    CANCEL_PATH, FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteReply,
-    cancel_remote_subagent, run_remote_subagent, run_remote_subagent_reply,
-    run_remote_subagent_reply_cancellable,
+    CANCEL_PATH, FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, IDEMPOTENCY_SCOPE_SEPARATOR,
+    MAX_IDEMPOTENCY_SCOPE_LEN, MAX_RESPONSE_BYTES, RemoteReply, cancel_remote_subagent,
+    idempotency_key, idempotency_scope, run_remote_subagent, run_remote_subagent_reply,
+    run_remote_subagent_reply_cancellable, run_remote_subagent_reply_cancellable_scoped,
+    run_remote_subagent_reply_scoped, validate_idempotency_scope,
 };
 pub use sampling::OpenAiSamplingHandler;
 pub use separation::{

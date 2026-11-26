@@ -86,6 +86,7 @@ fn remote_plan_cli_dispatches_across_nodes() {
         "workers": 2,
         "failure_threshold": 1,
         "retry_limit": 0,
+        "scope": "plan-main",
         "tasks": [task("t1"), task("t2"), task("t3")],
         "nodes": [node_json(&node_a, 1), node_json(&node_b, 1)],
     });
@@ -217,6 +218,29 @@ fn remote_plan_cli_persists_node_health() {
         .find(|node| node["id"] == "node-a")
         .unwrap();
     assert_eq!(bad_node["healthy"], false, "{report}");
+}
+
+#[test]
+fn remote_plan_cli_rejects_unsafe_scope() {
+    let node = spawn_node("node-a", &[]);
+    let input = serde_json::json!({
+        "revision": 1,
+        "scope": "../escape",
+        "tasks": [task("t1")],
+        "nodes": [node_json(&node, 1)],
+    });
+    let path = input_file("unsafe-scope", &input);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a safe namespace"), "{stderr}");
 }
 
 #[test]

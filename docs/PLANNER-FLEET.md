@@ -172,7 +172,7 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `subagent_protocol` 错误；
 - `run_remote_subagent`：`validate` → 编码单帧 → `POST`
   （`Content-Type: application/x-trit-frame`，可选 `Authorization: Bearer`，
-  幂等键 `X-Trit-Idempotency: <task>@<epoch>`）→
+  幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`）→
   有界读响应 → `validate_for` → `DelegationResult`；
 - 客户端**不跟随重定向**（3xx 直接记 `Failed`），单次调用**不自动重试**；传输
   失败/超时记 `Aborted`；非 2xx、空体、截断帧、超过 `MAX_RESPONSE_BYTES` 记
@@ -181,19 +181,23 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 - 参考服务端 `trit_host::remote_serve` 与 CLI `trit-host remote-echo`：一次
   连接一个 `POST`，`Content-Length` 有界（≤ 8 MiB + 4），可选 Bearer 校验，
   `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；带
-  `X-Trit-Idempotency` 且与帧一致时按 `<task>@<epoch>` 缓存首次响应（重试直接
-  回缓存、不再执行），缓存上限 1024、FIFO 淘汰；头与帧不一致回 400。启动先打印
+  `X-Trit-Idempotency` 且与帧的 `task@epoch` 后缀一致时，按完整键（可带
+  `<scope>|` 前缀）缓存首次响应（重试直接回缓存、不再执行），缓存上限 1024、
+  FIFO 淘汰；头与帧不一致回 400。不同计划用不同 scope 时互不回放。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口；
   `--max-connections` 默认 64，超额连接直接回 503、不再 spawn 线程。
   `RemoteMode::Exec` / `trit-host remote-exec (--workspace <dir> | --workspace-root <dir>) --script <json>`：
   每个请求 spawn 一个 `subagent-run` 子进程，请求帧走 stdin、响应帧走 stdout；
   只有子进程判定完成才回 `Completed`，进程错误按 `Failed` 回帧。权限仍由请求
   profile 与 workspace 决定（`ReadOnly` 拒绝写）。`--workspace-root` 按任务 ID
-  建 `<root>/<task>` 独立目录，`--script` 与 args 里的 `{task}`/`{workspace}`
-  按请求展开；任务 ID 只允许 ASCII 字母数字、`-`、`_`、`.`，含路径分隔符或为
-  `.`/`..` 时直接回 `Failed`、不创建目录。
+  建 `<root>/<task>` 独立目录；请求键带 `scope` 时建 `<root>/<scope>/<task>`，
+  `--script` 与 args 里的 `{task}`/`{workspace}` 按请求展开；任务 ID 与 scope
+  只允许 ASCII 字母数字、`-`、`_`、`.`，含路径分隔符或为 `.`/`..` 时直接回
+  `Failed`、不创建目录。同一计划内任务 ID 仍需唯一；不同计划靠 scope 隔离。
 - 共享幂等账本 `trit_host::remote_ledger`（CLI `trit-host remote-ledger`）：
-  `POST /claim` + `POST /complete`，键仍是 `X-Trit-Idempotency: <task>@<epoch>`。
+  `POST /claim` + `POST /complete`，键是 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`；
+  complete 校验 `task@epoch` 后缀并保留 scope，因此同名任务在不同 scope 下各有
+  独立的 claim/完成记录。
   claim 返回 `200` 空体 = 获得执行权，`200` + 帧 = 已完成、直接回放，`409` = 他人
   持有；complete 用同一帧登记（`204`，重复登记幂等）。占位 TTL 默认 60s，过期
   允许接管；容量默认 4096，满时先淘汰已完成项。`--state <path>` 打开追加日志，
@@ -236,7 +240,7 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   - `nodes`：`attempts / failures / healthy` 快照。
 - **有界重试（默认 0，显式 opt-in）**：只有节点级失败（传输错误 / 超时 /
   `Aborted` / 远端回 `Deferred`）才换节点重试，最多 `retry_limit` 次；任务级
-  `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: <task>@<epoch>`。
+  `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
   未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（上限 1024，FIFO
   淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
   **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/complete，
@@ -254,10 +258,11 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   边界：对端未实现 `/cancel` 时，客户端仍会在 2s 后返回，但远端请求会继续到
   端点超时，可能已经写盘；`Aborted` 不等于“远端一定没执行”。
 - CLI `trit-host remote-plan [--input <json|->] [--health <path>]`：输入
-  `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?}`，把每个
+  `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?, scope?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
   含 `completed/failed/deferred/results/assignments/attempts/nodes/metrics` 的
-  JSON 报告；用于跨机演练与运维冒烟。远端可以是 `remote-exec`（真实执行
+  JSON 报告；`scope` 是计划命名空间，多个计划共享账本或 `--workspace-root`
+  时必须给出不同值，否则同名任务会共用 key 与目录。用于跨机演练与运维冒烟。远端可以是 `remote-exec`（真实执行
   `subagent-run`）或任何实现同一帧协议的服务端。`--health` 读取上一次的节点
   快照（`healthy/attempts/failures`），跳过已隔离节点，并在本次结束后原子写回；
   文件里已删除的节点 ID 会被忽略，未知/损坏文件按错误退出。健康状态没有自动
@@ -267,11 +272,12 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、快照恢复、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表）、
-`crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、取消慢请求）、
+`crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、scope 隔离与
+非法 scope 拒绝、取消慢请求）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
-文件跨运行隔离与重复节点 ID 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
-（共享账本下双节点单次执行）。
+文件跨运行隔离、重复节点 ID 与非法 scope 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
+（共享账本下双节点单次执行、scope 隔离）。
 
 ## 非目标
 

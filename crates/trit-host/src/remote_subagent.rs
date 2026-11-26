@@ -32,11 +32,72 @@ use crate::AgentError;
 /// 远程端点交换的帧媒体类型；请求与响应都用它。
 pub const FRAME_CONTENT_TYPE: &str = "application/x-trit-frame";
 
-/// 幂等键头：值是 `"<task>@<epoch>"`。
+/// 幂等键头：值是 `"<task>@<epoch>"`，配了计划作用域时是
+/// `"<scope>|<task>@<epoch>"`。
 ///
 /// 跨机重试必须复用同一个键；服务端可据此去重（参考实现 `remote-echo` 会缓存
-/// 首次响应）。没有这个头时服务端按普通请求处理，不去重。
+/// 首次响应）。没有这个头时服务端按普通请求处理，不去重。不同计划即使任务 ID
+/// 相同，也通过 `scope` 隔离，避免账本/缓存互相回放。
 pub const IDEMPOTENCY_HEADER: &str = "X-Trit-Idempotency";
+
+/// 计划作用域与帧键之间的分隔符；作用域本身不允许包含它。
+pub const IDEMPOTENCY_SCOPE_SEPARATOR: char = '|';
+
+/// 计划作用域的最大字节数（只允许 ASCII，因此等于字符数）。
+pub const MAX_IDEMPOTENCY_SCOPE_LEN: usize = 128;
+
+/// 判断值能否作为单段命名空间目录（作用域、任务 ID）。
+pub(crate) fn is_safe_namespace_component(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+/// 校验计划作用域：非空、长度有界、只含安全字符、不是 `.`/`..`。
+pub fn validate_idempotency_scope(scope: &str) -> Result<(), AgentError> {
+    if scope.len() > MAX_IDEMPOTENCY_SCOPE_LEN || !is_safe_namespace_component(scope) {
+        return Err(AgentError::Kernel(trit_orch::Error::SubagentProtocol {
+            message: format!("idempotency scope {scope:?} is not a safe namespace"),
+        }));
+    }
+    Ok(())
+}
+
+/// 组装幂等键：`scope|task@epoch`，无作用域时保持旧的 `task@epoch`。
+pub fn idempotency_key(scope: Option<&str>, task: &str, epoch: u64) -> String {
+    match scope {
+        Some(scope) => format!("{scope}{IDEMPOTENCY_SCOPE_SEPARATOR}{task}@{epoch}"),
+        None => format!("{task}@{epoch}"),
+    }
+}
+
+/// 从请求头里的键还原计划作用域，并校验 `task@epoch` 后缀。
+pub fn idempotency_scope<'a>(
+    key: &'a str,
+    task: &str,
+    epoch: u64,
+) -> Result<Option<&'a str>, AgentError> {
+    let frame_key = format!("{task}@{epoch}");
+    if key == frame_key {
+        return Ok(None);
+    }
+    let Some((scope, rest)) = key.split_once(IDEMPOTENCY_SCOPE_SEPARATOR) else {
+        return Err(AgentError::Kernel(trit_orch::Error::SubagentProtocol {
+            message: "idempotency key does not match task@epoch".into(),
+        }));
+    };
+    if rest != frame_key
+        || scope.len() > MAX_IDEMPOTENCY_SCOPE_LEN
+        || !is_safe_namespace_component(scope)
+    {
+        return Err(AgentError::Kernel(trit_orch::Error::SubagentProtocol {
+            message: "idempotency key does not match task@epoch".into(),
+        }));
+    }
+    Ok(Some(scope))
+}
 
 /// 响应体硬上限：单帧上限加 4 字节长度前缀。
 pub const MAX_RESPONSE_BYTES: usize = MAX_FRAME_BYTES + 4;
@@ -72,6 +133,18 @@ pub fn run_remote_subagent_reply(
     endpoint: &RemoteEndpoint,
     request: &SubagentRequest,
 ) -> Result<RemoteReply, AgentError> {
+    run_remote_subagent_reply_scoped(endpoint, request, None)
+}
+
+/// 带计划作用域的 [`run_remote_subagent_reply`]：幂等键变为 `scope|task@epoch`。
+pub fn run_remote_subagent_reply_scoped(
+    endpoint: &RemoteEndpoint,
+    request: &SubagentRequest,
+    scope: Option<&str>,
+) -> Result<RemoteReply, AgentError> {
+    if let Some(scope) = scope {
+        validate_idempotency_scope(scope)?;
+    }
     endpoint.validate()?;
     let frame = encode_frame(request)?;
 
@@ -86,7 +159,7 @@ pub fn run_remote_subagent_reply(
         // 重试必须复用同一个幂等键；服务端据此去重。
         .set(
             IDEMPOTENCY_HEADER,
-            &format!("{}@{}", request.task, request.epoch),
+            &idempotency_key(scope, request.task.as_str(), request.epoch),
         );
     if let Some(token) = endpoint.auth_token.as_deref() {
         call = call.set("Authorization", &format!("Bearer {token}"));
@@ -180,16 +253,33 @@ pub fn run_remote_subagent_reply_cancellable(
     request: &SubagentRequest,
     cancel: &trit_orch::CancelToken,
 ) -> Result<RemoteReply, AgentError> {
+    run_remote_subagent_reply_cancellable_scoped(endpoint, request, cancel, None)
+}
+
+/// 带计划作用域的 [`run_remote_subagent_reply_cancellable`]；取消请求复用同一个
+/// `scope|task@epoch` 键。
+pub fn run_remote_subagent_reply_cancellable_scoped(
+    endpoint: &RemoteEndpoint,
+    request: &SubagentRequest,
+    cancel: &trit_orch::CancelToken,
+    scope: Option<&str>,
+) -> Result<RemoteReply, AgentError> {
+    if let Some(scope) = scope {
+        validate_idempotency_scope(scope)?;
+    }
     if cancel.is_cancelled() {
         return Ok(unresolved_reply(request, DelegationStatus::Aborted));
     }
+    let key = idempotency_key(scope, request.task.as_str(), request.epoch);
     let endpoint_for_call = endpoint.clone();
     let request_for_call = request.clone();
+    let scope_for_call = scope.map(str::to_string);
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = sender.send(run_remote_subagent_reply(
+        let _ = sender.send(run_remote_subagent_reply_scoped(
             &endpoint_for_call,
             &request_for_call,
+            scope_for_call.as_deref(),
         ));
     });
 
@@ -209,7 +299,6 @@ pub fn run_remote_subagent_reply_cancellable(
         }
     }
 
-    let key = format!("{}@{}", request.task, request.epoch);
     // 取消是 best-effort：通知失败也要按 Aborted 返回，不能让调用方卡住。
     let _ = cancel_remote_subagent(endpoint, &key);
     match receiver.recv_timeout(CLIENT_CANCEL_GRACE) {
