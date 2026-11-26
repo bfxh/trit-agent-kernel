@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -237,6 +238,90 @@ fn library_preflight_probes_isolated_nodes_with_bounded_concurrency() {
     for handle in handles.drain(..) {
         handle.join().unwrap();
     }
+}
+
+#[test]
+fn library_preflight_readmits_a_recovered_node_before_the_slowest_probe() {
+    let (fast, fast_handle) = delayed_health_node("fast", Duration::from_millis(50));
+    let (slow, slow_handle) = delayed_health_node("slow", Duration::from_millis(600));
+    let snapshot = |id: &str| NodeSnapshot {
+        id: id.into(),
+        healthy: false,
+        in_flight: 0,
+        attempts: 1,
+        failures: 1,
+    };
+    let table = Arc::new(
+        NodeTable::new(vec![fast, slow])
+            .unwrap()
+            .with_snapshots(&[snapshot("fast"), snapshot("slow")]),
+    );
+
+    let started = Instant::now();
+    let observed = Arc::new(Mutex::new(None::<u64>));
+    let stop = Arc::new(AtomicBool::new(false));
+    let poller = {
+        let table = Arc::clone(&table);
+        let observed = Arc::clone(&observed);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let snapshots = table.snapshot();
+                if let Some(fast) = snapshots.iter().find(|snapshot| snapshot.id == "fast")
+                    && fast.healthy
+                {
+                    let mut slot = observed.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(started.elapsed().as_millis() as u64);
+                    }
+                }
+                if snapshots.iter().all(|snapshot| snapshot.healthy) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+
+    let outcome = run_remote_plan_with_table(
+        &plan(vec![]),
+        Arc::clone(&table),
+        RemotePlanConfig::new(2)
+            .with_health_probe_on_start()
+            .with_health_probe_concurrency(2),
+        CancelToken::new(),
+        request_for,
+    );
+    stop.store(true, Ordering::Relaxed);
+    poller.join().unwrap();
+    let report = outcome.unwrap();
+
+    let fast_observed = observed
+        .lock()
+        .unwrap()
+        .expect("poll should observe the fast node recover");
+    assert!(
+        fast_observed < 300,
+        "fast node should be readmitted at ~50ms, but was observed at {fast_observed}ms; \
+         slow probe must not hold the whole scan"
+    );
+    assert_eq!(report.probes.len(), 2, "{:?}", report.probes);
+    let event_nodes: Vec<&str> = report
+        .probes
+        .iter()
+        .map(|probe| probe.node.as_str())
+        .collect();
+    assert_eq!(event_nodes, ["fast", "slow"], "事件仍按 id 升序");
+    assert!(
+        report
+            .probes
+            .iter()
+            .all(|probe| probe.ok && probe.readmitted),
+        "{:?}",
+        report.probes
+    );
+    fast_handle.join().unwrap();
+    slow_handle.join().unwrap();
 }
 
 #[test]

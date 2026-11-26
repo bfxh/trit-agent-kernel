@@ -25,8 +25,9 @@
 //! - 健康恢复由本层配置：`health_probe_on_start` 在派发前探测一次，
 //!   `health_probe_interval` 在派发期间周期探测；只探已隔离节点，`GET /health`
 //!   成功才调用 [`NodeTable::readmit`] 放行。`health_probe_concurrency` 控制一次
-//!   扫描内的并行上限（默认串行），事件仍按节点 id 升序写入
-//!   [`RemotePlanReport::probes`]，最多保留 1024 条；周期监控随本次派发结束而退出。
+//!   扫描内的并行上限（默认串行），单个节点成功即放行、不等其余探测返回；事件
+//!   仍按节点 id 升序写入 [`RemotePlanReport::probes`]，最多保留 1024 条；周期
+//!   监控随本次派发结束而退出。
 //!   跨运行的常驻恢复由 [`probe_remote_health_file`] + `trit-host remote-health`
 //!   承担：它独立读写节点健康文件，不依赖某个演练进程一直活着；CLI 每轮重读
 //!   节点表，并在 `<health>.lock` 上持单实例 OS 锁。
@@ -775,9 +776,9 @@ fn write_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentErr
 
 /// 探测当前所有已隔离节点；成功才放行，失败保持隔离并记录原因。
 ///
-/// 一次扫描内最多 `concurrency` 个探测并行；探测结果全部返回后再按节点 id
-/// 升序统一 readmit、写事件，避免并发回填打乱报告顺序。节点数少于并发上限时
-/// 只起相应数量的线程。
+/// 一次扫描内最多 `concurrency` 个探测并行；每个节点探测成功后立即 readmit，
+/// 不必等最慢的探测返回。事件先按本轮节点 id 升序整理，再追加到 `probes`，
+/// 保证报告顺序确定。节点数少于并发上限时只起相应数量的线程。
 fn probe_isolated_nodes(
     table: &NodeTable,
     probes: &Mutex<Vec<RemoteProbeEvent>>,
@@ -795,7 +796,7 @@ fn probe_isolated_nodes(
         return;
     }
 
-    let outcomes = Mutex::new(vec![None; targets.len()]);
+    let events = Mutex::new(Vec::with_capacity(targets.len()));
     let next = AtomicUsize::new(0);
     let workers = concurrency
         .clamp(1, MAX_HEALTH_PROBE_CONCURRENCY)
@@ -808,43 +809,35 @@ fn probe_isolated_nodes(
                     let Some(node) = targets.get(index) else {
                         break;
                     };
-                    let outcome = probe_remote_health(&node.endpoint);
-                    outcomes
+                    let event = match probe_remote_health(&node.endpoint) {
+                        Ok(()) => RemoteProbeEvent {
+                            node: node.id.clone(),
+                            phase,
+                            ok: true,
+                            readmitted: table.readmit(&node.id),
+                            error: None,
+                        },
+                        Err(error) => RemoteProbeEvent {
+                            node: node.id.clone(),
+                            phase,
+                            ok: false,
+                            readmitted: false,
+                            error: Some(error),
+                        },
+                    };
+                    events
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(outcome);
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(event);
                 }
             });
         }
     });
-    let outcomes = outcomes
+    let mut events = events
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    events.sort_by(|left, right| left.node.cmp(&right.node));
 
-    let mut events = Vec::new();
-    for (node, outcome) in targets.into_iter().zip(outcomes) {
-        let Some(outcome) = outcome else {
-            continue;
-        };
-        match outcome {
-            Ok(()) => {
-                let readmitted = table.readmit(&node.id);
-                events.push(RemoteProbeEvent {
-                    node: node.id,
-                    phase,
-                    ok: true,
-                    readmitted,
-                    error: None,
-                });
-            }
-            Err(error) => events.push(RemoteProbeEvent {
-                node: node.id,
-                phase,
-                ok: false,
-                readmitted: false,
-                error: Some(error),
-            }),
-        }
-    }
     let mut guard = probes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

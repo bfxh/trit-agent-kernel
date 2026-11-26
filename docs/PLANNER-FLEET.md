@@ -342,8 +342,9 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `NodeTable::readmit` 并唤醒等待容量的任务，失败保持隔离；事件带
   `phase: periodic` 写入 `probes`，最多保留 1024 条。`--probe-concurrency N`
   （需配 `--probe` 或 `--probe-interval-ms`，取值 1..=64）把一次 preflight/周期
-  扫描内的已隔离节点探测并行化：只并行 `GET /health`，全部结果返回后按节点 id
-  升序统一 readmit 并记录事件；未指定时沿用库级默认串行。这两项能力已下沉到库级：
+  扫描内的已隔离节点探测并行化：只并行 `GET /health`，单个节点探测成功即
+  `readmit` 放行、不必等最慢的探测返回；事件按本轮节点 id 升序整理后追加；
+  未指定时沿用库级默认串行。这两项能力已下沉到库级：
   `RemotePlanConfig::with_health_probe_on_start` / `with_health_probe_interval`
   / `with_health_probe_concurrency`
   让 `run_remote_plan_with_table` 自己探测并把 `RemoteProbeEvent` 写入
@@ -378,7 +379,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 快照恢复、显式 `readmit`、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表、库级
-preflight 探测重新放行隔离节点并返回 `probes`、preflight 有界并发探测且事件有序）、
+preflight 探测重新放行隔离节点并返回 `probes`、preflight 有界并发探测且事件有序、
+单节点恢复即放行不被最慢探测阻塞）、
 `crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、同键并发只执行
 一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程、stdout 超帧上限有界拒绝）、
