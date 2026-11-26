@@ -1,20 +1,24 @@
 //! 共享幂等账本：让多台远端在同一个 `task@epoch` 上达成至多一次执行。
 //!
-//! 协议（HTTP/1.1，一连接一请求，路径固定 `/claim` 与 `/complete`）：
+//! 协议（HTTP/1.1，一连接一请求，路径固定 `/claim`、`/renew` 与 `/complete`）：
 //!
 //! - `POST /claim`，头 `X-Trit-Idempotency: <task>@<epoch>` 或
 //!   `<scope>|<task>@<epoch>`：
-//!   - `200` + 空体：调用方获得执行权（[`Claim::New`]）；
+//!   - `200` + 空体 + `X-Trit-Lease`：调用方获得执行权（[`Claim::New`]），租约令牌
+//!     必须用于后续 `/renew` 与 `/complete`；
 //!   - `200` + 一帧：已有完成响应（[`Claim::Done`]），直接复用；
 //!   - `409`：另一执行者持有该键（[`Claim::Pending`]）；
 //!   - `503`：账本已满或内部错误。
-//! - `POST /complete`，同一个头 + 一帧响应：登记完成；`204` 接受（重复完成幂等）。
-//! - `POST /renew`，同一个头、空体：把该键的占位租约重置为当前时间，`204`；
-//!   已完成返回 `204`，未知键返回 `404`。用于执行时间超过 `pending_ttl` 的任务，
-//!   避免另一个节点误判过期而并发执行。
+//! - `POST /complete`，同一个头 + `X-Trit-Lease` + 一帧响应：登记完成；`204`
+//!   接受（已完成后重复登记为幂等 no-op，不覆盖原帧）；租约已失效或键未由该
+//!   令牌 claim 时 `403`。
+//! - `POST /renew`，同一个头 + `X-Trit-Lease`、空体：把该键的占位租约重置为
+//!   当前时间，`204`；已完成返回 `204`，未知键 `404`，令牌不匹配 `403`。用于
+//!   执行时间超过 `pending_ttl` 的任务，避免另一个节点误判过期而并发执行。
 //!
 //! 占位有 TTL（默认 60s）：执行者崩溃后，过期占位可以被接管。账本只保存响应帧，
-//! 不执行任务；它是跨机重试的协调点，不是任务队列。
+//! 不执行任务；它是跨机重试的协调点，不是任务队列。租约令牌是随机生成的持有者
+//! 凭证，不是加密身份：传输仍应放在 loopback 或可信内网，并配置 bearer token。
 //!
 //! 容量有键数与字节双重上限（默认 4096 / 64 MiB）：超出时按 key 顺序淘汰已完成
 //! 项。落盘每行是十六进制 JSONL，物理文件到逻辑上限的 1.5 倍时压缩为当前内存
@@ -22,16 +26,18 @@
 //!
 //! 安全边界：账本默认只应绑定 loopback 或置于内网；配置 token 后所有请求都要
 //! `Authorization: Bearer <token>`。账本不校验任务内容，只校验 `complete` 的帧
-//! 与幂等键一致。
+//! 与幂等键一致，并要求 `/renew`、`/complete` 携带当前持有者的租约令牌。
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::OpenOptions;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
 
@@ -54,6 +60,14 @@ const MAX_LEDGER_BODY: usize = MAX_FRAME_BYTES + 4;
 
 /// 状态文件单行上限：帧的十六进制编码再留 key 与 JSON 转义空间。
 const MAX_STATE_LINE_BYTES: usize = MAX_LEDGER_BODY * 2 + 16 * 1024;
+
+/// 租约持有者令牌头：`/claim` 成功时返回，`/renew` 与 `/complete` 必须携带。
+const LEASE_HEADER: &str = "X-Trit-Lease";
+
+/// 租约令牌长度上限；正常令牌是 16 位十六进制。
+const MAX_LEASE_LEN: usize = 128;
+
+static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 账本服务端配置。
 #[derive(Debug, Clone)]
@@ -112,8 +126,8 @@ impl LedgerServerConfig {
 /// 一次 claim 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
-    /// 获得执行权；执行完成后必须调用 [`complete`]。
-    New,
+    /// 获得执行权；`lease` 必须用于后续 [`renew`] 与 [`complete`]。
+    New { lease: String },
     /// 另一个执行者正在执行；稍后重试 claim。
     Pending,
     /// 已经有完成响应，直接回放这一帧。
@@ -121,8 +135,30 @@ pub enum Claim {
 }
 
 enum Entry {
-    Pending { since: Instant },
+    Pending { since: Instant, lease: String },
     Done { frame: Vec<u8> },
+}
+
+/// 生成新的随机持有者令牌；时间 + 随机哈希种子 + 进程内序号，避免不同 claim 重复。
+fn fresh_lease() -> String {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    hasher.write_u64(LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    format!("{:016x}", hasher.finish())
+}
+
+/// 令牌必须是有限长的安全 ASCII；拒绝空值、控制字符、冒号与超长头。
+fn valid_lease(lease: &str) -> bool {
+    !lease.is_empty()
+        && lease.len() <= MAX_LEASE_LEN
+        && lease
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 #[derive(Default)]
@@ -249,6 +285,7 @@ fn handle(
     let mut content_length = 0usize;
     let mut authorization: Option<String> = None;
     let mut idempotency: Option<String> = None;
+    let mut lease_header: Option<String> = None;
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -268,6 +305,7 @@ fn handle(
             },
             "authorization" => authorization = Some(value.to_string()),
             "x-trit-idempotency" => idempotency = Some(value.to_string()),
+            "x-trit-lease" => lease_header = Some(value.to_string()),
             _ => {}
         }
     }
@@ -297,11 +335,15 @@ fn handle(
             if !body.is_empty() {
                 return respond(&mut stream, 400, "Bad Request", b"");
             }
+            let Some(lease) = lease_header.as_deref().filter(|lease| valid_lease(lease)) else {
+                return respond(&mut stream, 400, "Bad Request", b"");
+            };
             let server = LedgerServerView { state, config };
-            match server.renew(&key) {
+            match server.renew(&key, lease) {
                 Ok(RenewOutcome::Renewed | RenewOutcome::AlreadyDone) => {
                     respond(&mut stream, 204, "No Content", b"")
                 }
+                Ok(RenewOutcome::NotOwner) => respond(&mut stream, 403, "Forbidden", b""),
                 Ok(RenewOutcome::Unknown) => respond(&mut stream, 404, "Not Found", b""),
                 Err(()) => respond(&mut stream, 503, "Service Unavailable", b""),
             }
@@ -309,13 +351,16 @@ fn handle(
         "/claim" => {
             let server = LedgerServerView { state, config };
             match server.claim(&key) {
-                Ok(Claim::New) => respond(&mut stream, 200, "OK", b""),
+                Ok(Claim::New { lease }) => respond_with_lease(&mut stream, 200, "OK", b"", &lease),
                 Ok(Claim::Pending) => respond(&mut stream, 409, "Conflict", b""),
                 Ok(Claim::Done(frame)) => respond(&mut stream, 200, "OK", &frame),
                 Err(()) => respond(&mut stream, 503, "Service Unavailable", b""),
             }
         }
         "/complete" => {
+            let Some(lease) = lease_header.as_deref().filter(|lease| valid_lease(lease)) else {
+                return respond(&mut stream, 400, "Bad Request", b"");
+            };
             let mut buffer = body;
             let response: SubagentResponse = match decode_frame(&mut buffer) {
                 Ok(Some(response)) => response,
@@ -329,11 +374,13 @@ fn handle(
                 Err(_) => return respond(&mut stream, 400, "Bad Request", b""),
             };
             let view = LedgerServerView { state, config };
-            if view.complete(&key, frame) {
-                completions.fetch_add(1, Ordering::SeqCst);
-                respond(&mut stream, 204, "No Content", b"")
-            } else {
-                respond(&mut stream, 503, "Service Unavailable", b"")
+            match view.complete(&key, lease, frame) {
+                Ok(CompleteOutcome::Completed) => {
+                    completions.fetch_add(1, Ordering::SeqCst);
+                    respond(&mut stream, 204, "No Content", b"")
+                }
+                Ok(CompleteOutcome::NotOwner) => respond(&mut stream, 403, "Forbidden", b""),
+                Err(()) => respond(&mut stream, 503, "Service Unavailable", b""),
             }
         }
         _ => respond(&mut stream, 404, "Not Found", b""),
@@ -349,16 +396,28 @@ struct LedgerServerView<'a> {
 enum RenewOutcome {
     Renewed,
     AlreadyDone,
+    NotOwner,
     Unknown,
 }
 
+enum CompleteOutcome {
+    Completed,
+    NotOwner,
+}
+
 impl LedgerServerView<'_> {
-    /// 延长占位租约；已完成视为成功，未知键返回 404。
-    fn renew(&self, key: &str) -> Result<RenewOutcome, ()> {
+    /// 延长占位租约；已完成视为成功，未知键返回 404，非持有者返回 403。
+    fn renew(&self, key: &str, lease: &str) -> Result<RenewOutcome, ()> {
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| ())?;
         match state.entries.get_mut(key) {
-            Some(Entry::Pending { since }) => {
+            Some(Entry::Pending {
+                since,
+                lease: owner,
+            }) => {
+                if owner != lease {
+                    return Ok(RenewOutcome::NotOwner);
+                }
                 *since = now;
                 Ok(RenewOutcome::Renewed)
             }
@@ -373,14 +432,17 @@ impl LedgerServerView<'_> {
         if let Some(entry) = state.entries.get_mut(key) {
             match entry {
                 Entry::Done { frame } => return Ok(Claim::Done(frame.clone())),
-                Entry::Pending { since }
+                Entry::Pending { since, .. }
                     if now.duration_since(*since) < self.config.pending_ttl =>
                 {
                     return Ok(Claim::Pending);
                 }
-                Entry::Pending { since } => {
+                Entry::Pending { since, lease } => {
                     *since = now;
-                    return Ok(Claim::New);
+                    *lease = fresh_lease();
+                    return Ok(Claim::New {
+                        lease: lease.clone(),
+                    });
                 }
             }
         }
@@ -396,19 +458,27 @@ impl LedgerServerView<'_> {
                 None => return Err(()),
             }
         }
-        state
-            .entries
-            .insert(key.to_string(), Entry::Pending { since: now });
-        Ok(Claim::New)
+        let lease = fresh_lease();
+        state.entries.insert(
+            key.to_string(),
+            Entry::Pending {
+                since: now,
+                lease: lease.clone(),
+            },
+        );
+        Ok(Claim::New { lease })
     }
 
-    fn complete(&self, key: &str, frame: Vec<u8>) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        // 已完成过就不再重复落盘；重复 complete 视为幂等成功。
-        if matches!(state.entries.get(key), Some(Entry::Done { .. })) {
-            return true;
+    fn complete(&self, key: &str, lease: &str, frame: Vec<u8>) -> Result<CompleteOutcome, ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        // 已完成过就不再重复落盘；同一持有者重复 complete 视为幂等成功。
+        match state.entries.get(key) {
+            Some(Entry::Done { .. }) => return Ok(CompleteOutcome::Completed),
+            Some(Entry::Pending { lease: owner, .. }) if owner != lease => {
+                return Ok(CompleteOutcome::NotOwner);
+            }
+            Some(Entry::Pending { .. }) => {}
+            None => return Ok(CompleteOutcome::NotOwner),
         }
         let new_bytes = record_bytes(key, &frame);
         let Some(victims) = capacity_victims(
@@ -418,13 +488,13 @@ impl LedgerServerView<'_> {
             self.config.max_entries,
             self.config.max_state_bytes,
         ) else {
-            return false;
+            return Err(());
         };
         if let Some(path) = self.config.state_path.as_deref()
             && append_record(path, key, &frame).is_err()
         {
             // 写盘失败就不承认完成，调用方拿到 5xx。
-            return false;
+            return Err(());
         }
         for victim in &victims {
             if let Some(Entry::Done { frame }) = state.entries.remove(victim) {
@@ -436,17 +506,41 @@ impl LedgerServerView<'_> {
         if let Some(path) = self.config.state_path.as_deref() {
             compact_if_bloated(path, &state.entries, self.config.max_state_bytes);
         }
-        true
+        Ok(CompleteOutcome::Completed)
     }
 }
 
 fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> std::io::Result<()> {
+    write_response(stream, code, reason, &[], body)
+}
+
+fn respond_with_lease(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    body: &[u8],
+    lease: &str,
+) -> std::io::Result<()> {
+    write_response(stream, code, reason, &[(LEASE_HEADER, lease)], body)
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {code} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
         crate::remote_subagent::FRAME_CONTENT_TYPE,
         body.len()
     )?;
+    for (name, value) in extra_headers {
+        write!(stream, "{name}: {value}\r\n")?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")?;
     stream.write_all(body)?;
     stream.flush()
 }
@@ -700,42 +794,65 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// 账本客户端：申请执行权。
+/// 账本客户端：申请执行权；成功时返回当前持有者租约令牌。
 pub fn claim(endpoint: &RemoteEndpoint, key: &str) -> Result<Claim, String> {
-    let (status, body) = post(endpoint, "/claim", key, None)?;
-    match status {
-        200 if body.is_empty() => Ok(Claim::New),
-        200 => Ok(Claim::Done(body)),
+    let reply = post(endpoint, "/claim", key, None, None)?;
+    match reply.status {
+        200 if reply.body.is_empty() => match reply.lease.filter(|lease| valid_lease(lease)) {
+            Some(lease) => Ok(Claim::New { lease }),
+            None => Err("ledger claim: missing or invalid lease header".into()),
+        },
+        200 => Ok(Claim::Done(reply.body)),
         409 => Ok(Claim::Pending),
         other => Err(format!("ledger claim returned HTTP {other}")),
     }
 }
 
 /// 账本客户端：延长一个占位租约。已完成或未知键不会延长，后者返回错误。
-pub fn renew(endpoint: &RemoteEndpoint, key: &str) -> Result<(), String> {
-    let (status, _) = post(endpoint, "/renew", key, None)?;
-    match status {
+pub fn renew(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Result<(), String> {
+    if !valid_lease(lease) {
+        return Err("ledger renew: invalid lease".into());
+    }
+    let reply = post(endpoint, "/renew", key, Some(lease), None)?;
+    match reply.status {
         200 | 204 => Ok(()),
+        403 => Err("ledger renew: lease not held".into()),
         404 => Err("ledger renew: unknown key".into()),
         other => Err(format!("ledger renew returned HTTP {other}")),
     }
 }
 
-/// 账本客户端：登记完成响应。
-pub fn complete(endpoint: &RemoteEndpoint, key: &str, frame: &[u8]) -> Result<(), String> {
-    let (status, _) = post(endpoint, "/complete", key, Some(frame))?;
-    match status {
+/// 账本客户端：登记完成响应；只接受当前持有者的租约令牌。
+pub fn complete(
+    endpoint: &RemoteEndpoint,
+    key: &str,
+    lease: &str,
+    frame: &[u8],
+) -> Result<(), String> {
+    if !valid_lease(lease) {
+        return Err("ledger complete: invalid lease".into());
+    }
+    let reply = post(endpoint, "/complete", key, Some(lease), Some(frame))?;
+    match reply.status {
         200 | 204 => Ok(()),
+        403 => Err("ledger complete: lease not held".into()),
         other => Err(format!("ledger complete returned HTTP {other}")),
     }
+}
+
+struct LedgerReply {
+    status: u16,
+    body: Vec<u8>,
+    lease: Option<String>,
 }
 
 fn post(
     endpoint: &RemoteEndpoint,
     path: &str,
     key: &str,
+    lease: Option<&str>,
     body: Option<&[u8]>,
-) -> Result<(u16, Vec<u8>), String> {
+) -> Result<LedgerReply, String> {
     endpoint.validate().map_err(|error| error.to_string())?;
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(endpoint.timeout_secs))
@@ -749,6 +866,9 @@ fn post(
     if let Some(token) = endpoint.auth_token.as_deref() {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
+    if let Some(lease) = lease {
+        request = request.set(LEASE_HEADER, lease);
+    }
     let result = match body {
         Some(bytes) => request
             .set("Content-Type", crate::remote_subagent::FRAME_CONTENT_TYPE)
@@ -760,11 +880,16 @@ fn post(
         Err(ureq::Error::Status(status, response)) => (status, response),
         Err(error) => return Err(format!("ledger transport: {error}")),
     };
+    let lease = response.header(LEASE_HEADER).map(str::to_string);
     let mut body = Vec::new();
     response
         .into_reader()
         .take(MAX_LEDGER_BODY as u64)
         .read_to_end(&mut body)
         .map_err(|error| format!("read ledger response: {error}"))?;
-    Ok((status, body))
+    Ok(LedgerReply {
+        status,
+        body,
+        lease,
+    })
 }

@@ -30,9 +30,11 @@
 //!    账本/本地缓存，避免后续重试再次执行同一键；
 //! 9. **连接有界**：`max_connections` 默认 64；超额连接直接 503，不排队、不 spawn，
 //!    防止慢客户端把服务端线程与内存堆爆；
-//! 10. **在途租约续约**：拿到账本占位后按 `ledger_renew_interval`（默认 10s）后台
-//!     调用 `/renew`，执行超过 `pending_ttl` 也不会被其他节点误判过期；完成/取消
-//!     时停止心跳。续约只延长当前占位，不做 owner token，网络分区下仍需人工兜底。
+//! 10. **在途租约续约与持有者令牌**：拿到账本占位后按 `ledger_renew_interval`
+//!     （默认 10s）后台调用 `/renew`，执行超过 `pending_ttl` 也不会被其他节点
+//!     误判过期；`/renew` 与 `/complete` 都携带 claim 返回的 `X-Trit-Lease`，
+//!     过期接管后旧持有者不能再续租或写完成。完成/取消时停止心跳；令牌不防
+//!     网络分区下的重复执行（旧执行者仍可能在本地跑完），这部分需任务幂等兜底。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -198,6 +200,7 @@ impl Drop for LedgerHeartbeat {
 fn start_ledger_heartbeat(
     endpoint: RemoteEndpoint,
     key: String,
+    lease: String,
     interval: Duration,
 ) -> Option<LedgerHeartbeat> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -208,7 +211,7 @@ fn start_ledger_heartbeat(
                 match receiver.recv_timeout(interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = remote_ledger::renew(&endpoint, &key);
+                        let _ = remote_ledger::renew(&endpoint, &key, &lease);
                     }
                 }
             }
@@ -514,6 +517,7 @@ fn handle(
     let _cancel_scope = dedupe.then(|| cancels.scope(&key));
     let token = _cancel_scope.as_ref().map(|scope| scope.token());
     let mut ledger_owned = false;
+    let mut ledger_lease: Option<String> = None;
     if dedupe {
         if let Some(endpoint) = config.ledger.as_ref() {
             // 账本是跨机权威：先 claim，再执行；等待期内轮询完成响应与取消。
@@ -523,8 +527,9 @@ fn handle(
                     return respond_aborted(&mut stream, &request);
                 }
                 match remote_ledger::claim(endpoint, &key) {
-                    Ok(Claim::New) => {
+                    Ok(Claim::New { lease }) => {
                         ledger_owned = true;
+                        ledger_lease = Some(lease);
                         break;
                     }
                     Ok(Claim::Done(frame)) => return respond(&mut stream, 200, "OK", &frame),
@@ -547,9 +552,15 @@ fn handle(
     }
 
     let _heartbeat = if ledger_owned {
-        config.ledger.as_ref().and_then(|endpoint| {
-            start_ledger_heartbeat(endpoint.clone(), key.clone(), config.ledger_renew_interval)
-        })
+        match (config.ledger.as_ref(), ledger_lease.as_deref()) {
+            (Some(endpoint), Some(lease)) => start_ledger_heartbeat(
+                endpoint.clone(),
+                key.clone(),
+                lease.to_string(),
+                config.ledger_renew_interval,
+            ),
+            _ => None,
+        }
     } else {
         None
     };
@@ -620,8 +631,11 @@ fn handle(
         Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
     };
     if ledger_owned && let Some(endpoint) = config.ledger.as_ref() {
-        // 执行后必须登记；登记失败时回 5xx，宁可让调用方失败也不谎报完成。
-        if remote_ledger::complete(endpoint, &key, &frame).is_err() {
+        // 执行后必须用当前持有者令牌登记；登记失败时回 5xx，宁可让调用方失败也不谎报完成。
+        let Some(lease) = ledger_lease.as_deref() else {
+            return respond(&mut stream, 503, "Service Unavailable", b"");
+        };
+        if remote_ledger::complete(endpoint, &key, lease, &frame).is_err() {
             return respond(&mut stream, 503, "Service Unavailable", b"");
         }
     }

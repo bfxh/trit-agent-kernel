@@ -1,4 +1,4 @@
-//! 共享幂等账本：claim/complete 协议，以及两台远端共享账本时的单次执行。
+//! 共享幂等账本：claim/renew/complete 协议，以及两台远端共享账本时的单次执行。
 
 use std::net::TcpListener;
 use std::sync::{Arc, Barrier};
@@ -79,21 +79,21 @@ fn ledger_claim_complete_and_pending_takeover() {
     thread::spawn(move || running.serve_forever().unwrap());
     let ledger_endpoint = endpoint(&format!("http://{address}"), Some("t"), 5);
 
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
-        Claim::New
-    );
+    let Claim::New { lease: lease_one } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap()
+    else {
+        panic!("expected first claim to win");
+    };
     assert_eq!(
         remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
         Claim::Pending
     );
 
-    // 占位过期后可被接管。
+    // 占位过期后可被接管，旧持有者的令牌同时失效。
     thread::sleep(Duration::from_millis(160));
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
-        Claim::New
-    );
+    let Claim::New { lease: lease_two } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap()
+    else {
+        panic!("expected expired lease to be taken over");
+    };
 
     let frame = encode_frame(&SubagentResponse {
         task: "t1".into(),
@@ -103,7 +103,15 @@ fn ledger_claim_complete_and_pending_takeover() {
         tokens: 0,
     })
     .unwrap();
-    remote_ledger::complete(&ledger_endpoint, "t1@0", &frame).unwrap();
+    assert!(
+        remote_ledger::renew(&ledger_endpoint, "t1@0", &lease_one).is_err(),
+        "a stale owner must not renew"
+    );
+    assert!(
+        remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_one, &frame).is_err(),
+        "a stale owner must not write the completion"
+    );
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_two, &frame).unwrap();
     match remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() {
         Claim::Done(body) => {
             let mut buffer = body;
@@ -198,12 +206,11 @@ fn completed_records_survive_restart() {
         running.serve_once().unwrap();
         running.serve_once().unwrap();
     });
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
-        Claim::New
-    );
-    remote_ledger::complete(&ledger_endpoint, "t1@0", &frame).unwrap();
-    remote_ledger::complete(&ledger_endpoint, "t1@0", &frame).unwrap();
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected empty ledger to grant the claim");
+    };
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
     handle.join().unwrap();
     drop(ledger);
 
@@ -251,22 +258,24 @@ fn scoped_ledger_keys_isolate_plans() {
     })
     .unwrap();
 
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "plan-a|t1@0").unwrap(),
-        Claim::New
-    );
-    remote_ledger::complete(&ledger_endpoint, "plan-a|t1@0", &frame).unwrap();
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "plan-a|t1@0").unwrap()
+    else {
+        panic!("expected scoped claim to win");
+    };
+    remote_ledger::complete(&ledger_endpoint, "plan-a|t1@0", &lease, &frame).unwrap();
     assert!(matches!(
         remote_ledger::claim(&ledger_endpoint, "plan-a|t1@0").unwrap(),
         Claim::Done(_)
     ));
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "plan-b|t1@0").unwrap(),
-        Claim::New,
+    assert!(
+        matches!(
+            remote_ledger::claim(&ledger_endpoint, "plan-b|t1@0").unwrap(),
+            Claim::New { .. }
+        ),
         "same task in another scope must not see plan-a's completion"
     );
     assert!(
-        remote_ledger::complete(&ledger_endpoint, "plan-a|t2@0", &frame).is_err(),
+        remote_ledger::complete(&ledger_endpoint, "plan-a|t2@0", &lease, &frame).is_err(),
         "complete must still verify the task@epoch suffix"
     );
 }
@@ -288,10 +297,9 @@ fn state_file_respects_byte_budget_and_compacts() {
     });
     for epoch in 0..8 {
         let key = format!("plan|t1@{epoch}");
-        assert_eq!(
-            remote_ledger::claim(&ledger_endpoint, &key).unwrap(),
-            Claim::New
-        );
+        let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, &key).unwrap() else {
+            panic!("expected fresh claim for {key}");
+        };
         let frame = encode_frame(&SubagentResponse {
             task: "t1".into(),
             epoch,
@@ -300,7 +308,7 @@ fn state_file_respects_byte_budget_and_compacts() {
             tokens: 0,
         })
         .unwrap();
-        remote_ledger::complete(&ledger_endpoint, &key, &frame).unwrap();
+        remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
     }
     handle.join().unwrap();
     drop(ledger);
@@ -331,9 +339,11 @@ fn state_file_respects_byte_budget_and_compacts() {
         remote_ledger::claim(&restarted_endpoint, "plan|t1@7").unwrap(),
         Claim::Done(_)
     ));
-    assert_eq!(
-        remote_ledger::claim(&restarted_endpoint, "plan|t1@0").unwrap(),
-        Claim::New,
+    assert!(
+        matches!(
+            remote_ledger::claim(&restarted_endpoint, "plan|t1@0").unwrap(),
+            Claim::New { .. }
+        ),
         "the byte cap must have evicted the oldest record"
     );
     handle.join().unwrap();
@@ -359,13 +369,12 @@ fn renew_extends_pending_lease() {
     thread::spawn(move || running.serve_forever().unwrap());
     let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
 
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
-        Claim::New
-    );
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected empty ledger to grant the claim");
+    };
     for _ in 0..4 {
         thread::sleep(Duration::from_millis(60));
-        remote_ledger::renew(&ledger_endpoint, "t1@0").unwrap();
+        remote_ledger::renew(&ledger_endpoint, "t1@0", &lease).unwrap();
     }
     assert_eq!(
         remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
@@ -373,13 +382,15 @@ fn renew_extends_pending_lease() {
         "renewed lease must still be owned"
     );
     thread::sleep(Duration::from_millis(150));
-    assert_eq!(
-        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
-        Claim::New,
+    assert!(
+        matches!(
+            remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+            Claim::New { .. }
+        ),
         "lease must expire after renewals stop"
     );
     assert!(
-        remote_ledger::renew(&ledger_endpoint, "never-claimed").is_err(),
+        remote_ledger::renew(&ledger_endpoint, "never-claimed", &lease).is_err(),
         "unknown keys are not renewable"
     );
 }
