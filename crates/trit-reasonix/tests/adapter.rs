@@ -55,6 +55,7 @@ fn criterion(id: &str, backed: bool, passed: bool) -> CriterionClaim {
         },
         backed,
         passed,
+        conflicted: false,
     }
 }
 
@@ -149,6 +150,7 @@ fn unbacked_and_manual_criteria_never_prove() {
                 kind: CriterionKind::Manual,
                 backed: true,
                 passed: true,
+                conflicted: false,
             },
         ],
     };
@@ -177,6 +179,27 @@ fn conflicting_backed_criteria_are_conflicted() {
     assert!(
         judgment.adherence.is_compliant(),
         "冲突不是断言不足；出口是裁决，不是补断言"
+    );
+}
+
+#[test]
+fn journal_conflicted_criterion_blocks_completion() {
+    let claim = CompletionClaim {
+        task: "turn-1".into(),
+        criteria: vec![
+            criterion("normal", true, true),
+            CriterionClaim {
+                conflicted: true,
+                ..criterion("doubt", true, false)
+            },
+        ],
+    };
+    let judgment = judge_completion(&brief(1), &claim).unwrap();
+    assert_eq!(judgment.verdict, EvidenceVerdict::Conflicted);
+    assert!(judgment.is_conflicted());
+    assert!(
+        !judgment.is_complete(),
+        "账本未闭合的写操作压在声明路径上，不能判完成"
     );
 }
 

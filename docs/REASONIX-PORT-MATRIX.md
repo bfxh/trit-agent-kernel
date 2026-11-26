@@ -143,6 +143,9 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   第三刀补「漏报」：所有 diff criterion 的并集必须覆盖本轮全部非 `move_path` 写入，
   改了三个文件只声明一个时，原本可通过的 diff 降为冲突；`move_path` 是单一原子操作、
   两端都被 claim 校验，不要求把源路径写进 diff。
+  第四刀补「账本对账」：完成裁决前只读 `inspect(<claim root>)`，mutation journal 里
+  未闭合的写操作若压在 diff 声明路径上，该 criterion 标 `conflicted`（rails 进
+  `Conflicted`），即使回执显示写过也不判完成；与声明无关的历史残留不阻断本轮。
 - 验收：伪完成、少断言、越界写、工具失败、超时未知五类测试；状态只降不升；回放一致。
 - 依赖：B7.3 + B7.4。
 

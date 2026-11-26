@@ -255,6 +255,105 @@ fn in_doubt_write_keeps_diff_unknown() {
     assert!(!claim.passed);
 }
 
+/// 构造一份只含一条未闭合 `begin` 的账本报告。
+fn journal_with_in_doubt(path: &str) -> JournalReport {
+    JournalReport {
+        total: 1,
+        in_doubt: vec![JournalRecord {
+            schema: crate::journal::JOURNAL_SCHEMA,
+            seq: 1,
+            op_id: 1,
+            phase: crate::journal::JournalPhase::Begin,
+            tool: "write_file".to_owned(),
+            call_id: "crash".to_owned(),
+            paths: vec![path.to_owned()],
+            lease_epoch: None,
+            passed: false,
+            in_doubt: false,
+            output: String::new(),
+            backups: Vec::new(),
+            at: 1,
+        }],
+        ..JournalReport::default()
+    }
+}
+
+fn judged_with_journal(
+    id: &str,
+    kind: CriterionKind,
+    receipts: &[ToolOutcome],
+    journal: &JournalReport,
+) -> CriterionClaim {
+    let request = ClaimRequest {
+        criteria: vec![CriterionRequest {
+            id: id.to_owned(),
+            kind,
+        }],
+    };
+    back_claim_with_journal(&request, "task", receipts, None, Some(journal))
+        .criteria
+        .into_iter()
+        .next()
+        .expect("criterion")
+}
+
+#[test]
+fn unclosed_journal_write_on_declared_path_conflicts() {
+    let receipts = vec![write("a", "src/lib.rs", false)];
+    let journal = journal_with_in_doubt("src/lib.rs");
+    let claim = judged_with_journal(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["src/lib.rs".to_owned()],
+        },
+        &receipts,
+        &journal,
+    );
+    assert!(claim.backed, "回执确实写了该文件");
+    assert!(!claim.passed, "账本里还有未闭合的写操作");
+    assert!(
+        claim.conflicted,
+        "存疑写操作压在声明路径上时必须是冲突，不能当普通未定"
+    );
+}
+
+#[test]
+fn unclosed_journal_write_elsewhere_does_not_block_other_paths() {
+    let receipts = vec![write("a", "src/lib.rs", false)];
+    let journal = journal_with_in_doubt("src/other.rs");
+    let claim = judged_with_journal(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["src/lib.rs".to_owned()],
+        },
+        &receipts,
+        &journal,
+    );
+    assert!(claim.backed);
+    assert!(claim.passed, "与声明无关的历史残留不阻断本条完成");
+    assert!(!claim.conflicted);
+}
+
+#[test]
+fn verification_claim_ignores_journal_paths() {
+    let receipts = vec![shell("a", "cargo test", true, 5, false)];
+    let journal = journal_with_in_doubt("src/lib.rs");
+    let claim = judged_with_journal(
+        "c1",
+        CriterionKind::Verification {
+            command: "cargo test".to_owned(),
+        },
+        &receipts,
+        &journal,
+    );
+    assert!(claim.backed);
+    assert!(
+        claim.passed,
+        "验证命令没有声明路径，不被 journal 的余留写操作否定"
+    );
+    assert!(!claim.conflicted);
+}
+
 fn scope(paths: &[&str]) -> crate::permissions::WriteClaim {
     crate::permissions::WriteClaim::new(
         env!("CARGO_MANIFEST_DIR"),

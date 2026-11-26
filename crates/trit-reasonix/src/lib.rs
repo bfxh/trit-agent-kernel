@@ -68,6 +68,10 @@ pub struct CriterionClaim {
     pub backed: bool,
     /// 回执本身是否成功；未背书时忽略。
     pub passed: bool,
+    /// 宿主账本与声明冲突（例如未闭合的写操作压在声明路径上）。
+    /// 冲突不是「证据不足」：即使回执看起来通过，也不能算完成。
+    #[serde(default)]
+    pub conflicted: bool,
 }
 
 /// 模型提交的完成请求；`backed/passed` 由宿主回执填写，模型不能自证。
@@ -115,11 +119,15 @@ impl CompletionJudgment {
 pub fn claim_rails(claim: &CompletionClaim, epoch: u64) -> EvidenceRails {
     let mut rails = EvidenceRails::default();
     for criterion in &claim.criteria {
-        let result = match criterion.kind {
-            CriterionKind::Manual => CheckResult::Inconclusive,
-            _ if !criterion.backed => CheckResult::Inconclusive,
-            _ if criterion.passed => CheckResult::Passed,
-            _ => CheckResult::Refuted,
+        let result = if criterion.conflicted {
+            CheckResult::Conflicted
+        } else {
+            match criterion.kind {
+                CriterionKind::Manual => CheckResult::Inconclusive,
+                _ if !criterion.backed => CheckResult::Inconclusive,
+                _ if criterion.passed => CheckResult::Passed,
+                _ => CheckResult::Refuted,
+            }
         };
         rails.push(
             format!("reasonix:{}", criterion.id),

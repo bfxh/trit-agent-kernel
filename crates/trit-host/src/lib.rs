@@ -1036,7 +1036,20 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                             .cloned()
                             .collect()
                     };
-                let backed = back_claim(claim, &turn.task, &evidence, self.write_claim.as_ref());
+                let journal = match self.write_claim.as_ref() {
+                    Some(claim) => Some(
+                        crate::journal::inspect(claim.root())
+                            .map_err(|error| AgentError::Io(error.to_string()))?,
+                    ),
+                    None => None,
+                };
+                let backed = back_claim_with_journal(
+                    claim,
+                    &turn.task,
+                    &evidence,
+                    self.write_claim.as_ref(),
+                    journal.as_ref(),
+                );
                 let judgment = judge_completion(&brief, &backed)?;
                 let complete = judgment.is_complete();
                 let metrics = TurnMetrics::capture(
@@ -1108,11 +1121,27 @@ fn merge_usage(into: &mut TokenUsage, other: TokenUsage) {
 }
 
 /// 宿主用回执给 criterion 背书；模型不能自己声明 backed/passed。
+#[cfg(test)]
 fn back_claim(
     claim: &ClaimRequest,
     task: &str,
     receipts: &[ToolOutcome],
     scope: Option<&crate::permissions::WriteClaim>,
+) -> CompletionClaim {
+    back_claim_with_journal(claim, task, receipts, scope, None)
+}
+
+/// 带 mutation journal 对账的完成背书。
+///
+/// `in_doubt` 记录来自上次崩溃留下的未闭合写操作：它们压在某条 diff 声明的路径上时，
+/// 这条声明既不能算通过、也不是单纯「证据不足」，而是账本与声明冲突（`Conflicted`）。
+/// 只有与声明路径相交的存疑记录才影响该 criterion——与本轮无关的历史残留不阻断其他声明。
+fn back_claim_with_journal(
+    claim: &ClaimRequest,
+    task: &str,
+    receipts: &[ToolOutcome],
+    scope: Option<&crate::permissions::WriteClaim>,
+    journal: Option<&JournalReport>,
 ) -> CompletionClaim {
     // 所有 diff criterion 的并集就是任务愿意申报的写入面。回执里出现任何未被
     // 申报的写入（例如改了三个文件只声明一个），说明完成声明漏报，不能让
@@ -1138,19 +1167,24 @@ fn back_claim(
             .criteria
             .iter()
             .map(|criterion| {
-                let (backed, passed) = match &criterion.kind {
-                    CriterionKind::Manual => (false, false),
+                let (backed, passed, conflicted) = match &criterion.kind {
+                    CriterionKind::Manual => (false, false, false),
                     CriterionKind::Verification { command } => {
-                        verification_backing(command, receipts)
+                        let (backed, passed) = verification_backing(command, receipts);
+                        (backed, passed, false)
                     }
                     CriterionKind::Diff { paths } => {
                         let (backed, passed) = diff_backing(paths, receipts, scope);
-                        // 漏报写入时，已经「通过」的 diff 降为冲突：文件确实写了，
-                        // 但完成声明不完整。
-                        if has_unreported_write && passed {
-                            (true, false)
+                        // 账本里还有未闭合的写操作压在声明路径上：完成声明与账本冲突，
+                        // 必须进 Conflicted，不能靠其余通过项把整单裁决抬成 Complete。
+                        if journal.is_some_and(|report| journal_conflicts(paths, report)) {
+                            (true, false, true)
+                        } else if has_unreported_write && passed {
+                            // 漏报写入时，已经「通过」的 diff 降为冲突：文件确实写了，
+                            // 但完成声明不完整。
+                            (true, false, false)
                         } else {
-                            (backed, passed)
+                            (backed, passed, false)
                         }
                     }
                 };
@@ -1159,6 +1193,7 @@ fn back_claim(
                     kind: criterion.kind.clone(),
                     backed,
                     passed,
+                    conflicted,
                 }
             })
             .collect(),
@@ -1182,6 +1217,14 @@ fn verification_backing(command: &str, receipts: &[ToolOutcome]) -> (bool, bool)
             .iter()
             .all(|outcome| outcome.passed && !outcome.in_doubt && outcome.assertions > 0);
     (proved, proved)
+}
+
+/// journal 里未闭合的写操作是否压在这条声明路径上。
+fn journal_conflicts(paths: &[String], report: &JournalReport) -> bool {
+    report
+        .in_doubt
+        .iter()
+        .any(|record| record.paths.iter().any(|path| paths.contains(path)))
 }
 
 /// 路径清单必须非空且全部被写入；空清单不能自证，存疑写入一律降为未定。
