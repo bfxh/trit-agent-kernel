@@ -963,15 +963,44 @@ pub fn claim(endpoint: &RemoteEndpoint, key: &str) -> Result<Claim, String> {
 
 /// 账本客户端：延长一个占位租约。已完成或未知键不会延长，后者返回错误。
 pub fn renew(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Result<(), String> {
-    if !valid_lease(lease) {
-        return Err("ledger renew: invalid lease".into());
+    renew_checked(endpoint, key, lease).map_err(|error| error.to_string())
+}
+
+/// 续租的结构化错误；心跳用它区分“租约已丢”和普通网络故障。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewError {
+    InvalidLease,
+    LeaseLost,
+    UnknownKey,
+    Http(u16),
+    Transport(String),
+}
+
+impl std::fmt::Display for RenewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLease => write!(formatter, "ledger renew: invalid lease"),
+            Self::LeaseLost => write!(formatter, "ledger renew: lease not held"),
+            Self::UnknownKey => write!(formatter, "ledger renew: unknown key"),
+            Self::Http(status) => write!(formatter, "ledger renew returned HTTP {status}"),
+            Self::Transport(message) => write!(formatter, "{message}"),
+        }
     }
-    let reply = post(endpoint, "/renew", key, Some(lease), None)?;
+}
+
+impl std::error::Error for RenewError {}
+
+/// 带结构化错误的续租：403 表示租约已被接管，404 表示账本已不认识该键。
+pub fn renew_checked(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Result<(), RenewError> {
+    if !valid_lease(lease) {
+        return Err(RenewError::InvalidLease);
+    }
+    let reply = post(endpoint, "/renew", key, Some(lease), None).map_err(RenewError::Transport)?;
     match reply.status {
         200 | 204 => Ok(()),
-        403 => Err("ledger renew: lease not held".into()),
-        404 => Err("ledger renew: unknown key".into()),
-        other => Err(format!("ledger renew returned HTTP {other}")),
+        403 => Err(RenewError::LeaseLost),
+        404 => Err(RenewError::UnknownKey),
+        other => Err(RenewError::Http(other)),
     }
 }
 

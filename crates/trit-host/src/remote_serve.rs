@@ -33,13 +33,16 @@
 //! 10. **在途租约续约与持有者令牌**：拿到账本占位后按 `ledger_renew_interval`
 //!     （默认 10s）后台调用 `/renew`，执行超过 `pending_ttl` 也不会被其他节点
 //!     误判过期；`/renew` 与 `/complete` 都携带 claim 返回的 `X-Trit-Lease`，
-//!     过期接管后旧持有者不能再续租或写完成。完成/取消时停止心跳；令牌不防
-//!     网络分区下的重复执行（旧执行者仍可能在本地跑完），这部分需任务幂等兜底。
+//!     过期接管后旧持有者不能再续租或写完成。心跳收到 `403`/`404` 会立即置位
+//!     取消令牌：睡眠与 Exec 子进程都被中止，服务端回 `Aborted` 且不登记完成，
+//!     避免旧持有者继续做无效副作用。网络分区导致心跳请求完全无法送达时，旧
+//!     执行者仍可能在本地跑完，这部分需任务幂等兜底。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -202,6 +205,8 @@ fn start_ledger_heartbeat(
     key: String,
     lease: String,
     interval: Duration,
+    cancel: CancelToken,
+    lease_lost: Arc<AtomicBool>,
 ) -> Option<LedgerHeartbeat> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -211,7 +216,19 @@ fn start_ledger_heartbeat(
                 match receiver.recv_timeout(interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = remote_ledger::renew(&endpoint, &key, &lease);
+                        match remote_ledger::renew_checked(&endpoint, &key, &lease) {
+                            Ok(()) => {}
+                            Err(
+                                remote_ledger::RenewError::LeaseLost
+                                | remote_ledger::RenewError::UnknownKey,
+                            ) => {
+                                // 租约已被接管或账本重启后遗忘：停止本地执行，避免重复副作用。
+                                lease_lost.store(true, Ordering::SeqCst);
+                                cancel.cancel();
+                                break;
+                            }
+                            Err(_) => {}
+                        }
                     }
                 }
             }
@@ -551,13 +568,16 @@ fn handle(
         }
     }
 
+    let lease_lost = Arc::new(AtomicBool::new(false));
     let _heartbeat = if ledger_owned {
-        match (config.ledger.as_ref(), ledger_lease.as_deref()) {
-            (Some(endpoint), Some(lease)) => start_ledger_heartbeat(
+        match (config.ledger.as_ref(), ledger_lease.as_deref(), token) {
+            (Some(endpoint), Some(lease), Some(token)) => start_ledger_heartbeat(
                 endpoint.clone(),
                 key.clone(),
                 lease.to_string(),
                 config.ledger_renew_interval,
+                token.clone(),
+                Arc::clone(&lease_lost),
             ),
             _ => None,
         }
@@ -587,7 +607,13 @@ fn handle(
                 format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
                 0,
             ),
-            RemoteMode::Silent => return respond(&mut stream, 200, "OK", b""),
+            RemoteMode::Silent => {
+                if lease_lost.load(Ordering::SeqCst) {
+                    (DelegationStatus::Aborted, Vec::new(), 0)
+                } else {
+                    return respond(&mut stream, 200, "OK", b"");
+                }
+            }
             RemoteMode::Exec => {
                 let Some(exec) = config.exec.as_ref() else {
                     return respond(&mut stream, 500, "Internal Server Error", b"");
@@ -619,6 +645,12 @@ fn handle(
             }
         }
     };
+    let lease_lost_now = lease_lost.load(Ordering::SeqCst);
+    let (status, content, tokens) = if lease_lost_now {
+        (DelegationStatus::Aborted, Vec::new(), 0)
+    } else {
+        (status, content, tokens)
+    };
     let response = SubagentResponse {
         task: request.task.clone(),
         epoch: request.epoch,
@@ -630,7 +662,11 @@ fn handle(
         Ok(frame) => frame,
         Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
     };
-    if ledger_owned && let Some(endpoint) = config.ledger.as_ref() {
+    // 租约已失效时不登记完成，只回 Aborted 让调度方等待当前持有者的结果或换节点。
+    if !lease_lost_now
+        && ledger_owned
+        && let Some(endpoint) = config.ledger.as_ref()
+    {
         // 执行后必须用当前持有者令牌登记；登记失败时回 5xx，宁可让调用方失败也不谎报完成。
         let Some(lease) = ledger_lease.as_deref() else {
             return respond(&mut stream, 503, "Service Unavailable", b"");

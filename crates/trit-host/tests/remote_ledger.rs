@@ -3,7 +3,7 @@
 use std::net::TcpListener;
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use trit_host::remote_ledger::{self, Claim};
 use trit_host::{
@@ -757,6 +757,63 @@ fn slow_remote_execution_heartbeat_prevents_lease_takeover() {
         Claim::Done(_)
     ));
     assert_eq!(ledger.completions(), 1);
+}
+
+#[test]
+fn lease_loss_aborts_in_flight_execution() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_millis(100)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let node = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(3000)
+            .with_ledger(ledger_endpoint.clone())
+            .with_ledger_renew_interval(Duration::from_millis(800)),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", node.addr().unwrap());
+    let server = thread::spawn(move || node.serve_once().unwrap());
+    let endpoint_for_call = endpoint(&url, None, 30);
+    let request_for_call = request();
+    let started = Instant::now();
+    let client = thread::spawn(move || run_remote_subagent(&endpoint_for_call, &request_for_call));
+
+    // 等节点拿到占位且其短 TTL 已过，再声称接管；下一次 800ms 心跳会拿到 403。
+    thread::sleep(Duration::from_millis(500));
+    loop {
+        match remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() {
+            Claim::New { .. } => break,
+            Claim::Pending => thread::sleep(Duration::from_millis(25)),
+            Claim::Done(_) => panic!("unexpected completion before takeover"),
+        }
+    }
+
+    let result = client.join().unwrap().unwrap();
+    assert!(
+        matches!(result.status, DelegationStatus::Aborted),
+        "a lost lease must abort in-flight work, got {:?}",
+        result.status
+    );
+    assert!(!result.reusable());
+    assert!(
+        started.elapsed() < Duration::from_millis(2800),
+        "execution must abort before the 3s sleep completes, took {:?}",
+        started.elapsed()
+    );
+    server.join().unwrap();
+    assert_eq!(
+        ledger.completions(),
+        0,
+        "the stale owner must not write a completion"
+    );
 }
 
 #[test]
