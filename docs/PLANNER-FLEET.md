@@ -182,8 +182,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   连接一个 `POST`，`Content-Length` 有界（≤ 8 MiB + 4），可选 Bearer 校验，
   `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；带
   `X-Trit-Idempotency` 且与帧的 `task@epoch` 后缀一致时，按完整键（可带
-  `<scope>|` 前缀）缓存首次响应（重试直接回缓存、不再执行），缓存上限 1024、
-  FIFO 淘汰；头与帧不一致回 400。不同计划用不同 scope 时互不回放。启动先打印
+  `<scope>|` 前缀）缓存首次响应（重试直接回缓存、不再执行），缓存同时限制 1024
+  条与逻辑字节（默认 64 MiB，`--max-cache-bytes`，按 key + 帧估算），按写入顺序
+  FIFO 淘汰、单条超预算不缓存；头与帧不一致回 400。不同计划用不同 scope 时互不回放。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口；
   `--max-connections` 默认 64，超额连接直接回 503、不再 spawn 线程。
   `GET /health` 是只读存活探针：配置 token 时沿用同一 Bearer，鉴权通过即回
@@ -278,8 +279,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   failures 与 attempts 但清零连续失败。租约接管后的重试请求会在账本上等待当前
   持有者并回放其完成帧。
   重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
-  未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（上限 1024，FIFO
-  淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
+  未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（1024 条 / 64 MiB，
+  FIFO 淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
   **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/renew/complete，
   换机重试也能做到**完成结果至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
   账本不可达时 fail-closed（503）。配合 `--state` 时完成帧与未过期占位都跨重启

@@ -13,8 +13,9 @@
 //!    失败模式回 `Failed` 帧，而不是让宿主把错误当成完成；
 //! 4. **一连接一请求**：读满一帧即回包并关闭，便于宿主侧超时语义保持简单；
 //! 5. **带键才去重**：`X-Trit-Idempotency` 必须等于帧里的 `task@epoch`，否则 400；
-//!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效），缓存上限
-//!    [`MAX_CACHED_RESPONSES`]，按 FIFO 淘汰。没有头就按普通请求处理；
+//!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效）；缓存同时限制
+//!    条数 [`MAX_CACHED_RESPONSES`] 与逻辑字节 `max_cache_bytes`（默认 64 MiB），
+//!    按写入顺序 FIFO 淘汰，单条超预算时不会缓存。没有头就按普通请求处理；
 //! 6. **账本优先**：配置 `ledger` 后，带键请求先向共享账本 claim；账本返回完成帧
 //!    就直接回放，返回占位则轮询等待，拿到执行权才执行，执行后必须 complete。
 //!    账本不可达时回 503，宁可不执行也不冒重复执行的风险。`Silent` 模式不产生
@@ -79,11 +80,67 @@ const DEFAULT_LEDGER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 幂等缓存上限：参考实现按 FIFO 淘汰，不做 LRU。
+/// 幂等缓存条数上限：按写入顺序 FIFO 淘汰，不做 LRU。
 const MAX_CACHED_RESPONSES: usize = 1024;
 
-/// 幂等缓存：`"<task>@<epoch>" -> 首次响应`。
-type ResponseCache = Arc<Mutex<BTreeMap<String, SubagentResponse>>>;
+/// 幂等缓存逻辑字节上限默认值：单条帧最大 8 MiB，只限条数会放大到 GiB 级内存。
+const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// 幂等缓存：`"<task>@<epoch>" -> 首次响应帧`，同时限制条数与逻辑字节。
+type ResponseCache = Arc<Mutex<ResponseCacheState>>;
+
+#[derive(Default)]
+struct ResponseCacheState {
+    entries: BTreeMap<String, CachedResponse>,
+    bytes: usize,
+    next_seq: u64,
+}
+
+struct CachedResponse {
+    frame: Vec<u8>,
+    /// 逻辑占用 = key 字节 + 帧字节。
+    bytes: usize,
+    /// 写入顺序，用于 FIFO 淘汰（BTreeMap 的 key 顺序不是写入顺序）。
+    seq: u64,
+}
+
+impl ResponseCacheState {
+    fn get(&self, key: &str) -> Option<&CachedResponse> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: String, frame: Vec<u8>, max_bytes: usize) {
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        let bytes = key.len().saturating_add(frame.len());
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.next_seq;
+        self.entries
+            .insert(key, CachedResponse { frame, bytes, seq });
+        self.bytes = self.bytes.saturating_add(bytes);
+        while self.entries.len() > MAX_CACHED_RESPONSES {
+            self.evict_oldest();
+        }
+        while self.bytes > max_bytes && !self.entries.is_empty() {
+            self.evict_oldest();
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        let Some(key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, cached)| cached.seq)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+    }
+}
 
 /// 在途请求的取消登记：按幂等键。
 #[derive(Default)]
@@ -269,6 +326,9 @@ pub struct RemoteServerConfig {
     pub exec_workspace_root: Option<PathBuf>,
     /// 同时在处理的连接上限；超限直接回 503，不再 spawn 线程。
     pub max_connections: usize,
+    /// 本地幂等缓存的逻辑字节上限（key + 响应帧）；超限按写入顺序 FIFO 淘汰。
+    /// 只对未接账本的带键请求生效；单条超过上限时不会被缓存。
+    pub max_cache_bytes: usize,
     /// 单次请求的墙钟执行上限；含账本等待、`sleep_ms` 与 `Exec` 子进程。
     /// `None` 不限制；超过后取消在途执行并回 `Aborted`，且不登记完成。
     pub exec_timeout: Option<Duration>,
@@ -286,6 +346,7 @@ impl RemoteServerConfig {
             exec: None,
             exec_workspace_root: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
             exec_timeout: None,
         }
     }
@@ -323,6 +384,11 @@ impl RemoteServerConfig {
 
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections.max(1);
+        self
+    }
+
+    pub fn with_max_cache_bytes(mut self, max_cache_bytes: usize) -> Self {
+        self.max_cache_bytes = max_cache_bytes.max(1);
         self
     }
 
@@ -586,12 +652,12 @@ fn handle(
                     Err(_) => return respond(&mut stream, 503, "Service Unavailable", b""),
                 }
             }
-        } else if let Some(cached) = cache.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
-            let frame = match encode_frame(&cached) {
-                Ok(frame) => frame,
-                Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
-            };
-            return respond(&mut stream, 200, "OK", &frame);
+        } else if let Some(cached) = cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&key).map(|cached| cached.frame.clone()))
+        {
+            return respond(&mut stream, 200, "OK", &cached);
         }
     }
 
@@ -711,12 +777,7 @@ fn handle(
         && !timed_out_now
         && let Ok(mut guard) = cache.lock()
     {
-        if guard.len() >= MAX_CACHED_RESPONSES
-            && let Some(oldest) = guard.keys().next().cloned()
-        {
-            guard.remove(&oldest);
-        }
-        guard.insert(key, response);
+        guard.insert(key, frame.clone(), config.max_cache_bytes);
     }
     if lease_lost_now {
         return respond_lease_lost(&mut stream, &frame);

@@ -582,6 +582,51 @@ fn execution_deadline_aborts_slow_request() {
 }
 
 #[test]
+fn cache_byte_budget_evicts_the_oldest_response() {
+    // 预算只够一条：第二条写入必须淘汰第一条，第三次请求才会重新执行。
+    let first = request();
+    let mut second = first.clone();
+    second.epoch = 4;
+    let expected_first = SubagentResponse {
+        task: first.task.clone(),
+        epoch: first.epoch,
+        status: DelegationStatus::Completed,
+        content: format!("remote echo {}@{}", first.task, first.epoch).into_bytes(),
+        tokens: 0,
+    };
+    let frame_bytes = encode_frame(&expected_first).unwrap().len();
+    let one_entry = format!("{}@{}", first.task, first.epoch).len() + frame_bytes;
+    let server = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(250)
+            .with_max_cache_bytes(one_entry + 1),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+
+    for (label, request) in [
+        ("first", &first),
+        ("second", &second),
+        ("first-again", &first),
+    ] {
+        let started = Instant::now();
+        let result = run_remote_subagent(&endpoint(&url, None, 30), request).unwrap();
+        assert!(result.reusable(), "{label}: {:?}", result.status);
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "{label} must execute instead of hitting an over-budget cache: {:?}",
+            started.elapsed()
+        );
+    }
+    handle.join().unwrap();
+}
+
+#[test]
 fn echo_server_rejects_mismatched_idempotency_key() {
     // 头里的 key 与帧里的 task@epoch 不一致：400，不解帧执行。
     let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();
