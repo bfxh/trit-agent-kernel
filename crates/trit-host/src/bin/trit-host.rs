@@ -2294,6 +2294,11 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
     } else {
         Box::new(local)
     };
+    // profile 的工具白名单同样要在执行侧生效。
+    let tools: Box<dyn ToolExecutor> = Box::new(trit_host::ToolWhitelist::new(
+        tools,
+        request.profile.tools.clone(),
+    ));
     // profile 的 write_roots 必须在执行侧真正生效：只在 validate() 里检查形状
     // 不够，否则子 agent 仍能写到声明的子树之外。
     let write_guard = if request.profile.access == trit_orch::AccessMode::ReadWrite {

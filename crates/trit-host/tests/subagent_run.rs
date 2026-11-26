@@ -86,6 +86,10 @@ fn script_for(dir: &Path, rel: &str) -> PathBuf {
 }
 
 fn request_with_roots(roots: Vec<String>) -> SubagentRequest {
+    request_with_tools(vec!["write_file".into(), "read_file".into()], roots)
+}
+
+fn request_with_tools(tools: Vec<String>, roots: Vec<String>) -> SubagentRequest {
     let task = TaskSpec {
         task: Task {
             id: "a".into(),
@@ -109,7 +113,7 @@ fn request_with_roots(roots: Vec<String>) -> SubagentRequest {
         name: "child".into(),
         access: AccessMode::ReadWrite,
         write_roots: roots,
-        tools: vec!["write_file".into(), "read_file".into()],
+        tools,
         max_tokens: 1000,
     };
     SubagentRequest::new(&task, capsule, profile)
@@ -189,6 +193,27 @@ fn subagent_run_allows_writes_inside_profile_roots() {
         result.status
     );
     assert!(workspace.join("src/ok.txt").is_file());
+
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&scripts);
+}
+
+#[test]
+fn subagent_run_rejects_tools_outside_profile_whitelist() {
+    let workspace = temp_dir("ws-tools");
+    let scripts = temp_dir("script-tools");
+    let result = run_subagent(
+        &config(&workspace, &script_for(&scripts, "a.txt")),
+        &request_with_tools(vec!["read_file".into()], vec!["a.txt".into()]),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(result.status, DelegationStatus::Failed { .. }),
+        "profile 只允许 read_file，写文件必须失败: {:?}",
+        result.status
+    );
+    assert!(!workspace.join("a.txt").exists(), "被拒绝的工具不能落盘");
 
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_dir_all(&scripts);
