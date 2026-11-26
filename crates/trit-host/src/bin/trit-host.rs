@@ -1453,13 +1453,13 @@ fn run_appcontainer_prune(mut args: impl Iterator<Item = String>) -> Result<(), 
             Err(error) => return Err(fail(error)),
         };
         println!("pruned {removed} AppContainer profile(s)");
+        Ok(())
     }
     #[cfg(not(windows))]
     {
         let _ = workspace;
-        return Err(fail("appcontainer-prune is Windows only"));
+        Err(fail("appcontainer-prune is Windows only"))
     }
-    Ok(())
 }
 
 /// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。
