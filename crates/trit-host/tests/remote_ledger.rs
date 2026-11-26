@@ -235,10 +235,331 @@ fn completed_records_survive_restart() {
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("t1@0"), "{text}");
     assert_eq!(
-        text.lines().count(),
+        text.lines()
+            .filter(|line| line.contains("\"frame\""))
+            .count(),
         1,
-        "duplicate complete must not append: {text}"
+        "duplicate complete must not append a second done record: {text}"
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pending_renewal_records_do_not_evict_done_on_restart() {
+    let path = state_file("renew-window");
+    let config = LedgerServerConfig::new("127.0.0.1:0")
+        .with_pending_ttl(Duration::from_secs(5))
+        .with_max_entries(2)
+        .with_state_path(&path);
+    let ledger = Arc::new(LedgerServer::bind(config).unwrap());
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"retained".to_vec(),
+        tokens: 0,
+    })
+    .unwrap();
+    let server = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        for _ in 0..3 {
+            server.serve_once().unwrap();
+        }
+    });
+    let Claim::New { lease: lease_one } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap()
+    else {
+        panic!("expected t1 claim");
+    };
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_one, &frame).unwrap();
+    let Claim::New { lease: lease_two } = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap()
+    else {
+        panic!("expected t2 claim");
+    };
+    handle.join().unwrap();
+    drop(ledger);
+
+    // 10 条续租记录会把 t1 的完成帧挤出“最后 N 条”窗口；回放必须按 key 状态去重。
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_pending_ttl(Duration::from_secs(5))
+                .with_max_entries(2)
+                .with_state_path(&path),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        for _ in 0..10 {
+            server.serve_once().unwrap();
+        }
+    });
+    for _ in 0..10 {
+        remote_ledger::renew(&ledger_endpoint, "t2@0", &lease_two).unwrap();
+    }
+    handle.join().unwrap();
+    drop(ledger);
+
+    let restarted = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_pending_ttl(Duration::from_secs(5))
+                .with_max_entries(2)
+                .with_state_path(&path),
+        )
+        .unwrap(),
+    );
+    let address = restarted.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+    assert!(
+        matches!(
+            remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+            Claim::Done(_)
+        ),
+        "done records must survive a long renewal log"
+    );
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap(),
+        Claim::Pending,
+        "the active renewed lease must also survive"
+    );
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn capacity_evictions_replay_in_the_same_key_order() {
+    let path = state_file("capacity-order");
+    let config = || {
+        LedgerServerConfig::new("127.0.0.1:0")
+            .with_pending_ttl(Duration::from_secs(5))
+            .with_max_entries(2)
+            .with_state_path(&path)
+    };
+    let ledger = Arc::new(LedgerServer::bind(config()).unwrap());
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        for _ in 0..6 {
+            server.serve_once().unwrap();
+        }
+    });
+    for task in ["y", "z", "a"] {
+        let key = format!("{task}@0");
+        let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, &key).unwrap() else {
+            panic!("expected {key} claim");
+        };
+        let frame = encode_frame(&SubagentResponse {
+            task: task.into(),
+            epoch: 0,
+            status: DelegationStatus::Completed,
+            content: task.as_bytes().to_vec(),
+            tokens: 0,
+        })
+        .unwrap();
+        remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
+    }
+    handle.join().unwrap();
+    drop(ledger);
+
+    let restarted = Arc::new(LedgerServer::bind(config()).unwrap());
+    let address = restarted.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || {
+        for _ in 0..3 {
+            server.serve_once().unwrap();
+        }
+    });
+    // 运行时先淘汰 y，再插入 a，最终是 z+a；回放不能因为 a 的 key 更小就反过来淘汰 a。
+    assert!(matches!(
+        remote_ledger::claim(&ledger_endpoint, "a@0").unwrap(),
+        Claim::Done(_)
+    ));
+    assert!(matches!(
+        remote_ledger::claim(&ledger_endpoint, "y@0").unwrap(),
+        Claim::New { .. }
+    ));
+    assert!(matches!(
+        remote_ledger::claim(&ledger_endpoint, "z@0").unwrap(),
+        Claim::Done(_)
+    ));
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn legacy_done_only_state_still_loads() {
+    let path = state_file("legacy");
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"legacy".to_vec(),
+        tokens: 0,
+    })
+    .unwrap();
+    let hex: String = frame.iter().map(|byte| format!("{byte:02x}")).collect();
+    std::fs::write(&path, format!("{{\"key\":\"t1@0\",\"frame\":\"{hex}\"}}\n")).unwrap();
+
+    let ledger = Arc::new(
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_state_path(&path)).unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&ledger);
+    let handle = thread::spawn(move || server.serve_once().unwrap());
+    match remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() {
+        Claim::Done(body) => {
+            let mut buffer = body;
+            let response: SubagentResponse = decode_frame(&mut buffer).unwrap().unwrap();
+            assert_eq!(response.content, b"legacy");
+        }
+        other => panic!("expected legacy Done, got {other:?}"),
+    }
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pending_lease_survives_restart_and_expires() {
+    let path = state_file("pending");
+    let ttl = Duration::from_secs(1);
+    let ledger = LedgerServer::bind(
+        LedgerServerConfig::new("127.0.0.1:0")
+            .with_pending_ttl(ttl)
+            .with_state_path(&path),
+    )
+    .unwrap();
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let running = Arc::new(ledger);
+    let server = Arc::clone(&running);
+    let handle = thread::spawn(move || server.serve_once().unwrap());
+    let Claim::New { lease: lease_one } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap()
+    else {
+        panic!("expected first claim to win");
+    };
+    handle.join().unwrap();
+    drop(running);
+
+    // 占位和令牌已落盘，重启后不能被其他节点立刻接管，续租也仍然可用。
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains(&lease_one),
+        "pending lease must be durable"
+    );
+    let restarted = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_pending_ttl(ttl)
+                .with_state_path(&path),
+        )
+        .unwrap(),
+    );
+    let address = restarted.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || {
+        for _ in 0..2 {
+            server.serve_once().unwrap();
+        }
+    });
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::Pending,
+        "a durable lease must still block takeover after restart"
+    );
+    remote_ledger::renew(&ledger_endpoint, "t1@0", &lease_one).unwrap();
+    handle.join().unwrap();
+    drop(restarted);
+
+    // 原始 TTL 已过，但续租记录也落盘了：再次重启仍保持 Pending。
+    thread::sleep(Duration::from_millis(600));
+    let renewed = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_pending_ttl(ttl)
+                .with_state_path(&path),
+        )
+        .unwrap(),
+    );
+    let address = renewed.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"after-restart".to_vec(),
+        tokens: 0,
+    })
+    .unwrap();
+    let server = Arc::clone(&renewed);
+    let handle = thread::spawn(move || {
+        for _ in 0..3 {
+            server.serve_once().unwrap();
+        }
+    });
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::Pending,
+        "a renewed lease must survive restart past the original TTL"
+    );
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_one, &frame).unwrap();
+    let Claim::New { lease: lease_two } = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap()
+    else {
+        panic!("expected t2 claim to win");
+    };
+    handle.join().unwrap();
+    drop(renewed);
+
+    let frame_two = encode_frame(&SubagentResponse {
+        task: "t2".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"stale".to_vec(),
+        tokens: 0,
+    })
+    .unwrap();
+
+    // 超过 TTL 再重启：过期占位被丢弃，旧令牌不能写完成。
+    thread::sleep(Duration::from_millis(1100));
+    let expired = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_pending_ttl(ttl)
+                .with_state_path(&path),
+        )
+        .unwrap(),
+    );
+    let address = expired.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&expired);
+    let handle = thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+    assert!(
+        matches!(
+            remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap(),
+            Claim::New { .. }
+        ),
+        "an expired lease must be claimable again"
+    );
+    assert!(
+        remote_ledger::complete(&ledger_endpoint, "t2@0", &lease_two, &frame_two).is_err(),
+        "the stale owner must not complete after expiry"
+    );
+    handle.join().unwrap();
     let _ = std::fs::remove_file(&path);
 }
 

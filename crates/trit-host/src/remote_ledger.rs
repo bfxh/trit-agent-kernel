@@ -1,4 +1,4 @@
-//! 共享幂等账本：让多台远端在同一个 `task@epoch` 上达成至多一次执行。
+//! 共享幂等账本：让多台远端在同一个 `task@epoch` 上最多登记一个完成结果，重试优先回放。
 //!
 //! 协议（HTTP/1.1，一连接一请求，路径固定 `/claim`、`/renew` 与 `/complete`）：
 //!
@@ -20,16 +20,18 @@
 //! 不执行任务；它是跨机重试的协调点，不是任务队列。租约令牌是随机生成的持有者
 //! 凭证，不是加密身份：传输仍应放在 loopback 或可信内网，并配置 bearer token。
 //!
-//! 容量有键数与字节双重上限（默认 4096 / 64 MiB）：超出时按 key 顺序淘汰已完成
-//! 项。落盘每行是十六进制 JSONL，物理文件到逻辑上限的 1.5 倍时压缩为当前内存
-//! 快照（临时文件 + 原子替换）；启动时若目标缺失会从 `.compact` 临时文件恢复。
+//! 容量有键数与字节双重上限（默认 4096 / 64 MiB）：键数包含占位与完成项，字节按
+//! 已完成帧估算；占位令牌与绝对到期时间也写入 JSONL，另受键数与单行长度约束。
+//! 物理文件到逻辑上限的 1.5 倍时压缩为当前内存快照（完成项 + 未过期占位，
+//! 临时文件 + 原子替换）；启动时若目标缺失会从 `.compact` 临时文件恢复。
 //!
 //! 安全边界：账本默认只应绑定 loopback 或置于内网；配置 token 后所有请求都要
-//! `Authorization: Bearer <token>`。账本不校验任务内容，只校验 `complete` 的帧
-//! 与幂等键一致，并要求 `/renew`、`/complete` 携带当前持有者的租约令牌。
+//! `Authorization: Bearer <token>`。状态文件同时包含完成帧与租约令牌，应按敏感
+//! 数据保护。账本不校验任务内容，只校验 `complete` 的帧与幂等键一致，并要求
+//! `/renew`、`/complete` 携带当前持有者的租约令牌。
 
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -52,7 +54,7 @@ const DEFAULT_PENDING_TTL: Duration = Duration::from_secs(60);
 /// 默认账本容量上限。
 const DEFAULT_MAX_ENTRIES: usize = 4096;
 
-/// 默认状态字节上限（已完成帧的十六进制 JSONL 记录总量）。
+/// 默认状态字节上限（按已完成帧的十六进制 JSONL 记录估算）。
 const DEFAULT_MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 
 /// 单个响应体的上限（与远程 runner 一致）。
@@ -81,7 +83,8 @@ pub struct LedgerServerConfig {
     pub max_entries: usize,
     /// 已完成记录的逻辑字节上限；超出时按 key 顺序淘汰并压缩日志。
     pub max_state_bytes: usize,
-    /// 可选持久化文件：只追加“已完成”记录，重启时回放；占位不落盘。
+    /// 可选持久化文件：追加完成帧与占位租约（含令牌/到期时间），重启时回放；
+    /// 过期占位会被丢弃。
     pub state_path: Option<PathBuf>,
 }
 
@@ -135,7 +138,7 @@ pub enum Claim {
 }
 
 enum Entry {
-    Pending { since: Instant, lease: String },
+    Pending { expires_at: Instant, lease: String },
     Done { frame: Vec<u8> },
 }
 
@@ -159,6 +162,19 @@ fn valid_lease(lease: &str) -> bool {
         && lease
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// 把内存里的单调时钟截止点换算成可落盘的绝对毫秒时间。
+fn expiry_unix_ms(expires_at: Instant) -> u64 {
+    let remaining = expires_at.saturating_duration_since(Instant::now());
+    unix_millis_now().saturating_add(remaining.as_millis() as u64)
 }
 
 #[derive(Default)]
@@ -210,7 +226,12 @@ impl LedgerServer {
         let state = match config.state_path.as_deref() {
             Some(path) => {
                 recover_compaction(path)?;
-                let state = load_entries(path, config.max_entries, config.max_state_bytes)?;
+                let state = load_entries(
+                    path,
+                    config.pending_ttl,
+                    config.max_entries,
+                    config.max_state_bytes,
+                )?;
                 if std::fs::metadata(path)
                     .is_ok_and(|meta| meta.len() > config.max_state_bytes as u64)
                 {
@@ -410,20 +431,33 @@ impl LedgerServerView<'_> {
     fn renew(&self, key: &str, lease: &str) -> Result<RenewOutcome, ()> {
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| ())?;
-        match state.entries.get_mut(key) {
+        let outcome = match state.entries.get_mut(key) {
             Some(Entry::Pending {
-                since,
+                expires_at,
                 lease: owner,
             }) => {
                 if owner != lease {
                     return Ok(RenewOutcome::NotOwner);
                 }
-                *since = now;
+                let new_expiry = now + self.config.pending_ttl;
+                if let Some(path) = self.config.state_path.as_deref()
+                    && append_pending_record(path, key, lease, expiry_unix_ms(new_expiry)).is_err()
+                {
+                    // 续租不落盘就不生效，避免重启后退回旧期限。
+                    return Err(());
+                }
+                *expires_at = new_expiry;
                 Ok(RenewOutcome::Renewed)
             }
             Some(Entry::Done { .. }) => Ok(RenewOutcome::AlreadyDone),
             None => Ok(RenewOutcome::Unknown),
+        };
+        if matches!(&outcome, Ok(RenewOutcome::Renewed))
+            && let Some(path) = self.config.state_path.as_deref()
+        {
+            compact_if_bloated(path, &state.entries, self.config.max_state_bytes);
         }
+        outcome
     }
 
     fn claim(&self, key: &str) -> Result<Claim, ()> {
@@ -432,40 +466,57 @@ impl LedgerServerView<'_> {
         if let Some(entry) = state.entries.get_mut(key) {
             match entry {
                 Entry::Done { frame } => return Ok(Claim::Done(frame.clone())),
-                Entry::Pending { since, .. }
-                    if now.duration_since(*since) < self.config.pending_ttl =>
-                {
+                Entry::Pending { expires_at, .. } if now < *expires_at => {
                     return Ok(Claim::Pending);
                 }
-                Entry::Pending { since, lease } => {
-                    *since = now;
-                    *lease = fresh_lease();
-                    return Ok(Claim::New {
-                        lease: lease.clone(),
-                    });
+                Entry::Pending { expires_at, lease } => {
+                    let new_lease = fresh_lease();
+                    let new_expiry = now + self.config.pending_ttl;
+                    if let Some(path) = self.config.state_path.as_deref()
+                        && append_pending_record(path, key, &new_lease, expiry_unix_ms(new_expiry))
+                            .is_err()
+                    {
+                        return Err(());
+                    }
+                    *expires_at = new_expiry;
+                    *lease = new_lease.clone();
+                    return Ok(Claim::New { lease: new_lease });
                 }
             }
         }
-        if state.entries.len() >= self.config.max_entries {
-            let victim = state
+        let victim = if state.entries.len() >= self.config.max_entries {
+            state
                 .entries
                 .iter()
-                .find_map(|(key, entry)| matches!(entry, Entry::Done { .. }).then(|| key.clone()));
-            match victim {
-                Some(victim) => {
-                    state.entries.remove(&victim);
-                }
-                None => return Err(()),
-            }
+                .find_map(|(key, entry)| matches!(entry, Entry::Done { .. }).then(|| key.clone()))
+        } else {
+            None
+        };
+        if state.entries.len() >= self.config.max_entries && victim.is_none() {
+            return Err(());
         }
         let lease = fresh_lease();
+        let expires_at = now + self.config.pending_ttl;
+        if let Some(path) = self.config.state_path.as_deref()
+            && append_pending_record(path, key, &lease, expiry_unix_ms(expires_at)).is_err()
+        {
+            return Err(());
+        }
+        if let Some(victim) = victim
+            && let Some(Entry::Done { frame }) = state.entries.remove(&victim)
+        {
+            state.bytes = state.bytes.saturating_sub(record_bytes(&victim, &frame));
+        }
         state.entries.insert(
             key.to_string(),
             Entry::Pending {
-                since: now,
+                expires_at,
                 lease: lease.clone(),
             },
         );
+        if let Some(path) = self.config.state_path.as_deref() {
+            compact_if_bloated(path, &state.entries, self.config.max_state_bytes);
+        }
         Ok(Claim::New { lease })
     }
 
@@ -491,7 +542,7 @@ impl LedgerServerView<'_> {
             return Err(());
         };
         if let Some(path) = self.config.state_path.as_deref()
-            && append_record(path, key, &frame).is_err()
+            && append_done_record(path, key, &frame).is_err()
         {
             // 写盘失败就不承认完成，调用方拿到 5xx。
             return Err(());
@@ -546,15 +597,28 @@ fn write_response(
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct StoredRecord {
-    key: String,
-    /// 响应帧的十六进制编码；避免为字节引入额外依赖。
-    frame: String,
+#[serde(untagged)]
+enum StoredRecord {
+    /// 已完成记录；旧格式没有 `kind` 字段，仍按这种形态解析。
+    Done {
+        key: String,
+        /// 响应帧的十六进制编码；避免为字节引入额外依赖。
+        frame: String,
+    },
+    /// 占位租约：claim 成功或续租时追加，重启后仍能识别当前持有者。
+    Pending {
+        key: String,
+        lease: String,
+        /// 绝对到期时间（Unix 毫秒），重启时据此恢复剩余 TTL。
+        expires_unix_ms: u64,
+    },
 }
 
-/// 从追加日志加载已完成记录；只保留最后 `max_entries` 条，并按字节上限淘汰。
+/// 从追加日志逐行回放；后出现的记录覆盖同 key 的旧状态，最终按键数与字节上限
+/// 裁剪，过期占位不再保留。不能只保留“最后 N 条”，否则高频续租会挤掉完成帧。
 fn load_entries(
     path: &Path,
+    pending_ttl: Duration,
     max_entries: usize,
     max_state_bytes: usize,
 ) -> std::io::Result<LedgerState> {
@@ -563,8 +627,9 @@ fn load_entries(
     }
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);
-    let mut retained: VecDeque<(StoredRecord, usize)> = VecDeque::new();
-    let mut retained_bytes = 0usize;
+    let now = Instant::now();
+    let now_unix_ms = unix_millis_now();
+    let mut state = LedgerState::default();
     for (index, line) in reader.lines().enumerate() {
         let line = line.map_err(|error| {
             invalid_data(format!(
@@ -585,60 +650,100 @@ fn load_entries(
         }
         let record: StoredRecord = serde_json::from_str(&line)
             .map_err(|error| invalid_data(format!("{}:{}: {error}", path.display(), index + 1)))?;
-        let line_bytes = record
-            .key
-            .len()
-            .saturating_mul(6)
-            .saturating_add(record.frame.len())
-            .saturating_add(32);
-        retained_bytes = retained_bytes.saturating_add(line_bytes);
-        retained.push_back((record, line_bytes));
-        while (retained.len() > max_entries || retained_bytes > max_state_bytes)
-            && !retained.is_empty()
-        {
-            if let Some((_, bytes)) = retained.pop_front() {
-                retained_bytes = retained_bytes.saturating_sub(bytes);
+        let event_key = match &record {
+            StoredRecord::Done { key, .. } | StoredRecord::Pending { key, .. } => key.clone(),
+        };
+        match record {
+            StoredRecord::Done { key, frame } => {
+                let frame = hex_decode(&frame)
+                    .ok_or_else(|| invalid_data(format!("{}: bad hex frame", path.display())))?;
+                let mut buffer = frame.clone();
+                let response: SubagentResponse = match decode_frame(&mut buffer) {
+                    Ok(Some(response)) => response,
+                    _ => {
+                        return Err(invalid_data(format!(
+                            "{}: stored frame is not a valid response",
+                            path.display()
+                        )));
+                    }
+                };
+                if idempotency_scope(&key, &response.task, response.epoch).is_err() {
+                    return Err(invalid_data(format!(
+                        "{}: stored frame does not match key {key}",
+                        path.display()
+                    )));
+                }
+                if let Some(Entry::Done { frame }) = state.entries.get(&key) {
+                    state.bytes = state.bytes.saturating_sub(record_bytes(&key, frame));
+                }
+                state.bytes = state.bytes.saturating_add(record_bytes(&key, &frame));
+                state.entries.insert(key, Entry::Done { frame });
+            }
+            StoredRecord::Pending {
+                key,
+                lease,
+                expires_unix_ms,
+            } => {
+                if !valid_lease(&lease) {
+                    return Err(invalid_data(format!(
+                        "{}: stored lease for {key} is invalid",
+                        path.display()
+                    )));
+                }
+                // 新的占位事件覆盖同 key 的旧完成/占位状态。
+                if let Some(Entry::Done { frame }) = state.entries.remove(&key) {
+                    state.bytes = state.bytes.saturating_sub(record_bytes(&key, &frame));
+                }
+                if expires_unix_ms > now_unix_ms {
+                    // 以当前配置的 TTL 为上限，避免损坏/时钟漂移把租约无限延长。
+                    let remaining =
+                        Duration::from_millis(expires_unix_ms - now_unix_ms).min(pending_ttl);
+                    state.entries.insert(
+                        key,
+                        Entry::Pending {
+                            expires_at: now + remaining,
+                            lease,
+                        },
+                    );
+                } else {
+                    state.entries.remove(&key);
+                }
             }
         }
-    }
-    let mut state = LedgerState::default();
-    for (record, _) in retained {
-        let frame = hex_decode(&record.frame)
-            .ok_or_else(|| invalid_data(format!("{}: bad hex frame", path.display())))?;
-        let mut buffer = frame.clone();
-        let response: SubagentResponse = match decode_frame(&mut buffer) {
-            Ok(Some(response)) => response,
-            _ => {
-                return Err(invalid_data(format!(
-                    "{}: stored frame is not a valid response",
-                    path.display()
-                )));
-            }
-        };
-        if idempotency_scope(&record.key, &response.task, response.epoch).is_err() {
-            return Err(invalid_data(format!(
-                "{}: stored frame does not match key {}",
-                path.display(),
-                record.key
-            )));
-        }
-        if let Some(Entry::Done { frame }) = state.entries.get(&record.key) {
-            state.bytes = state.bytes.saturating_sub(record_bytes(&record.key, frame));
-        }
-        state.bytes = state
-            .bytes
-            .saturating_add(record_bytes(&record.key, &frame));
-        state.entries.insert(record.key, Entry::Done { frame });
-    }
-    while state.bytes > max_state_bytes {
-        let Some(victim) = first_done_key(&state.entries) else {
-            break;
-        };
-        if let Some(Entry::Done { frame }) = state.entries.remove(&victim) {
-            state.bytes = state.bytes.saturating_sub(record_bytes(&victim, &frame));
-        }
+        trim_state(&mut state, max_entries, max_state_bytes, Some(&event_key));
     }
     Ok(state)
+}
+
+/// 按键数/字节上限裁剪回放后的状态：优先淘汰别的已完成项，保留刚回放的 key。
+fn trim_state(
+    state: &mut LedgerState,
+    max_entries: usize,
+    max_state_bytes: usize,
+    preserve: Option<&str>,
+) {
+    while state.entries.len() > max_entries || state.bytes > max_state_bytes {
+        if let Some(victim) = first_done_key_excluding(&state.entries, preserve) {
+            if let Some(Entry::Done { frame }) = state.entries.remove(&victim) {
+                state.bytes = state.bytes.saturating_sub(record_bytes(&victim, &frame));
+            }
+            continue;
+        }
+        if state.entries.len() > max_entries
+            && let Some(victim) = first_pending_key_excluding(&state.entries, preserve)
+        {
+            state.entries.remove(&victim);
+            continue;
+        }
+        // 没有别的可淘汰项：为了尊重上限，只能放弃刚回放的完成项（正常日志不会走到）。
+        if let Some(preserve) = preserve
+            && let Some(Entry::Done { frame }) = state.entries.remove(preserve)
+        {
+            state.bytes = state.bytes.saturating_sub(record_bytes(preserve, &frame));
+            continue;
+        }
+        break;
+    }
 }
 
 /// 保守估算一条 JSONL 记录占用的字节数：帧按十六进制翻倍，key 预留转义空间。
@@ -650,10 +755,30 @@ fn record_bytes(key: &str, frame: &[u8]) -> usize {
 }
 
 /// 按 key 顺序找第一个已完成项；`max_entries` 与字节淘汰共用这个顺序。
-fn first_done_key(entries: &BTreeMap<String, Entry>) -> Option<String> {
+fn first_done_key_excluding(
+    entries: &BTreeMap<String, Entry>,
+    exclude: Option<&str>,
+) -> Option<String> {
     entries
         .iter()
+        .filter(|(key, _)| Some(key.as_str()) != exclude)
         .find_map(|(key, entry)| matches!(entry, Entry::Done { .. }).then(|| key.clone()))
+}
+
+/// 占位键额超限时，优先放弃最早到期（最接近自然失效）的租约。
+fn first_pending_key_excluding(
+    entries: &BTreeMap<String, Entry>,
+    exclude: Option<&str>,
+) -> Option<String> {
+    entries
+        .iter()
+        .filter(|(key, _)| Some(key.as_str()) != exclude)
+        .filter_map(|(key, entry)| match entry {
+            Entry::Pending { expires_at, .. } => Some((*expires_at, key.clone())),
+            Entry::Done { .. } => None,
+        })
+        .min_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)))
+        .map(|(_, key)| key)
 }
 
 /// 预先计算完成 `key` 需要淘汰的已完成项；淘汰后仍装不下时返回 `None`。
@@ -685,25 +810,40 @@ fn capacity_victims(
 }
 
 /// 追加一条已完成记录并落盘。
-fn append_record(path: &Path, key: &str, frame: &[u8]) -> std::io::Result<()> {
+fn append_done_record(path: &Path, key: &str, frame: &[u8]) -> std::io::Result<()> {
+    let record = StoredRecord::Done {
+        key: key.to_string(),
+        frame: hex_encode(frame),
+    };
+    append_line(path, &record)
+}
+
+/// 追加一条占位记录并落盘；claim/续租在改内存状态前必须先成功。
+fn append_pending_record(
+    path: &Path,
+    key: &str,
+    lease: &str,
+    expires_unix_ms: u64,
+) -> std::io::Result<()> {
+    let record = StoredRecord::Pending {
+        key: key.to_string(),
+        lease: lease.to_string(),
+        expires_unix_ms,
+    };
+    append_line(path, &record)
+}
+
+fn append_line(path: &Path, record: &StoredRecord) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    let line = encode_record(key, frame)?;
+    let line = serde_json::to_string(record)
+        .map_err(|error| invalid_data(format!("serialize ledger record: {error}")))?;
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{line}")?;
     file.sync_all()
-}
-
-fn encode_record(key: &str, frame: &[u8]) -> std::io::Result<String> {
-    let record = StoredRecord {
-        key: key.to_string(),
-        frame: hex_encode(frame),
-    };
-    serde_json::to_string(&record)
-        .map_err(|error| invalid_data(format!("serialize ledger record: {error}")))
 }
 
 /// 压缩临时文件路径：始终追加 `.compact`，避免覆盖 `state.compact` 这类原路径。
@@ -713,7 +853,7 @@ fn compaction_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// 压缩日志：只写入当前内存里的已完成项，临时文件落盘后原子替换。
+/// 压缩日志：写入当前内存里的完成项与未过期占位，临时文件落盘后原子替换。
 fn compact_state(path: &Path, entries: &BTreeMap<String, Entry>) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -725,10 +865,23 @@ fn compact_state(path: &Path, entries: &BTreeMap<String, Entry>) -> std::io::Res
         std::fs::remove_file(&temporary)?;
     }
     let mut writer = BufWriter::new(std::fs::File::create(&temporary)?);
+    let now = Instant::now();
     for (key, entry) in entries {
-        if let Entry::Done { frame } = entry {
-            writeln!(writer, "{}", encode_record(key, frame)?)?;
-        }
+        let record = match entry {
+            Entry::Done { frame } => StoredRecord::Done {
+                key: key.clone(),
+                frame: hex_encode(frame),
+            },
+            Entry::Pending { expires_at, lease } if now < *expires_at => StoredRecord::Pending {
+                key: key.clone(),
+                lease: lease.clone(),
+                expires_unix_ms: expiry_unix_ms(*expires_at),
+            },
+            Entry::Pending { .. } => continue,
+        };
+        let line = serde_json::to_string(&record)
+            .map_err(|error| invalid_data(format!("serialize ledger record: {error}")))?;
+        writeln!(writer, "{line}")?;
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;

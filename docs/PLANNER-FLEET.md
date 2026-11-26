@@ -207,12 +207,14 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   延长租约，未知键 404、已完成 204、非持有者 403，因此长任务不会被误判过期；
   令牌防的是旧持有者写完成，不防网络分区下旧执行者继续本地执行。
   容量有键数（默认 4096）与字节（默认 64 MiB，`--max-state-bytes`）
-  双重上限，超出按 key 顺序淘汰已完成项。`--state <path>` 打开追加日志，
-  complete 先落盘再登记（写盘失败回 5xx），重启时回放最后 `max_entries` 条并
-  按字节上限裁剪；物理日志超过逻辑上限 1.5 倍时压缩为当前快照（临时文件 +
-  原子替换，启动时从残留 `.compact` 恢复），已完成任务不会再执行；占位不落盘，
-  崩溃后按 TTL 语义重新可执行。账本重启也会丢失占位令牌，在途执行者的
-  `/renew` 变成 404、`/complete` 变成 403，调用方只能重新 claim 并可能重复执行。
+  双重上限，键数含占位与完成项，字节按完成帧估算，超出按 key 顺序淘汰已完成项。
+  `--state <path>` 打开追加日志：claim/续租先追加占位记录（key、令牌、绝对到期
+  时间），complete 再追加完成帧；写盘失败回 5xx 且不改内存状态。重启时逐行回放
+  全部记录，按 key 覆盖旧状态，再按键数与字节上限裁剪；未过期占位的令牌与剩余
+  TTL 一并恢复，过期占位直接丢弃；物理日志超过逻辑上限 1.5 倍时压缩为当前快照（完成项 + 未过期
+  占位，临时文件 + 原子替换，启动时从残留 `.compact` 恢复），已完成任务不会再
+  执行。未配 `--state` 时占位只在内存，账本重启仍会丢失在途令牌；状态文件含完成
+  帧与租约令牌，应按敏感数据保护。
   `remote-echo --ledger <url>` 接入后，带键请求以账本为权威：账本不可达回 503
   且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权，
   `--ledger-renew-ms` 调整续约间隔（必须小于账本 TTL）。
@@ -222,7 +224,7 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
 503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
 慢执行期间不被接管、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
-时 fail-closed，以及落盘账本重启回放、字节上限淘汰与压缩；`tests/remote_exec.rs` 覆盖 `remote-exec`
+时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
 
@@ -255,11 +257,11 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
   未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（上限 1024，FIFO
   淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
-  **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/complete，
-  换机重试也能做到**至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
-  账本不可达时 fail-closed（503）。配合 `--state` 时已完成记录跨重启保留；
-  例外是占位 TTL 过期后的接管：若老执行者仍然存活并完成，会再登记一次，
-  TTL 越长越安全。
+  **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/renew/complete，
+  换机重试也能做到**完成结果至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
+  账本不可达时 fail-closed（503）。配合 `--state` 时完成帧与未过期占位都跨重启
+  保留；例外是 TTL 过期后的接管：老执行者可能仍在本地跑完（重复工作），但其
+  完成写入会被租约令牌拒绝，最终只记录当前持有者的结果。
 - **取消传播**：`run_remote_subagent_reply_cancellable` 在独立线程执行请求，
   等待期间每 25ms 检查取消令牌；置位后向端点 origin 的 `/cancel` 发同一幂等
   键，最多再等 2s 收尾，超时按 `Aborted` 返回。服务端按幂等键登记在途请求：
