@@ -1368,6 +1368,7 @@ pub fn run_headless<M: Model>(
 pub mod appcontainer;
 mod auth;
 pub mod checkpoint;
+pub mod child_env;
 mod connection_limit;
 pub mod context;
 pub mod context_layers;

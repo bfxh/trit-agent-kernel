@@ -39,6 +39,13 @@ shell 仍受 `allow_shell` / `allow_unsandboxed_shell` / 沙箱约束。
 - mutation journal 的备份与回滚同样走 cap-std；路径与备份文件名都只接受单段归一化
   名称，回滚拒绝符号链接父目录。
 
+## 子进程环境
+
+`bash`、`subagent-run`、MCP/supervisor 与 git checkpoint 的子进程 spawn 前统一
+`env_clear`，只透传路径、临时目录、locale 与 Windows 进程启动所需的宿主变量；
+`OPENAI_API_KEY` 等 provider 凭据不再被任何工具子进程继承。需要额外变量的调用方
+必须显式传入（`ProcessSpec.env` 或 `SubagentProcessConfig::with_env`）。
+
 ## 已知待补
 
 - 远程执行面需要 token / Host / Origin 与保留路径名校验（审计第 5 项）。

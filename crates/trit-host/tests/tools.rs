@@ -228,6 +228,34 @@ fn shell_session_available() -> bool {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn shell_does_not_inherit_provider_keys() {
+    if !shell_session_available() {
+        eprintln!("no bash/sh available; skipping shell env test");
+        return;
+    }
+    const KEY: &str = "TRIT_TEST_PROVIDER_KEY";
+    // SAFETY: 测试进程内设置唯一变量名，断言后立即恢复。
+    unsafe { std::env::set_var(KEY, "sk-test-should-not-leak") };
+    let root = temp_workspace("shell-env");
+    let mut tools = make_tools(&root, false, true);
+    let outcome = tools
+        .execute(&ToolRequest::shell(
+            KEY,
+            "printf %s \"$TRIT_TEST_PROVIDER_KEY\"",
+        ))
+        .unwrap();
+    // SAFETY: 与上面的 set_var 成对。
+    unsafe { std::env::remove_var(KEY) };
+    assert!(
+        !outcome.output.contains("sk-test-should-not-leak"),
+        "provider key leaked: {}",
+        outcome.output
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn persistent_shell_keeps_cwd_and_environment() {
     if !shell_session_available() {
