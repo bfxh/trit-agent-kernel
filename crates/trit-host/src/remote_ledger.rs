@@ -10,8 +10,9 @@
 //!   - `409`：另一执行者持有该键（[`Claim::Pending`]）；
 //!   - `503`：账本已满或内部错误。
 //! - `POST /complete`，同一个头 + `X-Trit-Lease` + 一帧响应：登记完成；`204`
-//!   接受（已完成后重复登记为幂等 no-op，不覆盖原帧）；租约已失效或键未由该
-//!   令牌 claim 时 `403`。
+//!   接受（同一持有者重复登记为幂等 no-op，不覆盖原帧；不同持有者 `403`，
+//!   避免旧执行者拿到“自己的结果获胜”的假象）。租约已失效或键未由该令牌
+//!   claim 时也返回 `403`。
 //! - `POST /renew`，同一个头 + `X-Trit-Lease`、空体：把该键的占位租约重置为
 //!   当前时间，`204`；已完成返回 `204` + `X-Trit-Lease-Done: 1`（当前令牌已
 //!   不再拥有该任务，调用方应立即停止在途执行），未知键 `404`，令牌不匹配 `403`。
@@ -22,7 +23,8 @@
 //! 凭证，不是加密身份：传输仍应放在 loopback 或可信内网，并配置 bearer token。
 //!
 //! 容量有键数与字节双重上限（默认 4096 / 64 MiB）：键数包含占位与完成项，字节按
-//! 已完成帧估算；占位令牌与绝对到期时间也写入 JSONL，另受键数与单行长度约束。
+//! 完成帧与持有者令牌估算；完成记录也保存写入者令牌（旧格式没有 `lease`，仍按
+//! 幂等成功兼容），占位令牌与绝对到期时间同样写入 JSONL，另受键数与单行长度约束。
 //! 物理文件到逻辑上限的 1.5 倍时压缩为当前内存快照（完成项 + 未过期占位，
 //! 临时文件 + 原子替换）；启动时若目标缺失会从 `.compact` 临时文件恢复。
 //!
@@ -142,8 +144,15 @@ pub enum Claim {
 }
 
 enum Entry {
-    Pending { expires_at: Instant, lease: String },
-    Done { frame: Vec<u8> },
+    Pending {
+        expires_at: Instant,
+        lease: String,
+    },
+    /// `lease` 是写入该完成帧的持有者；旧版状态没有这一列，回放后为 `None`。
+    Done {
+        frame: Vec<u8>,
+        lease: Option<String>,
+    },
 }
 
 /// 生成新的随机持有者令牌；时间 + 随机哈希种子 + 进程内序号，避免不同 claim 重复。
@@ -403,6 +412,7 @@ fn handle(
                     completions.fetch_add(1, Ordering::SeqCst);
                     respond(&mut stream, 204, "No Content", b"")
                 }
+                Ok(CompleteOutcome::Duplicate) => respond(&mut stream, 204, "No Content", b""),
                 Ok(CompleteOutcome::NotOwner) => respond(&mut stream, 403, "Forbidden", b""),
                 Err(()) => respond(&mut stream, 503, "Service Unavailable", b""),
             }
@@ -425,7 +435,10 @@ enum RenewOutcome {
 }
 
 enum CompleteOutcome {
+    /// 首次写入完成帧。
     Completed,
+    /// 同一持有者重复登记：幂等接受，但不重复计数。
+    Duplicate,
     NotOwner,
 }
 
@@ -468,7 +481,7 @@ impl LedgerServerView<'_> {
         let mut state = self.state.lock().map_err(|_| ())?;
         if let Some(entry) = state.entries.get_mut(key) {
             match entry {
-                Entry::Done { frame } => return Ok(Claim::Done(frame.clone())),
+                Entry::Done { frame, .. } => return Ok(Claim::Done(frame.clone())),
                 Entry::Pending { expires_at, .. } if now < *expires_at => {
                     return Ok(Claim::Pending);
                 }
@@ -506,9 +519,12 @@ impl LedgerServerView<'_> {
             return Err(());
         }
         if let Some(victim) = victim
-            && let Some(Entry::Done { frame }) = state.entries.remove(&victim)
+            && let Some(Entry::Done { frame, lease }) = state.entries.remove(&victim)
         {
-            state.bytes = state.bytes.saturating_sub(record_bytes(&victim, &frame));
+            state.bytes =
+                state
+                    .bytes
+                    .saturating_sub(record_bytes(&victim, &frame, lease.as_deref()));
         }
         state.entries.insert(
             key.to_string(),
@@ -527,14 +543,20 @@ impl LedgerServerView<'_> {
         let mut state = self.state.lock().map_err(|_| ())?;
         // 已完成过就不再重复落盘；同一持有者重复 complete 视为幂等成功。
         match state.entries.get(key) {
-            Some(Entry::Done { .. }) => return Ok(CompleteOutcome::Completed),
+            Some(Entry::Done { lease: owner, .. }) => {
+                // 旧版 Done 没有持有者信息，只能按幂等成功处理；新记录必须同令牌。
+                if owner.as_deref().is_some_and(|owner| owner != lease) {
+                    return Ok(CompleteOutcome::NotOwner);
+                }
+                return Ok(CompleteOutcome::Duplicate);
+            }
             Some(Entry::Pending { lease: owner, .. }) if owner != lease => {
                 return Ok(CompleteOutcome::NotOwner);
             }
             Some(Entry::Pending { .. }) => {}
             None => return Ok(CompleteOutcome::NotOwner),
         }
-        let new_bytes = record_bytes(key, &frame);
+        let new_bytes = record_bytes(key, &frame, Some(lease));
         let Some(victims) = capacity_victims(
             &state,
             key,
@@ -545,17 +567,26 @@ impl LedgerServerView<'_> {
             return Err(());
         };
         if let Some(path) = self.config.state_path.as_deref()
-            && append_done_record(path, key, &frame).is_err()
+            && append_done_record(path, key, &frame, lease).is_err()
         {
             // 写盘失败就不承认完成，调用方拿到 5xx。
             return Err(());
         }
         for victim in &victims {
-            if let Some(Entry::Done { frame }) = state.entries.remove(victim) {
-                state.bytes = state.bytes.saturating_sub(record_bytes(victim, &frame));
+            if let Some(Entry::Done { frame, lease }) = state.entries.remove(victim) {
+                state.bytes =
+                    state
+                        .bytes
+                        .saturating_sub(record_bytes(victim, &frame, lease.as_deref()));
             }
         }
-        state.entries.insert(key.to_string(), Entry::Done { frame });
+        state.entries.insert(
+            key.to_string(),
+            Entry::Done {
+                frame,
+                lease: Some(lease.to_string()),
+            },
+        );
         state.bytes = state.bytes.saturating_add(new_bytes);
         if let Some(path) = self.config.state_path.as_deref() {
             compact_if_bloated(path, &state.entries, self.config.max_state_bytes);
@@ -611,6 +642,9 @@ enum StoredRecord {
         key: String,
         /// 响应帧的十六进制编码；避免为字节引入额外依赖。
         frame: String,
+        /// 写入该帧的持有者令牌；旧格式没有此字段，回放为 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease: Option<String>,
     },
     /// 占位租约：claim 成功或续租时追加，重启后仍能识别当前持有者。
     Pending {
@@ -661,7 +695,15 @@ fn load_entries(
             StoredRecord::Done { key, .. } | StoredRecord::Pending { key, .. } => key.clone(),
         };
         match record {
-            StoredRecord::Done { key, frame } => {
+            StoredRecord::Done { key, frame, lease } => {
+                if let Some(owner) = lease.as_deref()
+                    && !valid_lease(owner)
+                {
+                    return Err(invalid_data(format!(
+                        "{}: stored completion lease for {key} is invalid",
+                        path.display()
+                    )));
+                }
                 let frame = hex_decode(&frame)
                     .ok_or_else(|| invalid_data(format!("{}: bad hex frame", path.display())))?;
                 let mut buffer = frame.clone();
@@ -680,11 +722,17 @@ fn load_entries(
                         path.display()
                     )));
                 }
-                if let Some(Entry::Done { frame }) = state.entries.get(&key) {
-                    state.bytes = state.bytes.saturating_sub(record_bytes(&key, frame));
+                if let Some(Entry::Done { frame, lease }) = state.entries.get(&key) {
+                    state.bytes =
+                        state
+                            .bytes
+                            .saturating_sub(record_bytes(&key, frame, lease.as_deref()));
                 }
-                state.bytes = state.bytes.saturating_add(record_bytes(&key, &frame));
-                state.entries.insert(key, Entry::Done { frame });
+                state.bytes =
+                    state
+                        .bytes
+                        .saturating_add(record_bytes(&key, &frame, lease.as_deref()));
+                state.entries.insert(key, Entry::Done { frame, lease });
             }
             StoredRecord::Pending {
                 key,
@@ -698,8 +746,11 @@ fn load_entries(
                     )));
                 }
                 // 新的占位事件覆盖同 key 的旧完成/占位状态。
-                if let Some(Entry::Done { frame }) = state.entries.remove(&key) {
-                    state.bytes = state.bytes.saturating_sub(record_bytes(&key, &frame));
+                if let Some(Entry::Done { frame, lease }) = state.entries.remove(&key) {
+                    state.bytes =
+                        state
+                            .bytes
+                            .saturating_sub(record_bytes(&key, &frame, lease.as_deref()));
                 }
                 if expires_unix_ms > now_unix_ms {
                     // 以当前配置的 TTL 为上限，避免损坏/时钟漂移把租约无限延长。
@@ -731,8 +782,11 @@ fn trim_state(
 ) {
     while state.entries.len() > max_entries || state.bytes > max_state_bytes {
         if let Some(victim) = first_done_key_excluding(&state.entries, preserve) {
-            if let Some(Entry::Done { frame }) = state.entries.remove(&victim) {
-                state.bytes = state.bytes.saturating_sub(record_bytes(&victim, &frame));
+            if let Some(Entry::Done { frame, lease }) = state.entries.remove(&victim) {
+                state.bytes =
+                    state
+                        .bytes
+                        .saturating_sub(record_bytes(&victim, &frame, lease.as_deref()));
             }
             continue;
         }
@@ -744,20 +798,24 @@ fn trim_state(
         }
         // 没有别的可淘汰项：为了尊重上限，只能放弃刚回放的完成项（正常日志不会走到）。
         if let Some(preserve) = preserve
-            && let Some(Entry::Done { frame }) = state.entries.remove(preserve)
+            && let Some(Entry::Done { frame, lease }) = state.entries.remove(preserve)
         {
-            state.bytes = state.bytes.saturating_sub(record_bytes(preserve, &frame));
+            state.bytes =
+                state
+                    .bytes
+                    .saturating_sub(record_bytes(preserve, &frame, lease.as_deref()));
             continue;
         }
         break;
     }
 }
 
-/// 保守估算一条 JSONL 记录占用的字节数：帧按十六进制翻倍，key 预留转义空间。
-fn record_bytes(key: &str, frame: &[u8]) -> usize {
+/// 保守估算一条 JSONL 记录占用的字节数：帧按十六进制翻倍，key/lease 预留转义空间。
+fn record_bytes(key: &str, frame: &[u8], lease: Option<&str>) -> usize {
     key.len()
         .saturating_mul(6)
         .saturating_add(frame.len().saturating_mul(2))
+        .saturating_add(lease.map_or(0, |lease| lease.len().saturating_mul(6)))
         .saturating_add(32)
 }
 
@@ -807,8 +865,9 @@ fn capacity_victims(
             (other != key && !victims.contains(other) && matches!(entry, Entry::Done { .. }))
                 .then(|| other.clone())
         })?;
-        if let Some(Entry::Done { frame }) = state.entries.get(&victim) {
-            projected_bytes = projected_bytes.saturating_sub(record_bytes(&victim, frame));
+        if let Some(Entry::Done { frame, lease }) = state.entries.get(&victim) {
+            projected_bytes =
+                projected_bytes.saturating_sub(record_bytes(&victim, frame, lease.as_deref()));
         }
         victims.insert(victim);
         projected_entries = projected_entries.saturating_sub(1);
@@ -817,10 +876,11 @@ fn capacity_victims(
 }
 
 /// 追加一条已完成记录并落盘。
-fn append_done_record(path: &Path, key: &str, frame: &[u8]) -> std::io::Result<()> {
+fn append_done_record(path: &Path, key: &str, frame: &[u8], lease: &str) -> std::io::Result<()> {
     let record = StoredRecord::Done {
         key: key.to_string(),
         frame: hex_encode(frame),
+        lease: Some(lease.to_string()),
     };
     append_line(path, &record)
 }
@@ -875,9 +935,10 @@ fn compact_state(path: &Path, entries: &BTreeMap<String, Entry>) -> std::io::Res
     let now = Instant::now();
     for (key, entry) in entries {
         let record = match entry {
-            Entry::Done { frame } => StoredRecord::Done {
+            Entry::Done { frame, lease } => StoredRecord::Done {
                 key: key.clone(),
                 frame: hex_encode(frame),
+                lease: lease.clone(),
             },
             Entry::Pending { expires_at, lease } if now < *expires_at => StoredRecord::Pending {
                 key: key.clone(),
@@ -1018,6 +1079,29 @@ pub fn renew_checked(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Resul
     }
 }
 
+/// 登记完成的结构化错误；服务端用它把“令牌已失效”转成 `Aborted`，而不是 5xx。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompleteError {
+    InvalidLease,
+    /// 403：占位已属于别人，或该键的完成帧已由另一个持有者写入。
+    LeaseLost,
+    Http(u16),
+    Transport(String),
+}
+
+impl std::fmt::Display for CompleteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLease => write!(formatter, "ledger complete: invalid lease"),
+            Self::LeaseLost => write!(formatter, "ledger complete: lease not held"),
+            Self::Http(status) => write!(formatter, "ledger complete returned HTTP {status}"),
+            Self::Transport(message) => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for CompleteError {}
+
 /// 账本客户端：登记完成响应；只接受当前持有者的租约令牌。
 pub fn complete(
     endpoint: &RemoteEndpoint,
@@ -1025,14 +1109,25 @@ pub fn complete(
     lease: &str,
     frame: &[u8],
 ) -> Result<(), String> {
+    complete_checked(endpoint, key, lease, frame).map_err(|error| error.to_string())
+}
+
+/// 带结构化错误的完成登记：403 表示租约已被接管或完成帧已由别人写入。
+pub fn complete_checked(
+    endpoint: &RemoteEndpoint,
+    key: &str,
+    lease: &str,
+    frame: &[u8],
+) -> Result<(), CompleteError> {
     if !valid_lease(lease) {
-        return Err("ledger complete: invalid lease".into());
+        return Err(CompleteError::InvalidLease);
     }
-    let reply = post(endpoint, "/complete", key, Some(lease), Some(frame))?;
+    let reply = post(endpoint, "/complete", key, Some(lease), Some(frame))
+        .map_err(CompleteError::Transport)?;
     match reply.status {
         200 | 204 => Ok(()),
-        403 => Err("ledger complete: lease not held".into()),
-        other => Err(format!("ledger complete returned HTTP {other}")),
+        403 => Err(CompleteError::LeaseLost),
+        other => Err(CompleteError::Http(other)),
     }
 }
 

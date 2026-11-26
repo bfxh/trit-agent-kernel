@@ -119,6 +119,14 @@ fn ledger_claim_complete_and_pending_takeover() {
     );
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_two, &frame).unwrap();
     assert!(
+        remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_two, &frame).is_ok(),
+        "the recorded owner may repeat its completion idempotently"
+    );
+    assert!(
+        remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_one, &frame).is_err(),
+        "a stale lease must not be told that its completion won"
+    );
+    assert!(
         remote_ledger::renew(&ledger_endpoint, "t1@0", &lease_two).is_err(),
         "a completed key must not be renewed"
     );
@@ -231,7 +239,11 @@ fn completed_records_survive_restart() {
     let address = restarted.addr().unwrap();
     let restarted_endpoint = endpoint(&format!("http://{address}"), None, 5);
     let server = Arc::clone(&restarted);
-    let handle = thread::spawn(move || server.serve_once().unwrap());
+    let handle = thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
     match remote_ledger::claim(&restarted_endpoint, "t1@0").unwrap() {
         Claim::Done(body) => {
             let mut buffer = body;
@@ -240,6 +252,14 @@ fn completed_records_survive_restart() {
         }
         other => panic!("expected persisted Done, got {other:?}"),
     }
+    assert!(
+        remote_ledger::complete(&restarted_endpoint, "t1@0", &lease, &frame).is_ok(),
+        "the persisted owner may repeat its completion"
+    );
+    assert!(
+        remote_ledger::complete(&restarted_endpoint, "t1@0", "0000000000000000", &frame).is_err(),
+        "another lease must not be told that it wrote the persisted frame"
+    );
     handle.join().unwrap();
     assert_eq!(restarted.completions(), 0);
     let text = std::fs::read_to_string(&path).unwrap();
@@ -829,6 +849,66 @@ fn lease_loss_aborts_in_flight_execution() {
         0,
         "the stale owner must not write a completion"
     );
+}
+
+#[test]
+fn stale_completion_is_aborted_instead_of_returned() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_millis(50)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let node = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(300)
+            .with_ledger(ledger_endpoint.clone())
+            // 心跳晚于执行结束：让“登记完成时才发现租约丢失”的路径必然发生。
+            .with_ledger_renew_interval(Duration::from_secs(30)),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", node.addr().unwrap());
+    let server = thread::spawn(move || node.serve_once().unwrap());
+    let client =
+        thread::spawn(move || run_remote_subagent_reply(&endpoint(&url, None, 10), &request()));
+
+    // node 已开始 300ms 睡眠；TTL 过期后外部持有者接管并写入自己的完成帧。
+    thread::sleep(Duration::from_millis(200));
+    let lease = loop {
+        match remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() {
+            Claim::New { lease } => break lease,
+            Claim::Pending => thread::sleep(Duration::from_millis(25)),
+            Claim::Done(_) => panic!("unexpected completion before takeover"),
+        }
+    };
+    let winner = SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"winner".to_vec(),
+        tokens: 0,
+    };
+    let frame = encode_frame(&winner).unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+
+    let reply = client.join().unwrap().unwrap();
+    assert!(
+        reply.lease_lost,
+        "a completion rejected by the ledger must be reported as lease loss"
+    );
+    assert!(
+        matches!(reply.result.status, DelegationStatus::Aborted),
+        "the stale owner must not return its own Completed frame, got {:?}",
+        reply.result.status
+    );
+    assert!(reply.content.is_empty());
+    assert_eq!(ledger.completions(), 1, "only the new owner's frame wins");
+    server.join().unwrap();
 }
 
 #[test]

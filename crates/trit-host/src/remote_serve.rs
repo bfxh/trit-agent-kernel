@@ -35,9 +35,10 @@
 //!     误判过期；`/renew` 与 `/complete` 都携带 claim 返回的 `X-Trit-Lease`，
 //!     过期接管后旧持有者不能再续租或写完成。心跳收到 `403`/`404` 或已完成标记
 //!     会立即置位取消令牌：睡眠与 Exec 子进程都被中止，服务端回 `Aborted`（带
-//!     `X-Trit-Lease-Lost: 1`）且不登记完成，避免旧持有者继续做无效副作用。网络
-//!     分区导致心跳请求完全无法送达时，旧执行者仍可能在本地跑完，这部分需任务
-//!     幂等兜底。
+//!     `X-Trit-Lease-Lost: 1`）且不登记完成，避免旧持有者继续做无效副作用。若
+//!     执行完才发现完成帧已由别人写入（`/complete` 403），同样回标记过的
+//!     `Aborted`，绝不把本机旧结果当成获胜帧返回。网络分区导致心跳请求完全无法
+//!     送达时，旧执行者仍可能在本地跑完，这部分需任务幂等兜底。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -669,12 +670,17 @@ fn handle(
         && ledger_owned
         && let Some(endpoint) = config.ledger.as_ref()
     {
-        // 执行后必须用当前持有者令牌登记；登记失败时回 5xx，宁可让调用方失败也不谎报完成。
+        // 执行后必须用当前持有者令牌登记；令牌失效时回 Aborted + 标记，让调度方
+        // 等待当前持有者的结果，而不是继续返回本机的旧结果。
         let Some(lease) = ledger_lease.as_deref() else {
             return respond(&mut stream, 503, "Service Unavailable", b"");
         };
-        if remote_ledger::complete(endpoint, &key, lease, &frame).is_err() {
-            return respond(&mut stream, 503, "Service Unavailable", b"");
+        match remote_ledger::complete_checked(endpoint, &key, lease, &frame) {
+            Ok(()) => {}
+            Err(remote_ledger::CompleteError::LeaseLost) => {
+                return respond_aborted_lease_lost(&mut stream, &request);
+            }
+            Err(_) => return respond(&mut stream, 503, "Service Unavailable", b""),
         }
     }
     if dedupe
@@ -787,6 +793,20 @@ fn sleep_unless_cancelled(ms: u64, token: Option<&CancelToken>) -> bool {
 
 /// 未开始执行就被取消：回一个合法 `Aborted` 帧，而不是空体。
 fn respond_aborted(stream: &mut TcpStream, request: &SubagentRequest) -> std::io::Result<()> {
+    let frame = aborted_frame(request)?;
+    respond(stream, 200, "OK", &frame)
+}
+
+/// 租约在完成登记时才发现失效：同样回 `Aborted`，但带“不是节点故障”的标记。
+fn respond_aborted_lease_lost(
+    stream: &mut TcpStream,
+    request: &SubagentRequest,
+) -> std::io::Result<()> {
+    let frame = aborted_frame(request)?;
+    respond_lease_lost(stream, &frame)
+}
+
+fn aborted_frame(request: &SubagentRequest) -> std::io::Result<Vec<u8>> {
     let response = SubagentResponse {
         task: request.task.clone(),
         epoch: request.epoch,
@@ -794,8 +814,7 @@ fn respond_aborted(stream: &mut TcpStream, request: &SubagentRequest) -> std::io
         content: Vec::new(),
         tokens: 0,
     };
-    let frame = encode_frame(&response).map_err(std::io::Error::other)?;
-    respond(stream, 200, "OK", &frame)
+    encode_frame(&response).map_err(std::io::Error::other)
 }
 
 /// 租约被接管后返回合法 `Aborted` 帧，并标记“不是节点故障”。
