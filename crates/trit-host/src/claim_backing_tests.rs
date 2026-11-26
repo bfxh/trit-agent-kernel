@@ -158,6 +158,90 @@ fn written_paths_back_a_diff_claim() {
 }
 
 #[test]
+fn underreported_write_refutes_a_passing_diff_claim() {
+    let receipts = vec![write("a", "src/a.rs", false), write("b", "src/b.rs", false)];
+    let claim = judged(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["src/a.rs".to_owned()],
+        },
+        &receipts,
+    );
+    assert!(claim.backed, "声明的文件确实写了");
+    assert!(
+        !claim.passed,
+        "还改了 src/b.rs 却只声明 src/a.rs，完成声明漏报"
+    );
+}
+
+#[test]
+fn declaring_every_write_across_diff_criteria_still_passes() {
+    let receipts = vec![write("a", "src/a.rs", false), write("b", "src/b.rs", false)];
+    let request = ClaimRequest {
+        criteria: vec![
+            CriterionRequest {
+                id: "c1".to_owned(),
+                kind: CriterionKind::Diff {
+                    paths: vec!["src/a.rs".to_owned()],
+                },
+            },
+            CriterionRequest {
+                id: "c2".to_owned(),
+                kind: CriterionKind::Diff {
+                    paths: vec!["src/b.rs".to_owned()],
+                },
+            },
+        ],
+    };
+    let claim = back_claim(&request, "task", &receipts, None);
+    assert_eq!(claim.criteria.len(), 2);
+    assert!(claim.criteria.iter().all(|criterion| criterion.passed));
+}
+
+#[test]
+fn verification_claim_is_unaffected_by_writes_outside_diff_scope() {
+    let receipts = vec![
+        shell("a", "cargo test", true, 5, false),
+        write("b", "src/a.rs", false),
+    ];
+    let claim = judged(
+        "c1",
+        CriterionKind::Verification {
+            command: "cargo test".to_owned(),
+        },
+        &receipts,
+    );
+    assert!(claim.backed);
+    assert!(claim.passed, "没有 diff criterion 时不做漏报判定");
+}
+
+#[test]
+fn move_receipts_are_not_treated_as_unreported() {
+    let receipts = vec![ToolOutcome {
+        call_id: "m1".to_owned(),
+        tool: "move_path".to_owned(),
+        command: None,
+        passed: true,
+        assertions: 0,
+        written_paths: vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()],
+        in_doubt: false,
+        output: String::new(),
+    }];
+    let claim = judged(
+        "c1",
+        CriterionKind::Diff {
+            paths: vec!["src/b.rs".to_owned()],
+        },
+        &receipts,
+    );
+    assert!(claim.backed);
+    assert!(
+        claim.passed,
+        "move 的变更面是双向的，声明目标即可，不按漏报处理"
+    );
+}
+
+#[test]
 fn in_doubt_write_keeps_diff_unknown() {
     let receipts = vec![write("a", "src/lib.rs", true)];
     let claim = judged(
