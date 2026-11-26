@@ -290,7 +290,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 - **取消传播**：`run_remote_subagent_reply_cancellable` 在独立线程执行请求，
   等待期间每 25ms 检查取消令牌；置位后向端点 origin 的 `/cancel` 发同一幂等
   键，最多再等 2s 收尾，超时按 `Aborted` 返回。服务端按幂等键登记在途请求：
-  等待账本、`sleep_ms` 与执行前都会检查，`Exec` 模式直接 kill 子进程；取消
+  同一个键的并发请求全部登记，`/cancel` 会把它们全部置位；等待账本、`sleep_ms`
+  与执行前都会检查，`Exec` 模式直接 kill 子进程；取消
   回合法 `Aborted` 帧并照常登记账本/本地缓存，后续重试不会再次执行同一键。
   跨机派发对应用户取消：在途任务以 `Aborted` 结束、容量按
   `NodeOutcome::Abandoned` 归还（不计 attempts/failures、不换节点重试）。

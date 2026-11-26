@@ -136,6 +136,23 @@ fn spawn_echo(args: &[&str]) -> (String, Child) {
     (format!("http://{bind}/run"), child)
 }
 
+fn cancel(url: &str, key: &str) {
+    let origin = url.strip_suffix("/run").unwrap_or(url);
+    let address = origin.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    write!(
+        stream,
+        "POST /cancel HTTP/1.1\r\nHost: test\r\n{IDEMPOTENCY_HEADER}: {key}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 204"),
+        "cancel should be accepted, got {response}"
+    );
+}
+
 #[test]
 fn remote_round_trip_over_loopback() {
     let request = request();
@@ -747,6 +764,40 @@ fn connection_limit_rejects_excess_with_503() {
 
     drop(first);
     drop(server);
+}
+
+#[test]
+fn cancel_reaches_all_concurrent_requests_with_the_same_key() {
+    let (url, mut child) = spawn_echo(&["--sleep-ms", "1000"]);
+    let endpoint = endpoint(&url, None, 10);
+    let request = request();
+    let first = {
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        std::thread::spawn(move || run_remote_subagent(&endpoint, &request))
+    };
+    let second = {
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        std::thread::spawn(move || run_remote_subagent(&endpoint, &request))
+    };
+
+    std::thread::sleep(Duration::from_millis(250));
+    cancel(&url, "a@3");
+    // 两个请求的登记有先后；再取消一次，确保晚到者也被覆盖。
+    std::thread::sleep(Duration::from_millis(100));
+    cancel(&url, "a@3");
+
+    for (label, worker) in [("first", first), ("second", second)] {
+        let response = worker.join().unwrap().unwrap();
+        assert!(
+            matches!(&response.status, DelegationStatus::Aborted),
+            "{label} must be aborted, got {:?}",
+            response.status
+        );
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

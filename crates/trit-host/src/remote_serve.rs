@@ -26,8 +26,8 @@
 //!    建 `<root>[/<scope>]/<task>` 并展开 args 里的 `{workspace}` / `{task}`；任务
 //!    ID 含路径分隔符或为 `.`/`..` 时直接回 `Failed`，不落盘；
 //! 8. **取消传播**：`POST /cancel`（origin 上的固定路径）+ `X-Trit-Idempotency`
-//!    按幂等键置位在途请求；等待账本、`sleep_ms` 与执行前都会检查，Exec 用可
-//!    取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
+//!    按幂等键置位所有在途请求（同键并发时每个持有者都会被取消）；等待账本、
+//!    `sleep_ms` 与执行前都会检查，Exec 用可取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
 //!    账本/本地缓存，避免后续重试再次执行同一键；
 //! 9. **连接有界**：`max_connections` 默认 64；超额连接直接 503，不排队、不 spawn，
 //!    防止慢客户端把服务端线程与内存堆爆；
@@ -142,7 +142,7 @@ impl ResponseCacheState {
     }
 }
 
-/// 在途请求的取消登记：按幂等键。
+/// 在途请求的取消登记：按幂等键；同一个键可能有多个并发请求，全部保留。
 #[derive(Default)]
 struct ActiveCancels {
     inner: Mutex<CancelRegistry>,
@@ -150,7 +150,9 @@ struct ActiveCancels {
 
 #[derive(Default)]
 struct CancelRegistry {
-    active: BTreeMap<String, CancelToken>,
+    active: BTreeMap<String, Vec<(u64, CancelToken)>>,
+    /// 每个 `CancelScope` 的唯一编号，避免先结束的请求删掉后来者的登记。
+    next_id: u64,
     /// 取消先于请求到达的键；请求登记时立即继承取消状态。
     pre: BTreeSet<String>,
 }
@@ -159,39 +161,56 @@ impl ActiveCancels {
     /// 登记一个请求并返回自动注销的守卫。
     fn scope(&self, key: &str) -> CancelScope<'_> {
         let token = CancelToken::new();
-        if let Ok(mut registry) = self.inner.lock() {
+        let id = {
+            let mut registry = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if registry.pre.remove(key) {
                 token.cancel();
             }
-            registry.active.insert(key.to_string(), token.clone());
-        }
+            registry.next_id = registry.next_id.wrapping_add(1);
+            let id = registry.next_id;
+            registry
+                .active
+                .entry(key.to_string())
+                .or_default()
+                .push((id, token.clone()));
+            id
+        };
         CancelScope {
             registry: self,
             key: key.to_string(),
+            id,
             token,
         }
     }
 
-    /// 取消一个键；在途请求立即置位，尚未到达的键先暂存。
+    /// 取消一个键：该键当前所有在途请求都置位；尚未到达的键先暂存。
     fn cancel(&self, key: &str) {
-        if let Ok(mut registry) = self.inner.lock() {
-            if let Some(token) = registry.active.get(key) {
+        let mut registry = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tokens) = registry.active.get(key) {
+            for (_, token) in tokens {
                 token.cancel();
-                return;
             }
-            if registry.pre.len() >= MAX_PRE_CANCELLED
-                && let Some(oldest) = registry.pre.iter().next().cloned()
-            {
-                registry.pre.remove(&oldest);
-            }
-            registry.pre.insert(key.to_string());
+            return;
         }
+        if registry.pre.len() >= MAX_PRE_CANCELLED
+            && let Some(oldest) = registry.pre.iter().next().cloned()
+        {
+            registry.pre.remove(&oldest);
+        }
+        registry.pre.insert(key.to_string());
     }
 }
 
 struct CancelScope<'a> {
     registry: &'a ActiveCancels,
     key: String,
+    id: u64,
     token: CancelToken,
 }
 
@@ -203,7 +222,16 @@ impl CancelScope<'_> {
 
 impl Drop for CancelScope<'_> {
     fn drop(&mut self) {
-        if let Ok(mut registry) = self.registry.inner.lock() {
+        let mut registry = self
+            .registry
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(tokens) = registry.active.get_mut(&self.key) else {
+            return;
+        };
+        tokens.retain(|(id, _)| *id != self.id);
+        if tokens.is_empty() {
             registry.active.remove(&self.key);
         }
     }
