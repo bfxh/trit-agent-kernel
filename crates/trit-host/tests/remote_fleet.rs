@@ -75,6 +75,30 @@ fn spawn_node(id: &str, capacity: usize, args: &[&str]) -> TestNode {
     }
 }
 
+/// 起一个只接受一次 `/health`、延迟后回 200 的节点，用于测探测并发。
+fn delayed_health_node(id: &str, delay: Duration) -> (RemoteNode, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request);
+        std::thread::sleep(delay);
+        let _ =
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    });
+    let node = RemoteNode::new(
+        id,
+        RemoteEndpoint {
+            url: format!("{base}/run"),
+            auth_token: None,
+            timeout_secs: 5,
+        },
+    );
+    (node, handle)
+}
+
 fn task(id: &str, deps: &[&str]) -> TaskSpec {
     TaskSpec {
         task: Task {
@@ -150,6 +174,69 @@ fn library_preflight_readmits_an_isolated_node() {
     assert!(probe.readmitted);
     assert!(probe.error.is_none(), "{probe:?}");
     assert!(report.nodes[0].healthy, "{:?}", report.nodes);
+}
+
+#[test]
+fn library_preflight_probes_isolated_nodes_with_bounded_concurrency() {
+    let worker = spawn_node("a-worker", 1, &[]);
+    let delay = Duration::from_millis(250);
+    let (mut nodes, mut handles): (Vec<RemoteNode>, Vec<JoinHandle<()>>) = (0..4)
+        .map(|index| delayed_health_node(&format!("n{index}"), delay))
+        .unzip();
+    nodes.push(worker.remote());
+    let snapshots: Vec<NodeSnapshot> = nodes
+        .iter()
+        .filter(|node| node.id != "a-worker")
+        .map(|node| NodeSnapshot {
+            id: node.id.clone(),
+            healthy: false,
+            in_flight: 0,
+            attempts: 2,
+            failures: 1,
+        })
+        .collect();
+    let table = NodeTable::new(nodes).unwrap().with_snapshots(&snapshots);
+
+    let started = Instant::now();
+    let report = run_remote_plan_with_table(
+        &plan(vec![task("t1", &[])]),
+        Arc::new(table),
+        RemotePlanConfig::new(1)
+            .with_health_probe_on_start()
+            .with_health_probe_concurrency(4),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(report.report.completed.len(), 1, "{:?}", report.report);
+    assert_eq!(report.probes.len(), 4, "{:?}", report.probes);
+    let event_nodes: Vec<&str> = report
+        .probes
+        .iter()
+        .map(|probe| probe.node.as_str())
+        .collect();
+    assert_eq!(
+        event_nodes,
+        ["n0", "n1", "n2", "n3"],
+        "并发 preflight 的事件仍按节点 id 升序"
+    );
+    assert!(
+        report
+            .probes
+            .iter()
+            .all(|probe| probe.ok && probe.readmitted),
+        "{:?}",
+        report.probes
+    );
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "4 个 250ms 探测串行需 1s；并发应明显更快，实际 {elapsed:?}"
+    );
+    for handle in handles.drain(..) {
+        handle.join().unwrap();
+    }
 }
 
 #[test]

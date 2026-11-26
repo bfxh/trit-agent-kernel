@@ -589,6 +589,37 @@ fn remote_plan_cli_requires_health_for_health_flush() {
 }
 
 #[test]
+fn remote_plan_cli_validates_probe_concurrency() {
+    let orphan = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--probe-concurrency")
+        .arg("4")
+        .output()
+        .unwrap();
+    assert_eq!(orphan.status.code(), Some(2), "{orphan:?}");
+    let stderr = String::from_utf8_lossy(&orphan.stderr);
+    assert!(
+        stderr.contains("--probe-concurrency requires --probe or --probe-interval-ms"),
+        "{stderr}"
+    );
+
+    for (value, expected) in [("0", "must be positive"), ("65", "must be <= 64")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+            .arg("remote-plan")
+            .arg("--health")
+            .arg("unused-health.json")
+            .arg("--probe")
+            .arg("--probe-concurrency")
+            .arg(value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{value}: {stderr}");
+    }
+}
+
+#[test]
 fn remote_plan_cli_requires_health_for_probe() {
     let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .arg("remote-plan")

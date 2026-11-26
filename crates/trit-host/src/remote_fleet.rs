@@ -24,11 +24,12 @@
 //!   [`RemotePlanReport::attempts`]。
 //! - 健康恢复由本层配置：`health_probe_on_start` 在派发前探测一次，
 //!   `health_probe_interval` 在派发期间周期探测；只探已隔离节点，`GET /health`
-//!   成功才调用 [`NodeTable::readmit`] 放行。事件写入 [`RemotePlanReport::probes`]，
-//!   最多保留 1024 条；周期监控随本次派发结束而退出。跨运行的常驻恢复由
-//!   [`probe_remote_health_file`] + `trit-host remote-health` 承担：它独立读写
-//!   节点健康文件，不依赖某个演练进程一直活着；CLI 每轮重读节点表，并在
-//!   `<health>.lock` 上持单实例 OS 锁。
+//!   成功才调用 [`NodeTable::readmit`] 放行。`health_probe_concurrency` 控制一次
+//!   扫描内的并行上限（默认串行），事件仍按节点 id 升序写入
+//!   [`RemotePlanReport::probes`]，最多保留 1024 条；周期监控随本次派发结束而退出。
+//!   跨运行的常驻恢复由 [`probe_remote_health_file`] + `trit-host remote-health`
+//!   承担：它独立读写节点健康文件，不依赖某个演练进程一直活着；CLI 每轮重读
+//!   节点表，并在 `<health>.lock` 上持单实例 OS 锁。
 //! - 长演练可用 [`spawn_remote_health_flusher`] 把节点表快照周期写回健康文件；
 //!   这样进程中途崩溃时，最近的隔离/放行结果仍留在磁盘上，而不是只在计划
 //!   正常结束才落盘。写回与其它写者走同一套 `.write.lock` 合并协议。
@@ -94,6 +95,8 @@ pub struct RemotePlanConfig {
     /// 派发期间周期探测已隔离节点的间隔；`None` 不启动周期监控。
     /// 周期监控随本次派发结束而退出，不做常驻后台恢复。
     pub health_probe_interval: Option<Duration>,
+    /// 一次 preflight / 周期扫描内最多并行探测多少个已隔离节点；默认 1（串行）。
+    pub health_probe_concurrency: usize,
 }
 
 impl RemotePlanConfig {
@@ -105,6 +108,7 @@ impl RemotePlanConfig {
             scope: None,
             health_probe_on_start: false,
             health_probe_interval: None,
+            health_probe_concurrency: 1,
         }
     }
 
@@ -133,6 +137,12 @@ impl RemotePlanConfig {
     /// 派发期间周期探测已隔离节点；`Duration::ZERO` 关闭周期监控。
     pub fn with_health_probe_interval(mut self, interval: Duration) -> Self {
         self.health_probe_interval = (!interval.is_zero()).then_some(interval);
+        self
+    }
+
+    /// 一次健康扫描最多并行探测多少个节点；0 与超上限都夹到合法区间。
+    pub fn with_health_probe_concurrency(mut self, concurrency: usize) -> Self {
+        self.health_probe_concurrency = concurrency.clamp(1, MAX_HEALTH_PROBE_CONCURRENCY);
         self
     }
 }
@@ -380,13 +390,19 @@ where
 
     let probes = Arc::new(Mutex::new(Vec::new()));
     if config.health_probe_on_start {
-        probe_isolated_nodes(&table, &probes, RemoteProbePhase::Preflight);
+        probe_isolated_nodes(
+            &table,
+            &probes,
+            RemoteProbePhase::Preflight,
+            config.health_probe_concurrency,
+        );
     }
     let monitor = match config.health_probe_interval {
         Some(interval) => Some(spawn_health_monitor(
             Arc::clone(&table),
             interval,
             Arc::clone(&probes),
+            config.health_probe_concurrency,
         )?),
         None => None,
     };
@@ -758,21 +774,58 @@ fn write_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentErr
 }
 
 /// 探测当前所有已隔离节点；成功才放行，失败保持隔离并记录原因。
+///
+/// 一次扫描内最多 `concurrency` 个探测并行；探测结果全部返回后再按节点 id
+/// 升序统一 readmit、写事件，避免并发回填打乱报告顺序。节点数少于并发上限时
+/// 只起相应数量的线程。
 fn probe_isolated_nodes(
     table: &NodeTable,
     probes: &Mutex<Vec<RemoteProbeEvent>>,
     phase: RemoteProbePhase,
+    concurrency: usize,
 ) {
-    let mut events = Vec::new();
-    for snapshot in table
+    let mut targets: Vec<RemoteNode> = table
         .snapshot()
         .into_iter()
         .filter(|snapshot| !snapshot.healthy)
-    {
-        let Some(node) = table.node(&snapshot.id) else {
+        .filter_map(|snapshot| table.node(&snapshot.id))
+        .collect();
+    targets.sort_by(|left, right| left.id.cmp(&right.id));
+    if targets.is_empty() {
+        return;
+    }
+
+    let outcomes = Mutex::new(vec![None; targets.len()]);
+    let next = AtomicUsize::new(0);
+    let workers = concurrency
+        .clamp(1, MAX_HEALTH_PROBE_CONCURRENCY)
+        .min(targets.len());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(node) = targets.get(index) else {
+                        break;
+                    };
+                    let outcome = probe_remote_health(&node.endpoint);
+                    outcomes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())[index] = Some(outcome);
+                }
+            });
+        }
+    });
+    let outcomes = outcomes
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut events = Vec::new();
+    for (node, outcome) in targets.into_iter().zip(outcomes) {
+        let Some(outcome) = outcome else {
             continue;
         };
-        match probe_remote_health(&node.endpoint) {
+        match outcome {
             Ok(()) => {
                 let readmitted = table.readmit(&node.id);
                 events.push(RemoteProbeEvent {
@@ -832,6 +885,7 @@ fn spawn_health_monitor(
     table: Arc<NodeTable>,
     interval: Duration,
     probes: Arc<Mutex<Vec<RemoteProbeEvent>>>,
+    concurrency: usize,
 ) -> Result<HealthMonitor, AgentError> {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = std::thread::Builder::new()
@@ -840,7 +894,7 @@ fn spawn_health_monitor(
             let stop = Arc::clone(&stop);
             move || {
                 while !stop.load(Ordering::SeqCst) {
-                    probe_isolated_nodes(&table, &probes, RemoteProbePhase::Periodic);
+                    probe_isolated_nodes(&table, &probes, RemoteProbePhase::Periodic, concurrency);
                     let mut remaining = interval;
                     while !stop.load(Ordering::SeqCst) && !remaining.is_zero() {
                         let wait = remaining.min(HEALTH_MONITOR_STEP);

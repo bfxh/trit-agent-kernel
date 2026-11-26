@@ -1348,9 +1348,10 @@ fn usage() {
          [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>] [--probe]\n\
-         [--probe-interval-ms N] [--health-flush-ms N]\n\
+         [--probe-interval-ms N] [--probe-concurrency N] [--health-flush-ms N]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?,scope?}},\n\
          dispatches tasks as read-only subagent requests to the static node table, prints JSON.\n\
+         --probe-concurrency bounds parallel GET /health inside one scan (1..64, needs a probe mode).\n\
          --health-flush-ms defaults to 30000 when --health is set; 0 disables periodic rewrite.\n\n\
          remote-health: trit-host remote-health --nodes <json> --health <path> [--interval-ms N] [--once]\n\
          [--probe-concurrency N]\n\
@@ -1750,6 +1751,8 @@ const DEFAULT_HEALTH_FLUSH_MS: u64 = 30_000;
 /// `--probe` 会在加载健康文件后对已隔离节点做一次 `GET /health`，成功才重新放行。
 /// `--probe-interval-ms` 会在本次演练运行期间周期探测已隔离节点，成功后重新放行；
 /// 它要求 `--health <path>`，且只在本进程内有效，不做常驻后台监控。
+/// `--probe-concurrency N` 限制一次 preflight/周期扫描内的并行探测数（1..=64，
+/// 需配合 `--probe` 或 `--probe-interval-ms`；未指定时沿用库级默认的串行探测）。
 /// `--health` 还存在时默认每 30s 把当前节点健康写回文件（`--health-flush-ms` 可调，
 /// 0 关闭），避免长演练中途崩溃只在正常结束才落盘；停止写回线程后才做最终写回。
 /// 两种探测都映射到库级 `RemotePlanConfig::with_health_probe_*`，事件来自报告的
@@ -1760,6 +1763,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut health_path: Option<String> = None;
     let mut probe = false;
     let mut probe_interval_ms: Option<u64> = None;
+    let mut probe_concurrency: Option<usize> = None;
     let mut health_flush_ms: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1768,6 +1772,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
             "--probe" => probe = true,
             "--probe-interval-ms" => {
                 probe_interval_ms = Some(next(&mut args, "--probe-interval-ms")?.parse()?)
+            }
+            "--probe-concurrency" => {
+                probe_concurrency = Some(next(&mut args, "--probe-concurrency")?.parse()?)
             }
             "--health-flush-ms" => {
                 health_flush_ms = Some(next(&mut args, "--health-flush-ms")?.parse()?)
@@ -1784,8 +1791,24 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     if health_flush_ms.is_some() && health_path.is_none() {
         return Err(fail("--health-flush-ms requires --health <path>"));
     }
+    if probe_concurrency.is_some() && !probe && probe_interval_ms.is_none() {
+        return Err(fail(
+            "--probe-concurrency requires --probe or --probe-interval-ms",
+        ));
+    }
     if probe_interval_ms == Some(0) {
         return Err(fail("--probe-interval-ms must be positive"));
+    }
+    if let Some(concurrency) = probe_concurrency {
+        if concurrency == 0 {
+            return Err(fail("--probe-concurrency must be positive"));
+        }
+        if concurrency > trit_host::MAX_HEALTH_PROBE_CONCURRENCY {
+            return Err(fail(format!(
+                "--probe-concurrency must be <= {}",
+                trit_host::MAX_HEALTH_PROBE_CONCURRENCY
+            )));
+        }
     }
     let probe_interval = probe_interval_ms.map(std::time::Duration::from_millis);
     let health_flush_interval =
@@ -1815,6 +1838,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     }
     if let Some(interval) = probe_interval {
         config = config.with_health_probe_interval(interval);
+    }
+    if let Some(concurrency) = probe_concurrency {
+        config = config.with_health_probe_concurrency(concurrency);
     }
     let mut table =
         trit_orch::NodeTable::new(input.nodes)?.with_failure_threshold(input.failure_threshold);
