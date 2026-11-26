@@ -183,6 +183,12 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   - history 索引与归档。
 - 不做：云同步、跨设备迁移。
 - 验收：旧会话目录可读；投影删除后重建；崩溃点矩阵；回退失败不静默；租约过期/抢占测试。
+- 已落地（首刀，files checkpoint）：`rewind-journal.jsonl` 以 append-only 记录
+  `begin / applying / finish / rollback`；未闭合或回滚失败的操作在 `rewind-status`
+  报 `in_doubt`（含 planned 与 applied 路径），并让新的 rewind fail-closed。崩溃点
+  矩阵覆盖「未 applying」「已 applying 首条」「已完成」三类状态。
+- 仍待补：journal 的自动恢复/继续回退（当前只解释与拦截）；git checkpoint 后端；
+  JSONL 布局兼容矩阵；SQLite 投影重建；租约恢复边界。
 - 依赖：B7.3；与 B7.4 联动。
 
 ### B7.8 宿主表面与诊断（P2）

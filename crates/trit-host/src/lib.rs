@@ -1408,6 +1408,7 @@ pub use trit_orch::SelectionPressure;
 
 pub use checkpoint::{
     CHECKPOINT_SCHEMA, Checkpoint, CheckpointRecorder, CheckpointStore, CheckpointingTools,
+    REWIND_JOURNAL, REWIND_SCHEMA, RewindDoubt, RewindJournalReport, RewindPhase, RewindRecord,
     RewindReport, RewindScope, rewind_session, rewind_session_with_policy,
 };
 pub use context::{CompactedContext, ContextPolicy, compact_receipts};

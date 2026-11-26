@@ -47,6 +47,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "journal-status" {
         return run_journal_status(args);
     }
+    if command == "rewind-status" {
+        return run_rewind_status(args);
+    }
     if command == "appcontainer-run" {
         return run_appcontainer(args);
     }
@@ -1345,6 +1348,9 @@ fn usage() {
          journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes;\n\
          exits 1 on remaining doubt or rollback failure.\n\
+         rewind-status: trit-host rewind-status --checkpoint-dir <dir>\n\
+         prints the checkpoint rewind journal; exits 1 when a rewind is unfinished or\n\
+         its rollback failed (a new rewind will refuse until this is resolved).\n\
          appcontainer-prune: trit-host appcontainer-prune --workspace <dir>\n\
          deletes AppContainer profiles recorded for the workspace.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
@@ -1536,6 +1542,31 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
         serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
     );
     if after.has_in_doubt() || rollbacks.iter().any(|outcome| !outcome.ok()) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `rewind-status --checkpoint-dir <dir>`：只读检查回退 journal；
+/// 有未完成或回滚失败的操作时退出 1，供崩溃后先解释再决定下一步。
+fn run_rewind_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut checkpoint_dir: Option<PathBuf> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--checkpoint-dir" => {
+                checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
+            }
+            other => return Err(fail(format!("unknown rewind-status argument: {other}"))),
+        }
+    }
+    let dir = checkpoint_dir.ok_or_else(|| fail("rewind-status requires --checkpoint-dir"))?;
+    let store = CheckpointStore::open(dir)?;
+    let report = store.rewind_status()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+    );
+    if report.has_in_doubt() {
         std::process::exit(1);
     }
     Ok(())

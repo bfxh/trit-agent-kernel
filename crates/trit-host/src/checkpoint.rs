@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -18,6 +19,8 @@ use crate::{
 };
 
 pub const CHECKPOINT_SCHEMA: u32 = 1;
+pub const REWIND_SCHEMA: u32 = 1;
+pub const REWIND_JOURNAL: &str = "rewind-journal.jsonl";
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +127,11 @@ impl CheckpointStore {
         }
     }
 
+    /// 只读检查回退 journal：未完成/回滚失败的 rewind 会让新回退 fail-closed。
+    pub fn rewind_status(&self) -> Result<RewindJournalReport, AgentError> {
+        RewindJournal::open(&self.dir)?.report()
+    }
+
     /// 恢复 `turn` 及之后所有 checkpoint 中每个路径的最早快照。
     ///
     /// 先完成所有路径的归一化、symlink/类型检查和当前内容捕获，再开始写入；
@@ -134,6 +142,14 @@ impl CheckpointStore {
         if !checkpoints.iter().any(|checkpoint| checkpoint.turn == turn) {
             return Err(AgentError::SessionState(format!(
                 "checkpoint for turn {turn} is missing"
+            )));
+        }
+        let mut journal = RewindJournal::open(&self.dir)?;
+        let status = journal.report()?;
+        if status.has_in_doubt() {
+            return Err(AgentError::SessionState(format!(
+                "rewind journal has {} unfinished operation(s); inspect rewind-status before retrying",
+                status.in_doubt.len()
             )));
         }
         let root = std::fs::canonicalize(root)
@@ -186,10 +202,15 @@ impl CheckpointStore {
             previous.insert(relative.clone(), current);
         }
 
+        // 任何路径被改写前先落 `begin`：进程若在下面任何一步崩溃，账本会留下未闭合记录。
+        let planned: Vec<String> = entries.iter().map(|(_, entry)| entry.raw.clone()).collect();
+        let op_id = journal.begin(turn, planned)?;
+
         let mut created_dirs = Vec::new();
         let mut attempted = Vec::new();
         let applied = (|| -> Result<(), AgentError> {
             for (relative, entry) in &entries {
+                journal.applying(op_id, turn, &entry.raw)?;
                 attempted.push(relative.clone());
                 if let Some(content) = &entry.content {
                     ensure_parents(&dir, relative, &entry.raw, &mut created_dirs)?;
@@ -212,6 +233,7 @@ impl CheckpointStore {
 
         if let Err(original) = applied {
             let failures = rollback(&dir, &entries, &previous, &attempted, &created_dirs);
+            journal.rollback(op_id, turn, &failures)?;
             if failures.is_empty() {
                 return Err(original);
             }
@@ -233,6 +255,7 @@ impl CheckpointStore {
                 report.deleted.push(entry.raw.clone());
             }
         }
+        journal.finish(op_id, turn, &report.restored, &report.deleted)?;
         Ok(report)
     }
 
@@ -300,6 +323,293 @@ impl CheckpointStore {
             }
         }
     }
+}
+
+/// 回退 journal 的单个阶段。`begin` 之后没有 `finish`/`rollback` 即「未完成回退」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindPhase {
+    Begin,
+    Applying,
+    Finish,
+    Rollback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindRecord {
+    pub schema: u32,
+    pub seq: u64,
+    pub op_id: u64,
+    pub phase: RewindPhase,
+    pub turn: usize,
+    /// `begin`：本次回退计划触碰的全部路径。
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// `applying`：即将（或可能已经）被改写的单个路径。
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub restored: Vec<String>,
+    #[serde(default)]
+    pub deleted: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<String>,
+    pub at: u64,
+}
+
+/// 未完成或回滚失败的回退操作。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RewindDoubt {
+    pub op_id: u64,
+    pub turn: usize,
+    /// 计划触碰的路径。
+    pub planned: Vec<String>,
+    /// 已经进入 `applying` 的路径（崩溃时可能处于半写状态）。
+    pub applied: Vec<String>,
+    /// 进程内回滚失败明细；为空表示只是崩溃导致未闭合。
+    #[serde(default)]
+    pub rollback_failures: Vec<String>,
+    pub at: u64,
+}
+
+impl RewindDoubt {
+    /// 是否有路径可能已被改写。
+    pub fn touched_paths(&self) -> &[String] {
+        &self.applied
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RewindJournalReport {
+    pub total: usize,
+    pub completed: usize,
+    pub rolled_back: usize,
+    /// 未闭合的 `begin` 与回滚失败的操作；非空时新回退必须 fail-closed。
+    pub in_doubt: Vec<RewindDoubt>,
+}
+
+impl RewindJournalReport {
+    pub fn has_in_doubt(&self) -> bool {
+        !self.in_doubt.is_empty()
+    }
+}
+
+struct RewindJournal {
+    path: PathBuf,
+    seq: u64,
+}
+
+impl RewindJournal {
+    fn open(dir: &Path) -> Result<Self, AgentError> {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| AgentError::Io(format!("rewind journal dir: {error}")))?;
+        let path = dir.join(REWIND_JOURNAL);
+        let records = read_rewind_records(&path)?;
+        let seq = records.last().map_or(0, |record| record.seq);
+        Ok(Self { path, seq })
+    }
+
+    fn begin(&mut self, turn: usize, paths: Vec<String>) -> Result<u64, AgentError> {
+        self.seq = self.seq.saturating_add(1);
+        let op_id = self.seq;
+        self.append(RewindRecord {
+            schema: REWIND_SCHEMA,
+            seq: op_id,
+            op_id,
+            phase: RewindPhase::Begin,
+            turn,
+            paths,
+            path: String::new(),
+            restored: Vec::new(),
+            deleted: Vec::new(),
+            failures: Vec::new(),
+            at: now_secs(),
+        })?;
+        Ok(op_id)
+    }
+
+    fn applying(&mut self, op_id: u64, turn: usize, path: &str) -> Result<(), AgentError> {
+        self.seq = self.seq.saturating_add(1);
+        let seq = self.seq;
+        self.append(RewindRecord {
+            schema: REWIND_SCHEMA,
+            seq,
+            op_id,
+            phase: RewindPhase::Applying,
+            turn,
+            paths: Vec::new(),
+            path: path.to_owned(),
+            restored: Vec::new(),
+            deleted: Vec::new(),
+            failures: Vec::new(),
+            at: now_secs(),
+        })
+    }
+
+    fn finish(
+        &mut self,
+        op_id: u64,
+        turn: usize,
+        restored: &[String],
+        deleted: &[String],
+    ) -> Result<(), AgentError> {
+        self.seq = self.seq.saturating_add(1);
+        let seq = self.seq;
+        self.append(RewindRecord {
+            schema: REWIND_SCHEMA,
+            seq,
+            op_id,
+            phase: RewindPhase::Finish,
+            turn,
+            paths: Vec::new(),
+            path: String::new(),
+            restored: restored.to_vec(),
+            deleted: deleted.to_vec(),
+            failures: Vec::new(),
+            at: now_secs(),
+        })
+    }
+
+    fn rollback(&mut self, op_id: u64, turn: usize, failures: &[String]) -> Result<(), AgentError> {
+        self.seq = self.seq.saturating_add(1);
+        let seq = self.seq;
+        self.append(RewindRecord {
+            schema: REWIND_SCHEMA,
+            seq,
+            op_id,
+            phase: RewindPhase::Rollback,
+            turn,
+            paths: Vec::new(),
+            path: String::new(),
+            restored: Vec::new(),
+            deleted: Vec::new(),
+            failures: failures.to_vec(),
+            at: now_secs(),
+        })
+    }
+
+    fn report(&self) -> Result<RewindJournalReport, AgentError> {
+        rewind_report(read_rewind_records(&self.path)?)
+    }
+
+    fn append(&self, record: RewindRecord) -> Result<(), AgentError> {
+        let mut line = serde_json::to_string(&record)
+            .map_err(|error| AgentError::SessionState(format!("rewind journal encode: {error}")))?;
+        line.push('\n');
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| AgentError::Io(format!("open {}: {error}", self.path.display())))?;
+        file.write_all(line.as_bytes())
+            .map_err(|error| AgentError::Io(format!("write rewind journal: {error}")))
+    }
+}
+
+fn read_rewind_records(path: &Path) -> Result<Vec<RewindRecord>, AgentError> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(AgentError::Io(format!("open {}: {error}", path.display())));
+        }
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|error| AgentError::Io(format!("read {}: {error}", path.display())))?;
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let mut records = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        match serde_json::from_str::<RewindRecord>(line) {
+            Ok(record) => {
+                if record.schema != REWIND_SCHEMA {
+                    return Err(AgentError::SessionState(format!(
+                        "{}:{}: rewind schema {} != {}",
+                        path.display(),
+                        index + 1,
+                        record.schema,
+                        REWIND_SCHEMA
+                    )));
+                }
+                records.push(record);
+            }
+            Err(error) => {
+                // 崩溃可能留下半行；只容忍最后一行。
+                if index + 1 == lines.len() {
+                    break;
+                }
+                return Err(AgentError::SessionState(format!(
+                    "{}:{}: {error}",
+                    path.display(),
+                    index + 1
+                )));
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn rewind_report(records: Vec<RewindRecord>) -> Result<RewindJournalReport, AgentError> {
+    let mut report = RewindJournalReport::default();
+    let mut open: BTreeMap<u64, (usize, Vec<String>, Vec<String>, u64)> = BTreeMap::new();
+    for record in records {
+        report.total += 1;
+        match record.phase {
+            RewindPhase::Begin => {
+                open.insert(
+                    record.op_id,
+                    (record.turn, record.paths, Vec::new(), record.at),
+                );
+            }
+            RewindPhase::Applying => {
+                if let Some((_, _, applied, _)) = open.get_mut(&record.op_id)
+                    && !record.path.is_empty()
+                    && !applied.contains(&record.path)
+                {
+                    applied.push(record.path);
+                }
+            }
+            RewindPhase::Finish => {
+                open.remove(&record.op_id);
+                report.completed += 1;
+            }
+            RewindPhase::Rollback => {
+                open.remove(&record.op_id);
+                report.rolled_back += 1;
+                if !record.failures.is_empty() {
+                    report.in_doubt.push(RewindDoubt {
+                        op_id: record.op_id,
+                        turn: record.turn,
+                        planned: Vec::new(),
+                        applied: Vec::new(),
+                        rollback_failures: record.failures,
+                        at: record.at,
+                    });
+                }
+            }
+        }
+    }
+    for (op_id, (turn, planned, applied, at)) in open {
+        report.in_doubt.push(RewindDoubt {
+            op_id,
+            turn,
+            planned,
+            applied,
+            rollback_failures: Vec::new(),
+            at,
+        });
+    }
+    Ok(report)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 pub struct CheckpointRecorder {
@@ -666,6 +976,115 @@ pub(crate) fn normalize_relative(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "trit-ckpt-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// 造一条 turn 0 的 checkpoint：a.txt 在 turn 开始时是 `before`。
+    fn store_with_checkpoint(dir: &Path, root: &Path, before: &str) -> CheckpointStore {
+        let store = CheckpointStore::open(dir).unwrap();
+        std::fs::write(root.join("a.txt"), before).unwrap();
+        let mut recorder = store.begin(0, "t");
+        recorder.snapshot(root, "a.txt").unwrap();
+        recorder.finish().unwrap();
+        store
+    }
+
+    #[test]
+    fn rewind_code_journals_begin_apply_and_finish() {
+        let root = temp_root("journal-ok");
+        let store_dir = temp_root("journal-ok-store");
+        let store = store_with_checkpoint(&store_dir, &root, "before");
+        std::fs::write(root.join("a.txt"), "after").unwrap();
+
+        let report = store.rewind_code(&root, 0).unwrap();
+        assert_eq!(report.restored, ["a.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "before"
+        );
+
+        let status = store.rewind_status().unwrap();
+        assert_eq!(status.completed, 1);
+        assert!(!status.has_in_doubt(), "{status:?}");
+        let journal = std::fs::read_to_string(store_dir.join(REWIND_JOURNAL)).unwrap();
+        let phases: Vec<RewindRecord> = journal
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            phases.iter().map(|record| record.phase).collect::<Vec<_>>(),
+            [
+                RewindPhase::Begin,
+                RewindPhase::Applying,
+                RewindPhase::Finish
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn unfinished_rewind_is_in_doubt_and_blocks_the_next_one() {
+        let root = temp_root("journal-block");
+        let store_dir = temp_root("journal-block-store");
+        let store = store_with_checkpoint(&store_dir, &root, "before");
+        std::fs::write(root.join("a.txt"), "after").unwrap();
+
+        // 模拟崩溃：begin + applying 已落盘，但没有 finish/rollback。
+        let mut journal = RewindJournal::open(&store_dir).unwrap();
+        let op_id = journal.begin(0, vec!["a.txt".to_owned()]).unwrap();
+        journal.applying(op_id, 0, "a.txt").unwrap();
+
+        let status = store.rewind_status().unwrap();
+        assert!(status.has_in_doubt(), "{status:?}");
+        assert_eq!(status.in_doubt[0].planned, ["a.txt"]);
+        assert_eq!(status.in_doubt[0].touched_paths(), ["a.txt"]);
+
+        let error = store.rewind_code(&root, 0).unwrap_err();
+        match error {
+            AgentError::SessionState(message) => {
+                assert!(message.contains("unfinished"), "{message}")
+            }
+            other => panic!("expected SessionState, got {other:?}"),
+        }
+        // 被拦截的回退不能改动工作区。
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "after"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn crash_after_first_path_reports_only_touched_paths() {
+        let root = temp_root("journal-matrix");
+        let store_dir = temp_root("journal-matrix-store");
+        let _ = store_with_checkpoint(&store_dir, &root, "before");
+
+        let mut journal = RewindJournal::open(&store_dir).unwrap();
+        // 计划两条，只 applied 第一条：崩溃点矩阵的第一格。
+        let op_id = journal
+            .begin(0, vec!["a.txt".to_owned(), "b.txt".to_owned()])
+            .unwrap();
+        journal.applying(op_id, 0, "a.txt").unwrap();
+
+        let status = journal.report().unwrap();
+        assert_eq!(status.in_doubt.len(), 1);
+        assert_eq!(status.in_doubt[0].planned.len(), 2);
+        assert_eq!(status.in_doubt[0].touched_paths(), ["a.txt"]);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
 
     #[test]
     fn rollback_restores_previous_contents_and_removes_new_files() {
