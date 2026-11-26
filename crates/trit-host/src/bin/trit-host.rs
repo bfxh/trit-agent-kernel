@@ -2294,6 +2294,29 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
     } else {
         Box::new(local)
     };
+    // profile 的 write_roots 必须在执行侧真正生效：只在 validate() 里检查形状
+    // 不够，否则子 agent 仍能写到声明的子树之外。
+    let write_guard = if request.profile.access == trit_orch::AccessMode::ReadWrite {
+        let claim = WriteClaim::new(
+            &workspace,
+            request
+                .profile
+                .write_roots
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        )
+        .map_err(|error| fail(format!("subagent write roots: {error}")))?;
+        Some(WriteGuard {
+            claim,
+            lease: None,
+            journal: None,
+        })
+    } else {
+        None
+    };
+    let claim_for_host = write_guard.as_ref().map(|guard| guard.claim.clone());
+    let tools = apply_write_guard(tools, write_guard);
 
     let script_path =
         script.ok_or_else(|| fail("subagent-run requires --script <proposals.json>"))?;
@@ -2314,7 +2337,9 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
         min_assertions: 0,
         max_tokens: request.profile.max_tokens,
     };
-    let mut host = AgentHost::new(model, tools).with_max_steps(max_steps);
+    let mut host = AgentHost::new(model, tools)
+        .with_max_steps(max_steps)
+        .with_write_claim(claim_for_host);
     let outcome = host.run_turn(&turn)?;
     let status = if outcome.judgment.is_complete() {
         trit_orch::DelegationStatus::Completed
