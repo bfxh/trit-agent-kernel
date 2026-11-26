@@ -42,7 +42,7 @@
 | 4 | 工具契约 / 注册表 / schema 规范化 | `TOOL_CONTRACT.md`、`SPEC §3.2` | 部分 | `ToolSpec` 已有，缺 schema 规范化、契约对照测试、工具家族 | B7.1/B7.2 |
 | 5 | 缓存优先、追加式上下文 | `SPEC §3.6`、cache-prefix 基准 | 部分（投影+prompt+迁移） | `ContextProjection` 进入 prompt、迁移 bundle 携带投影；缺跨设备/跨存储实际落盘 | B7.3 |
 | 6 | 压缩 → Rebasis / freshness | `SPEC §3.6`、`CacheLedger` | 部分（epoch+恢复+Plan 联动） | 完成裁决要求当前 epoch + freshness True；新证据恢复、Manual 策略、Plan/Observation epoch 已联动；缺跨设备落盘与多任务图迁移 | B7.3 |
-| 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；三类 JSONL 的布局矩阵与 byte parity 已落地（`JSONL-COMPAT.md`），缺 sidecar 布局与重建投影 | B7.7 |
+| 7 | 会话 JSONL / sidecar / 迁移 | `state/store`、`RUST_MIGRATION.md` | 部分 | 本仓已有 session + migration；三类 JSONL 的布局矩阵与 byte parity 已落地（`JSONL-COMPAT.md`），SQLite 投影可删库重建（`SESSION-INDEX.md`）；缺 sidecar 布局与 history 归档 | B7.7 |
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 均已接持久 rewind journal、pre-rewind 备份与自动恢复；files 备份在成功路径即时回收、失败保留，git backup commit 等 `gc` | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分（首版） | `PermissionGate` 已有 ask/auto/yolo、deny 优先、无 approver fail-closed；缺交互审批 UI 与 MCP 策略映射 | B7.4 |
 | 10 | Write claim / 路径范围强制 | `SPEC §3.12`、`OPAQUE_WRITE_ADMISSION_SECURITY.md` | 部分（首版） | `WriteClaim` + `ClaimingTools` 限制 write_file 路径子树，shell 写入 fail-closed；缺 move 双端、mutation journal 对账 | B7.4 |
@@ -221,7 +221,15 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   `prune{removed,kept,failures}`，清理出错退出 2，不掩盖 `in_doubt` 的退出 1。
   files checkpoint 的 rewind 备份本就在成功回退/成功回滚/成功恢复后即时删除，
   失败或 `in_doubt` 保留；git backup commit 仍不主动回收，等 `gc`。
-- 仍待补：SQLite 投影重建。
+- 已落地（第七刀，SQLite 投影重建）：`SessionIndex` 把 session JSONL 投影成
+  SQLite（`meta` / `records` / `turns`，`INDEX_SCHEMA=1`），JSONL 仍是唯一权威，
+  投影可随时删除重建。`rebuild` 先写 `<db>.rebuild.<pid>` 暂存库、成功后删旧库并
+  原子改名，失败不留半份可读投影；`verify` 在暂存库重建后先比 `summary`、再比
+  `records` + `turns` 全量行转储，投影缺失或被篡改时 `matches=false`。
+  CLI 为 `session-index --session <jsonl> --db <path> [--rebuild|--verify]`，
+  校验不一致或投影缺失时退出 1。见 `docs/SESSION-INDEX.md`。
+- 仍待补：history 归档（跨会话汇总与冷数据搬迁）；Go 宿主 sidecar 的目录/文件布局
+  属跨仓项，不在本内核范围。
 - 依赖：B7.3；与 B7.4 联动。
 
 ### B7.8 宿主表面与诊断（P2）
