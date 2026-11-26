@@ -404,11 +404,14 @@ fn remote_plan_cli_failed_probe_keeps_the_node_isolated() {
 #[test]
 fn remote_plan_cli_persists_node_health() {
     let good = spawn_node("node-b", &[]);
+    // 用一个会拖过 1s 超时的节点代替立即拒绝连接：否则 node-a 的失败可能
+    // 赶在调度器把另一个任务派到 node-b 之前发生，测试结果依赖线程时序。
+    let slow = spawn_node("node-a", &["--sleep-ms", "2000"]);
     let dead = serde_json::to_value(
         RemoteNode::new(
             "node-a",
             RemoteEndpoint {
-                url: "http://127.0.0.1:1/run".into(),
+                url: format!("{}/run", slow.base),
                 auth_token: None,
                 timeout_secs: 1,
             },
