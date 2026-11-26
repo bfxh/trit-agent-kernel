@@ -134,7 +134,33 @@ fn run_warns_when_journal_has_in_doubt() {
     .unwrap();
 
     let script_path = script("warn", "src/a.py");
-    let (_, text) = run_with_journal(&root, &script_path);
+    let (code, text) = run_with_journal(&root, &script_path);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("left in doubt"), "{text}");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_file(script_path);
+}
+
+#[test]
+fn run_does_not_complete_when_declared_path_is_in_doubt() {
+    let root = root("reconcile");
+    write(&root, "src/a.py", "x");
+    let path = root.join(".agent/write-journal.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+        &path,
+        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/a.py\"],\"at\":1}\n",
+    )
+    .unwrap();
+
+    // 本轮确实写了并声明了 src/a.py，但账本里同一路径还压着上次崩溃的未闭合写操作。
+    let script_path = script("reconcile", "src/a.py");
+    let (code, text) = run_with_journal(&root, &script_path);
+    assert_eq!(
+        code,
+        Some(1),
+        "声明路径与未闭合账本冲突时不能判完成：{text}"
+    );
     assert!(text.contains("left in doubt"), "{text}");
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);

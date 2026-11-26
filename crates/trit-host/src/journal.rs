@@ -226,33 +226,7 @@ impl MutationJournal {
 
     /// 对账：找到没有 `finish` 的 `begin`。
     pub fn report(&self) -> Result<JournalReport, JournalError> {
-        let records = read_records(&self.path)?;
-        let mut report = JournalReport::default();
-        let mut open: BTreeMap<u64, JournalRecord> = BTreeMap::new();
-        for record in records {
-            report.total += 1;
-            match record.phase {
-                JournalPhase::Begin => {
-                    open.insert(record.op_id, record);
-                }
-                JournalPhase::Finish => match open.remove(&record.op_id) {
-                    Some(_) => {
-                        if record.passed {
-                            report.completed += 1;
-                        } else {
-                            report.failed += 1;
-                        }
-                    }
-                    None => report.orphans += 1,
-                },
-                JournalPhase::Rollback => {
-                    open.remove(&record.op_id);
-                    report.rolled_back += 1;
-                }
-            }
-        }
-        report.in_doubt = open.into_values().collect();
-        Ok(report)
+        report_records(read_records(&self.path)?)
     }
 
     /// 记录一次回滚结果，闭合对应的 `begin`。
@@ -400,6 +374,43 @@ impl MutationJournal {
         file.write_all(line.as_bytes())
             .map_err(|error| JournalError::Io(format!("write {}: {error}", self.path.display())))
     }
+}
+
+/// 只读对账：账本不存在时返回空报告，也不创建 `.agent` 目录。
+///
+/// 完成裁决用它确认本轮声明路径上是否还压着上次崩溃留下的未闭合写操作。
+pub fn inspect(root: impl AsRef<Path>) -> Result<JournalReport, JournalError> {
+    let path = root.as_ref().join(JOURNAL_PATH);
+    report_records(read_records(&path)?)
+}
+
+fn report_records(records: Vec<JournalRecord>) -> Result<JournalReport, JournalError> {
+    let mut report = JournalReport::default();
+    let mut open: BTreeMap<u64, JournalRecord> = BTreeMap::new();
+    for record in records {
+        report.total += 1;
+        match record.phase {
+            JournalPhase::Begin => {
+                open.insert(record.op_id, record);
+            }
+            JournalPhase::Finish => match open.remove(&record.op_id) {
+                Some(_) => {
+                    if record.passed {
+                        report.completed += 1;
+                    } else {
+                        report.failed += 1;
+                    }
+                }
+                None => report.orphans += 1,
+            },
+            JournalPhase::Rollback => {
+                open.remove(&record.op_id);
+                report.rolled_back += 1;
+            }
+        }
+    }
+    report.in_doubt = open.into_values().collect();
+    Ok(report)
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
