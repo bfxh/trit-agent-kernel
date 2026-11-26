@@ -29,7 +29,7 @@ use crate::{AgentError, Proposal, ToolExecutor, ToolOutcome, ToolRequest};
 ///
 /// `submit_plan` 也在这里：它是 planner 唯一的输出通道，只提交结构化计划，
 /// 不读写工作区文件。
-pub const READ_ONLY_TOOLS: &[&str] = &["read_file", "grep", "glob", "ls", "submit_plan"];
+pub const READ_ONLY_TOOLS: &[&str] = &["read_file", "search_code", "glob", "submit_plan"];
 
 /// planner 提交结构化计划时调用的工具名。
 pub const PLAN_TOOL: &str = "submit_plan";

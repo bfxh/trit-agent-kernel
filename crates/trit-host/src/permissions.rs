@@ -88,7 +88,9 @@ impl PermissionPolicy {
                 return decision;
             }
         }
-        if request.read_only {
+        // `read_only` 必须是宿主可信元数据；shell 命令的只读属性无法证明，
+        // 也绝不允许由模型参数自报，因此 bash 永远不享受只读快路径。
+        if request.read_only && request.tool != "bash" {
             return PermissionDecision::Allow;
         }
         match self.mode {
@@ -259,6 +261,11 @@ impl WriteClaim {
     }
 
     pub fn allows_request(&self, request: &ToolRequest) -> bool {
+        // shell 无法从命令文本证明路径范围；claim 存在时 fail-closed。
+        // 这条判断必须在 read_only 快路径之前，否则模型自报 read_only 就能绕过 claim。
+        if request.tool == "bash" {
+            return false;
+        }
         if request.read_only {
             return true;
         }
@@ -270,8 +277,6 @@ impl WriteClaim {
             "move_path" => {
                 request.paths.len() == 2 && request.paths.iter().all(|path| self.allows_path(path))
             }
-            // shell 无法从命令文本证明路径范围；claim 存在时 fail-closed。
-            "bash" => false,
             _ => true,
         }
     }
@@ -716,6 +721,33 @@ mod tests {
                 .unwrap()
                 .passed
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_only_shell_is_not_trusted_by_claim_or_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-shell-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src")]).unwrap();
+
+        let mut tools = ClaimingTools::new(FakeTools::new(), claim);
+        let mut request = ToolRequest::shell("call-1", "echo pwn > hooks/pre-commit");
+        request.read_only = true;
+        let outcome = tools.execute(&request).unwrap();
+        assert!(!outcome.passed, "{outcome:?}");
+        assert_eq!(tools.inner().calls, 0, "shell must never reach the tool");
+
+        let mut gate = PermissionGate::new(FakeTools::new(), PermissionPolicy::default());
+        let mut request = ToolRequest::shell("call-2", "echo pwn > hooks/pre-commit");
+        request.read_only = true;
+        let outcome = gate.execute(&request).unwrap();
+        assert!(!outcome.passed, "{outcome:?}");
+        assert_eq!(gate.inner().calls, 0, "Ask mode must not auto-allow shell");
         let _ = std::fs::remove_dir_all(&root);
     }
 

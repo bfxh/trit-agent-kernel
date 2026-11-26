@@ -59,8 +59,9 @@
 ## 3. planner / executor 分离（`trit_host::separation`）
 
 - `ReadOnlyTools<T>` 把任意 `ToolExecutor` 收窄为只读白名单
-  （`read_file` / `grep` / `glob` / `ls`）。非白名单工具或 `read_only == false` 的
-  请求在**转发之前**被拒绝（`AgentError::ToolDenied`），内层执行器看不到写请求。
+  （`read_file` / `search_code` / `glob` / `submit_plan`；工具名与 `LocalTools` 实现一致）。
+  非白名单工具或 `read_only == false` 的请求在**转发之前**被拒绝
+  （`AgentError::ToolDenied`），内层执行器看不到写请求。
 - `SessionPaths::under(dir)` 给出 `planner.jsonl` 与 `executor.jsonl`；两者必须不同，
   `Session::open` 只从自己的记录重建状态。
 - 两个 session 各自持有独立 `CacheLedger`（不同 `Arc`）：planner 的研究上下文不会

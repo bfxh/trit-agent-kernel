@@ -1,0 +1,38 @@
+# 权限与只读边界
+
+内核把“能不能写”拆成三层，默认都 fail-closed：
+
+| 层 | 作用 | 信任来源 |
+| --- | --- | --- |
+| `PermissionPolicy` / `PermissionGate` | Ask/Auto/Yolo 与规则匹配，决定是否放行一次调用 | 宿主配置 + 工具静态元数据 |
+| `WriteClaim` / `ClaimingTools` | 把写路径收窄到声明根；shell 直接拒绝 | 宿主构造的 claim |
+| checkpoint / mutation journal | 写前快照、失败回滚、`in_doubt` 对账 | 宿主文件 |
+
+## `read_only` 不可由模型自报
+
+- `read_file` / `search_code` / `glob` 等本地工具的 `read_only` 来自宿主
+  `ToolSpec`，模型参数不参与。
+- `bash` 的只读属性**无法从命令文本证明**。`bash` 工具 schema 不再暴露
+  `read_only` 参数；即使调用方手工构造 `ToolRequest { tool: "bash",
+  read_only: true }`，`PermissionGate` 也不会走只读快路径，`WriteClaim` 也会先拒。
+- 这条约束是安全边界，不是 UX 偏好：一条写命令只要附上 `read_only: true`
+  就能绕过审批、写声明、checkpoint 和 journal。
+
+## MCP `readOnlyHint` 只做展示
+
+MCP 服务端返回的 `annotations.readOnlyHint` 是**对端自报**，不可信。内核把它
+保留在 `McpToolRoute.declared_read_only` 供诊断，但映射到 `ToolSpec.read_only`
+时恒为 `false`。因此 MCP 工具默认按可写处理，必须经过 `PermissionGate` /
+`WriteClaim`；需要只读能力时由宿主显式配置工具名。
+
+## shell 与 claim
+
+`ClaimingTools::allows_request` 对 `bash` 无条件返回 `false`（在 `read_only`
+快路径之前），与 `write_file` / `move_path` 的路径校验分开。没有 claim 时，
+shell 仍受 `allow_shell` / `allow_unsandboxed_shell` / 沙箱约束。
+
+## 已知待补
+
+- 写前快照与 mutation journal 回滚仍用 `std::fs`，会跟随父符号链接；
+  需要统一改为 cap-std `Dir` + 逐段祖先检查（见安全审计第 2 项）。
+- 远程执行面需要 token / Host / Origin 与保留路径名校验（审计第 5 项）。

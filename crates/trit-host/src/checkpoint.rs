@@ -1003,7 +1003,8 @@ impl<T: ToolExecutor> ToolExecutor for CheckpointingTools<T> {
             {
                 recorder.record_command(command);
             }
-            if !request.read_only {
+            // shell 的 read_only 不可信：只要它可能写，就必须先拍快照。
+            if !request.read_only || request.tool == "bash" {
                 for path in &request.paths {
                     recorder.snapshot(&self.root, path)?;
                 }
