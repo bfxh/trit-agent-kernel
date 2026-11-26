@@ -1352,8 +1352,9 @@ fn usage() {
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?,scope?}},\n\
          dispatches tasks as read-only subagent requests to the static node table, prints JSON.\n\n\
          remote-health: trit-host remote-health --nodes <json> --health <path> [--interval-ms N] [--once]\n\
-         standalone health monitor: probes isolated nodes, rewrites the health file via temp+rename;\n\
-         runs forever by default, --once for cron/Task Scheduler, prints one JSON line per sweep."
+         standalone health monitor: reloads --nodes each sweep, probes isolated nodes,\n\
+         rewrites the health file via temp+rename, takes an OS lock on <health>.lock;\n\
+         runs forever by default, --once for cron/Task Scheduler, one JSON line per sweep."
     );
 }
 
@@ -1826,8 +1827,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
 }
 
 /// `remote-health --nodes <path> --health <path> [--interval-ms N] [--once]`：
-/// 独立健康守护。每次扫描只探已隔离节点，成功即写回健康文件；默认常驻，
-/// `--once` 适合 cron / 任务计划程序。
+/// 独立健康守护。每轮重读节点表，只探已隔离节点，成功即写回健康文件；
+/// 默认常驻，`--once` 适合 cron / 任务计划程序。持有 `<health>.lock` 的单实例
+/// OS 锁，进程退出（包括崩溃）时自动释放。
 fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut nodes_path: Option<String> = None;
     let mut health_path: Option<String> = None;
@@ -1849,13 +1851,20 @@ fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     }
     let nodes_path = nodes_path.ok_or_else(|| fail("remote-health requires --nodes <path>"))?;
     let health_path = health_path.ok_or_else(|| fail("remote-health requires --health <path>"))?;
-    let text = std::fs::read_to_string(&nodes_path)
-        .map_err(|error| fail(format!("read nodes {nodes_path}: {error}")))?;
-    let nodes: Vec<trit_orch::RemoteNode> = serde_json::from_str(&text)
-        .map_err(|error| fail(format!("parse nodes {nodes_path}: {error}")))?;
+    let lock_path = PathBuf::from(format!("{health_path}.lock"));
+    let _lock = trit_host::SingleInstanceLock::acquire(&lock_path)
+        .map_err(|error| fail(format!("lock {}: {error}", lock_path.display())))?
+        .ok_or_else(|| {
+            fail(format!(
+                "another remote-health monitor holds {}",
+                lock_path.display()
+            ))
+        })?;
 
     let mut stdout = std::io::stdout().lock();
     loop {
+        // 每轮重读节点表：增删节点或轮换 token 不需要重启守护。
+        let nodes = load_remote_nodes(&nodes_path)?;
         let report = trit_host::probe_remote_health_file(&nodes, Path::new(&health_path))?;
         writeln!(
             stdout,
@@ -1877,6 +1886,12 @@ fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
     Ok(())
+}
+
+fn load_remote_nodes(path: &str) -> Result<Vec<trit_orch::RemoteNode>, Box<dyn Error>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| fail(format!("read nodes {path}: {error}")))?;
+    serde_json::from_str(&text).map_err(|error| fail(format!("parse nodes {path}: {error}")))
 }
 
 #[derive(serde::Deserialize)]

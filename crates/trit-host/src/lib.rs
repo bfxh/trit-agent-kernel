@@ -1319,7 +1319,7 @@ pub use journal::{
     BackupEntry, JOURNAL_PATH, JOURNAL_SCHEMA, JournalEntry, JournalError, JournalPhase,
     JournalRecord, JournalReport, MutationJournal, RollbackOutcome,
 };
-pub use lease::{LEASE_PATH, LeaseError, OperationLease};
+pub use lease::{LEASE_PATH, LeaseError, OperationLease, SingleInstanceLock};
 pub use mcp_tools::{McpToolClient, McpToolExecutor, McpToolRoute};
 pub use memory::{MemoryEntry, MemoryHit, MemoryStore};
 pub use openai::{OpenAiConfig, OpenAiProvider};

@@ -19,6 +19,17 @@ impl Drop for TestNode {
     }
 }
 
+struct ChildGuard {
+    child: Child,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("trit-remote-health-{tag}-{}", std::process::id()));
@@ -126,7 +137,7 @@ fn monitor_keeps_node_isolated_when_probe_fails() {
 }
 
 #[test]
-fn monitor_drops_health_entries_outside_the_node_table() {
+fn monitor_preserves_health_entries_outside_the_node_table() {
     let dir = temp_dir("stale");
     let health = dir.join("health.json");
     write_health(&health, &[isolated("n1"), isolated("ghost")]);
@@ -134,9 +145,15 @@ fn monitor_drops_health_entries_outside_the_node_table() {
     let report =
         probe_remote_health_file(&[node("n1", "http://127.0.0.1:1/run".into())], &health).unwrap();
     assert_eq!(report.ignored, vec!["ghost".to_owned()]);
+    assert_eq!(report.nodes.len(), 2, "未知节点仍应写回");
     let stored = read_health(&health);
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].id, "n1");
+    assert_eq!(stored.len(), 2);
+    assert!(
+        stored
+            .iter()
+            .any(|snapshot| snapshot.id == "ghost" && !snapshot.healthy),
+        "未知节点保留原快照，不因本轮未探测而被删除"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -153,6 +170,84 @@ fn monitor_initializes_missing_health_file_as_all_healthy() {
     assert_eq!(stored.len(), 1);
     assert!(stored[0].healthy);
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn monitor_reloads_nodes_and_holds_single_instance_lock() {
+    let dir = temp_dir("reload");
+    let first_server = spawn_node();
+    let second_server = spawn_node();
+    let nodes_path = dir.join("nodes.json");
+    let health = dir.join("health.json");
+    std::fs::write(
+        &nodes_path,
+        serde_json::to_string(&[node("a", format!("{}/run", first_server.base))]).unwrap(),
+    )
+    .unwrap();
+    write_health(&health, &[isolated("a"), isolated("b")]);
+
+    let mut monitor = ChildGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_trit-host"))
+            .arg("remote-health")
+            .arg("--nodes")
+            .arg(&nodes_path)
+            .arg("--health")
+            .arg(&health)
+            .arg("--interval-ms")
+            .arg("500")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    };
+    let stdout = monitor.child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let first: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(first["readmitted"], 1);
+    assert_eq!(first["ignored"], serde_json::json!(["b"]));
+    assert!(
+        read_health(&health)
+            .iter()
+            .any(|snapshot| snapshot.id == "b" && !snapshot.healthy),
+        "本轮未探测的节点仍保留原快照"
+    );
+
+    let busy = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-health")
+        .arg("--nodes")
+        .arg(&nodes_path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--once")
+        .output()
+        .unwrap();
+    assert!(!busy.status.success(), "second monitor must fail closed");
+    assert!(
+        String::from_utf8_lossy(&busy.stderr).contains("another remote-health monitor"),
+        "stderr: {}",
+        String::from_utf8_lossy(&busy.stderr)
+    );
+
+    std::fs::write(
+        &nodes_path,
+        serde_json::to_string(&[node("b", format!("{}/run", second_server.base))]).unwrap(),
+    )
+    .unwrap();
+    let mut next = String::new();
+    reader.read_line(&mut next).unwrap();
+    let second: serde_json::Value = serde_json::from_str(next.trim()).unwrap();
+    assert_eq!(second["readmitted"], 1, "下一个节点应被热加载并探测");
+    assert_eq!(second["events"][0]["node"], "b");
+    assert!(
+        read_health(&health)
+            .iter()
+            .any(|snapshot| snapshot.id == "b" && snapshot.healthy)
+    );
+
+    drop(monitor);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

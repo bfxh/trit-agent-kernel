@@ -179,6 +179,54 @@ impl Drop for OperationLease {
     }
 }
 
+/// 任意文件上的单实例 OS 排他锁；进程退出（包括崩溃）时内核自动释放。
+///
+/// 与 [`OperationLease`] 不同，它不写 epoch / owner，也不承担 fencing：
+/// 只回答“这个文件此刻是否已有另一个持有者”。适合守护进程的实例互斥。
+#[derive(Debug)]
+pub struct SingleInstanceLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl SingleInstanceLock {
+    /// 尝试独占 `path`；已被占用返回 `Ok(None)`，不排队。
+    pub fn acquire(path: impl AsRef<Path>) -> Result<Option<Self>, LeaseError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| LeaseError::Io(format!("create {}: {error}", parent.display())))?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| LeaseError::Io(format!("open {}: {error}", path.display())))?;
+        if !try_lock(&file)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            file,
+            path: path.to_path_buf(),
+        }))
+    }
+
+    /// 被锁定的文件路径。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SingleInstanceLock {
+    fn drop(&mut self) {
+        let _ = unlock(&self.file);
+    }
+}
+
 fn open_and_lock(path: &Path, owner: &str) -> Result<LeaseLock, LeaseError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -407,6 +455,26 @@ mod tests {
                 output: "ok".into(),
             })
         }
+    }
+
+    #[test]
+    fn single_instance_lock_is_exclusive_and_released_on_drop() {
+        let root = root("single-instance");
+        let path = root.join("monitor.lock");
+        let first = SingleInstanceLock::acquire(&path)
+            .unwrap()
+            .expect("first lock");
+        assert_eq!(first.path(), path.as_path());
+        assert!(
+            SingleInstanceLock::acquire(&path).unwrap().is_none(),
+            "second holder must not acquire the same lock"
+        );
+        drop(first);
+        assert!(
+            SingleInstanceLock::acquire(&path).unwrap().is_some(),
+            "drop must release the OS lock"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -27,7 +27,8 @@
 //!   成功才调用 [`NodeTable::readmit`] 放行。事件写入 [`RemotePlanReport::probes`]，
 //!   最多保留 1024 条；周期监控随本次派发结束而退出。跨运行的常驻恢复由
 //!   [`probe_remote_health_file`] + `trit-host remote-health` 承担：它独立读写
-//!   节点健康文件，不依赖某个演练进程一直活着。
+//!   节点健康文件，不依赖某个演练进程一直活着；CLI 每轮重读节点表，并在
+//!   `<health>.lock` 上持单实例 OS 锁。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -165,7 +166,7 @@ pub struct RemoteHealthReport {
     pub events: Vec<RemoteProbeEvent>,
     /// 写回健康文件后的完整节点快照（按 id 升序）。
     pub nodes: Vec<NodeSnapshot>,
-    /// 健康文件里存在、但不在本次节点表中的节点 ID；写回时不再保留。
+    /// 健康文件里存在、但不在本次节点表中的节点 ID；保留原快照但不再探测。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignored: Vec<String>,
 }
@@ -410,7 +411,8 @@ where
 /// 与演练内的周期监控不同，本函数不依赖 `remote-plan` 进程：调用方可以按
 /// `trit-host remote-health` 常驻循环，或用 cron / 任务计划程序单次调用。
 /// 健康文件是 `Vec<NodeSnapshot>`；文件不存在时按“全部健康”初始化并写出。
-/// 表里不存在的旧节点会被丢弃，并在 [`RemoteHealthReport::ignored`] 中报告。
+/// 表里不存在的旧节点保留原快照、不再探测，并在 [`RemoteHealthReport::ignored`]
+/// 中报告，避免监控器缩减节点表时抹掉其他节点的健康状态。
 pub fn probe_remote_health_file(
     nodes: &[RemoteNode],
     health_path: impl AsRef<Path>,
@@ -478,7 +480,8 @@ pub fn probe_remote_health_file(
         snapshots.push(snapshot);
     }
 
-    let ignored: Vec<String> = stored.into_keys().collect();
+    let ignored: Vec<String> = stored.keys().cloned().collect();
+    snapshots.extend(stored.into_values());
     snapshots.sort_by(|left, right| left.id.cmp(&right.id));
     let report = RemoteHealthReport {
         checked,
