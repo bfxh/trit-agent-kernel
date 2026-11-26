@@ -1373,6 +1373,7 @@ pub mod context;
 pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
+pub mod diagnostics;
 pub mod extensions;
 pub mod fleet_runner;
 pub mod frontend_compat;
@@ -1432,6 +1433,10 @@ pub use context_projection::{
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
+};
+pub use diagnostics::{
+    DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions,
+    ProjectionDiagnostics, SessionDiagnostics, TOOL_CAPABILITIES, ToolCapability, diagnose,
 };
 pub use extensions::{
     CommandRegistry, CommandSpec, HookEvent, HookRegistry, HookSpec, ParsedCommand, SkillIndex,
