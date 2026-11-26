@@ -25,9 +25,12 @@
 //! - 健康恢复由本层配置：`health_probe_on_start` 在派发前探测一次，
 //!   `health_probe_interval` 在派发期间周期探测；只探已隔离节点，`GET /health`
 //!   成功才调用 [`NodeTable::readmit`] 放行。事件写入 [`RemotePlanReport::probes`]，
-//!   最多保留 1024 条；周期监控随本次派发结束而退出，不做常驻后台恢复。
+//!   最多保留 1024 条；周期监控随本次派发结束而退出。跨运行的常驻恢复由
+//!   [`probe_remote_health_file`] + `trit-host remote-health` 承担：它独立读写
+//!   节点健康文件，不依赖某个演练进程一直活着。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -131,6 +134,8 @@ pub enum RemoteProbePhase {
     Preflight,
     /// 派发期间的周期探测。
     Periodic,
+    /// 独立健康守护进程的一次扫描。
+    Monitor,
 }
 
 /// 一次节点健康探测事件。
@@ -145,6 +150,24 @@ pub struct RemoteProbeEvent {
     /// 探测失败的原因；成功时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// 一次独立健康扫描的结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RemoteHealthReport {
+    /// 本轮实际发出 `GET /health` 的节点数（只探已隔离节点）。
+    pub checked: usize,
+    /// 本轮成功放行的节点数。
+    pub readmitted: usize,
+    /// 探测失败、仍保持隔离的节点数。
+    pub still_isolated: usize,
+    /// 探测事件；最多保留 1024 条。
+    pub events: Vec<RemoteProbeEvent>,
+    /// 写回健康文件后的完整节点快照（按 id 升序）。
+    pub nodes: Vec<NodeSnapshot>,
+    /// 健康文件里存在、但不在本次节点表中的节点 ID；写回时不再保留。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored: Vec<String>,
 }
 
 /// 一次跨机执行的报告。
@@ -380,6 +403,131 @@ where
             .unwrap_or_default(),
         report,
     })
+}
+
+/// 对节点健康文件做一次独立扫描：只探测已隔离节点，成功即写回 `healthy`。
+///
+/// 与演练内的周期监控不同，本函数不依赖 `remote-plan` 进程：调用方可以按
+/// `trit-host remote-health` 常驻循环，或用 cron / 任务计划程序单次调用。
+/// 健康文件是 `Vec<NodeSnapshot>`；文件不存在时按“全部健康”初始化并写出。
+/// 表里不存在的旧节点会被丢弃，并在 [`RemoteHealthReport::ignored`] 中报告。
+pub fn probe_remote_health_file(
+    nodes: &[RemoteNode],
+    health_path: impl AsRef<Path>,
+) -> Result<RemoteHealthReport, AgentError> {
+    let path = health_path.as_ref();
+    NodeTable::new(nodes.to_vec())
+        .map_err(|error| AgentError::Io(format!("remote health nodes: {error}")))?;
+
+    let mut stored = BTreeMap::new();
+    for snapshot in load_remote_health_file(path)? {
+        if stored.insert(snapshot.id.clone(), snapshot).is_some() {
+            return Err(AgentError::Io(format!(
+                "health file {} has duplicate node ids",
+                path.display()
+            )));
+        }
+    }
+
+    let mut events = Vec::new();
+    let mut snapshots = Vec::with_capacity(nodes.len());
+    let mut checked = 0usize;
+    let mut readmitted = 0usize;
+    let mut still_isolated = 0usize;
+
+    for node in nodes {
+        let mut snapshot = stored.remove(&node.id).unwrap_or_else(|| NodeSnapshot {
+            id: node.id.clone(),
+            healthy: true,
+            in_flight: 0,
+            attempts: 0,
+            failures: 0,
+        });
+        // 健康文件跨运行保存，不应携带某一时刻的在途计数。
+        snapshot.in_flight = 0;
+        if !snapshot.healthy {
+            checked += 1;
+            match probe_remote_health(&node.endpoint) {
+                Ok(()) => {
+                    snapshot.healthy = true;
+                    readmitted += 1;
+                    if events.len() < MAX_PROBE_EVENTS {
+                        events.push(RemoteProbeEvent {
+                            node: node.id.clone(),
+                            phase: RemoteProbePhase::Monitor,
+                            ok: true,
+                            readmitted: true,
+                            error: None,
+                        });
+                    }
+                }
+                Err(error) => {
+                    still_isolated += 1;
+                    if events.len() < MAX_PROBE_EVENTS {
+                        events.push(RemoteProbeEvent {
+                            node: node.id.clone(),
+                            phase: RemoteProbePhase::Monitor,
+                            ok: false,
+                            readmitted: false,
+                            error: Some(error),
+                        });
+                    }
+                }
+            }
+        }
+        snapshots.push(snapshot);
+    }
+
+    let ignored: Vec<String> = stored.into_keys().collect();
+    snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+    let report = RemoteHealthReport {
+        checked,
+        readmitted,
+        still_isolated,
+        events,
+        nodes: snapshots,
+        ignored,
+    };
+    save_remote_health_file(path, &report.nodes)?;
+    Ok(report)
+}
+
+fn load_remote_health_file(path: &Path) -> Result<Vec<NodeSnapshot>, AgentError> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|error| {
+            AgentError::Io(format!("parse health file {}: {error}", path.display()))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(AgentError::Io(format!(
+            "read health file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// 写回节点健康文件（`Vec<NodeSnapshot>`，按调用方给定顺序）；先写临时文件再替换。
+pub fn save_remote_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentError> {
+    let text = serde_json::to_string_pretty(nodes)
+        .map_err(|error| AgentError::Io(format!("encode health file: {error}")))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| AgentError::Io(format!("create health dir: {error}")))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("health.json");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, text)
+        .map_err(|error| AgentError::Io(format!("write health file: {error}")))?;
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|error| AgentError::Io(format!("replace health file: {error}")))?;
+    }
+    std::fs::rename(&temporary, path)
+        .map_err(|error| AgentError::Io(format!("rename health file: {error}")))
 }
 
 /// 探测当前所有已隔离节点；成功才放行，失败保持隔离并记录原因。

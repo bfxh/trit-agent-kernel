@@ -63,6 +63,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "remote-plan" {
         return run_remote_plan_cli(args);
     }
+    if command == "remote-health" {
+        return run_remote_health(args);
+    }
     if command == "remote-ledger" {
         return run_remote_ledger(args);
     }
@@ -1347,7 +1350,10 @@ fn usage() {
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>] [--probe]\n\
          [--probe-interval-ms N]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?,scope?}},\n\
-         dispatches tasks as read-only subagent requests to the static node table, prints JSON."
+         dispatches tasks as read-only subagent requests to the static node table, prints JSON.\n\n\
+         remote-health: trit-host remote-health --nodes <json> --health <path> [--interval-ms N] [--once]\n\
+         standalone health monitor: probes isolated nodes, rewrites the health file via temp+rename;\n\
+         runs forever by default, --once for cron/Task Scheduler, prints one JSON line per sweep."
     );
 }
 
@@ -1794,7 +1800,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
         remote_request_for,
     )?;
     if let Some(path) = health_path.as_deref() {
-        save_health(path, &report.nodes)?;
+        trit_host::save_remote_health_file(Path::new(path), &report.nodes)?;
     }
 
     let failed = report
@@ -1819,21 +1825,57 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     Ok(())
 }
 
-/// 写节点健康快照：先写临时文件再替换，避免半截文件。
-fn save_health(path: &str, nodes: &[trit_orch::NodeSnapshot]) -> Result<(), Box<dyn Error>> {
-    let text = serde_json::to_string_pretty(nodes)?;
-    let target = Path::new(path);
-    if let Some(parent) = target.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+/// `remote-health --nodes <path> --health <path> [--interval-ms N] [--once]`：
+/// 独立健康守护。每次扫描只探已隔离节点，成功即写回健康文件；默认常驻，
+/// `--once` 适合 cron / 任务计划程序。
+fn run_remote_health(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut nodes_path: Option<String> = None;
+    let mut health_path: Option<String> = None;
+    let mut interval_ms: u64 = 30_000;
+    let mut once = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--nodes" => nodes_path = Some(next(&mut args, "--nodes")?),
+            "--health" => health_path = Some(next(&mut args, "--health")?),
+            "--interval-ms" => {
+                interval_ms = next(&mut args, "--interval-ms")?.parse()?;
+                if interval_ms == 0 {
+                    return Err(fail("--interval-ms must be greater than zero"));
+                }
+            }
+            "--once" => once = true,
+            other => return Err(fail(format!("unknown remote-health argument: {other}"))),
+        }
     }
-    let temporary = target.with_extension("tmp");
-    std::fs::write(&temporary, &text)?;
-    if target.exists() {
-        std::fs::remove_file(target)?;
+    let nodes_path = nodes_path.ok_or_else(|| fail("remote-health requires --nodes <path>"))?;
+    let health_path = health_path.ok_or_else(|| fail("remote-health requires --health <path>"))?;
+    let text = std::fs::read_to_string(&nodes_path)
+        .map_err(|error| fail(format!("read nodes {nodes_path}: {error}")))?;
+    let nodes: Vec<trit_orch::RemoteNode> = serde_json::from_str(&text)
+        .map_err(|error| fail(format!("parse nodes {nodes_path}: {error}")))?;
+
+    let mut stdout = std::io::stdout().lock();
+    loop {
+        let report = trit_host::probe_remote_health_file(&nodes, Path::new(&health_path))?;
+        writeln!(
+            stdout,
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "checked": report.checked,
+                "readmitted": report.readmitted,
+                "still_isolated": report.still_isolated,
+                "events": report.events,
+                "nodes": report.nodes,
+                "ignored": report.ignored,
+            }))?
+        )?;
+        stdout.flush()?;
+        if once {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
-    std::fs::rename(&temporary, target)?;
     Ok(())
 }
 

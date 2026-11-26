@@ -1345,8 +1345,9 @@ pub use reasonix_wire::{
     WireEvent, WireFixture, WireTool, WireUsage, parse_fixture,
 };
 pub use remote_fleet::{
-    RemoteAttempt, RemotePlanConfig, RemotePlanReport, RemoteProbeEvent, RemoteProbePhase,
-    run_remote_plan, run_remote_plan_with_table,
+    RemoteAttempt, RemoteHealthReport, RemotePlanConfig, RemotePlanReport, RemoteProbeEvent,
+    RemoteProbePhase, probe_remote_health_file, run_remote_plan, run_remote_plan_with_table,
+    save_remote_health_file,
 };
 pub use remote_ledger::{Claim, LedgerServer, LedgerServerConfig};
 pub use remote_serve::{RemoteMode, RemoteServer, RemoteServerConfig};
