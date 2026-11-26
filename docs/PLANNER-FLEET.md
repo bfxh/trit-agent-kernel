@@ -220,6 +220,15 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   占位，临时文件 + 原子替换，启动时从残留 `.compact` 恢复），已完成任务不会再
   执行。未配 `--state` 时占位只在内存，账本重启仍会丢失在途令牌；状态文件含完成
   帧与租约令牌，应按敏感数据保护。
+  服务端单请求执行时限：`RemoteServerConfig::exec_timeout` /
+  `remote-echo|remote-exec --request-timeout-ms`（0 表示不限制）。deadline 从
+  handler 入口启动，覆盖账本 claim 等待、`sleep_ms` 与 `Exec` 子进程；到点先置
+  `timed_out` 再取消与请求共用的令牌，最终强制 `Aborted`、清空内容，并跳过账本
+  complete 与本地缓存（占位保留到 TTL）。响应带 `X-Trit-Deadline-Exceeded: 1`，
+  客户端 `RemoteReply::deadline_exceeded` 转成调度层 `NodeOutcome::OverBudget`：
+  计入 attempts/failures、连续失败清零、节点保持健康，并按 `retry_limit` 换节点；
+  租约丢失与超时同时发生时以租约丢失优先。deadline 线程 spawn 失败时该请求不受
+  时限约束；超时 `Aborted` 仍不代表远端一定没有产生副作用。
   `remote-echo --ledger <url>` 接入后，带键请求以账本为权威：账本不可达回 503
   且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权，
   `--ledger-renew-ms` 调整续约间隔（必须小于账本 TTL）。
@@ -229,7 +238,7 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
 503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
 慢执行期间不被接管、租约丢失中止在途执行、完成帧已由别人写入时旧执行者回 Aborted 而非旧结果、租约被接管不隔离节点且换机重试回放完成、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
-时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩；`tests/remote_exec.rs` 覆盖 `remote-exec`
+时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
 
@@ -259,9 +268,12 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   - `attempts`：每次尝试的 `{ node, status }`，按发生顺序；
   - `nodes`：`attempts / failures / healthy` 快照。
 - **有界重试（默认 0，显式 opt-in）**：节点级失败（传输错误 / 超时 / 没有
-  `X-Trit-Lease-Lost` 的 `Aborted` / 远端回 `Deferred`）或租约被接管
-  （`Superseded`）才换节点重试，最多 `retry_limit` 次；任务级 `Failed` 不重试。
-  `Superseded` 不隔离节点，重试请求会在账本上等待当前持有者并回放其完成帧。
+  `X-Trit-Lease-Lost` 的 `Aborted` / 远端回 `Deferred`）、执行超预算
+  （`OverBudget`，带 `X-Trit-Deadline-Exceeded`）或租约被接管（`Superseded`）
+  才换节点重试，最多 `retry_limit` 次；任务级 `Failed` 不重试。
+  `Superseded` 与 `OverBudget` 不隔离节点；前者不计失败并唤醒等待者，后者计入
+  failures 与 attempts 但清零连续失败。租约接管后的重试请求会在账本上等待当前
+  持有者并回放其完成帧。
   重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
   未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（上限 1024，FIFO
   淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是

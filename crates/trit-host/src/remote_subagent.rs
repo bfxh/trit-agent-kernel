@@ -21,6 +21,9 @@
 //! 7. **租约丢失不是节点故障**：服务端因账本租约被接管而中止时，会在合法
 //!    `Aborted` 帧旁带 `X-Trit-Lease-Lost: 1`；[`RemoteReply::lease_lost`] 供
 //!    调度层区分“节点不可用”与“任务已由其他持有者接手”。
+//! 8. **执行时限不是节点故障**：服务端墙钟到点会回带 `X-Trit-Deadline-Exceeded: 1`
+//!    的合法 `Aborted`；[`RemoteReply::deadline_exceeded`] 供调度层区分
+//!    “节点失联”与“节点健康但本次请求超预算”。
 
 use std::io::Read;
 use std::time::Duration;
@@ -46,6 +49,10 @@ pub const IDEMPOTENCY_HEADER: &str = "X-Trit-Idempotency";
 /// 租约丢失标记头：服务端因账本租约被接管而中止本机执行时置 `1`。
 /// 客户端据此区分“节点故障”与“同一任务已由其他持有者接手”，后者不应隔离节点。
 pub const LEASE_LOST_HEADER: &str = "X-Trit-Lease-Lost";
+
+/// 服务端执行时限到点标记：超时返回的 `Aborted` 帧旁带 `1`。
+/// 客户端据此区分“节点不可用”与“节点健康但请求超出本次墙钟预算”。
+pub const DEADLINE_EXCEEDED_HEADER: &str = "X-Trit-Deadline-Exceeded";
 
 /// 计划作用域与帧键之间的分隔符；作用域本身不允许包含它。
 pub const IDEMPOTENCY_SCOPE_SEPARATOR: char = '|';
@@ -118,6 +125,8 @@ pub struct RemoteReply {
     pub content: Vec<u8>,
     /// 服务端因账本租约被其他持有者接管而中止：节点仍健康，任务应由当前持有者完成。
     pub lease_lost: bool,
+    /// 服务端执行时限到点而中止：节点仍健康，可按重试预算换节点。
+    pub deadline_exceeded: bool,
 }
 
 /// 把请求帧 POST 到 `endpoint`，把合法响应映射成稳定结果引用。
@@ -200,6 +209,7 @@ pub fn run_remote_subagent_reply_scoped(
         ));
     }
     let lease_lost_header = response.header(LEASE_LOST_HEADER) == Some("1");
+    let deadline_exceeded_header = response.header(DEADLINE_EXCEEDED_HEADER) == Some("1");
 
     let mut body = Vec::new();
     // 读到一半断开同样算传输失败：对端是否执行过无法判定，按 Aborted 处理。
@@ -226,6 +236,8 @@ pub fn run_remote_subagent_reply_scoped(
             response.validate_for(request)?;
             let lease_lost =
                 lease_lost_header && matches!(&response.status, DelegationStatus::Aborted);
+            let deadline_exceeded =
+                deadline_exceeded_header && matches!(&response.status, DelegationStatus::Aborted);
             let result = DelegationResult {
                 task: response.task,
                 epoch: response.epoch,
@@ -237,6 +249,7 @@ pub fn run_remote_subagent_reply_scoped(
                 result,
                 content: response.content,
                 lease_lost,
+                deadline_exceeded,
             })
         }
         Ok(None) if body.is_empty() => Ok(unresolved_reply(
@@ -382,5 +395,6 @@ fn unresolved_reply(request: &SubagentRequest, status: DelegationStatus) -> Remo
         result: unresolved(request, status),
         content: Vec::new(),
         lease_lost: false,
+        deadline_exceeded: false,
     }
 }

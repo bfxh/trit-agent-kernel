@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use trit_host::{
     FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteServer, RemoteServerConfig,
-    run_remote_subagent, run_remote_subagent_reply_cancellable, run_remote_subagent_reply_scoped,
+    run_remote_subagent, run_remote_subagent_reply, run_remote_subagent_reply_cancellable,
+    run_remote_subagent_reply_scoped,
 };
 use trit_orch::{
     AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint,
@@ -416,6 +417,30 @@ fn remote_timeout_is_aborted() {
 }
 
 #[test]
+fn request_deadline_aborts_cli_slow_request() {
+    let (url, mut child) = spawn_echo(&[
+        "--once",
+        "--sleep-ms",
+        "2000",
+        "--request-timeout-ms",
+        "250",
+    ]);
+    let started = Instant::now();
+    let result = run_remote_subagent(&endpoint(&url, None, 30), &request()).unwrap();
+    assert!(
+        matches!(result.status, DelegationStatus::Aborted),
+        "the CLI watchdog must abort a request past its deadline, got {:?}",
+        result.status
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "watchdog must fire before the 2s sleep completes, took {:?}",
+        started.elapsed()
+    );
+    let _ = child.wait();
+}
+
+#[test]
 fn idempotency_header_carries_task_at_epoch() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -494,6 +519,37 @@ fn echo_server_dedupes_matching_idempotency_key() {
     assert!(
         second_elapsed < Duration::from_millis(300),
         "dedupe hit must skip execution: {second_elapsed:?}"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn execution_deadline_aborts_slow_request() {
+    let server = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(2000)
+            .with_exec_timeout(Duration::from_millis(250)),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let handle = std::thread::spawn(move || server.serve_once().unwrap());
+
+    let started = Instant::now();
+    let reply = run_remote_subagent_reply(&endpoint(&url, None, 30), &request()).unwrap();
+    assert!(
+        matches!(reply.result.status, DelegationStatus::Aborted),
+        "a request past its deadline must abort, got {:?}",
+        reply.result.status
+    );
+    assert!(
+        reply.deadline_exceeded,
+        "the server must flag the abort as a deadline miss"
+    );
+    assert!(!reply.result.reusable());
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "deadline must fire before the 2s sleep completes, took {:?}",
+        started.elapsed()
     );
     handle.join().unwrap();
 }

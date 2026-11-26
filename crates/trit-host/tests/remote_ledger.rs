@@ -912,6 +912,83 @@ fn stale_completion_is_aborted_instead_of_returned() {
 }
 
 #[test]
+fn deadline_does_not_register_a_completion() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_secs(5)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let node = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(300)
+            .with_exec_timeout(Duration::from_millis(100))
+            .with_ledger(ledger_endpoint.clone()),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", node.addr().unwrap());
+    let server = thread::spawn(move || node.serve_once().unwrap());
+
+    let reply = run_remote_subagent_reply(&endpoint(&url, None, 10), &request()).unwrap();
+    assert!(matches!(reply.result.status, DelegationStatus::Aborted));
+    assert!(reply.deadline_exceeded);
+    server.join().unwrap();
+    assert_eq!(
+        ledger.completions(),
+        0,
+        "a timed-out execution must not become the authoritative completion"
+    );
+    // 占位仍在，直到 TTL 过期；调用方不会看到伪造的 Done。
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::Pending
+    );
+}
+
+#[test]
+fn deadline_covers_ledger_wait_and_keeps_the_timeout_flag() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_secs(5)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    // 另一个持有者先占位：本节点会停在 claim 等待，直到自己的 deadline 到点。
+    assert!(matches!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::New { .. }
+    ));
+
+    let node = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_exec_timeout(Duration::from_millis(100))
+            .with_ledger(ledger_endpoint.clone()),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", node.addr().unwrap());
+    let server = thread::spawn(move || node.serve_once().unwrap());
+
+    let reply = run_remote_subagent_reply(&endpoint(&url, None, 10), &request()).unwrap();
+    assert!(matches!(reply.result.status, DelegationStatus::Aborted));
+    assert!(
+        reply.deadline_exceeded,
+        "a deadline hit while waiting for the ledger must stay distinguishable"
+    );
+    server.join().unwrap();
+    assert_eq!(ledger.completions(), 0);
+}
+
+#[test]
 fn superseded_node_stays_healthy_and_retry_reads_completion() {
     let ledger = Arc::new(
         LedgerServer::bind(

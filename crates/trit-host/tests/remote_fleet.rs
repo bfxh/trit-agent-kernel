@@ -377,6 +377,48 @@ fn retry_switches_node_and_reuses_idempotency_key() {
 }
 
 #[test]
+fn deadline_miss_is_retried_without_quarantining_the_node() {
+    // node-a 自己配了 250ms 请求上限；它仍能回合法 Aborted，只是本次超预算。
+    let slow = spawn_node(
+        "node-a",
+        1,
+        &["--sleep-ms", "2000", "--request-timeout-ms", "250"],
+    );
+    let fast = spawn_node("node-b", 1, &[]);
+    let plan = plan(vec![task("t1", &[])]);
+
+    let report = run_remote_plan(
+        &plan,
+        vec![slow.remote(), fast.remote()],
+        RemotePlanConfig::new(1).with_retry_limit(1),
+        CancelToken::new(),
+        request_for,
+    )
+    .unwrap();
+
+    assert_eq!(report.report.completed, ["t1"], "{:?}", report.report);
+    assert_eq!(report.node_of("t1"), Some("node-b"), "超预算必须换节点");
+    assert_eq!(report.attempts_of("t1").len(), 2);
+    assert!(matches!(
+        report.attempts_of("t1")[0].status,
+        DelegationStatus::Aborted
+    ));
+    let nodes: BTreeMap<&str, &trit_orch::NodeSnapshot> = report
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    assert!(
+        nodes["node-a"].healthy,
+        "a deadline reply proves the node is reachable: {:?}",
+        report.nodes
+    );
+    assert_eq!(nodes["node-a"].failures, 1);
+    assert_eq!(nodes["node-a"].attempts, 1);
+    assert!(nodes["node-b"].healthy);
+}
+
+#[test]
 fn retry_limit_bounds_attempts() {
     // 两个节点都不回包：retry_limit=1 只允许一次换节点重试。
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

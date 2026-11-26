@@ -99,6 +99,35 @@ fn superseded_resets_failures_without_quarantining() {
 }
 
 #[test]
+fn over_budget_counts_an_attempt_but_keeps_the_node_healthy() {
+    let table = NodeTable::new(vec![node("a", 1)])
+        .unwrap()
+        .with_failure_threshold(2);
+    let cancel = CancelToken::new();
+
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    assert!(table.snapshot()[0].healthy);
+
+    // 服务端明确回了超时，说明节点仍能服务：本事计入失败数，但清零连续失败。
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::OverBudget);
+    let snapshot = table.snapshot();
+    assert!(snapshot[0].healthy);
+    assert_eq!(snapshot[0].attempts, 2);
+    assert_eq!(snapshot[0].failures, 2);
+
+    // 连续失败计数已清零，一次 NodeFailed 不足以隔离。
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    assert!(table.snapshot()[0].healthy);
+
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    assert!(!table.snapshot()[0].healthy);
+}
+
+#[test]
 fn snapshots_restore_quarantine_and_counts() {
     let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
     let cancel = CancelToken::new();

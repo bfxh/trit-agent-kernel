@@ -70,6 +70,9 @@ pub enum NodeOutcome {
     /// 账本租约被其他持有者接管：本节点中止在途执行；节点仍健康，任务应等待
     /// 当前持有者的结果或换节点重试。
     Superseded,
+    /// 服务端执行时限到点：本节点明确回了 `Aborted`，节点仍健康；本次尝试计入
+    /// 失败数但不累计连续失败，可按重试预算换节点。
+    OverBudget,
 }
 
 /// 节点状态快照（用于报告与测试断言）。
@@ -280,6 +283,10 @@ impl NodeTable {
                 }
             }
             NodeOutcome::Superseded => slot.consecutive_failures = 0,
+            NodeOutcome::OverBudget => {
+                slot.failures = slot.failures.saturating_add(1);
+                slot.consecutive_failures = 0;
+            }
             NodeOutcome::Abandoned => {}
         }
         self.cond.notify_all();

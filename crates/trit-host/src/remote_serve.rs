@@ -39,6 +39,10 @@
 //!     执行完才发现完成帧已由别人写入（`/complete` 403），同样回标记过的
 //!     `Aborted`，绝不把本机旧结果当成获胜帧返回。网络分区导致心跳请求完全无法
 //!     送达时，旧执行者仍可能在本地跑完，这部分需任务幂等兜底。
+//! 11. **单请求墙钟有界**：配置 `exec_timeout` 后，deadline 覆盖账本等待、`sleep_ms`
+//!     与 Exec 子进程；到点先标记 `timed_out` 再取消同一令牌，最终强制 `Aborted`、
+//!     跳过 complete 与本地缓存，并带 `X-Trit-Deadline-Exceeded: 1` 让调度层
+//!     区分“节点失联”与“节点健康但请求超预算”。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -54,10 +58,10 @@ use trit_orch::{
 };
 
 use crate::remote_ledger::{self, Claim};
-use crate::remote_subagent::{CANCEL_PATH, LEASE_LOST_HEADER, idempotency_scope};
-use crate::subagent_process::{
-    SubagentProcessConfig, run_subagent_reply, run_subagent_reply_cancellable,
+use crate::remote_subagent::{
+    CANCEL_PATH, DEADLINE_EXCEEDED_HEADER, LEASE_LOST_HEADER, idempotency_scope,
 };
+use crate::subagent_process::{SubagentProcessConfig, run_subagent_reply_cancellable};
 
 /// 等待容量/执行期间检查取消的步长。
 const CANCEL_CHECK_STEP: Duration = Duration::from_millis(25);
@@ -240,6 +244,39 @@ fn start_ledger_heartbeat(
     Some(LedgerHeartbeat { stop: Some(sender) })
 }
 
+/// 执行时限守卫：Drop 时关闭通道，后台计时线程退出；不 join。
+struct ExecutionDeadline {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Drop for ExecutionDeadline {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+    }
+}
+
+fn start_execution_deadline(
+    timeout: Duration,
+    cancel: CancelToken,
+    timed_out: Arc<AtomicBool>,
+) -> Option<ExecutionDeadline> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("trit-exec-deadline".into())
+        .spawn(move || {
+            match receiver.recv_timeout(timeout) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // 先记录原因再取消：最终响应要走 Aborted 且不登记完成。
+                    timed_out.store(true, Ordering::SeqCst);
+                    cancel.cancel();
+                }
+            }
+        })
+        .ok()?;
+    Some(ExecutionDeadline { stop: Some(sender) })
+}
+
 /// 服务端应答模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteMode {
@@ -275,6 +312,9 @@ pub struct RemoteServerConfig {
     pub exec_workspace_root: Option<PathBuf>,
     /// 同时在处理的连接上限；超限直接回 503，不再 spawn 线程。
     pub max_connections: usize,
+    /// 单次请求的墙钟执行上限；含账本等待、`sleep_ms` 与 `Exec` 子进程。
+    /// `None` 不限制；超过后取消在途执行并回 `Aborted`，且不登记完成。
+    pub exec_timeout: Option<Duration>,
 }
 
 impl RemoteServerConfig {
@@ -289,6 +329,7 @@ impl RemoteServerConfig {
             exec: None,
             exec_workspace_root: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            exec_timeout: None,
         }
     }
 
@@ -325,6 +366,12 @@ impl RemoteServerConfig {
 
     pub fn with_max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = max_connections.max(1);
+        self
+    }
+
+    /// 设置单次请求的墙钟上限；`Duration::ZERO` 表示不限制。
+    pub fn with_exec_timeout(mut self, timeout: Duration) -> Self {
+        self.exec_timeout = (!timeout.is_zero()).then_some(timeout);
         self
     }
 
@@ -535,7 +582,15 @@ fn handle(
     };
     let dedupe = idempotency.is_some();
     let _cancel_scope = dedupe.then(|| cancels.scope(&key));
-    let token = _cancel_scope.as_ref().map(|scope| scope.token());
+    // 即使没有幂等键也保留一个本地取消令牌，执行时限与 Exec 子进程共用它。
+    let token = _cancel_scope
+        .as_ref()
+        .map(|scope| scope.token().clone())
+        .unwrap_or_default();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let _deadline = config.exec_timeout.and_then(|timeout| {
+        start_execution_deadline(timeout, token.clone(), Arc::clone(&timed_out))
+    });
     let mut ledger_owned = false;
     let mut ledger_lease: Option<String> = None;
     if dedupe {
@@ -543,8 +598,14 @@ fn handle(
             // 账本是跨机权威：先 claim，再执行；等待期内轮询完成响应与取消。
             let deadline = std::time::Instant::now() + Duration::from_secs(endpoint.timeout_secs);
             loop {
-                if token.is_some_and(CancelToken::is_cancelled) {
-                    return respond_aborted(&mut stream, &request);
+                if token.is_cancelled() {
+                    // 等待账本期间也可能是 deadline 触发：保留超预算标记，
+                    // 否则调度层会把健康节点误判成故障。
+                    return if timed_out.load(Ordering::SeqCst) {
+                        respond_aborted_deadline(&mut stream, &request)
+                    } else {
+                        respond_aborted(&mut stream, &request)
+                    };
                 }
                 match remote_ledger::claim(endpoint, &key) {
                     Ok(Claim::New { lease }) => {
@@ -573,8 +634,8 @@ fn handle(
 
     let lease_lost = Arc::new(AtomicBool::new(false));
     let _heartbeat = if ledger_owned {
-        match (config.ledger.as_ref(), ledger_lease.as_deref(), token) {
-            (Some(endpoint), Some(lease), Some(token)) => start_ledger_heartbeat(
+        match (config.ledger.as_ref(), ledger_lease.as_deref()) {
+            (Some(endpoint), Some(lease)) => start_ledger_heartbeat(
                 endpoint.clone(),
                 key.clone(),
                 lease.to_string(),
@@ -589,9 +650,9 @@ fn handle(
     };
 
     let cancelled = if config.sleep_ms > 0 {
-        sleep_unless_cancelled(config.sleep_ms, token)
+        sleep_unless_cancelled(config.sleep_ms, Some(&token))
     } else {
-        token.is_some_and(CancelToken::is_cancelled)
+        token.is_cancelled()
     };
 
     let (status, content, tokens) = if cancelled {
@@ -611,7 +672,7 @@ fn handle(
                 0,
             ),
             RemoteMode::Silent => {
-                if lease_lost.load(Ordering::SeqCst) {
+                if lease_lost.load(Ordering::SeqCst) || timed_out.load(Ordering::SeqCst) {
                     (DelegationStatus::Aborted, Vec::new(), 0)
                 } else {
                     return respond(&mut stream, 200, "OK", b"");
@@ -628,10 +689,7 @@ fn handle(
                     scope.as_deref(),
                 ) {
                     Ok(exec) => {
-                        let reply = match token {
-                            Some(token) => run_subagent_reply_cancellable(&exec, &request, token),
-                            None => run_subagent_reply(&exec, &request),
-                        };
+                        let reply = run_subagent_reply_cancellable(&exec, &request, &token);
                         match reply {
                             Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
                             Err(error) => (
@@ -649,7 +707,9 @@ fn handle(
         }
     };
     let lease_lost_now = lease_lost.load(Ordering::SeqCst);
-    let (status, content, tokens) = if lease_lost_now {
+    let timed_out_now = timed_out.load(Ordering::SeqCst);
+    let aborted_now = lease_lost_now || timed_out_now;
+    let (status, content, tokens) = if aborted_now {
         (DelegationStatus::Aborted, Vec::new(), 0)
     } else {
         (status, content, tokens)
@@ -665,8 +725,8 @@ fn handle(
         Ok(frame) => frame,
         Err(_) => return respond(&mut stream, 500, "Internal Server Error", b""),
     };
-    // 租约已失效时不登记完成，只回 Aborted 让调度方等待当前持有者的结果或换节点。
-    if !lease_lost_now
+    // 租约失效或本机执行超时：都不登记完成，避免把放弃/失败写成权威结果。
+    if !aborted_now
         && ledger_owned
         && let Some(endpoint) = config.ledger.as_ref()
     {
@@ -685,6 +745,7 @@ fn handle(
     }
     if dedupe
         && !ledger_owned
+        && !timed_out_now
         && let Ok(mut guard) = cache.lock()
     {
         if guard.len() >= MAX_CACHED_RESPONSES
@@ -696,6 +757,9 @@ fn handle(
     }
     if lease_lost_now {
         return respond_lease_lost(&mut stream, &frame);
+    }
+    if timed_out_now {
+        return respond_deadline_exceeded(&mut stream, &frame);
     }
     respond(&mut stream, 200, "OK", &frame)
 }
@@ -806,6 +870,15 @@ fn respond_aborted_lease_lost(
     respond_lease_lost(stream, &frame)
 }
 
+/// 执行时限在账本等待期到点：回带超预算标记的合法 `Aborted`。
+fn respond_aborted_deadline(
+    stream: &mut TcpStream,
+    request: &SubagentRequest,
+) -> std::io::Result<()> {
+    let frame = aborted_frame(request)?;
+    respond_deadline_exceeded(stream, &frame)
+}
+
 fn aborted_frame(request: &SubagentRequest) -> std::io::Result<Vec<u8>> {
     let response = SubagentResponse {
         task: request.task.clone(),
@@ -819,9 +892,22 @@ fn aborted_frame(request: &SubagentRequest) -> std::io::Result<Vec<u8>> {
 
 /// 租约被接管后返回合法 `Aborted` 帧，并标记“不是节点故障”。
 fn respond_lease_lost(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    respond_flagged_aborted(stream, body, LEASE_LOST_HEADER)
+}
+
+/// 执行时限到点后返回合法 `Aborted` 帧，并标记“节点健康、请求超预算”。
+fn respond_deadline_exceeded(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    respond_flagged_aborted(stream, body, DEADLINE_EXCEEDED_HEADER)
+}
+
+fn respond_flagged_aborted(
+    stream: &mut TcpStream,
+    body: &[u8],
+    header: &str,
+) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{LEASE_LOST_HEADER}: 1\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{header}: 1\r\nConnection: close\r\n\r\n",
         crate::remote_subagent::FRAME_CONTENT_TYPE,
         body.len()
     )?;

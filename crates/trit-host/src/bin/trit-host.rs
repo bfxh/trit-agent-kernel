@@ -1316,8 +1316,8 @@ fn usage() {
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]\n\n\
          remote-echo: trit-host remote-echo [--bind <addr>] [--token <t>] [--once] \\\n\
-         [--fail] [--silent] [--sleep-ms N] [--max-connections N] [--ledger <url>] [--ledger-token <t>] \\\n\
-         [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
+         [--fail] [--silent] [--sleep-ms N] [--request-timeout-ms N] [--max-connections N] \\\n\
+         [--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
@@ -1326,7 +1326,7 @@ fn usage() {
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
          (--workspace <dir> | --workspace-root <dir>) --script <proposals.json> \\\n\
-         [--max-steps N] [--exec-timeout-secs N] \\\n\
+         [--max-steps N] [--exec-timeout-secs N] [--request-timeout-ms N] \\\n\
          [--once] [--max-connections N] [--ledger <url>] [--ledger-token <t>] \\\n\
          [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
@@ -1607,7 +1607,8 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
 }
 
 /// `remote-echo [--bind <addr>] [--token <t>] [--once] [--fail] [--silent] [--sleep-ms N]`
-/// `[--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N] [--ledger-renew-ms N]`：
+/// `[--request-timeout-ms N] [--ledger <url>] [--ledger-token <t>]`
+/// `[--ledger-timeout-secs N] [--ledger-renew-ms N]`：
 /// 远程端点的参考服务端。HTTP、帧与鉴权规则见 `trit_host::remote_serve`。
 ///
 /// 启动后先向 stdout 打一行 `{"bind":"127.0.0.1:PORT"}`（含系统分配的端口），
@@ -1619,6 +1620,7 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     let mut ledger_token: Option<String> = None;
     let mut ledger_timeout_secs = 30u64;
     let mut ledger_renew_ms: Option<u64> = None;
+    let mut request_timeout_ms: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--bind" => config.bind = next(&mut args, "--bind")?,
@@ -1627,6 +1629,9 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             "--fail" => config.mode = trit_host::RemoteMode::Fail,
             "--silent" => config.mode = trit_host::RemoteMode::Silent,
             "--sleep-ms" => config.sleep_ms = next(&mut args, "--sleep-ms")?.parse()?,
+            "--request-timeout-ms" => {
+                request_timeout_ms = Some(next(&mut args, "--request-timeout-ms")?.parse()?)
+            }
             "--max-connections" => {
                 config.max_connections = next(&mut args, "--max-connections")?.parse()?
             }
@@ -1655,6 +1660,9 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             return Err(fail("--ledger-renew-ms requires --ledger <url>"));
         }
         config.ledger_renew_interval = std::time::Duration::from_millis(ms);
+    }
+    if let Some(ms) = request_timeout_ms {
+        config = config.with_exec_timeout(std::time::Duration::from_millis(ms));
     }
     let server = trit_host::RemoteServer::bind(config)?;
     let addr = server.addr()?;
@@ -1860,8 +1868,8 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
 }
 
 /// `remote-exec [--bind <addr>] [--token <t>] (--workspace <dir> | --workspace-root <dir>)`
-/// `--script <proposals.json>` `[--max-steps N] [--exec-timeout-secs N] [--once]`
-/// `[--ledger <url> ...]`：可执行的远程端点。每个请求 spawn 一个 `subagent-run`
+/// `--script <proposals.json>` `[--max-steps N] [--exec-timeout-secs N]`
+/// `[--request-timeout-ms N] [--once] [--ledger <url> ...]`：可执行的远程端点。每个请求 spawn 一个 `subagent-run`
 /// 子进程，帧走 stdin/stdout。`--workspace-root` 会按任务 ID 建独立子目录；
 /// args/`--script` 中的 `{task}` 与 `{workspace}` 在每次请求前展开。
 fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -1872,6 +1880,7 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     let mut script: Option<PathBuf> = None;
     let mut max_steps = 20usize;
     let mut exec_timeout_secs = 30u64;
+    let mut request_timeout_ms: Option<u64> = None;
     let mut ledger_url: Option<String> = None;
     let mut ledger_token: Option<String> = None;
     let mut ledger_timeout_secs = 30u64;
@@ -1892,6 +1901,9 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             }
             "--exec-timeout-secs" => {
                 exec_timeout_secs = next(&mut args, "--exec-timeout-secs")?.parse()?
+            }
+            "--request-timeout-ms" => {
+                request_timeout_ms = Some(next(&mut args, "--request-timeout-ms")?.parse()?)
             }
             "--ledger" => ledger_url = Some(next(&mut args, "--ledger")?),
             "--ledger-token" => ledger_token = Some(next(&mut args, "--ledger-token")?),
@@ -1950,6 +1962,9 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             return Err(fail("--ledger-renew-ms requires --ledger <url>"));
         }
         config.ledger_renew_interval = std::time::Duration::from_millis(ms);
+    }
+    if let Some(ms) = request_timeout_ms {
+        config = config.with_exec_timeout(std::time::Duration::from_millis(ms));
     }
 
     let server = trit_host::RemoteServer::bind(config)?;

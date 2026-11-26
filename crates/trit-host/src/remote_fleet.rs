@@ -15,8 +15,10 @@
 //! - 节点级失败（传输/超时/协议违约/远端中止）按 `failure_threshold` 隔离该节点，
 //!   任务级失败（远端回了 `Failed`）不牵连节点健康度；远端带
 //!   `X-Trit-Lease-Lost` 的 `Aborted` 表示任务已被其他账本持有者接手，记
-//!   `NodeOutcome::Superseded`，节点仍健康，任务按重试预算等待新结果；
-//! - 节点级失败与租约被接管最多换节点重试 `retry_limit` 次（默认 0）。重试复用
+//!   `NodeOutcome::Superseded`，节点仍健康，任务按重试预算等待新结果；带
+//!   `X-Trit-Deadline-Exceeded` 的 `Aborted` 记 `NodeOutcome::OverBudget`，
+//!   同样不隔离节点，只换节点重试；
+//! - 节点级失败、租约被接管与执行超预算最多换节点重试 `retry_limit` 次（默认 0）。重试复用
 //!   同一个幂等键 `X-Trit-Idempotency: task@epoch`，因此要求服务端去重；任务级
 //!   失败与 `Deferred` 不重试。每次尝试（节点 + 结局）记进
 //!   [`RemotePlanReport::attempts`]。
@@ -218,6 +220,12 @@ where
                             last_error = Some(format!(
                                 "remote node {node_id} lost the ledger lease to another owner"
                             ));
+                        } else if reply.deadline_exceeded {
+                            // 节点明确回了超时帧：它还能服务，只是本次请求超出墙钟预算。
+                            lease.finish(NodeOutcome::OverBudget);
+                            last_error = Some(format!(
+                                "remote node {node_id} exceeded its execution deadline"
+                            ));
                         } else {
                             match &status {
                                 DelegationStatus::Completed => {
@@ -266,8 +274,8 @@ where
                     }
                 }
 
-                // 能走到这里只有节点级失败（Aborted / 传输错误）或租约被接管：
-                // 跳过本节点并重试，但 Superseded 已在节点表里按健康记账。
+                // 能走到这里只有节点级失败（Aborted / 传输错误）、租约被接管或
+                // 执行超预算：跳过本节点并重试；后两者在节点表里按健康记账。
                 excluded.insert(node_id);
                 if retries_used >= retry_limit {
                     return Err(last_error.unwrap_or_else(|| "remote node failed".into()));
