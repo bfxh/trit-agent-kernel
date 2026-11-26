@@ -246,8 +246,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
 
-**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS）与周期性自动探测；
-显式 `remote-plan --probe` 已提供。静态节点表、派发与有界换机重试见 §9。
+**仍然非目标（本批不做）**：动态节点发现（注册中心 / mDNS）与跨进程常驻周期
+探测；单轮演练内的 `remote-plan --probe` / `--probe-interval-ms` 已提供。静态
+节点表、派发与有界换机重试见 §9。
 
 ## 9. 跨机器调度（`trit_orch::NodeTable` + `trit_host::run_remote_plan`）
 
@@ -300,7 +301,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `NodeOutcome::Abandoned` 归还（不计 attempts/failures、不换节点重试）。
   边界：对端未实现 `/cancel` 时，客户端仍会在 2s 后返回，但远端请求会继续到
   端点超时，可能已经写盘；`Aborted` 不等于“远端一定没执行”。
-- CLI `trit-host remote-plan [--input <json|->] [--health <path>] [--probe]`：输入
+- CLI `trit-host remote-plan [--input <json|->] [--health <path>] [--probe]
+  [--probe-interval-ms N]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?, scope?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
   含 `completed/failed/deferred/results/assignments/attempts/nodes/probes/metrics` 的
@@ -312,7 +314,11 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `--health`：派发前对健康文件里标记为隔离、且仍存在于本次节点表的节点逐个做
   `GET /health`，成功的调用 `NodeTable::readmit` 重新放行（保留累计 attempts/
   failures、清零连续失败），失败保持隔离；探测结果写进报告的 `probes`，探测本身
-  不计 attempt/failure。没有自动周期性恢复：恢复动作只在显式 `--probe` 时发生。
+  不计 attempt/failure。`--probe-interval-ms`（需配 `--health`）会在本次
+  `remote-plan` 运行期间启动周期监控：只探当前已隔离节点，成功后调用
+  `NodeTable::readmit` 并唤醒等待容量的任务，失败保持隔离；事件带
+  `phase: periodic` 写入 `probes`，最多保留 1024 条。监控随计划结束退出，不做
+  跨进程常驻：计划结束后的恢复仍需下次显式 `--probe` 或 `--probe-interval-ms`。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
 隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、`OverBudget` 健康语义、
@@ -323,7 +329,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 一次、缓存条数/字节预算、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
-文件跨运行隔离、`--probe` 成功放行/失败保持隔离、重复节点 ID 与非法 scope 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
+文件跨运行隔离、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间
+恢复节点、重复节点 ID 与非法 scope 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
 （共享账本下双节点单次执行、scope 隔离）。
 
 ## 非目标

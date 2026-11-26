@@ -192,6 +192,74 @@ fn remote_plan_cli_probe_readmits_a_recovered_node() {
 }
 
 #[test]
+fn remote_plan_cli_periodic_probe_readmits_isolated_node() {
+    let slow = spawn_node("node-a", &["--sleep-ms", "1000"]);
+    let recovered = spawn_node("node-b", &[]);
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-probe-periodic-{}.json",
+        std::process::id()
+    ));
+    let snapshots = serde_json::json!([
+        {"id": "node-a", "healthy": true, "in_flight": 0, "attempts": 0, "failures": 0},
+        {"id": "node-b", "healthy": false, "in_flight": 0, "attempts": 0, "failures": 1},
+    ]);
+    std::fs::write(&health, serde_json::to_vec(&snapshots).unwrap()).unwrap();
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 2,
+        "failure_threshold": 1,
+        "tasks": [task("t1"), task("t2")],
+        "nodes": [node_json(&slow, 1), node_json(&recovered, 1)],
+    });
+    let path = input_file("probe-periodic", &input);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--probe-interval-ms")
+        .arg("100")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&health);
+    assert!(
+        output.status.success(),
+        "remote-plan --probe-interval-ms failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let nodes: std::collections::BTreeMap<&str, &serde_json::Value> = report["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| (node["id"].as_str().unwrap(), node))
+        .collect();
+    assert_eq!(nodes["node-b"]["healthy"], true, "{report}");
+    assert!(
+        report["probes"].as_array().unwrap().iter().any(|probe| {
+            probe["node"] == "node-b"
+                && probe["phase"] == "periodic"
+                && probe["ok"] == true
+                && probe["readmitted"] == true
+        }),
+        "periodic probe should readmit node-b: {report}"
+    );
+    let used: HashSet<&str> = report["assignments"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|node| node.as_str().unwrap())
+        .collect();
+    assert!(
+        used.contains("node-b"),
+        "the recovered node must take the queued task: {report}"
+    );
+}
+
+#[test]
 fn remote_plan_cli_failed_probe_keeps_the_node_isolated() {
     let good = spawn_node("node-b", &[]);
     let dead = serde_json::to_value(
@@ -349,6 +417,37 @@ fn remote_plan_cli_persists_node_health() {
         .find(|node| node["id"] == "node-a")
         .unwrap();
     assert_eq!(bad_node["healthy"], false, "{report}");
+}
+
+#[test]
+fn remote_plan_cli_requires_health_and_positive_interval_for_periodic_probe() {
+    let missing_health = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--probe-interval-ms")
+        .arg("100")
+        .output()
+        .unwrap();
+    assert_eq!(missing_health.status.code(), Some(2), "{missing_health:?}");
+    let stderr = String::from_utf8_lossy(&missing_health.stderr);
+    assert!(
+        stderr.contains("--probe-interval-ms requires --health"),
+        "{stderr}"
+    );
+
+    let zero = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--health")
+        .arg("unused-health.json")
+        .arg("--probe-interval-ms")
+        .arg("0")
+        .output()
+        .unwrap();
+    assert_eq!(zero.status.code(), Some(2), "{zero:?}");
+    let stderr = String::from_utf8_lossy(&zero.stderr);
+    assert!(
+        stderr.contains("--probe-interval-ms must be positive"),
+        "{stderr}"
+    );
 }
 
 #[test]
