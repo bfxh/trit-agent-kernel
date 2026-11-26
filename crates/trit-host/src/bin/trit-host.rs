@@ -1316,7 +1316,7 @@ fn usage() {
          [--checkpoint-backend files|git] [--workspace <dir>] [--scope code|conversation|both] \\\n\
          [--allow-unrewindable]\n\n\
          remote-echo: trit-host remote-echo [--bind <addr>] [--token <t>] [--once] \\\n\
-         [--fail] [--silent] [--sleep-ms N] [--ledger <url>] [--ledger-token <t>] \\\n\
+         [--fail] [--silent] [--sleep-ms N] [--max-connections N] [--ledger <url>] [--ledger-token <t>] \\\n\
          [--ledger-timeout-secs N]\n\
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
@@ -1326,7 +1326,7 @@ fn usage() {
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
          --workspace <dir> --script <proposals.json> [--max-steps N] [--exec-timeout-secs N] \\\n\
-         [--once] [--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N]\n\
+         [--once] [--max-connections N] [--ledger <url>] [--ledger-token <t>] [--ledger-timeout-secs N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?}},\n\
@@ -1623,6 +1623,9 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             "--fail" => config.mode = trit_host::RemoteMode::Fail,
             "--silent" => config.mode = trit_host::RemoteMode::Silent,
             "--sleep-ms" => config.sleep_ms = next(&mut args, "--sleep-ms")?.parse()?,
+            "--max-connections" => {
+                config.max_connections = next(&mut args, "--max-connections")?.parse()?
+            }
             "--ledger" => ledger_url = Some(next(&mut args, "--ledger")?),
             "--ledger-token" => ledger_token = Some(next(&mut args, "--ledger-token")?),
             "--ledger-timeout-secs" => {
@@ -1853,6 +1856,9 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
             "--script" => script = Some(PathBuf::from(next(&mut args, "--script")?)),
             "--max-steps" => max_steps = next(&mut args, "--max-steps")?.parse()?,
+            "--max-connections" => {
+                config.max_connections = next(&mut args, "--max-connections")?.parse()?
+            }
             "--exec-timeout-secs" => {
                 exec_timeout_secs = next(&mut args, "--exec-timeout-secs")?.parse()?
             }

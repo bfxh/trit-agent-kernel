@@ -4,6 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -524,6 +525,54 @@ fn echo_server_rejects_mismatched_idempotency_key() {
         "unexpected response: {response}"
     );
     handle.join().unwrap();
+}
+
+#[test]
+fn connection_limit_rejects_excess_with_503() {
+    let server = Arc::new(
+        RemoteServer::bind(
+            RemoteServerConfig::new("127.0.0.1:0")
+                .with_sleep_ms(3000)
+                .with_max_connections(1),
+        )
+        .unwrap(),
+    );
+    let address = server.addr().unwrap();
+    let running = Arc::clone(&server);
+    std::thread::spawn(move || {
+        let _ = running.serve_forever();
+    });
+
+    let frame = encode_frame(&request()).unwrap();
+    let mut first = TcpStream::connect(address).unwrap();
+    let _ = write!(
+        first,
+        "POST /run HTTP/1.1\r\nHost: test\r\nContent-Type: {FRAME_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        frame.len()
+    );
+    let _ = first.write_all(&frame);
+    let _ = first.flush();
+    // 等第一个连接被 accept 并占住唯一槽位。
+    std::thread::sleep(Duration::from_millis(150));
+
+    let mut second = TcpStream::connect(address).unwrap();
+    let _ = write!(
+        second,
+        "POST /run HTTP/1.1\r\nHost: test\r\nContent-Type: {FRAME_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        frame.len()
+    );
+    let _ = second.write_all(&frame);
+    let _ = second.flush();
+    let mut reader = BufReader::new(second);
+    let mut status = String::new();
+    reader.read_line(&mut status).unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 503"),
+        "excess connection must be rejected with 503, got {status}"
+    );
+
+    drop(first);
+    drop(server);
 }
 
 #[test]

@@ -25,7 +25,9 @@
 //! 8. **取消传播**：`POST /cancel`（origin 上的固定路径）+ `X-Trit-Idempotency`
 //!    按幂等键置位在途请求；等待账本、`sleep_ms` 与执行前都会检查，Exec 用可
 //!    取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
-//!    账本/本地缓存，避免后续重试再次执行同一键。
+//!    账本/本地缓存，避免后续重试再次执行同一键；
+//! 9. **连接有界**：`max_connections` 默认 64；超额连接直接 503，不排队、不 spawn，
+//!    防止慢客户端把服务端线程与内存堆爆。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -47,8 +49,11 @@ use crate::subagent_process::{
 /// 等待容量/执行期间检查取消的步长。
 const CANCEL_CHECK_STEP: Duration = Duration::from_millis(25);
 
-/// 预先取消但尚未到达的键上限，防止 `/cancel` 被用来无限占用内存。
+/// 预取消但尚未到达的键上限，防止 `/cancel` 被用来无限占用内存。
 const MAX_PRE_CANCELLED: usize = 1024;
+
+/// 同时在处理的连接上限（参考实现；可通过 `--max-connections` 调整）。
+const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -126,6 +131,50 @@ impl Drop for CancelScope<'_> {
     }
 }
 
+/// 连接并发上限：超额连接回 503，不再创建线程。
+struct ConnectionSlots {
+    limit: usize,
+    active: Mutex<usize>,
+}
+
+struct ConnectionSlot {
+    slots: Arc<ConnectionSlots>,
+}
+
+impl ConnectionSlots {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit.max(1),
+            active: Mutex::new(0),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionSlot> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *active >= self.limit {
+            return None;
+        }
+        *active += 1;
+        Some(ConnectionSlot {
+            slots: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut active = self
+            .slots
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+    }
+}
+
 /// 服务端应答模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteMode {
@@ -154,6 +203,8 @@ pub struct RemoteServerConfig {
     pub ledger: Option<RemoteEndpoint>,
     /// `Exec` 模式下的子 agent 进程配置；其他模式必须为空。
     pub exec: Option<SubagentProcessConfig>,
+    /// 同时在处理的连接上限；超限直接回 503，不再 spawn 线程。
+    pub max_connections: usize,
 }
 
 impl RemoteServerConfig {
@@ -165,6 +216,7 @@ impl RemoteServerConfig {
             sleep_ms: 0,
             ledger: None,
             exec: None,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -193,6 +245,11 @@ impl RemoteServerConfig {
         self.exec = Some(exec);
         self
     }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections.max(1);
+        self
+    }
 }
 
 /// 已绑定的参考服务端。
@@ -201,6 +258,7 @@ pub struct RemoteServer {
     config: RemoteServerConfig,
     cache: ResponseCache,
     cancels: Arc<ActiveCancels>,
+    slots: Arc<ConnectionSlots>,
 }
 
 impl RemoteServer {
@@ -227,11 +285,13 @@ impl RemoteServer {
             _ => {}
         }
         let listener = TcpListener::bind(config.bind.as_str())?;
+        let slots = ConnectionSlots::new(config.max_connections);
         Ok(Self {
             listener,
             config,
             cache: Arc::default(),
             cancels: Arc::default(),
+            slots,
         })
     }
 
@@ -242,7 +302,10 @@ impl RemoteServer {
 
     /// 服务一个连接后返回；测试与单次演示用。
     pub fn serve_once(&self) -> std::io::Result<()> {
-        let (stream, _) = self.listener.accept()?;
+        let (mut stream, _) = self.listener.accept()?;
+        let Some(_slot) = self.slots.try_acquire() else {
+            return respond(&mut stream, 503, "Service Unavailable", b"");
+        };
         handle(stream, &self.config, &self.cache, &self.cancels)
     }
 
@@ -252,11 +315,17 @@ impl RemoteServer {
     /// 同时打到一个端点，串行处理会让 `max_in_flight > 1` 的容量形同虚设。
     pub fn serve_forever(&self) -> std::io::Result<()> {
         loop {
-            let (stream, _) = self.listener.accept()?;
+            let (mut stream, _) = self.listener.accept()?;
+            let Some(slot) = self.slots.try_acquire() else {
+                // 超额连接不排队、不 spawn：直接 503，保护服务端线程与内存。
+                let _ = respond(&mut stream, 503, "Service Unavailable", b"");
+                continue;
+            };
             let config = self.config.clone();
             let cache = Arc::clone(&self.cache);
             let cancels = Arc::clone(&self.cancels);
             std::thread::spawn(move || {
+                let _slot = slot;
                 let _ = handle(stream, &config, &cache, &cancels);
             });
         }
