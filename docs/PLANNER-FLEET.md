@@ -280,7 +280,10 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   持有者并回放其完成帧。
   重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
   未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（1024 条 / 64 MiB，
-  FIFO 淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
+  FIFO 淘汰）；同键并发请求会在端点内排队，只有首个执行，其余等待并回放首次
+  结果（等待受 `exec_timeout` 约束，未配置时最多等 30s；首个未缓存时下一个继续
+  执行）。换到一台从未
+  见过该 key 的机器会再次执行，因此默认语义是
   **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/renew/complete，
   换机重试也能做到**完成结果至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
   账本不可达时 fail-closed（503）。配合 `--state` 时完成帧与未过期占位都跨重启
@@ -316,8 +319,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 快照恢复、显式 `readmit`、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表）、
-`crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、scope 隔离与
-非法 scope 拒绝、取消慢请求）、
+`crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、同键并发只执行
+一次、缓存条数/字节预算、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
 文件跨运行隔离、`--probe` 成功放行/失败保持隔离、重复节点 ID 与非法 scope 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`

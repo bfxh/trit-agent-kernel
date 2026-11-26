@@ -644,6 +644,44 @@ fn cache_byte_budget_evicts_the_oldest_response() {
 }
 
 #[test]
+fn concurrent_duplicate_requests_execute_once_without_a_ledger() {
+    let server = Arc::new(
+        RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_sleep_ms(250)).unwrap(),
+    );
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let worker = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || server.serve_connections(2).unwrap())
+    };
+    let request = request();
+    let first = {
+        let endpoint = endpoint(&url, None, 30);
+        let request = request.clone();
+        std::thread::spawn(move || run_remote_subagent(&endpoint, &request))
+    };
+    let second = {
+        let endpoint = endpoint(&url, None, 30);
+        let request = request.clone();
+        std::thread::spawn(move || run_remote_subagent(&endpoint, &request))
+    };
+
+    for (label, worker) in [("first", first), ("second", second)] {
+        let response = worker.join().unwrap().unwrap();
+        assert!(
+            matches!(&response.status, DelegationStatus::Completed),
+            "{label}: {:?}",
+            response.status
+        );
+    }
+    worker.join().unwrap();
+    assert_eq!(
+        server.executed_requests(),
+        1,
+        "the second duplicate must wait and replay the cached response"
+    );
+}
+
+#[test]
 fn echo_server_rejects_mismatched_idempotency_key() {
     // 头里的 key 与帧里的 task@epoch 不一致：400，不解帧执行。
     let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();

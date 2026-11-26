@@ -15,7 +15,10 @@
 //! 5. **带键才去重**：`X-Trit-Idempotency` 必须等于帧里的 `task@epoch`，否则 400；
 //!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效）；缓存同时限制
 //!    条数 [`MAX_CACHED_RESPONSES`] 与逻辑字节 `max_cache_bytes`（默认 64 MiB），
-//!    按写入顺序 FIFO 淘汰，单条超预算时不会缓存。没有头就按普通请求处理；
+//!    按写入顺序 FIFO 淘汰，单条超预算时不会缓存。没有共享账本时，同键并发请求
+//!    先在端点内排队，只有第一个执行，其余等待并回放首次结果；等待受 `exec_timeout`
+//!    约束（未配置时最多等 30s），首个结果未缓存（如 Aborted）时下一个继续执行。
+//!    没有头就按普通请求处理；
 //! 6. **账本优先**：配置 `ledger` 后，带键请求先向共享账本 claim；账本返回完成帧
 //!    就直接回放，返回占位则轮询等待，拿到执行权才执行，执行后必须 complete。
 //!    账本不可达时回 503，宁可不执行也不冒重复执行的风险。`Silent` 模式不产生
@@ -52,8 +55,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use trit_orch::{
@@ -82,6 +85,15 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 幂等缓存条数上限：按写入顺序 FIFO 淘汰，不做 LRU。
 const MAX_CACHED_RESPONSES: usize = 1024;
+
+/// 同键在途闸门上限：每个键一个闸门，活跃请求之外的条目会被清理。
+const MAX_INFLIGHT_GATES: usize = 1024;
+
+/// 没有配置执行时限时，同键等待的兜底上限，避免半开客户端无限占住闸门。
+const KEY_GATE_WAIT: Duration = Duration::from_secs(30);
+
+/// 同键闸门的轮询间隔：等待期间按期检查取消与执行时限。
+const KEY_GATE_POLL: Duration = Duration::from_millis(25);
 
 /// 幂等缓存逻辑字节上限默认值：单条帧最大 8 MiB，只限条数会放大到 GiB 级内存。
 const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -139,6 +151,113 @@ impl ResponseCacheState {
         if let Some(old) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old.bytes);
         }
+    }
+}
+
+/// 同键在途请求的端点内闸门：无共享账本时，只有一个请求执行，其余等待并回放缓存。
+#[derive(Default)]
+struct KeyGates {
+    inner: Mutex<GateTable>,
+}
+
+#[derive(Default)]
+struct GateTable {
+    gates: BTreeMap<String, Weak<KeyGate>>,
+}
+
+struct KeyGate {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+impl Default for KeyGate {
+    fn default() -> Self {
+        Self {
+            held: Mutex::new(false),
+            available: Condvar::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateError {
+    Cancelled,
+    Deadline,
+    Capacity,
+}
+
+impl KeyGates {
+    /// 取得某个键的执行权；等待期间检查取消与截止时间。
+    ///
+    /// 闸门条目用 `Weak` 保存，最后一个持有者退出后会被下一次插入顺手清理；
+    /// 活跃键超过 [`MAX_INFLIGHT_GATES`] 时直接返回容量错误，不再无限建闸门。
+    fn acquire(
+        &self,
+        key: &str,
+        cancel: &CancelToken,
+        deadline: Instant,
+    ) -> Result<KeyGateGuard, GateError> {
+        let gate = {
+            let mut table = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(gate) = table.gates.get(key).and_then(Weak::upgrade) {
+                gate
+            } else {
+                table.gates.retain(|_, gate| gate.strong_count() > 0);
+                if table.gates.len() >= MAX_INFLIGHT_GATES {
+                    return Err(GateError::Capacity);
+                }
+                let gate = Arc::new(KeyGate::default());
+                table.gates.insert(key.to_string(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+
+        let mut held = gate
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if cancel.is_cancelled() {
+                return Err(GateError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(GateError::Deadline);
+            }
+            if !*held {
+                *held = true;
+                drop(held);
+                return Ok(KeyGateGuard { gate });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(KEY_GATE_POLL);
+            if wait.is_zero() {
+                continue;
+            }
+            let (next, _) = gate
+                .available
+                .wait_timeout(held, wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            held = next;
+        }
+    }
+}
+
+struct KeyGateGuard {
+    gate: Arc<KeyGate>,
+}
+
+impl Drop for KeyGateGuard {
+    fn drop(&mut self) {
+        let mut held = self
+            .gate
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *held = false;
+        self.gate.available.notify_all();
     }
 }
 
@@ -439,6 +558,8 @@ pub struct RemoteServer {
     config: RemoteServerConfig,
     cache: ResponseCache,
     cancels: Arc<ActiveCancels>,
+    gates: Arc<KeyGates>,
+    executions: Arc<AtomicU64>,
     slots: Arc<ConnectionSlots>,
 }
 
@@ -493,6 +614,8 @@ impl RemoteServer {
             config,
             cache: Arc::default(),
             cancels: Arc::default(),
+            gates: Arc::default(),
+            executions: Arc::default(),
             slots,
         })
     }
@@ -502,13 +625,52 @@ impl RemoteServer {
         self.listener.local_addr()
     }
 
+    /// 未命中缓存、真正进入执行阶段的请求数；用于观测与并发语义测试。
+    pub fn executed_requests(&self) -> u64 {
+        self.executions.load(Ordering::SeqCst)
+    }
+
     /// 服务一个连接后返回；测试与单次演示用。
     pub fn serve_once(&self) -> std::io::Result<()> {
         let (mut stream, _) = self.listener.accept()?;
         let Some(_slot) = self.slots.try_acquire() else {
             return respond(&mut stream, 503, "Service Unavailable", b"");
         };
-        handle(stream, &self.config, &self.cache, &self.cancels)
+        handle(
+            stream,
+            &self.config,
+            &self.cache,
+            &self.cancels,
+            &self.gates,
+            &self.executions,
+        )
+    }
+
+    /// 接受并并发处理固定数量的连接后返回；用于测试与有界演练。
+    pub fn serve_connections(&self, count: usize) -> std::io::Result<()> {
+        let mut workers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (mut stream, _) = self.listener.accept()?;
+            let Some(slot) = self.slots.try_acquire() else {
+                let _ = respond(&mut stream, 503, "Service Unavailable", b"");
+                continue;
+            };
+            let config = self.config.clone();
+            let cache = Arc::clone(&self.cache);
+            let cancels = Arc::clone(&self.cancels);
+            let gates = Arc::clone(&self.gates);
+            let executions = Arc::clone(&self.executions);
+            workers.push(std::thread::spawn(move || {
+                let _slot = slot;
+                let _ = handle(stream, &config, &cache, &cancels, &gates, &executions);
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("server worker panicked"))?;
+        }
+        Ok(())
     }
 
     /// 持续服务，直到进程被终止；单连接错误只丢弃该连接。
@@ -526,9 +688,11 @@ impl RemoteServer {
             let config = self.config.clone();
             let cache = Arc::clone(&self.cache);
             let cancels = Arc::clone(&self.cancels);
+            let gates = Arc::clone(&self.gates);
+            let executions = Arc::clone(&self.executions);
             std::thread::spawn(move || {
                 let _slot = slot;
-                let _ = handle(stream, &config, &cache, &cancels);
+                let _ = handle(stream, &config, &cache, &cancels, &gates, &executions);
             });
         }
     }
@@ -540,6 +704,8 @@ fn handle(
     config: &RemoteServerConfig,
     cache: &ResponseCache,
     cancels: &ActiveCancels,
+    gates: &KeyGates,
+    executions: &AtomicU64,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -645,9 +811,41 @@ fn handle(
         .map(|scope| scope.token().clone())
         .unwrap_or_default();
     let timed_out = Arc::new(AtomicBool::new(false));
-    let _deadline = config.exec_timeout.and_then(|timeout| {
-        start_execution_deadline(timeout, token.clone(), Arc::clone(&timed_out))
+    let request_deadline = config.exec_timeout.map(|timeout| Instant::now() + timeout);
+    let _deadline = request_deadline.and_then(|deadline| {
+        start_execution_deadline(
+            deadline.saturating_duration_since(Instant::now()),
+            token.clone(),
+            Arc::clone(&timed_out),
+        )
     });
+    // 无共享账本时，同键请求先在端点内排队：只让第一个执行，其余等待后回放缓存。
+    // 等待受执行时限约束；没配时限时用 KEY_GATE_WAIT 兜底，避免无限挂住连接。
+    let gate_deadline = request_deadline.unwrap_or_else(|| Instant::now() + KEY_GATE_WAIT);
+    let _gate_guard = if dedupe && config.ledger.is_none() {
+        match gates.acquire(&key, &token, gate_deadline) {
+            Ok(guard) => Some(guard),
+            Err(GateError::Cancelled) => {
+                return if timed_out.load(Ordering::SeqCst) {
+                    respond_aborted_deadline(&mut stream, &request)
+                } else {
+                    respond_aborted(&mut stream, &request)
+                };
+            }
+            Err(GateError::Deadline) => {
+                return if request_deadline.is_some() {
+                    respond_aborted_deadline(&mut stream, &request)
+                } else {
+                    respond(&mut stream, 503, "Service Unavailable", b"")
+                };
+            }
+            Err(GateError::Capacity) => {
+                return respond(&mut stream, 503, "Service Unavailable", b"");
+            }
+        }
+    } else {
+        None
+    };
     let mut ledger_owned = false;
     let mut ledger_lease: Option<String> = None;
     if dedupe {
@@ -685,6 +883,7 @@ fn handle(
             .ok()
             .and_then(|guard| guard.get(&key).map(|cached| cached.frame.clone()))
         {
+            drop(_gate_guard);
             return respond(&mut stream, 200, "OK", &cached);
         }
     }
@@ -706,6 +905,7 @@ fn handle(
         None
     };
 
+    executions.fetch_add(1, Ordering::SeqCst);
     let cancelled = if config.sleep_ms > 0 {
         sleep_unless_cancelled(config.sleep_ms, Some(&token))
     } else {
@@ -807,6 +1007,7 @@ fn handle(
     {
         guard.insert(key, frame.clone(), config.max_cache_bytes);
     }
+    drop(_gate_guard);
     if lease_lost_now {
         return respond_lease_lost(&mut stream, &frame);
     }
