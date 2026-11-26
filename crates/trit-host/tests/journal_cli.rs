@@ -216,6 +216,52 @@ fn journal_status_rolls_back_in_doubt_write() {
 }
 
 #[test]
+fn journal_status_rollback_refuses_while_lease_is_live() {
+    let root = root("lease-guard");
+    write(&root, "src/a.py", "old");
+    let mut journal = trit_host::MutationJournal::open(&root).unwrap();
+    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "new");
+    let lease = trit_host::OperationLease::acquire_paths(
+        &root,
+        "live-writer",
+        &[PathBuf::from("src/a.py")],
+    )
+    .unwrap();
+    let locks: Vec<String> = lease
+        .lock_paths()
+        .into_iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    journal
+        .record_begin_with_lease(&request, Some(lease.epoch()), &locks)
+        .unwrap();
+    fs::write(root.join("src/a.py"), "new").unwrap();
+    drop(journal);
+
+    let (code, value) = journal_status_rollback(&root);
+    assert_eq!(code, Some(1), "{value}");
+    assert_eq!(value["blocked"].as_array().unwrap().len(), 1, "{value}");
+    assert_eq!(value["rollbacks"].as_array().unwrap().len(), 0, "{value}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/a.py")).unwrap(),
+        "new",
+        "live lease must protect the in-doubt write"
+    );
+
+    drop(lease);
+    let (code, value) = journal_status_rollback(&root);
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(value["blocked"].as_array().unwrap().len(), 0, "{value}");
+    assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn run_can_roll_back_in_doubt_writes_on_start() {
     let root = root("auto-rollback");
     write(&root, "src/a.py", "old");

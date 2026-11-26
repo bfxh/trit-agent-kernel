@@ -89,12 +89,37 @@ impl OperationLease {
         paths: &[PathBuf],
     ) -> Result<Self, LeaseError> {
         let root = root.as_ref();
-        let owner = owner.into();
         let targets: Vec<PathBuf> = if paths.is_empty() {
             vec![root.join(LEASE_PATH)]
         } else {
             paths.iter().map(|path| lock_path(root, path)).collect()
         };
+        Self::from_targets(owner, targets)
+    }
+
+    /// 按**锁文件路径**获取租约（相对 `root` 或绝对）；供恢复工具精确重放
+    /// journal 里记录的 lease，而不是重新推导声明路径。
+    pub fn acquire_lock_files(
+        root: impl AsRef<Path>,
+        owner: impl Into<String>,
+        lock_paths: &[PathBuf],
+    ) -> Result<Self, LeaseError> {
+        let root = root.as_ref();
+        let targets: Vec<PathBuf> = lock_paths
+            .iter()
+            .map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                }
+            })
+            .collect();
+        Self::from_targets(owner, targets)
+    }
+
+    fn from_targets(owner: impl Into<String>, targets: Vec<PathBuf>) -> Result<Self, LeaseError> {
+        let owner = owner.into();
         let mut locks: Vec<LeaseLock> = Vec::with_capacity(targets.len());
         for path in targets {
             match open_and_lock(&path, &owner) {
@@ -118,6 +143,11 @@ impl OperationLease {
     /// 第一个锁文件路径（root 级或第一个声明路径）。
     pub fn path(&self) -> &Path {
         &self.locks[0].path
+    }
+
+    /// 本次租约持有的全部锁文件路径；用于 mutation journal 记录恢复边界。
+    pub fn lock_paths(&self) -> Vec<&Path> {
+        self.locks.iter().map(|lock| lock.path.as_path()).collect()
     }
 
     /// 持有者标识。
@@ -260,6 +290,11 @@ fn open_and_lock(path: &Path, owner: &str) -> Result<LeaseLock, LeaseError> {
         epoch,
         file,
     })
+}
+
+/// 声明路径对应的锁文件路径；对外暴露以便 journal 记录同一把锁。
+pub fn lease_path_for(root: &Path, path: &Path) -> PathBuf {
+    lock_path(root, path)
 }
 
 fn lock_path(root: &Path, path: &Path) -> PathBuf {
@@ -423,6 +458,7 @@ fn unlock(_file: &File) -> Result<(), LeaseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::{JOURNAL_PATH, JournalRecord, MutationJournal};
     use crate::permissions::{ClaimingTools, WriteClaim};
     use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
 
@@ -561,6 +597,56 @@ mod tests {
         drop(a);
         drop(b);
         drop(c);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claiming_tools_record_lease_locks_in_the_journal() {
+        let root = root("journal-locks");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.py"), "x").unwrap();
+        let lease =
+            OperationLease::acquire_paths(&root, "host-a", &[PathBuf::from("src/a.py")]).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("src/a.py")]).unwrap();
+        let journal = MutationJournal::open(&root).unwrap();
+        let mut tools = ClaimingTools::new(EchoTools, claim)
+            .with_lease(lease)
+            .with_journal(journal);
+
+        let request = ToolRequest::write("w1", "write_file", "src/a.py", "y");
+        assert!(tools.execute(&request).unwrap().passed);
+        let text = std::fs::read_to_string(root.join(JOURNAL_PATH)).unwrap();
+        let first: JournalRecord =
+            serde_json::from_str(text.lines().next().expect("begin line")).unwrap();
+        assert!(!first.lease_locks.is_empty(), "{first:?}");
+        assert!(
+            first
+                .lease_locks
+                .iter()
+                .all(|lock| lock.replace('\\', "/").contains("/.agent/leases/")),
+            "{first:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn acquire_lock_files_conflicts_with_a_live_path_lease() {
+        let root = root("lock-files");
+        let live =
+            OperationLease::acquire_paths(&root, "host-a", &[PathBuf::from("src/a.py")]).unwrap();
+        let locks: Vec<PathBuf> = live
+            .lock_paths()
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect();
+        let busy =
+            OperationLease::acquire_lock_files(&root, "journal-rollback", &locks).unwrap_err();
+        assert!(matches!(busy, LeaseError::Busy { .. }), "{busy:?}");
+        drop(live);
+        let recovered =
+            OperationLease::acquire_lock_files(&root, "journal-rollback", &locks).unwrap();
+        assert!(recovered.check());
+        drop(recovered);
         let _ = std::fs::remove_dir_all(root);
     }
 }
