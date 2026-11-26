@@ -504,6 +504,7 @@ mod tests {
                 SessionEvent::TurnFinished {
                     steps: 2,
                     complete: true,
+                    metrics: None,
                 },
             ),
         ];
@@ -692,6 +693,7 @@ mod tests {
                 SessionEvent::TurnFinished {
                     steps: 0,
                     complete: true,
+                    metrics: None,
                 },
             ),
             started(4),
@@ -782,6 +784,7 @@ mod tests {
             SessionEvent::TurnFinished {
                 steps: 0,
                 complete: true,
+                metrics: None,
             },
         )]);
         assert_eq!(orphan.validation.verdict, Ternary::False);
@@ -810,6 +813,7 @@ mod tests {
                 SessionEvent::TurnFinished {
                     steps: 0,
                     complete: false,
+                    metrics: None,
                 },
             ),
         ];

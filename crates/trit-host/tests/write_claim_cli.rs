@@ -253,3 +253,39 @@ fn write_claim_checks_both_move_endpoints() {
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
+
+#[test]
+fn run_defaults_to_markdown_output() {
+    let md_root = root("output-format");
+    let script_path = script("output-format", "a.txt");
+    let (code, text) = host(
+        &md_root,
+        &["--allow-write", "--script", script_path.to_str().unwrap()],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.starts_with("# 任务：headless"), "{text}");
+    assert!(text.contains("- 目标：x"), "{text}");
+    assert!(text.contains("## 工具回执"), "{text}");
+    assert!(text.contains("- 步数：2 / 8"), "{text}");
+
+    let json_root = root("output-format-json");
+    let (code, text) = host(
+        &json_root,
+        &[
+            "--allow-write",
+            "--script",
+            script_path.to_str().unwrap(),
+            "--output-format",
+            "json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let value: Value = serde_json::from_str(text.trim_start()).unwrap();
+    assert_eq!(value["task"], "headless");
+    assert_eq!(value["brief"]["guidance"]["objective"], "x");
+    assert!(value["metrics"]["completed"].as_bool().unwrap());
+
+    let _ = fs::remove_dir_all(md_root);
+    let _ = fs::remove_dir_all(json_root);
+    let _ = fs::remove_file(script_path);
+}

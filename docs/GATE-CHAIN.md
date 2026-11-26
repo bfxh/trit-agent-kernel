@@ -226,12 +226,25 @@ trit-host run --task "..." --workspace . \
 trit-host session-status --session .agent/session.jsonl
 ```
 
-只读输出 turn 数与最新门链裁决：
+只读输出 turn 数、最新一轮的单轮指标与最新门链裁决；没有带指标的轮次时
+`latest_metrics` 为 `null`（旧日志或指标字段加入前的会话）：
 
 ```json
 {
   "session": ".agent/session.jsonl",
   "turns": 1,
+  "latest_metrics": {
+    "steps": 2,
+    "max_steps": 8,
+    "tool_calls": 1,
+    "verified_tools": 1,
+    "failed_tools": 0,
+    "cache_hit_bp": 8000,
+    "tokens_total": 110,
+    "tokens_per_step": 55,
+    "elapsed_ms": 42,
+    "completed": true
+  },
   "gate_chains": {
     "history": 2,
     "latest": { "phase": "post", "status": "aligned", "exit": 0 },
@@ -239,6 +252,9 @@ trit-host session-status --session .agent/session.jsonl
   }
 }
 ```
+
+`latest_metrics` 与 `TurnOutcome.metrics` 同形，比率字段分母为 0 时为 `null`；
+它只描述实际观测，不改变完成裁决。
 
 退出码：`0` 最新门链未阻塞、`1` 最新门链阻塞、`2` 参数/读取错误。不存在的
 session 文件按空日志处理（`history=0`、`blocked=false`）。

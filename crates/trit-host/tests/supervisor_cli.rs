@@ -117,6 +117,8 @@ fn cli_exposes_and_executes_mcp_tools() {
             script_path.to_str().unwrap(),
             "--supervisor-config",
             config_path.to_str().unwrap(),
+            "--output-format",
+            "json",
         ])
         .output()
         .unwrap();
@@ -186,6 +188,8 @@ fn cli_executes_native_search_tools() {
             "--allow-write",
             "--script",
             script_path.to_str().unwrap(),
+            "--output-format",
+            "json",
         ])
         .output()
         .unwrap();
@@ -295,6 +299,8 @@ fn cli_starts_supervised_gateway_and_reports_it() {
             script_path.to_str().unwrap(),
             "--supervisor-config",
             config_path.to_str().unwrap(),
+            "--output-format",
+            "json",
         ])
         .output()
         .unwrap();

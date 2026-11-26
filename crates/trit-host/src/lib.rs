@@ -4,7 +4,9 @@
 //! 宿主实现 [`Model`] 与 [`ToolExecutor`] 即可。内核仍是纯库，I/O 只发生在工具实现里。
 
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use trit_orch::{
@@ -357,6 +359,95 @@ impl ToolExecutor for ScriptedTools {
     }
 }
 
+/// 单轮次工作效率指标：只描述这一轮实际发生了什么，不参与完成裁决。
+///
+/// 比率统一用 basis point（万分之一，`10000` = 100%），避免浮点比较；
+/// 分母为 0 时对应字段为 `None`，不伪造 0% 或 100%。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnMetrics {
+    /// 实际用掉的模型回合数（每个 step 一次 proposal）。
+    pub steps: usize,
+    /// 本轮允许的最大 step 数。
+    pub max_steps: usize,
+    /// 模型调用次数；当前实现等于 `steps`。
+    pub model_calls: usize,
+    /// 已收到回执的工具调用数。
+    pub tool_calls: usize,
+    /// 通过且结果确定的工具调用数（`passed && !in_doubt`）。
+    pub verified_tools: usize,
+    /// 明确失败且结果确定的工具调用数（`!passed && !in_doubt`）。
+    pub failed_tools: usize,
+    /// 结果不明（超时/断流）的工具调用数。
+    pub in_doubt_tools: usize,
+    /// `steps / max_steps`，basis point，最大 10000。
+    pub step_budget_used_bp: u32,
+    /// `verified_tools / tool_calls`，basis point；没有工具调用时为 `None`。
+    pub tool_success_bp: Option<u32>,
+    /// `cached / (fresh + cached)`，basis point；没有输入 token 时为 `None`。
+    pub cache_hit_bp: Option<u32>,
+    /// fresh + cached + output 的 token 总量。
+    pub tokens_total: u64,
+    /// 总 token / steps；成功结束的轮次至少 1 step。
+    pub tokens_per_step: u64,
+    /// provider 未给精确用量时为 true；此时 token 指标只作估算。
+    pub tokens_estimated: bool,
+    /// 从进入 turn 到完成裁决的墙钟耗时。
+    pub elapsed_ms: u64,
+    /// 完成裁决是否通过。
+    pub completed: bool,
+}
+
+impl TurnMetrics {
+    fn capture(
+        steps: usize,
+        max_steps: usize,
+        receipts: &[ToolOutcome],
+        usage: TokenUsage,
+        completed: bool,
+        elapsed: std::time::Duration,
+    ) -> Self {
+        let tool_calls = receipts.len();
+        let verified_tools = receipts
+            .iter()
+            .filter(|outcome| outcome.passed && !outcome.in_doubt)
+            .count();
+        let failed_tools = receipts
+            .iter()
+            .filter(|outcome| !outcome.passed && !outcome.in_doubt)
+            .count();
+        let in_doubt_tools = receipts.iter().filter(|outcome| outcome.in_doubt).count();
+        let tokens_total = usage
+            .fresh
+            .saturating_add(usage.cached)
+            .saturating_add(usage.output);
+        let input_tokens = usage.fresh.saturating_add(usage.cached);
+        Self {
+            steps,
+            max_steps,
+            model_calls: steps,
+            tool_calls,
+            verified_tools,
+            failed_tools,
+            in_doubt_tools,
+            step_budget_used_bp: ratio_bp(steps as u64, max_steps as u64).unwrap_or(0),
+            tool_success_bp: ratio_bp(verified_tools as u64, tool_calls as u64),
+            cache_hit_bp: ratio_bp(usage.cached, input_tokens),
+            tokens_total,
+            tokens_per_step: tokens_total / steps.max(1) as u64,
+            tokens_estimated: usage.estimated,
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            completed,
+        }
+    }
+}
+
+fn ratio_bp(numerator: u64, denominator: u64) -> Option<u32> {
+    if denominator == 0 {
+        return None;
+    }
+    Some(((numerator as u128 * 10_000) / denominator as u128).min(10_000) as u32)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnOutcome {
     pub task: String,
@@ -367,6 +458,153 @@ pub struct TurnOutcome {
     pub judgment: CompletionJudgment,
     pub effects: Ledger,
     pub rebasis: Vec<AdmissionObligation>,
+    /// 本轮效率指标；随 outcome 一起落到 CLI / session / 子 agent 响应。
+    pub metrics: TurnMetrics,
+}
+
+impl TurnOutcome {
+    /// 把整轮结果渲染为人类可读的 Markdown；机器消费仍可用 JSON。
+    pub fn render_markdown(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "# 任务：{}", markdown_cell(&self.task, 200));
+        if !self.brief.guidance.objective.trim().is_empty() {
+            let _ = writeln!(
+                out,
+                "- 目标：{}",
+                markdown_cell(&self.brief.guidance.objective, 200)
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "- 状态：{}",
+            if self.judgment.is_complete() {
+                "完成"
+            } else {
+                "未完成"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "- 步数：{} / {}（{}）",
+            self.metrics.steps,
+            self.metrics.max_steps,
+            percent_bp(self.metrics.step_budget_used_bp)
+        );
+        let _ = writeln!(
+            out,
+            "- 裁决：{:?} / {:?}",
+            self.judgment.verdict, self.judgment.ternary
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| 指标 | 值 |");
+        let _ = writeln!(out, "| --- | --- |");
+        let _ = writeln!(out, "| 模型调用 | {} |", self.metrics.model_calls);
+        let _ = writeln!(out, "| 工具调用 | {} |", self.metrics.tool_calls);
+        let _ = writeln!(
+            out,
+            "| 工具成功 | {} |",
+            percent_bp_opt(self.metrics.tool_success_bp)
+        );
+        let _ = writeln!(out, "| 工具失败 | {} |", self.metrics.failed_tools);
+        let _ = writeln!(out, "| 结果不明 | {} |", self.metrics.in_doubt_tools);
+        let _ = writeln!(
+            out,
+            "| Token 总量 | {}{} |",
+            self.metrics.tokens_total,
+            if self.metrics.tokens_estimated {
+                "（估算）"
+            } else {
+                ""
+            }
+        );
+        let _ = writeln!(out, "| Token/步 | {} |", self.metrics.tokens_per_step);
+        let _ = writeln!(
+            out,
+            "| 缓存命中 | {} |",
+            percent_bp_opt(self.metrics.cache_hit_bp)
+        );
+        let _ = writeln!(out, "| 墙钟耗时 | {} ms |", self.metrics.elapsed_ms);
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## 工具回执");
+        let _ = writeln!(out);
+        if self.receipts.is_empty() {
+            let _ = writeln!(out, "（无）");
+        } else {
+            let _ = writeln!(out, "| 调用 | 工具 | 结果 | 断言 | 输出 |");
+            let _ = writeln!(out, "| --- | --- | --- | --- | --- |");
+            for receipt in &self.receipts {
+                let result = if receipt.in_doubt {
+                    "不确定"
+                } else if receipt.passed {
+                    "通过"
+                } else {
+                    "失败"
+                };
+                let mut output = markdown_cell(&receipt.output, 160);
+                if !receipt.written_paths.is_empty() {
+                    let paths = markdown_cell(&receipt.written_paths.join(", "), 80);
+                    if output.is_empty() {
+                        output = format!("写入：{paths}");
+                    } else {
+                        output.push_str(&format!("；写入：{paths}"));
+                    }
+                }
+                if output.is_empty() {
+                    output.push('-');
+                }
+                let _ = writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} |",
+                    markdown_cell(&receipt.call_id, 80),
+                    markdown_cell(&receipt.tool, 80),
+                    result,
+                    receipt.assertions,
+                    output
+                );
+            }
+        }
+        if !self.rebasis.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "## 需要重新背书");
+            let _ = writeln!(out);
+            for obligation in &self.rebasis {
+                let _ = writeln!(
+                    out,
+                    "- `{}` / `{}`: {}",
+                    markdown_cell(obligation.kind.as_str(), 40),
+                    markdown_cell(&obligation.subject, 80),
+                    markdown_cell(&obligation.detail, 200)
+                );
+            }
+        }
+        out
+    }
+}
+
+fn percent_bp(bp: u32) -> String {
+    format!("{}.{:02}%", bp / 100, bp % 100)
+}
+
+fn percent_bp_opt(bp: Option<u32>) -> String {
+    bp.map(percent_bp).unwrap_or_else(|| "不适用".into())
+}
+
+fn markdown_cell(value: &str, max_chars: usize) -> String {
+    let flattened: String = value
+        .chars()
+        .map(|character| match character {
+            '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect();
+    let escaped = flattened.replace('|', "\\|");
+    if escaped.chars().count() <= max_chars {
+        return escaped;
+    }
+    let mut truncated: String = escaped.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
 }
 
 pub struct AgentHost<M, T> {
@@ -464,6 +702,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         turn: &TurnSpec,
         mut session: Option<&mut SessionLog>,
     ) -> Result<TurnOutcome, AgentError> {
+        let started = Instant::now();
         let mut spec = turn.task_spec();
         spec.epoch = self.context_projection.epoch();
         let task_epoch = spec.epoch;
@@ -791,6 +1030,14 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 let backed = back_claim(claim, &turn.task, &evidence);
                 let judgment = judge_completion(&brief, &backed)?;
                 let complete = judgment.is_complete();
+                let metrics = TurnMetrics::capture(
+                    step + 1,
+                    self.max_steps,
+                    &receipts,
+                    usage,
+                    complete,
+                    started.elapsed(),
+                );
                 log_session(
                     &mut session,
                     SessionEvent::Judgment {
@@ -805,6 +1052,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     SessionEvent::TurnFinished {
                         steps: step + 1,
                         complete,
+                        metrics: Some(metrics.clone()),
                     },
                 )?;
                 return Ok(TurnOutcome {
@@ -816,10 +1064,27 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     judgment,
                     effects: ledger,
                     rebasis,
+                    metrics,
                 });
             }
         }
 
+        let metrics = TurnMetrics::capture(
+            self.max_steps,
+            self.max_steps,
+            &receipts,
+            usage,
+            false,
+            started.elapsed(),
+        );
+        log_session(
+            &mut session,
+            SessionEvent::TurnFinished {
+                steps: self.max_steps,
+                complete: false,
+                metrics: Some(metrics),
+            },
+        )?;
         Err(AgentError::StepLimit {
             limit: self.max_steps,
         })

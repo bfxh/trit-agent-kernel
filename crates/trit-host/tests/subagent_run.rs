@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use trit_host::{SubagentProcessConfig, run_subagent};
+use trit_host::{SubagentProcessConfig, run_subagent, run_subagent_reply};
 use trit_orch::{
     AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, SubagentProfile, SubagentRequest,
     Task, TaskSpec,
@@ -95,15 +95,19 @@ fn config(workspace: &Path, script: &Path) -> SubagentProcessConfig {
 fn subagent_run_executes_with_write_profile() {
     let workspace = temp_dir("ws");
     let scripts = temp_dir("script");
-    let result = run_subagent(
+    let reply = run_subagent_reply(
         &config(&workspace, &script(&scripts)),
         &request(AccessMode::ReadWrite),
     )
     .unwrap();
+    let result = &reply.result;
 
     assert!(result.reusable(), "{:?}", result.status);
     assert_eq!(result.task, "a");
     assert!(result.reference().starts_with("a@0#"));
+    let content = String::from_utf8_lossy(&reply.content);
+    assert!(content.starts_with("# 任务：a"), "{content}");
+    assert!(content.contains("## 工具回执"), "{content}");
     // 真实执行：workspace 里出现文件。
     assert!(workspace.join("a.txt").is_file());
 

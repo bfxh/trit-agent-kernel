@@ -131,6 +131,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut supervisor_config: Option<SupervisorConfig> = None;
     let mut mcp_sampling = false;
     let mut mcp_sampling_model: Option<String> = None;
+    // 人类面默认输出 Markdown；需要机器消费时显式 `--output-format json`。
+    let mut output_format = String::from("md");
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -177,6 +179,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
+            "--output-format" => {
+                output_format = match next(&mut args, "--output-format")?.as_str() {
+                    "md" | "markdown" => "md".into(),
+                    "json" => "json".into(),
+                    other => return Err(fail(format!("bad --output-format: {other}"))),
+                };
+            }
             "--write-claim" => {
                 write_claim_paths.push(PathBuf::from(next(&mut args, "--write-claim")?));
             }
@@ -814,11 +823,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         eprintln!("cache ledger: {text}");
     }
     let mut stdout = std::io::stdout().lock();
-    writeln!(
-        stdout,
-        "{}",
+    let rendered = if output_format == "json" {
         serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
-    )?;
+    } else {
+        outcome.render_markdown()
+    };
+    writeln!(stdout, "{rendered}")?;
     if gate_chain_post || gate_chain_post_report.is_some() {
         let mut exclude: Vec<&Path> = Vec::new();
         if let Some(path) = gate_chain_report.as_deref() {
@@ -1249,6 +1259,7 @@ fn usage() {
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
          [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \
+         [--output-format md|json] \\\n    \
          [--write-journal [--write-journal-rollback]] \\\n    \
          [--context-receipts N] [--context-chars N] [--context-output N] \\\n    \
          [--context-catalog <json> [--context-project <id>] [--context-session-id <id>] \\\n    \
@@ -1265,6 +1276,7 @@ fn usage() {
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
+         --output-format: md (default) renders a Markdown turn report; json keeps TurnOutcome.\n\
          --repo-identity: fail closed unless .agent/repo.json is valid; --repo-expected\n\
          additionally pins owner/repo, and agent tasks require owns_agent_runtime=true.\n\
          If the workspace already contains .agent/repo.json, the gate runs automatically.\n\
@@ -1358,6 +1370,7 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     let status = serde_json::json!({
         "session": session.display().to_string(),
         "turns": state.turns.len(),
+        "latest_metrics": state.turns.last().and_then(|turn| turn.metrics.clone()),
         "gate_chains": {
             "history": state.gate_chains.len(),
             "latest": latest,
@@ -2122,7 +2135,7 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
         task: request.task,
         epoch: request.epoch,
         status,
-        content: serde_json::to_vec(&outcome)?,
+        content: outcome.render_markdown().into_bytes(),
         tokens: outcome.usage.total()?,
     };
     let frame = trit_orch::encode_frame(&response)?;

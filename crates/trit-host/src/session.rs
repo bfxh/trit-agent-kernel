@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentError, AgentHost, Model, ToolExecutor, ToolOutcome, ToolRequest, TurnOutcome};
+use crate::{
+    AgentError, AgentHost, Model, ToolExecutor, ToolOutcome, ToolRequest, TurnMetrics, TurnOutcome,
+};
 use trit_orch::{EvidenceVerdict, Ternary, TokenUsage};
 use trit_reasonix::{CriterionRequest, HostUsage, TurnSpec};
 
@@ -91,6 +93,9 @@ pub enum SessionEvent {
     TurnFinished {
         steps: usize,
         complete: bool,
+        /// 单轮效率指标；旧日志没有该字段时为 `None`。
+        #[serde(default)]
+        metrics: Option<TurnMetrics>,
     },
     /// 门链结论：派发前（`pre`）或 run 后复核（`post`）。
     ///
@@ -363,6 +368,7 @@ pub struct TurnRecord {
     pub usage: TokenUsage,
     pub tool_calls: usize,
     pub criteria: usize,
+    pub metrics: Option<TurnMetrics>,
 }
 
 /// 从 JSONL 事件重建会话；未收到 `TurnFinished` 的 turn 标记为未完成。
@@ -411,7 +417,11 @@ pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
                     turn.complete = *complete;
                 }
             }
-            SessionEvent::TurnFinished { steps, complete } => {
+            SessionEvent::TurnFinished {
+                steps,
+                complete,
+                metrics,
+            } => {
                 let Some(mut turn) = current.take() else {
                     return Err(AgentError::SessionState(
                         "turn finished without a start".into(),
@@ -420,6 +430,7 @@ pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
                 turn.steps = *steps;
                 turn.complete = *complete;
                 turn.finished = true;
+                turn.metrics = metrics.clone();
                 state.turns.push(turn);
             }
             SessionEvent::GateChain { .. } => {

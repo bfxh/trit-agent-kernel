@@ -55,12 +55,12 @@
 | 17 | Skills / commands / hooks | `SKILLS.md`、`EXTENSIONS.md`、`CAPABILITY_DIAGNOSTICS.md` | 部分（注册表） | `SkillIndex`（最长触发词优先）、`CommandRegistry`（斜杠命令解析、参数数量 fail-closed）、`HookRegistry`（事件 + 工具匹配、`*` 通配、`invalidate_on` 失效联动）已实现；缺技能目录发现与 hook 动作执行 | B7.9 |
 | 18 | Memory / history 检索 | `SESSION_MEMORY_RETRIEVAL.md`、`HISTORY_SEARCH_CATALOG.md` | 部分（内存索引） | `MemoryStore` CRUD + BM25（k1=1.2、b=0.75，分数降序、同分按 id 升序）+ `Sensitivity::Secret` 默认排除已实现；缺持久化/归档与 history 目录投影 | B7.9 |
 | 19 | Serve HTTP/SSE + loopback gate | `RUST_MIGRATION.md`、`serve` | 部分（准入 + 路由） | `ServeConfig::validate`（仅 loopback、token 非空）、`authorize`（Host / Origin / bearer）、`route`（golden 路由表，405 / 404）已实现；缺真实 HTTP/SSE 传输与响应编码 | B7.8 |
-| 20 | CLI / TUI / ACP | `CLI.md`、`ACP.md` | 部分 | 无头 CLI 已有；缺 TUI、ACP 编辑器、结构化 JSON 输出 | B7.8 |
+| 20 | CLI / TUI / ACP | `CLI.md`、`ACP.md` | 部分 | 无头 CLI 已有；默认输出 Markdown 报告（`--output-format json` 保留 `TurnOutcome` JSON）；缺 TUI、ACP 编辑器 | B7.8 |
 | 21 | Tauri / 桌面 host | `desktop-tauri` | 阶段外 | 不进入本仓；只保留 `FeatureGate` 与宿主契约 | B7.8 |
 | 22 | Capability diagnostics | `CAPABILITY_DIAGNOSTICS.md` | 缺口 | 静态/实时能力报告、MCP 启动阶段、脱敏 stderr tail | B7.8 |
 | 23 | Remote SSH / worktree | `remote/*`、`SESSION_WORKTREES.md` | 阶段外 | 先不移植；等本地 host 稳定后单独立项 | — |
 | 24 | Golden fixture / wire parity | `RUST_MIGRATION.md` | 缺口 | 录制、回放、字段双向对齐、拒绝也是契约 | B7.1 |
-| 25 | Metrics / usage catalog | `USAGE_CATALOG.md`、`SPEC §3.17` | 部分 | 已有 orch metrics；缺 catalog、成本、委派收益 counter | B7.1/B7.9 |
+| 25 | Metrics / usage catalog | `USAGE_CATALOG.md`、`SPEC §3.17` | 部分 | 已有 orch metrics 与单轮 `TurnOutcome.metrics`（步数预算、工具成功/失败/不确定、token/步、缓存命中、耗时；分母为 0 输出 `null`）；缺 catalog、成本、委派收益 counter | B7.1/B7.9 |
 | 26 | 许可 / 署名 / 移植记录 | MIT 仓库与文档 | 已有流程 | 每批记录来源提交、修改点、NOTICE | 全程 |
 
 ## 3. 批次依赖图

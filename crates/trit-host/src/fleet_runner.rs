@@ -95,7 +95,7 @@ where
         let outcome = run_headless(turn_spec_from_task(task), (self.model)(task), config)
             .map_err(|error| error.to_string())?;
         let tokens = outcome.usage.total().map_err(|error| error.to_string())?;
-        let content = serde_json::to_vec(&outcome).map_err(|error| error.to_string())?;
+        let content = outcome.render_markdown().into_bytes();
         Ok(FleetOutput { content, tokens })
     }
 }

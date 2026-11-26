@@ -90,6 +90,26 @@ fn backed_verification_proves_and_usage_maps() {
         },
         "ORCH_AGENT_USAGE"
     );
+    assert_eq!(outcome.metrics.steps, 1);
+    assert_eq!(outcome.metrics.max_steps, 8);
+    assert_eq!(outcome.metrics.model_calls, 1);
+    assert_eq!(outcome.metrics.tool_calls, 1);
+    assert_eq!(outcome.metrics.verified_tools, 1);
+    assert_eq!(outcome.metrics.failed_tools, 0);
+    assert_eq!(outcome.metrics.in_doubt_tools, 0);
+    assert_eq!(outcome.metrics.step_budget_used_bp, 1_250);
+    assert_eq!(outcome.metrics.tool_success_bp, Some(10_000));
+    assert_eq!(outcome.metrics.cache_hit_bp, Some(8_000));
+    assert_eq!(outcome.metrics.tokens_total, 110);
+    assert_eq!(outcome.metrics.tokens_per_step, 110);
+    assert!(outcome.metrics.completed);
+
+    let markdown = outcome.render_markdown();
+    assert!(markdown.starts_with("# 任务：turn-1"), "{markdown}");
+    assert!(markdown.contains("12.50%"), "{markdown}");
+    assert!(markdown.contains("| 工具成功 | 100.00% |"), "{markdown}");
+    assert!(markdown.contains("## 工具回执"), "{markdown}");
+    assert!(markdown.contains("call-1"), "{markdown}");
 }
 
 #[test]

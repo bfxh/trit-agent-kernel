@@ -135,6 +135,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   runtime 决定；
 - `HeadlessFleetRunner` 给每个子任务一个 `<dir>/<task-id>.jsonl`，用 `run_headless`
   在调用方给的 `WorkspaceConfig` 里跑真实一轮（模型 + 本地工具）；
+- `FleetOutput.content` 是该轮 `TurnOutcome::render_markdown()` 的 Markdown 报告，
+  含状态、步数预算、单轮指标与工具回执；结构化数据仍在 `FleetOutput.tokens` 与
+  每任务 session JSONL 中；
 - 写权限沿用 `WorkspaceConfig` / `WriteGuard`，不存在 fleet 旁路；
 - `turn_spec_from_task`：`guidance` → `TurnSpec`，`produces.min_assertions` 与
   `max_tokens` 原样传递。
@@ -144,7 +147,8 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 帧格式：4 字节大端长度 + UTF-8 JSON，单帧上限 8 MiB。
 
 - `SubagentRequest { task, epoch, capsule, profile }`；
-- `SubagentResponse { task, epoch, status, content, tokens }`；
+- `SubagentResponse { task, epoch, status, content, tokens }`；`content` 是 UTF-8
+  字节，参考实现写 `TurnOutcome::render_markdown()`；协议本身不限定内容格式；
 - `validate_for` 强制响应回显 `task + epoch`，旧响应/串话直接拒绝；
 - `exit_status`：零退出但无响应、非零退出、被信号/超时终止都不产生 `Completed`；
 - `decode_frame` 支持半包与粘包，超限/非法载荷一律 `subagent_protocol` 错误。

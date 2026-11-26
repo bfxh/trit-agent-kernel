@@ -87,7 +87,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         task: request.task,
         epoch: request.epoch,
         status,
-        content: serde_json::to_vec(&outcome)?,
+        content: outcome.render_markdown().into_bytes(),
         tokens: outcome.usage.total()?,
     };
     let frame = trit_orch::encode_frame(&response)?;
