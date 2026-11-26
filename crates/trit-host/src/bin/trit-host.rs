@@ -1318,7 +1318,7 @@ fn usage() {
          [--allow-unrewindable]\n\n\
          remote-echo: trit-host remote-echo [--bind <addr>] [--token <t>] [--once] \\\n\
          [--fail] [--silent] [--sleep-ms N] [--request-timeout-ms N] [--request-read-timeout-ms N] \\\n\
-         [--max-connections N] [--max-cache-bytes N] [--ledger <url>] [--ledger-token <t>] \\\n\
+         [--max-connections N] [--max-cache-bytes N] [--cache-ttl-ms N] [--ledger <url>] [--ledger-token <t>] \\\n\
          [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          reference remote endpoint: HTTP POST of one subagent frame per request;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
@@ -1330,7 +1330,7 @@ fn usage() {
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
          (--workspace <dir> | --workspace-root <dir>) --script <proposals.json> \\\n\
          [--max-steps N] [--exec-timeout-secs N] [--request-timeout-ms N] [--request-read-timeout-ms N] \\\n\
-         [--once] [--max-connections N] [--max-cache-bytes N] [--ledger <url>] [--ledger-token <t>] \\\n\
+         [--once] [--max-connections N] [--max-cache-bytes N] [--cache-ttl-ms N] [--ledger <url>] [--ledger-token <t>] \\\n\
          [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>] [--probe]\n\
@@ -1612,6 +1612,7 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
 
 /// `remote-echo [--bind <addr>] [--token <t>] [--once] [--fail] [--silent] [--sleep-ms N]`
 /// `[--request-timeout-ms N] [--request-read-timeout-ms N] [--max-connections N] [--max-cache-bytes N]`
+/// `[--cache-ttl-ms N]`（0 关闭按时间淘汰）
 /// `[--ledger <url>] [--ledger-token <t>]`
 /// `[--ledger-timeout-secs N] [--ledger-renew-ms N]`：
 /// 远程端点的参考服务端。HTTP、帧与鉴权规则见 `trit_host::remote_serve`。
@@ -1647,6 +1648,11 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             }
             "--max-cache-bytes" => {
                 config.max_cache_bytes = next(&mut args, "--max-cache-bytes")?.parse()?
+            }
+            "--cache-ttl-ms" => {
+                config = config.with_cache_ttl(std::time::Duration::from_millis(
+                    next(&mut args, "--cache-ttl-ms")?.parse()?,
+                ))
             }
             "--ledger" => ledger_url = Some(next(&mut args, "--ledger")?),
             "--ledger-token" => ledger_token = Some(next(&mut args, "--ledger-token")?),
@@ -2029,7 +2035,8 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
 
 /// `remote-exec [--bind <addr>] [--token <t>] (--workspace <dir> | --workspace-root <dir>)`
 /// `--script <proposals.json>` `[--max-steps N] [--exec-timeout-secs N]`
-/// `[--request-timeout-ms N] [--request-read-timeout-ms N] [--max-connections N] [--max-cache-bytes N] [--once]`
+/// `[--request-timeout-ms N] [--request-read-timeout-ms N] [--max-connections N] [--max-cache-bytes N]`
+/// `[--cache-ttl-ms N] [--once]`
 /// `[--ledger <url> ...]`：可执行的远程端点。每个请求 spawn 一个 `subagent-run`
 /// 子进程，帧走 stdin/stdout。`--workspace-root` 会按任务 ID 建独立子目录；
 /// args/`--script` 中的 `{task}` 与 `{workspace}` 在每次请求前展开。
@@ -2063,6 +2070,11 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
             }
             "--max-cache-bytes" => {
                 config.max_cache_bytes = next(&mut args, "--max-cache-bytes")?.parse()?
+            }
+            "--cache-ttl-ms" => {
+                config = config.with_cache_ttl(std::time::Duration::from_millis(
+                    next(&mut args, "--cache-ttl-ms")?.parse()?,
+                ))
             }
             "--exec-timeout-secs" => {
                 exec_timeout_secs = next(&mut args, "--exec-timeout-secs")?.parse()?

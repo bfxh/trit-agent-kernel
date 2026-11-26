@@ -17,8 +17,9 @@
 //!    不把整行读进内存；
 //! 5. **带键才去重**：`X-Trit-Idempotency` 必须等于帧里的 `task@epoch`，否则 400；
 //!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效）；缓存同时限制
-//!    条数 [`MAX_CACHED_RESPONSES`] 与逻辑字节 `max_cache_bytes`（默认 64 MiB），
-//!    按写入顺序 FIFO 淘汰，单条超预算时不会缓存。没有共享账本时，同键并发请求
+//!    条数 [`MAX_CACHED_RESPONSES`]、逻辑字节 `max_cache_bytes`（默认 64 MiB）与
+//!    保留时间 `cache_ttl`（默认 1h，0 关闭），按写入顺序 FIFO 淘汰，单条超预算
+//!    时不会缓存；过期条目在命中或写入时清理，不再回放。没有共享账本时，同键并发请求
 //!    先在端点内排队，只有第一个执行，其余等待并回放首次结果；等待受 `exec_timeout`
 //!    约束（未配置时最多等 30s），首个结果未缓存（如 Aborted）时下一个继续执行。
 //!    没有头就按普通请求处理；
@@ -107,7 +108,10 @@ const KEY_GATE_POLL: Duration = Duration::from_millis(25);
 /// 幂等缓存逻辑字节上限默认值：单条帧最大 8 MiB，只限条数会放大到 GiB 级内存。
 const DEFAULT_MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// 幂等缓存：`"<task>@<epoch>" -> 首次响应帧`，同时限制条数与逻辑字节。
+/// 本地幂等缓存的默认保留时间（1h）；`with_cache_ttl(Duration::ZERO)` 关闭按时间淘汰。
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// 幂等缓存：`"<task>@<epoch>" -> 首次响应帧`，同时限制条数、逻辑字节与保留时间。
 type ResponseCache = Arc<Mutex<ResponseCacheState>>;
 
 #[derive(Default)]
@@ -123,28 +127,53 @@ struct CachedResponse {
     bytes: usize,
     /// 写入顺序，用于 FIFO 淘汰（BTreeMap 的 key 顺序不是写入顺序）。
     seq: u64,
+    /// 写入时刻；超过缓存 TTL 后不再回放。
+    inserted_at: Instant,
 }
 
 impl ResponseCacheState {
-    fn get(&self, key: &str) -> Option<&CachedResponse> {
+    fn get(&mut self, key: &str, ttl: Option<Duration>) -> Option<&CachedResponse> {
+        self.prune_expired(Instant::now(), ttl);
         self.entries.get(key)
     }
 
-    fn insert(&mut self, key: String, frame: Vec<u8>, max_bytes: usize) {
+    fn insert(&mut self, key: String, frame: Vec<u8>, max_bytes: usize, ttl: Option<Duration>) {
+        let now = Instant::now();
+        self.prune_expired(now, ttl);
         if let Some(old) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(old.bytes);
         }
         let bytes = key.len().saturating_add(frame.len());
         self.next_seq = self.next_seq.wrapping_add(1);
         let seq = self.next_seq;
-        self.entries
-            .insert(key, CachedResponse { frame, bytes, seq });
+        self.entries.insert(
+            key,
+            CachedResponse {
+                frame,
+                bytes,
+                seq,
+                inserted_at: now,
+            },
+        );
         self.bytes = self.bytes.saturating_add(bytes);
         while self.entries.len() > MAX_CACHED_RESPONSES {
             self.evict_oldest();
         }
         while self.bytes > max_bytes && !self.entries.is_empty() {
             self.evict_oldest();
+        }
+    }
+
+    /// 删除超过 TTL 的条目；TTL 越小，保留窗口越短。
+    fn prune_expired(&mut self, now: Instant, ttl: Option<Duration>) {
+        let Some(ttl) = ttl else {
+            return;
+        };
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, cached| now.saturating_duration_since(cached.inserted_at) < ttl);
+        if self.entries.len() != before {
+            self.bytes = self.entries.values().map(|cached| cached.bytes).sum();
         }
     }
 
@@ -485,6 +514,9 @@ pub struct RemoteServerConfig {
     /// 本地幂等缓存的逻辑字节上限（key + 响应帧）；超限按写入顺序 FIFO 淘汰。
     /// 只对未接账本的带键请求生效；单条超过上限时不会被缓存。
     pub max_cache_bytes: usize,
+    /// 本地幂等缓存的保留时间；`None` 表示不按时间淘汰，只受条数/字节限制。
+    /// 只对未接账本的带键请求生效。
+    pub cache_ttl: Option<Duration>,
     /// 单次请求的墙钟执行上限；含账本等待、`sleep_ms` 与 `Exec` 子进程。
     /// `None` 不限制；超过后取消在途执行并回 `Aborted`，且不登记完成。
     pub exec_timeout: Option<Duration>,
@@ -506,6 +538,7 @@ impl RemoteServerConfig {
             exec_workspace_root: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_cache_bytes: DEFAULT_MAX_CACHE_BYTES,
+            cache_ttl: Some(DEFAULT_CACHE_TTL),
             exec_timeout: None,
             request_read_timeout: Some(DEFAULT_REQUEST_READ_TIMEOUT),
         }
@@ -549,6 +582,12 @@ impl RemoteServerConfig {
 
     pub fn with_max_cache_bytes(mut self, max_cache_bytes: usize) -> Self {
         self.max_cache_bytes = max_cache_bytes.max(1);
+        self
+    }
+
+    /// 设置本地幂等缓存的保留时间；`Duration::ZERO` 表示不按时间淘汰。
+    pub fn with_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.cache_ttl = (!ttl.is_zero()).then_some(ttl);
         self
     }
 
@@ -955,11 +994,11 @@ fn handle(
                     Err(_) => return respond(&mut stream, 503, "Service Unavailable", b""),
                 }
             }
-        } else if let Some(cached) = cache
-            .lock()
-            .ok()
-            .and_then(|guard| guard.get(&key).map(|cached| cached.frame.clone()))
-        {
+        } else if let Some(cached) = cache.lock().ok().and_then(|mut guard| {
+            guard
+                .get(&key, config.cache_ttl)
+                .map(|cached| cached.frame.clone())
+        }) {
             drop(_gate_guard);
             return respond(&mut stream, 200, "OK", &cached);
         }
@@ -1082,7 +1121,7 @@ fn handle(
         && !timed_out_now
         && let Ok(mut guard) = cache.lock()
     {
-        guard.insert(key, frame.clone(), config.max_cache_bytes);
+        guard.insert(key, frame.clone(), config.max_cache_bytes, config.cache_ttl);
     }
     drop(_gate_guard);
     if lease_lost_now {

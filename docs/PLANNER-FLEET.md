@@ -185,8 +185,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `--once` / `--fail` / `--silent` / `--sleep-ms` 供端到端回归；带
   `X-Trit-Idempotency` 且与帧的 `task@epoch` 后缀一致时，按完整键（可带
   `<scope>|` 前缀）缓存首次响应（重试直接回缓存、不再执行），缓存同时限制 1024
-  条与逻辑字节（默认 64 MiB，`--max-cache-bytes`，按 key + 帧估算），按写入顺序
-  FIFO 淘汰、单条超预算不缓存；头与帧不一致回 400。不同计划用不同 scope 时互不回放。启动先打印
+  条与逻辑字节（默认 64 MiB，`--max-cache-bytes`，按 key + 帧估算）及保留时间
+  （默认 1h，`--cache-ttl-ms` 可调、0 关闭；过期条目在命中或写入时清理），按写入
+  顺序 FIFO 淘汰、单条超预算不缓存；头与帧不一致回 400。不同计划用不同 scope 时互不回放。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口；
   `--max-connections` 默认 64，超额连接直接回 503、不再 spawn 线程。
   `GET /health` 是只读存活探针：配置 token 时沿用同一 Bearer，鉴权通过即回
@@ -291,8 +292,8 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   failures 与 attempts 但清零连续失败。租约接管后的重试请求会在账本上等待当前
   持有者并回放其完成帧。
   重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
-  未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（1024 条 / 64 MiB，
-  FIFO 淘汰）；同键并发请求会在端点内排队，只有首个执行，其余等待并回放首次
+  未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（1024 条 / 64 MiB /
+  默认 1h，FIFO 淘汰，`--cache-ttl-ms` 可调、0 关闭）；同键并发请求会在端点内排队，只有首个执行，其余等待并回放首次
   结果（等待受 `exec_timeout` 约束，未配置时最多等 30s；首个未缓存时下一个继续
   执行）。换到一台从未
   见过该 key 的机器会再次执行，因此默认语义是
@@ -339,7 +340,7 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表）、
 `crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、同键并发只执行
-一次、缓存条数/字节预算、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
+一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
 文件跨运行隔离、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间

@@ -688,6 +688,50 @@ fn cache_byte_budget_evicts_the_oldest_response() {
 }
 
 #[test]
+fn cache_ttl_expires_completed_responses() {
+    let server = Arc::new(
+        RemoteServer::bind(
+            RemoteServerConfig::new("127.0.0.1:0").with_cache_ttl(Duration::from_millis(300)),
+        )
+        .unwrap(),
+    );
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let worker = {
+        let server = Arc::clone(&server);
+        std::thread::spawn(move || server.serve_connections(3).unwrap())
+    };
+    let request = request();
+
+    for label in ["first", "cache-hit"] {
+        let result = run_remote_subagent(&endpoint(&url, None, 30), &request).unwrap();
+        assert!(
+            matches!(&result.status, DelegationStatus::Completed),
+            "{label}: {:?}",
+            result.status
+        );
+    }
+    assert_eq!(
+        server.executed_requests(),
+        1,
+        "a duplicate inside the TTL must replay the cached response"
+    );
+
+    std::thread::sleep(Duration::from_millis(500));
+    let result = run_remote_subagent(&endpoint(&url, None, 30), &request).unwrap();
+    assert!(
+        matches!(&result.status, DelegationStatus::Completed),
+        "after TTL: {:?}",
+        result.status
+    );
+    assert_eq!(
+        server.executed_requests(),
+        2,
+        "an expired entry must not be replayed"
+    );
+    worker.join().unwrap();
+}
+
+#[test]
 fn concurrent_duplicate_requests_execute_once_without_a_ledger() {
     let server = Arc::new(
         RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_sleep_ms(250)).unwrap(),
