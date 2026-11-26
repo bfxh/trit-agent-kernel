@@ -682,6 +682,71 @@ fn concurrent_duplicate_requests_execute_once_without_a_ledger() {
 }
 
 #[test]
+fn oversized_header_line_is_rejected_with_431() {
+    let (url, mut child) = spawn_echo(&["--once"]);
+    let origin = url.strip_suffix("/run").unwrap();
+    let address = origin.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    write!(
+        stream,
+        "POST /run HTTP/1.1\r\nHost: test\r\nX-Long: {}\r\n",
+        "a".repeat(9000)
+    )
+    .unwrap();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 431"),
+        "oversized header must be rejected, got {response}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn too_many_headers_are_rejected_with_431() {
+    let (url, mut child) = spawn_echo(&["--once"]);
+    let origin = url.strip_suffix("/run").unwrap();
+    let address = origin.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    let mut request = String::from("POST /run HTTP/1.1\r\nHost: test\r\n");
+    for index in 0..65 {
+        request.push_str(&format!("X-Header-{index}: value\r\n"));
+    }
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 431"),
+        "too many headers must be rejected, got {response}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn oversized_header_block_is_rejected_with_431() {
+    let (url, mut child) = spawn_echo(&["--once"]);
+    let origin = url.strip_suffix("/run").unwrap();
+    let address = origin.strip_prefix("http://").unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    let mut request = String::from("POST /run HTTP/1.1\r\nHost: test\r\n");
+    let filler = "b".repeat(8000);
+    for index in 0..9 {
+        request.push_str(&format!("X-Header-{index}: {filler}\r\n"));
+    }
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 431"),
+        "oversized header block must be rejected, got {response}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn echo_server_rejects_mismatched_idempotency_key() {
     // 头里的 key 与帧里的 task@epoch 不一致：400，不解帧执行。
     let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();

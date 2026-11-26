@@ -12,6 +12,8 @@
 //! 3. **只回合法帧**：响应体永远是 `trit_orch::encode_frame` 的产物；
 //!    失败模式回 `Failed` 帧，而不是让宿主把错误当成完成；
 //! 4. **一连接一请求**：读满一帧即回包并关闭，便于宿主侧超时语义保持简单；
+//!    请求行与头部也有界（单行 8 KiB、总计 64 KiB、最多 64 个），超限直接 431，
+//!    不把整行读进内存；
 //! 5. **带键才去重**：`X-Trit-Idempotency` 必须等于帧里的 `task@epoch`，否则 400；
 //!    命中缓存直接回首次响应、不再执行（`sleep_ms` 也不生效）；缓存同时限制
 //!    条数 [`MAX_CACHED_RESPONSES`] 与逻辑字节 `max_cache_bytes`（默认 64 MiB），
@@ -43,8 +45,9 @@
 //!     执行完才发现完成帧已由别人写入（`/complete` 403），同样回标记过的
 //!     `Aborted`，绝不把本机旧结果当成获胜帧返回。网络分区导致心跳请求完全无法
 //!     送达时，旧执行者仍可能在本地跑完，这部分需任务幂等兜底。
-//! 11. **单请求墙钟有界**：配置 `exec_timeout` 后，deadline 覆盖账本等待、`sleep_ms`
-//!     与 Exec 子进程；到点先标记 `timed_out` 再取消同一令牌，最终强制 `Aborted`、
+//! 11. **执行阶段墙钟有界**：配置 `exec_timeout` 后，deadline 从请求体解码完成
+//!     后启动，覆盖账本等待、`sleep_ms` 与 Exec 子进程；头/体上传由 30s socket
+//!     读写超时和长度上限约束，不计入该 deadline。到点先标记 `timed_out` 再取消同一令牌，最终强制 `Aborted`、
 //!     跳过 complete 与本地缓存，并带 `X-Trit-Deadline-Exceeded: 1` 让调度层
 //!     区分“节点失联”与“节点健康但请求超预算”。
 //! 12. **健康探测只读**：`GET /health` 沿用同一 Bearer 鉴权，鉴权通过即回 200 空体；
@@ -82,6 +85,15 @@ const DEFAULT_LEDGER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// HTTP 请求行/单个头部的字节上限；超限直接 431，不继续缓冲。
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+
+/// 整个请求行 + 头部块的总字节上限。
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// 头部字段数量上限（含请求行之外的空行）。
+const MAX_HEADERS: usize = 64;
 
 /// 幂等缓存条数上限：按写入顺序 FIFO 淘汰，不做 LRU。
 const MAX_CACHED_RESPONSES: usize = 1024;
@@ -698,6 +710,46 @@ impl RemoteServer {
     }
 }
 
+#[derive(Debug)]
+enum HeaderReadError {
+    Io(std::io::Error),
+    TooLarge,
+    Invalid,
+}
+
+/// 有界读取一行 HTTP 头：逐块从 `BufReader` 取，不先分配整行。
+fn read_http_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<Option<String>, HeaderReadError> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(HeaderReadError::Io)?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|_| HeaderReadError::Invalid)
+            };
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(available.len(), |position| position + 1);
+        if bytes.len().saturating_add(take) > limit {
+            reader.consume(take);
+            return Err(HeaderReadError::TooLarge);
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| HeaderReadError::Invalid);
+        }
+    }
+}
+
 /// 处理一个连接：解析请求头 → 鉴权 → 读一帧 → 幂等查缓存/执行 → 回一帧 → 关闭。
 fn handle(
     mut stream: TcpStream,
@@ -711,8 +763,17 @@ fn handle(
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
 
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    let request_line = match read_http_line(&mut reader, MAX_HEADER_LINE_BYTES) {
+        Ok(Some(line)) => line,
+        Ok(None) | Err(HeaderReadError::Invalid) => {
+            return respond(&mut stream, 400, "Bad Request", b"");
+        }
+        Err(HeaderReadError::TooLarge) => {
+            return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+        }
+        Err(HeaderReadError::Io(error)) => return Err(error),
+    };
+    let mut header_bytes = request_line.len();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
@@ -727,9 +788,23 @@ fn handle(
     let mut content_length: Option<usize> = None;
     let mut authorization: Option<String> = None;
     let mut idempotency: Option<String> = None;
+    let mut header_count = 0;
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = match read_http_line(&mut reader, MAX_HEADER_LINE_BYTES) {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(HeaderReadError::Invalid) => {
+                return respond(&mut stream, 400, "Bad Request", b"");
+            }
+            Err(HeaderReadError::TooLarge) => {
+                return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+            }
+            Err(HeaderReadError::Io(error)) => return Err(error),
+        };
+        header_count += 1;
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_count > MAX_HEADERS || header_bytes > MAX_HEADER_BYTES {
+            return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;

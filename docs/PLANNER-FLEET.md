@@ -188,7 +188,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口；
   `--max-connections` 默认 64，超额连接直接回 503、不再 spawn 线程。
   `GET /health` 是只读存活探针：配置 token 时沿用同一 Bearer，鉴权通过即回
-  `200` 空体；不读任务帧、不触碰缓存/账本、不执行任务。
+  `200` 空体；不读任务帧、不触碰缓存/账本、不执行任务。请求行与头部有界：
+  单行 8 KiB、总计 64 KiB、最多 64 个，超限直接 431、不继续缓冲；头部读取仍受
+  30s socket 读写超时约束。
   `RemoteMode::Exec` / `trit-host remote-exec (--workspace <dir> | --workspace-root <dir>) --script <json>`：
   每个请求 spawn 一个 `subagent-run` 子进程，请求帧走 stdin、响应帧走 stdout；
   只有子进程判定完成才回 `Completed`，进程错误按 `Failed` 回帧。权限仍由请求
@@ -226,7 +228,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   连接直接 503、不排队不 spawn；账本是跨机协调单点，不能由慢客户端耗尽线程。
   服务端单请求执行时限：`RemoteServerConfig::exec_timeout` /
   `remote-echo|remote-exec --request-timeout-ms`（0 表示不限制）。deadline 从
-  handler 入口启动，覆盖账本 claim 等待、`sleep_ms` 与 `Exec` 子进程；到点先置
+  请求体解码完成后启动，覆盖账本 claim 等待、`sleep_ms` 与 `Exec` 子进程；请求行/
+  头部读取与请求体上传阶段由 30s socket 读写超时和上述头/体长度上限约束，不计入
+  `exec_timeout`。到点先置
   `timed_out` 再取消与请求共用的令牌，最终强制 `Aborted`、清空内容，并跳过账本
   complete 与本地缓存（占位保留到 TTL）。响应带 `X-Trit-Deadline-Exceeded: 1`，
   客户端 `RemoteReply::deadline_exceeded` 转成调度层 `NodeOutcome::OverBudget`：
