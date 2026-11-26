@@ -1,0 +1,47 @@
+name: verified-core
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verified-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: embedded trit-core K3 specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.100.0"
+
+      - name: Checkout trit verification anchor (main)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none https://github.com/bfxh/trit.git /tmp/trit
+
+      - name: Install Verus (pinned + SHA-256)
+        run: python3 /tmp/trit/scripts/verify.py --install
+
+      - name: Verify embedded trit-core K3 specs
+        run: |
+          set -euo pipefail
+          # 在上游锚点的独立 workspace 内用本仓的 trit-core 替换同名包，
+          # 这样 verus 新增的 trit-belnap 等路径依赖也能按主库布局解析。
+          rm -rf /tmp/trit/crates/trit-core
+          cp -r "$GITHUB_WORKSPACE/crates/trit-core" /tmp/trit/crates/trit-core
+          export PATH="$HOME/tools/verus-x86-linux:$HOME/tools/z3-4.16.0-x64-glibc-2.39/bin:$HOME/.cargo/bin:$PATH"
+          export RUSTUP_TOOLCHAIN=1.100.0-x86_64-unknown-linux-gnu
+          cd /tmp/trit/verus
+          cargo-verus verify
+          cargo test
