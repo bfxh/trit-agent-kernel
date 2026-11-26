@@ -1348,9 +1348,10 @@ fn usage() {
          [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
          remote-plan: trit-host remote-plan [--input <json|->] [--health <path>] [--probe]\n\
-         [--probe-interval-ms N]\n\
+         [--probe-interval-ms N] [--health-flush-ms N]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?,scope?}},\n\
-         dispatches tasks as read-only subagent requests to the static node table, prints JSON.\n\n\
+         dispatches tasks as read-only subagent requests to the static node table, prints JSON.\n\
+         --health-flush-ms defaults to 30000 when --health is set; 0 disables periodic rewrite.\n\n\
          remote-health: trit-host remote-health --nodes <json> --health <path> [--interval-ms N] [--once]\n\
          standalone health monitor: reloads --nodes each sweep, probes isolated nodes,\n\
          rewrites the health file via temp+rename, takes an OS lock on <health>.lock;\n\
@@ -1733,6 +1734,10 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     Ok(())
 }
 
+/// `remote-plan` 在提供 `--health` 时默认每 30s 把节点健康写回一次；长演练
+/// 中途崩溃也只丢最近一个周期的变化。`--health-flush-ms 0` 关闭。
+const DEFAULT_HEALTH_FLUSH_MS: u64 = 30_000;
+
 /// `remote-plan [--input <json|->]`：跨机演练。
 ///
 /// 输入是一个 JSON 文档：`{revision, tasks, nodes, workers?, failure_threshold?,
@@ -1743,6 +1748,8 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 /// `--probe` 会在加载健康文件后对已隔离节点做一次 `GET /health`，成功才重新放行。
 /// `--probe-interval-ms` 会在本次演练运行期间周期探测已隔离节点，成功后重新放行；
 /// 它要求 `--health <path>`，且只在本进程内有效，不做常驻后台监控。
+/// `--health` 还存在时默认每 30s 把当前节点健康写回文件（`--health-flush-ms` 可调，
+/// 0 关闭），避免长演练中途崩溃只在正常结束才落盘；停止写回线程后才做最终写回。
 /// 两种探测都映射到库级 `RemotePlanConfig::with_health_probe_*`，事件来自报告的
 /// `probes`；库级调用方不依赖 `--health` 文件也能使用同一能力。
 /// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
@@ -1751,6 +1758,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut health_path: Option<String> = None;
     let mut probe = false;
     let mut probe_interval_ms: Option<u64> = None;
+    let mut health_flush_ms: Option<u64> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--input" => input_path = Some(next(&mut args, "--input")?),
@@ -1758,6 +1766,9 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
             "--probe" => probe = true,
             "--probe-interval-ms" => {
                 probe_interval_ms = Some(next(&mut args, "--probe-interval-ms")?.parse()?)
+            }
+            "--health-flush-ms" => {
+                health_flush_ms = Some(next(&mut args, "--health-flush-ms")?.parse()?)
             }
             other => return Err(fail(format!("unknown remote-plan argument: {other}"))),
         }
@@ -1768,10 +1779,15 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     if probe_interval_ms.is_some() && health_path.is_none() {
         return Err(fail("--probe-interval-ms requires --health <path>"));
     }
+    if health_flush_ms.is_some() && health_path.is_none() {
+        return Err(fail("--health-flush-ms requires --health <path>"));
+    }
     if probe_interval_ms == Some(0) {
         return Err(fail("--probe-interval-ms must be positive"));
     }
     let probe_interval = probe_interval_ms.map(std::time::Duration::from_millis);
+    let health_flush_interval =
+        std::time::Duration::from_millis(health_flush_ms.unwrap_or(DEFAULT_HEALTH_FLUSH_MS));
     let text = match input_path.as_deref() {
         None | Some("-") => {
             let mut buffer = String::new();
@@ -1809,13 +1825,31 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
             .map_err(|error| fail(format!("parse health file {path}: {error}")))?;
         table = table.with_snapshots(&snapshots);
     }
-    let report = trit_host::run_remote_plan_with_table(
+    let table = Arc::new(table);
+    let flusher = match health_path.as_deref() {
+        Some(path) if !health_flush_interval.is_zero() => {
+            Some(trit_host::spawn_remote_health_flusher(
+                Arc::clone(&table),
+                Path::new(path),
+                health_flush_interval,
+            )?)
+        }
+        _ => None,
+    };
+    let result = trit_host::run_remote_plan_with_table(
         &plan,
-        Arc::new(table),
+        Arc::clone(&table),
         config,
         trit_orch::CancelToken::new(),
         remote_request_for,
-    )?;
+    );
+    if let Some(mut flusher) = flusher {
+        flusher.stop_and_join();
+        if let Some(error) = flusher.last_error() {
+            eprintln!("remote-plan health flush warning: {error}");
+        }
+    }
+    let report = result?;
     if let Some(path) = health_path.as_deref() {
         trit_host::save_remote_health_file(Path::new(path), &report.nodes)?;
     }

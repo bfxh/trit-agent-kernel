@@ -29,6 +29,9 @@
 //!   [`probe_remote_health_file`] + `trit-host remote-health` 承担：它独立读写
 //!   节点健康文件，不依赖某个演练进程一直活着；CLI 每轮重读节点表，并在
 //!   `<health>.lock` 上持单实例 OS 锁。
+//! - 长演练可用 [`spawn_remote_health_flusher`] 把节点表快照周期写回健康文件；
+//!   这样进程中途崩溃时，最近的隔离/放行结果仍留在磁盘上，而不是只在计划
+//!   正常结束才落盘。写回与其它写者走同一套 `.write.lock` 合并协议。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -500,6 +503,99 @@ pub fn probe_remote_health_file(
     };
     save_remote_health_file(path, &report.nodes)?;
     Ok(report)
+}
+
+/// 周期把节点表快照写回健康文件的后台线程。
+///
+/// 只负责“最近一次成功写回”，不改变调度：写回失败会记录在
+/// [`RemoteHealthFlusher::last_error`]，下一轮成功则清除；不终止演练。停止时
+/// 先置停止标志再 join，保证返回后不会再有后台写者与调用方的最终写回并发。
+pub struct RemoteHealthFlusher {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+impl RemoteHealthFlusher {
+    /// 停止并等待后台线程退出。
+    pub fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    /// 最近一轮写回的错误；成功后会被清除。
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for RemoteHealthFlusher {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// 启动健康文件周期写回：立即写一次，之后每 `interval` 写一次节点表快照。
+///
+/// 每次写回都先把快照里的 `in_flight` 清零（健康文件跨运行恢复时不应携带
+/// 某一时刻的在途计数），再调用 [`save_remote_health_file`]，因此会与
+/// `remote-health` / 另一个演练的写者按 `.write.lock` 合并，不会抹掉节点表外
+/// 的旧条目，也不会留下半截文件。`interval` 必须大于 0。
+pub fn spawn_remote_health_flusher(
+    table: Arc<NodeTable>,
+    path: impl Into<PathBuf>,
+    interval: Duration,
+) -> Result<RemoteHealthFlusher, AgentError> {
+    if interval.is_zero() {
+        return Err(AgentError::Io(
+            "remote health flush interval must be positive".into(),
+        ));
+    }
+    let path = path.into();
+    if path.as_os_str().is_empty() {
+        return Err(AgentError::Io("remote health flush path is empty".into()));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_error = Arc::new(Mutex::new(None::<String>));
+    let handle = std::thread::Builder::new()
+        .name("trit-health-flush".into())
+        .spawn({
+            let stop = Arc::clone(&stop);
+            let last_error = Arc::clone(&last_error);
+            move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let mut snapshots = table.snapshot();
+                    for snapshot in &mut snapshots {
+                        snapshot.in_flight = 0;
+                    }
+                    let outcome = save_remote_health_file(&path, &snapshots)
+                        .map_err(|error| error.to_string());
+                    let mut slot = last_error
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *slot = outcome.err();
+                    drop(slot);
+
+                    let mut remaining = interval;
+                    while !stop.load(Ordering::SeqCst) && !remaining.is_zero() {
+                        let wait = remaining.min(HEALTH_MONITOR_STEP);
+                        std::thread::sleep(wait);
+                        remaining = remaining.saturating_sub(wait);
+                    }
+                }
+            }
+        })
+        .map_err(|error| AgentError::Io(format!("spawn health flusher: {error}")))?;
+    Ok(RemoteHealthFlusher {
+        stop,
+        handle: Some(handle),
+        last_error,
+    })
 }
 
 fn load_remote_health_file(path: &Path) -> Result<Vec<NodeSnapshot>, AgentError> {

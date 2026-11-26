@@ -3,9 +3,11 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use trit_host::{probe_remote_health_file, save_remote_health_file};
-use trit_orch::{NodeSnapshot, RemoteEndpoint, RemoteNode};
+use trit_host::{probe_remote_health_file, save_remote_health_file, spawn_remote_health_flusher};
+use trit_orch::{CancelToken, NodeOutcome, NodeSnapshot, NodeTable, RemoteEndpoint, RemoteNode};
 
 struct TestNode {
     base: String,
@@ -142,6 +144,58 @@ fn concurrent_health_writers_merge_instead_of_losing_entries() {
         ["n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7"],
         "并发写者必须串行合并，而不是互相覆盖"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn health_flusher_persists_changes_between_intervals() {
+    let dir = temp_dir("flusher");
+    let health = dir.join("health.json");
+    let table =
+        Arc::new(NodeTable::new(vec![node("n1", "http://127.0.0.1:1/run".into())]).unwrap());
+    let lease = table.acquire(&CancelToken::new()).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+
+    let mut flusher =
+        spawn_remote_health_flusher(Arc::clone(&table), &health, Duration::from_millis(20))
+            .unwrap();
+
+    let wait_until = |predicate: &dyn Fn(&[NodeSnapshot]) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(stored) = std::fs::read_to_string(&health)
+                && let Ok(snapshots) = serde_json::from_str::<Vec<NodeSnapshot>>(&stored)
+                && predicate(&snapshots)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "health flusher did not persist expected snapshot: {}",
+                std::fs::read_to_string(&health).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    wait_until(&|snapshots| {
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.id == "n1" && !snapshot.healthy)
+    });
+    let stored = read_health(&health);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].in_flight, 0, "在途计数不得写进跨运行健康文件");
+
+    assert!(table.readmit("n1"));
+    wait_until(&|snapshots| {
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.id == "n1" && snapshot.healthy)
+    });
+
+    flusher.stop_and_join();
+    assert_eq!(flusher.last_error(), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

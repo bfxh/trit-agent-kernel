@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use trit_orch::{RemoteEndpoint, RemoteNode, Task, TaskSpec};
 
@@ -260,6 +261,75 @@ fn remote_plan_cli_periodic_probe_readmits_isolated_node() {
 }
 
 #[test]
+fn remote_plan_flushes_health_while_running() {
+    let slow = spawn_node("node-a", &["--sleep-ms", "1500"]);
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-flush-{}.json",
+        std::process::id()
+    ));
+    let snapshots = serde_json::json!([
+        {"id": "node-a", "healthy": true, "in_flight": 0, "attempts": 0, "failures": 0},
+    ]);
+    // 紧凑写入（无换行）；后台写回走 pretty JSON，因此出现换行即说明文件被
+    // 健康写回线程重写过，而不是只在计划结束后才落盘。
+    std::fs::write(&health, serde_json::to_vec(&snapshots).unwrap()).unwrap();
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 1,
+        "failure_threshold": 1,
+        "tasks": [task("t1")],
+        "nodes": [node_json(&slow, 1)],
+    });
+    let path = input_file("health-flush", &input);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--health-flush-ms")
+        .arg("100")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut observed_while_running = false;
+    loop {
+        let rewritten = std::fs::read_to_string(&health)
+            .ok()
+            .is_some_and(|text| text.contains('\n'));
+        if rewritten && child.try_wait().unwrap().is_none() {
+            observed_while_running = true;
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plan did not flush health while still running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&health);
+    assert!(
+        observed_while_running,
+        "health flush must persist state before the plan exits: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "remote-plan --health-flush-ms failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn remote_plan_cli_failed_probe_keeps_the_node_isolated() {
     let good = spawn_node("node-b", &[]);
     let dead = serde_json::to_value(
@@ -498,6 +568,22 @@ fn remote_plan_cli_requires_health_and_positive_interval_for_periodic_probe() {
     let stderr = String::from_utf8_lossy(&zero.stderr);
     assert!(
         stderr.contains("--probe-interval-ms must be positive"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn remote_plan_cli_requires_health_for_health_flush() {
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--health-flush-ms")
+        .arg("100")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--health-flush-ms requires --health"),
         "{stderr}"
     );
 }

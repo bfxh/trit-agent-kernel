@@ -325,7 +325,7 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   边界：对端未实现 `/cancel` 时，客户端仍会在 2s 后返回，但远端请求会继续到
   端点超时，可能已经写盘；`Aborted` 不等于“远端一定没执行”。
 - CLI `trit-host remote-plan [--input <json|->] [--health <path>] [--probe]
-  [--probe-interval-ms N]`：输入
+  [--probe-interval-ms N] [--health-flush-ms N]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?, scope?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
   含 `completed/failed/deferred/results/assignments/attempts/nodes/probes/metrics` 的
@@ -344,7 +344,13 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `RemotePlanConfig::with_health_probe_on_start` / `with_health_probe_interval`
   让 `run_remote_plan_with_table` 自己探测并把 `RemoteProbeEvent` 写入
   `RemotePlanReport::probes`；CLI 只负责把 flag 映射成配置、读写 `--health`
-  文件。计划内的监控随计划结束退出；跨进程常驻恢复由 `trit-host remote-health` 承担：
+  文件。配 `--health` 时 CLI 默认每 30s 把当前节点表快照写回一次
+  （`--health-flush-ms N` 可调、0 关闭；需配 `--health`），避免长演练只在
+  正常结束才落盘：写回线程每次先把 `in_flight` 清零，再走同一 `.write.lock`
+  合并协议；CLI 在计划结束后先停止并 join 写回线程，再做最终原子写回，因此
+  崩溃最多丢最近一个周期的健康变化。库级调用方可直接用
+  `spawn_remote_health_flusher(table, path, interval)` 获得同一能力。计划内的
+  监控随计划结束退出；跨进程常驻恢复由 `trit-host remote-health` 承担：
   `--nodes <json> --health <path> [--interval-ms N] [--once]` 每轮重读同一节点表与
   健康文件（`Vec<NodeSnapshot>`），只探已隔离节点，`GET /health` 成功即写回
   `healthy`（保留 `attempts/failures`、清零 `in_flight`），失败保持隔离并记录原因；
@@ -370,10 +376,12 @@ preflight 探测重新放行隔离节点并返回 `probes`）、
 一次、缓存条数/字节预算与 TTL 过期、scope 隔离与非法 scope 拒绝、取消覆盖同键并发）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程、stdout 超帧上限有界拒绝）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
-文件跨运行隔离、计划写回保留节点表外的健康条目、`--probe` 成功放行/失败保持隔离、
-`--probe-interval-ms` 演练期间恢复节点、重复节点 ID 与非法 scope 拒绝）、
+文件跨运行隔离、计划写回保留节点表外的健康条目、运行期间用 `--health-flush-ms`
+写回健康、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间恢复节点、
+重复节点 ID 与非法 scope 拒绝）、
 `crates/trit-host/tests/remote_health.rs`（独立守护成功放行并保留累计计数、探测
-失败保持隔离、未知节点保留原快照、保存时合并未提及条目、并发写者不丢条目、缺失文件
+失败保持隔离、未知节点保留原快照、保存时合并未提及条目、并发写者不丢条目、周期
+写回线程持久化隔离与放行且清零 `in_flight`、缺失文件
 初始化、节点表热加载与单实例锁、`--once` CLI 输出）与 `crates/trit-host/tests/remote_ledger.rs`
 （共享账本下双节点单次执行、scope 隔离）。
 
