@@ -211,7 +211,9 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   `POST /claim` + `POST /renew` + `POST /complete`，键是
   `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`；
   complete 校验 `task@epoch` 后缀并保留 scope，因此同名任务在不同 scope 下各有
-  独立的 claim/完成记录。
+  独立的 claim/完成记录。另提供 `GET /health` 只读探针：走同一 Bearer，鉴权通过
+  即回 200 空体，不读取请求体、不触碰 claim/complete 状态，供负载均衡或外部监控
+  判断账本进程存活。
   claim 返回 `200` 空体 + `X-Trit-Lease` = 获得执行权，`200` + 帧 = 已完成、直接回放，
   `409` = 他人持有；`/renew` 与 `/complete` 必须携带同一个租约令牌，缺失或不匹配
   返回 `403`，因此过期接管后旧持有者不能再续租或写完成。完成记录保存写入者令牌：
@@ -261,7 +263,7 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 503、请求行/头长度超限 431、慢头/慢体触发请求读取总时限 408。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
 慢执行期间不被接管、租约丢失中止在途执行、完成帧已由别人写入时旧执行者回 Aborted 而非旧结果、租约被接管不隔离节点且换机重试回放完成、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
 时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩、账本连接上限 503、账本慢请求总读取时限 408、
-同一状态文件只允许一个账本进程；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
+同一状态文件只允许一个账本进程、`GET /health` 走同一 Bearer 且只读；`exec_timeout` 到点回 `Aborted` 且不登记完成、CLI 看门狗中止慢请求也各有回归；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
 

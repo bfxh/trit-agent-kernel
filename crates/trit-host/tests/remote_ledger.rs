@@ -1,6 +1,6 @@
 //! 共享幂等账本：claim/renew/complete 协议，以及两台远端共享账本时的单次执行。
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
@@ -72,6 +72,24 @@ fn state_file(tag: &str) -> std::path::PathBuf {
     path
 }
 
+fn request_status(address: &str, method: &str, path: &str, authorization: Option<&str>) -> String {
+    let auth = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    let mut stream = TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: test\r\n{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response.lines().next().unwrap_or_default().to_string()
+}
+
 #[test]
 fn state_file_is_single_writer() {
     let path = state_file("single-writer");
@@ -95,6 +113,39 @@ fn state_file_is_single_writer() {
     drop(restarted);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&lock_path);
+}
+
+#[test]
+fn ledger_health_is_read_only_and_requires_bearer() {
+    let server =
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_token("secret")).unwrap();
+    let address = server.addr().unwrap().to_string();
+    let handle = thread::spawn(move || {
+        for _ in 0..6 {
+            server.serve_once().unwrap();
+        }
+    });
+
+    assert_eq!(
+        request_status(&address, "GET", "/health", Some("Bearer secret")),
+        "HTTP/1.1 200 OK"
+    );
+    for header in [None, Some("Bearer secre"), Some("Bearer secretx")] {
+        assert_eq!(
+            request_status(&address, "GET", "/health", header),
+            "HTTP/1.1 401 Unauthorized",
+            "health must use the same bearer as the ledger"
+        );
+    }
+    assert_eq!(
+        request_status(&address, "GET", "/claim", Some("Bearer secret")),
+        "HTTP/1.1 405 Method Not Allowed"
+    );
+    assert_eq!(
+        request_status(&address, "POST", "/health", Some("Bearer secret")),
+        "HTTP/1.1 405 Method Not Allowed"
+    );
+    handle.join().unwrap();
 }
 
 #[test]

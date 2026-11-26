@@ -1,6 +1,7 @@
 //! 共享幂等账本：让多台远端在同一个 `task@epoch` 上最多登记一个完成结果，重试优先回放。
 //!
-//! 协议（HTTP/1.1，一连接一请求，路径固定 `/claim`、`/renew` 与 `/complete`）：
+//! 协议（HTTP/1.1，一连接一请求，路径固定 `/claim`、`/renew`、`/complete`
+//! 与只读 `/health`）：
 //!
 //! - `POST /claim`，头 `X-Trit-Idempotency: <task>@<epoch>` 或
 //!   `<scope>|<task>@<epoch>`：
@@ -17,6 +18,8 @@
 //!   当前时间，`204`；已完成返回 `204` + `X-Trit-Lease-Done: 1`（当前令牌已
 //!   不再拥有该任务，调用方应立即停止在途执行），未知键 `404`，令牌不匹配 `403`。
 //!   用于执行时间超过 `pending_ttl` 的任务，避免另一个节点误判过期而并发执行。
+//! - `GET /health`：走同一 bearer token，鉴权通过即回 `200` 空体；不读取请求
+//!   体、不触碰 claim/complete 状态，供负载均衡或外部监控判断进程存活。
 //!
 //! 占位有 TTL（默认 60s）：执行者崩溃后，过期占位可以被接管。账本只保存响应帧，
 //! 不执行任务；它是跨机重试的协调点，不是任务队列。租约令牌是随机生成的持有者
@@ -61,7 +64,7 @@ use crate::http_read::{
     DEFAULT_REQUEST_READ_TIMEOUT, DeadlineStream, HeaderReadError, IO_TIMEOUT, MAX_HEADER_BYTES,
     MAX_HEADER_LINE_BYTES, MAX_HEADERS, is_timeout, read_http_line,
 };
-use crate::remote_subagent::idempotency_scope;
+use crate::remote_subagent::{HEALTH_PATH, idempotency_scope};
 
 /// 默认占位 TTL：执行者崩溃后，多久允许其他节点接管。
 const DEFAULT_PENDING_TTL: Duration = Duration::from_secs(60);
@@ -406,9 +409,7 @@ fn handle(
         .split('?')
         .next()
         .unwrap_or_default();
-    if method != "POST" {
-        return respond(&mut stream, 405, "Method Not Allowed", b"");
-    }
+    let is_health = method == "GET" && path == HEALTH_PATH;
 
     let mut content_length = 0usize;
     let mut authorization: Option<String> = None;
@@ -454,6 +455,11 @@ fn handle(
             _ => {}
         }
     }
+    // 先把请求头读完再拒绝方法：否则客户端还在写头时服务端就关闭，
+    // Windows 可能把带响应的关闭变成 RST，调用方反而读不到 405。
+    if !is_health && (method != "POST" || path == HEALTH_PATH) {
+        return respond(&mut stream, 405, "Method Not Allowed", b"");
+    }
     if content_length > MAX_LEDGER_BODY {
         return respond(&mut stream, 413, "Payload Too Large", b"");
     }
@@ -461,6 +467,11 @@ fn handle(
         && !authorization_matches(authorization.as_deref(), expected)
     {
         return respond(&mut stream, 401, "Unauthorized", b"");
+    }
+
+    if is_health {
+        // 只报存活与鉴权通过；不读取请求体、不触碰 claim/complete 状态。
+        return respond(&mut stream, 200, "OK", b"");
     }
 
     let mut body = vec![0u8; content_length];
