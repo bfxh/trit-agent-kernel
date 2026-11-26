@@ -128,6 +128,33 @@ fn over_budget_counts_an_attempt_but_keeps_the_node_healthy() {
 }
 
 #[test]
+fn readmit_revives_only_known_isolated_nodes() {
+    let table = NodeTable::new(vec![node("a", 1)])
+        .unwrap()
+        .with_failure_threshold(1);
+    let cancel = CancelToken::new();
+
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    let before = &table.snapshot()[0];
+    assert!(!before.healthy);
+    assert_eq!(before.attempts, 1);
+    assert_eq!(before.failures, 1);
+
+    assert!(table.readmit("a"));
+    let after = &table.snapshot()[0];
+    assert!(after.healthy);
+    assert_eq!(after.attempts, 1, "恢复不能抹掉历史尝试数");
+    assert_eq!(after.failures, 1, "恢复不能抹掉历史失败数");
+
+    // 已恢复节点、未知节点都不做隐式放行。
+    assert!(!table.readmit("a"));
+    assert!(!table.readmit("missing"));
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::Succeeded);
+}
+
+#[test]
 fn snapshots_restore_quarantine_and_counts() {
     let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
     let cancel = CancelToken::new();

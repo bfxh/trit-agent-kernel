@@ -133,6 +133,137 @@ fn remote_plan_cli_dispatches_across_nodes() {
 }
 
 #[test]
+fn remote_plan_cli_probe_readmits_a_recovered_node() {
+    let node_a = spawn_node("node-a", &[]);
+    let node_b = spawn_node("node-b", &[]);
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-probe-ok-{}.json",
+        std::process::id()
+    ));
+    let snapshots = serde_json::json!([
+        {"id": "node-a", "healthy": false, "in_flight": 0, "attempts": 0, "failures": 1},
+        {"id": "node-b", "healthy": true, "in_flight": 0, "attempts": 0, "failures": 0},
+    ]);
+    std::fs::write(&health, serde_json::to_vec(&snapshots).unwrap()).unwrap();
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 2,
+        "failure_threshold": 1,
+        "tasks": [task("t1"), task("t2")],
+        "nodes": [node_json(&node_a, 1), node_json(&node_b, 1)],
+    });
+    let path = input_file("probe-ok", &input);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--probe")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&health);
+    assert!(
+        output.status.success(),
+        "remote-plan --probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["probes"][0]["node"], "node-a", "{report}");
+    assert_eq!(report["probes"][0]["ok"], true, "{report}");
+    assert_eq!(report["probes"][0]["readmitted"], true, "{report}");
+
+    let nodes: std::collections::BTreeMap<&str, &serde_json::Value> = report["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| (node["id"].as_str().unwrap(), node))
+        .collect();
+    assert_eq!(nodes["node-a"]["healthy"], true, "{report}");
+    let used: HashSet<&str> = report["assignments"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|node| node.as_str().unwrap())
+        .collect();
+    assert_eq!(used, HashSet::from(["node-a", "node-b"]), "{report}");
+}
+
+#[test]
+fn remote_plan_cli_failed_probe_keeps_the_node_isolated() {
+    let good = spawn_node("node-b", &[]);
+    let dead = serde_json::to_value(
+        RemoteNode::new(
+            "node-a",
+            RemoteEndpoint {
+                url: "http://127.0.0.1:1/run".into(),
+                auth_token: None,
+                timeout_secs: 1,
+            },
+        )
+        .with_max_in_flight(1),
+    )
+    .unwrap();
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-probe-fail-{}.json",
+        std::process::id()
+    ));
+    let snapshots = serde_json::json!([
+        {"id": "node-a", "healthy": false, "in_flight": 0, "attempts": 0, "failures": 1},
+        {"id": "node-b", "healthy": true, "in_flight": 0, "attempts": 0, "failures": 0},
+    ]);
+    std::fs::write(&health, serde_json::to_vec(&snapshots).unwrap()).unwrap();
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 2,
+        "failure_threshold": 1,
+        "tasks": [task("t1"), task("t2")],
+        "nodes": [dead, node_json(&good, 1)],
+    });
+    let path = input_file("probe-fail", &input);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--probe")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&health);
+    assert!(
+        output.status.success(),
+        "remote-plan --probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["probes"][0]["node"], "node-a", "{report}");
+    assert_eq!(report["probes"][0]["ok"], false, "{report}");
+    assert_eq!(report["probes"][0]["readmitted"], false, "{report}");
+    assert!(
+        report["probes"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("transport"),
+        "{report}"
+    );
+    let bad_node = report["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "node-a")
+        .unwrap();
+    assert_eq!(bad_node["healthy"], false, "{report}");
+    for task in ["t1", "t2"] {
+        assert_eq!(report["assignments"][task], "node-b", "{report}");
+    }
+}
+
+#[test]
 fn remote_plan_cli_persists_node_health() {
     let good = spawn_node("node-b", &[]);
     let dead = serde_json::to_value(
@@ -218,6 +349,18 @@ fn remote_plan_cli_persists_node_health() {
         .find(|node| node["id"] == "node-a")
         .unwrap();
     assert_eq!(bad_node["healthy"], false, "{report}");
+}
+
+#[test]
+fn remote_plan_cli_requires_health_for_probe() {
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--probe")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--probe requires --health"), "{stderr}");
 }
 
 #[test]

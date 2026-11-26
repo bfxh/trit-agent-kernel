@@ -186,6 +186,8 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   FIFO 淘汰；头与帧不一致回 400。不同计划用不同 scope 时互不回放。启动先打印
   `{"bind":"127.0.0.1:PORT"}`，便于 `--bind 127.0.0.1:0` 取真实端口；
   `--max-connections` 默认 64，超额连接直接回 503、不再 spawn 线程。
+  `GET /health` 是只读存活探针：配置 token 时沿用同一 Bearer，鉴权通过即回
+  `200` 空体；不读任务帧、不触碰缓存/账本、不执行任务。
   `RemoteMode::Exec` / `trit-host remote-exec (--workspace <dir> | --workspace-root <dir>) --script <json>`：
   每个请求 spawn 一个 `subagent-run` 子进程，请求帧走 stdin、响应帧走 stdout；
   只有子进程判定完成才回 `Completed`，进程错误按 `Failed` 回帧。权限仍由请求
@@ -292,26 +294,30 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   `NodeOutcome::Abandoned` 归还（不计 attempts/failures、不换节点重试）。
   边界：对端未实现 `/cancel` 时，客户端仍会在 2s 后返回，但远端请求会继续到
   端点超时，可能已经写盘；`Aborted` 不等于“远端一定没执行”。
-- CLI `trit-host remote-plan [--input <json|->] [--health <path>]`：输入
+- CLI `trit-host remote-plan [--input <json|->] [--health <path>] [--probe]`：输入
   `{revision, tasks, nodes, workers?, failure_threshold?, retry_limit?, scope?}`，把每个
   任务映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），输出
-  含 `completed/failed/deferred/results/assignments/attempts/nodes/metrics` 的
+  含 `completed/failed/deferred/results/assignments/attempts/nodes/probes/metrics` 的
   JSON 报告；`scope` 是计划命名空间，多个计划共享账本或 `--workspace-root`
   时必须给出不同值，否则同名任务会共用 key 与目录。用于跨机演练与运维冒烟。远端可以是 `remote-exec`（真实执行
   `subagent-run`）或任何实现同一帧协议的服务端。`--health` 读取上一次的节点
   快照（`healthy/attempts/failures`），跳过已隔离节点，并在本次结束后原子写回；
-  文件里已删除的节点 ID 会被忽略，未知/损坏文件按错误退出。健康状态没有自动
-  恢复：节点修好后需删除该文件或把对应 `healthy` 改回 `true`。
+  文件里已删除的节点 ID 会被忽略，未知/损坏文件按错误退出。`--probe` 必须先配
+  `--health`：派发前对健康文件里标记为隔离、且仍存在于本次节点表的节点逐个做
+  `GET /health`，成功的调用 `NodeTable::readmit` 重新放行（保留累计 attempts/
+  failures、清零连续失败），失败保持隔离；探测结果写进报告的 `probes`，探测本身
+  不计 attempt/failure。没有自动周期性恢复：恢复动作只在显式 `--probe` 时发生。
 
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
-隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、快照恢复、JSON 默认值）、
+隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、`OverBudget` 健康语义、
+快照恢复、显式 `readmit`、JSON 默认值）、
 `crates/trit-host/tests/remote_fleet.rs`（真实双节点均衡、无响应节点隔离、远端
 任务失败不重试、换节点重试复用幂等键、重试上限、预取消、非法节点表）、
 `crates/trit-host/tests/remote_subagent.rs`（往返、鉴权、幂等去重、scope 隔离与
 非法 scope 拒绝、取消慢请求）、
 `crates/trit-host/tests/subagent_process.rs`（取消 kill 慢子进程）、
 `crates/trit-host/tests/remote_plan_cli.rs`（`remote-plan` 真实双节点演练、健康
-文件跨运行隔离、重复节点 ID 与非法 scope 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
+文件跨运行隔离、`--probe` 成功放行/失败保持隔离、重复节点 ID 与非法 scope 拒绝）与 `crates/trit-host/tests/remote_ledger.rs`
 （共享账本下双节点单次执行、scope 隔离）。
 
 ## 非目标

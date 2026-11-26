@@ -11,6 +11,8 @@
 //!   （`in_flight / max_in_flight`，平手按 id 升序），满载时等待而不是超发；
 //! - **故障隔离**：连续 `failure_threshold` 次节点级失败后该节点退出本轮调度，
 //!   不再接收新任务；任务级失败（对端明确回了 `Failed`）不牵连节点；
+//!   隔离不会自动解除，只有显式 [`NodeTable::readmit`]（通常由健康探测成功驱动）
+//!   才重新放行；
 //! - **取消**：等待中的调用方按 [`CancelToken`] 退出，返回 `Ok(None)`；
 //! - **不自动重试**：远程可能已经执行过，重试需要幂等键；本层不做隐式重试。
 
@@ -255,6 +257,27 @@ impl NodeTable {
     /// 仍然健康的节点数。
     pub fn healthy_nodes(&self) -> usize {
         self.lock().iter().filter(|slot| slot.healthy).count()
+    }
+
+    /// 显式健康探测成功后重新放行一个已隔离节点。
+    ///
+    /// 保留累计 `attempts/failures` 作为历史，只清零连续失败计数并恢复 `healthy`。
+    /// 未知节点或本来就健康的节点返回 `false`，不做隐式放行。
+    pub fn readmit(&self, id: &str) -> bool {
+        let mut slots = self.lock();
+        let changed = match slots.iter_mut().find(|slot| slot.node.id == id) {
+            Some(slot) if !slot.healthy => {
+                slot.healthy = true;
+                slot.consecutive_failures = 0;
+                true
+            }
+            _ => false,
+        };
+        drop(slots);
+        if changed {
+            self.cond.notify_all();
+        }
+        changed
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Slot>> {

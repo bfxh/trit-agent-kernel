@@ -24,6 +24,8 @@
 //! 8. **执行时限不是节点故障**：服务端墙钟到点会回带 `X-Trit-Deadline-Exceeded: 1`
 //!    的合法 `Aborted`；[`RemoteReply::deadline_exceeded`] 供调度层区分
 //!    “节点失联”与“节点健康但本次请求超预算”。
+//! 9. **健康探测只读且同鉴权**：`GET <origin>/health` 沿用 Bearer、不跳转、
+//!    不派发任务；只有 2xx 才算可达，供显式恢复隔离节点使用。
 
 use std::io::Read;
 use std::time::Duration;
@@ -333,14 +335,20 @@ pub fn run_remote_subagent_reply_cancellable_scoped(
     }
 }
 
-/// 取消入口固定在端点 **origin** 上：`http://host:port/run` → `http://host:port/cancel`。
-fn cancel_endpoint_url(endpoint_url: &str) -> String {
+/// 把端点 URL 折叠到 **origin** 上的固定路径：`http://host:port/run` →
+/// `http://host:port<path>`。
+fn endpoint_origin_url(endpoint_url: &str, path: &str) -> String {
     let trimmed = endpoint_url.trim();
     let Some((scheme, rest)) = trimmed.split_once("://") else {
-        return format!("{trimmed}{CANCEL_PATH}");
+        return format!("{trimmed}{path}");
     };
     let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    format!("{scheme}://{authority}{CANCEL_PATH}")
+    format!("{scheme}://{authority}{path}")
+}
+
+/// 取消入口固定在端点 **origin** 上：`http://host:port/run` → `http://host:port/cancel`。
+fn cancel_endpoint_url(endpoint_url: &str) -> String {
+    endpoint_origin_url(endpoint_url, CANCEL_PATH)
 }
 
 /// 通知远程端点取消一个在途请求；未知键按服务端语义视为 no-op。
@@ -367,8 +375,36 @@ pub fn cancel_remote_subagent(endpoint: &RemoteEndpoint, key: &str) -> Result<()
     }
 }
 
+/// 探测远程端点是否还能服务：`GET <origin>/health`，带同一 Bearer。
+///
+/// 只验证可达与鉴权，不派发任务、不触碰幂等账本。成功返回 `Ok(())`；
+/// 非 2xx、3xx、传输失败都返回错误。超时限制在 1–5s，避免恢复流程被慢节点拖住。
+pub fn probe_remote_health(endpoint: &RemoteEndpoint) -> Result<(), String> {
+    endpoint.validate().map_err(|error| error.to_string())?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(
+            endpoint.timeout_secs.clamp(1, HEALTH_REQUEST_TIMEOUT_SECS),
+        ))
+        .redirects(0)
+        .build();
+    let url = endpoint_origin_url(&endpoint.url, HEALTH_PATH);
+    let mut call = agent.get(&url);
+    if let Some(token) = endpoint.auth_token.as_deref() {
+        call = call.set("Authorization", &format!("Bearer {token}"));
+    }
+    match call.call() {
+        Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+        Ok(response) => Err(format!("health rejected with HTTP {}", response.status())),
+        Err(ureq::Error::Status(code, _)) => Err(format!("health rejected with HTTP {code}")),
+        Err(ureq::Error::Transport(error)) => Err(format!("health transport: {error}")),
+    }
+}
+
 /// 服务端取消入口：`POST <endpoint>/cancel` + `X-Trit-Idempotency: <task>@<epoch>`。
 pub const CANCEL_PATH: &str = "/cancel";
+
+/// 服务端健康探测入口：`GET <endpoint>/health`，沿用同一 Bearer 鉴权。
+pub const HEALTH_PATH: &str = "/health";
 
 /// 取消轮询步长。
 const CLIENT_CANCEL_POLL: Duration = Duration::from_millis(25);
@@ -378,6 +414,9 @@ const CLIENT_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// 取消请求自身的短超时，避免取消动作把调用方拖住。
 const CANCEL_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// 健康探测自身的短超时；恢复流程不应被慢节点拖住。
+const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 /// 没有合法响应时的保守结局：digest 为空，token 记 0，绝不伪装成完成。
 fn unresolved(request: &SubagentRequest, status: DelegationStatus) -> DelegationResult {

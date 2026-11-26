@@ -1,7 +1,7 @@
 //! 远程子 agent 的**参考服务端**：HTTP/1.1 单帧 POST。
 //!
-//! 只实现一条最小、可审计的线：`POST <path>`，请求体是一帧，回一帧，
-//! `Connection: close`。不是通用 HTTP 服务器，也不做长连接 / 分块 / 重定向。
+//! 除只读 `GET /health` 外，只实现一条最小、可审计的线：`POST <path>`，请求体是一帧，
+//! 回一帧，`Connection: close`。不是通用 HTTP 服务器，也不做长连接 / 分块 / 重定向。
 //!
 //! 不变量：
 //!
@@ -43,6 +43,9 @@
 //!     与 Exec 子进程；到点先标记 `timed_out` 再取消同一令牌，最终强制 `Aborted`、
 //!     跳过 complete 与本地缓存，并带 `X-Trit-Deadline-Exceeded: 1` 让调度层
 //!     区分“节点失联”与“节点健康但请求超预算”。
+//! 12. **健康探测只读**：`GET /health` 沿用同一 Bearer 鉴权，鉴权通过即回 200 空体；
+//!     不解析任务帧、不读写幂等缓存/账本、不执行任务，供 `remote-plan --probe`
+//!     在重新放行隔离节点前做一次轻量可达性检查。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -59,7 +62,7 @@ use trit_orch::{
 
 use crate::remote_ledger::{self, Claim};
 use crate::remote_subagent::{
-    CANCEL_PATH, DEADLINE_EXCEEDED_HEADER, LEASE_LOST_HEADER, idempotency_scope,
+    CANCEL_PATH, DEADLINE_EXCEEDED_HEADER, HEALTH_PATH, LEASE_LOST_HEADER, idempotency_scope,
 };
 use crate::subagent_process::{SubagentProcessConfig, run_subagent_reply_cancellable};
 
@@ -502,7 +505,8 @@ fn handle(
     if method.is_empty() || path.is_empty() {
         return respond(&mut stream, 400, "Bad Request", b"");
     }
-    if method != "POST" {
+    let is_health = method == "GET" && path == HEALTH_PATH;
+    if method != "POST" && !is_health {
         return respond(&mut stream, 405, "Method Not Allowed", b"");
     }
 
@@ -532,18 +536,23 @@ fn handle(
         }
     }
 
-    let Some(length) = content_length else {
-        return respond(&mut stream, 411, "Length Required", b"");
-    };
-    if length > MAX_FRAME_BYTES + 4 {
-        return respond(&mut stream, 413, "Payload Too Large", b"");
-    }
-
     if let Some(token) = config.token.as_deref() {
         // 参考实现：按字节相等比较；旁路/时序防护不在本层。
         if authorization.as_deref() != Some(&format!("Bearer {token}")) {
             return respond(&mut stream, 401, "Unauthorized", b"");
         }
+    }
+
+    if is_health {
+        // 只报存活与鉴权通过；不派发任务、不读取/登记幂等状态。
+        return respond(&mut stream, 200, "OK", b"");
+    }
+
+    let Some(length) = content_length else {
+        return respond(&mut stream, 411, "Length Required", b"");
+    };
+    if length > MAX_FRAME_BYTES + 4 {
+        return respond(&mut stream, 413, "Payload Too Large", b"");
     }
 
     if path == CANCEL_PATH {

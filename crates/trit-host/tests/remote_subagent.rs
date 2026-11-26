@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use trit_host::{
     FRAME_CONTENT_TYPE, IDEMPOTENCY_HEADER, MAX_RESPONSE_BYTES, RemoteServer, RemoteServerConfig,
-    run_remote_subagent, run_remote_subagent_reply, run_remote_subagent_reply_cancellable,
-    run_remote_subagent_reply_scoped,
+    probe_remote_health, run_remote_subagent, run_remote_subagent_reply,
+    run_remote_subagent_reply_cancellable, run_remote_subagent_reply_scoped,
 };
 use trit_orch::{
     AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint,
@@ -438,6 +438,33 @@ fn request_deadline_aborts_cli_slow_request() {
         started.elapsed()
     );
     let _ = child.wait();
+}
+
+#[test]
+fn health_probe_is_authenticated_and_does_not_execute() {
+    let server = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_token("t")
+            .with_sleep_ms(2000),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", server.addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        server.serve_once().unwrap();
+        server.serve_once().unwrap();
+    });
+
+    let started = Instant::now();
+    probe_remote_health(&endpoint(&url, Some("t"), 5)).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "health probe must not enter the 2s sleep path: {:?}",
+        started.elapsed()
+    );
+
+    let error = probe_remote_health(&endpoint(&url, None, 5)).unwrap_err();
+    assert!(error.contains("401"), "{error}");
+    handle.join().unwrap();
 }
 
 #[test]

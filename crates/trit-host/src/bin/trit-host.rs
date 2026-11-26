@@ -1330,7 +1330,7 @@ fn usage() {
          [--once] [--max-connections N] [--ledger <url>] [--ledger-token <t>] \\\n\
          [--ledger-timeout-secs N] [--ledger-renew-ms N]\n\
          executable endpoint: spawns subagent-run per request (stdin/stdout frames).\n\n\
-         remote-plan: trit-host remote-plan [--input <json|->] [--health <path>]\n\
+         remote-plan: trit-host remote-plan [--input <json|->] [--health <path>] [--probe]\n\
          cross-machine drill: reads {{revision,tasks,nodes,workers?,failure_threshold?,retry_limit?,scope?}},\n\
          dispatches tasks as read-only subagent requests to the static node table, prints JSON."
     );
@@ -1683,16 +1683,22 @@ fn run_remote_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 /// 使用不同值。任务按 `TaskSpec` 反序列化，节点按 `RemoteNode` 反序列化；
 /// 每个任务都映射成只读 subagent 请求（capsule 的 `goal` 取任务引导或任务 ID），
 /// 由 `run_remote_plan` 复用 fleet 调度并输出 JSON 报告（含每次尝试与节点快照）。
+/// `--probe` 会在加载健康文件后对已隔离节点做一次 `GET /health`，成功才重新放行。
 /// 这是演练入口，不自带真实模型：远端需要能执行 subagent 帧的服务端。
 fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut input_path: Option<String> = None;
     let mut health_path: Option<String> = None;
+    let mut probe = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--input" => input_path = Some(next(&mut args, "--input")?),
             "--health" => health_path = Some(next(&mut args, "--health")?),
+            "--probe" => probe = true,
             other => return Err(fail(format!("unknown remote-plan argument: {other}"))),
         }
+    }
+    if probe && health_path.is_none() {
+        return Err(fail("--probe requires --health <path>"));
     }
     let text = match input_path.as_deref() {
         None | Some("-") => {
@@ -1714,16 +1720,43 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
     if let Some(scope) = input.scope {
         config = config.with_scope(scope);
     }
+    let nodes = input.nodes;
     let mut table =
-        trit_orch::NodeTable::new(input.nodes)?.with_failure_threshold(input.failure_threshold);
+        trit_orch::NodeTable::new(nodes.clone())?.with_failure_threshold(input.failure_threshold);
+    let mut snapshots = Vec::new();
     if let Some(path) = health_path.as_deref()
         && Path::new(path).exists()
     {
         let text = std::fs::read_to_string(path)
             .map_err(|error| fail(format!("read health file {path}: {error}")))?;
-        let snapshots: Vec<trit_orch::NodeSnapshot> = serde_json::from_str(&text)
+        snapshots = serde_json::from_str(&text)
             .map_err(|error| fail(format!("parse health file {path}: {error}")))?;
         table = table.with_snapshots(&snapshots);
+    }
+    let mut probes = Vec::new();
+    if probe {
+        // 只探已隔离节点；成功才放行，失败保持隔离并记录原因。
+        for snapshot in snapshots.iter().filter(|snapshot| !snapshot.healthy) {
+            let Some(node) = nodes.iter().find(|node| node.id == snapshot.id) else {
+                continue;
+            };
+            match trit_host::probe_remote_health(&node.endpoint) {
+                Ok(()) => {
+                    let readmitted = table.readmit(&node.id);
+                    probes.push(serde_json::json!({
+                        "node": snapshot.id,
+                        "ok": true,
+                        "readmitted": readmitted,
+                    }));
+                }
+                Err(error) => probes.push(serde_json::json!({
+                    "node": snapshot.id,
+                    "ok": false,
+                    "readmitted": false,
+                    "error": error,
+                })),
+            }
+        }
     }
     let table = Arc::new(table);
     let report = trit_host::run_remote_plan_with_table(
@@ -1752,6 +1785,7 @@ fn run_remote_plan_cli(mut args: impl Iterator<Item = String>) -> Result<(), Box
         "assignments": report.assignments,
         "attempts": report.attempts,
         "nodes": report.nodes,
+        "probes": probes,
         "metrics": report.report.metrics,
     });
     println!("{}", serde_json::to_string_pretty(&value)?);
