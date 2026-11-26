@@ -31,8 +31,15 @@ MCP 服务端返回的 `annotations.readOnlyHint` 是**对端自报**，不可�
 快路径之前），与 `write_file` / `move_path` 的路径校验分开。没有 claim 时，
 shell 仍受 `allow_shell` / `allow_unsandboxed_shell` / 沙箱约束。
 
+## 快照与回滚
+
+- checkpoint 快照先逐段拒绝符号链接祖先，再以 cap-std `Dir` + `FollowSymlinks::No`
+  读取；最终路径是符号链接时跳过。单文件上限 8 MiB，超限 fail-closed，不会把大文件
+  静默记成“不存在”。
+- mutation journal 的备份与回滚同样走 cap-std；路径与备份文件名都只接受单段归一化
+  名称，回滚拒绝符号链接父目录。
+
 ## 已知待补
 
-- 写前快照与 mutation journal 回滚仍用 `std::fs`，会跟随父符号链接；
-  需要统一改为 cap-std `Dir` + 逐段祖先检查（见安全审计第 2 项）。
 - 远程执行面需要 token / Host / Origin 与保留路径名校验（审计第 5 项）。
+- git journal 的 `backup` 字段与控制面文件完整性校验（审计第 6 项）。
