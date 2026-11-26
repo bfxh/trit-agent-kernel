@@ -436,6 +436,39 @@ where
 /// 单次健康扫描最多并行探测多少个节点；避免一个超大节点表瞬间打满连接/线程。
 pub const MAX_HEALTH_PROBE_CONCURRENCY: usize = 64;
 
+/// 在目标集合上执行有界并行探测，最多 `concurrency` 个线程。
+///
+/// 这是 `remote-health` 与演练内监控共用的调度器：只负责按索引取任务、限制
+/// 并发和回收线程，结果由 `probe` 自行保存。调用方应先按节点 id 排序
+/// `targets`，并在 `probe` 内自行保证结果顺序确定；`concurrency` 会被夹到
+/// `1..=MAX_HEALTH_PROBE_CONCURRENCY`，且不超过目标数。
+fn probe_targets_in_parallel<T: Sync>(
+    targets: &[T],
+    concurrency: usize,
+    probe: impl Fn(usize, &T) + Sync,
+) {
+    let workers = concurrency
+        .clamp(1, MAX_HEALTH_PROBE_CONCURRENCY)
+        .min(targets.len());
+    if workers == 0 {
+        return;
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(target) = targets.get(index) else {
+                        break;
+                    };
+                    probe(index, target);
+                }
+            });
+        }
+    });
+}
+
 /// 对节点健康文件做一次独立扫描：只探测已隔离节点，成功即写回 `healthy`。
 ///
 /// 与演练内的周期监控不同，本函数不依赖 `remote-plan` 进程：调用方可以按
@@ -508,27 +541,12 @@ pub fn probe_remote_health_file_with_concurrency(
         .collect();
     targets.sort_by(|left, right| left.1.id.cmp(&right.1.id));
     let outcomes = Mutex::new(vec![None; targets.len()]);
-    let next = AtomicUsize::new(0);
-    let workers = concurrency.min(targets.len());
-    if workers > 0 {
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| {
-                    loop {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((_, node)) = targets.get(index) else {
-                            break;
-                        };
-                        let outcome = probe_remote_health(&node.endpoint);
-                        outcomes
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
-                            Some(outcome);
-                    }
-                });
-            }
-        });
-    }
+    probe_targets_in_parallel(&targets, concurrency, |index, (_, node)| {
+        outcomes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())[index] =
+            Some(probe_remote_health(&node.endpoint));
+    });
     let outcomes = outcomes
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -797,41 +815,27 @@ fn probe_isolated_nodes(
     }
 
     let events = Mutex::new(Vec::with_capacity(targets.len()));
-    let next = AtomicUsize::new(0);
-    let workers = concurrency
-        .clamp(1, MAX_HEALTH_PROBE_CONCURRENCY)
-        .min(targets.len());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(node) = targets.get(index) else {
-                        break;
-                    };
-                    let event = match probe_remote_health(&node.endpoint) {
-                        Ok(()) => RemoteProbeEvent {
-                            node: node.id.clone(),
-                            phase,
-                            ok: true,
-                            readmitted: table.readmit(&node.id),
-                            error: None,
-                        },
-                        Err(error) => RemoteProbeEvent {
-                            node: node.id.clone(),
-                            phase,
-                            ok: false,
-                            readmitted: false,
-                            error: Some(error),
-                        },
-                    };
-                    events
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push(event);
-                }
-            });
-        }
+    probe_targets_in_parallel(&targets, concurrency, |_, node| {
+        let event = match probe_remote_health(&node.endpoint) {
+            Ok(()) => RemoteProbeEvent {
+                node: node.id.clone(),
+                phase,
+                ok: true,
+                readmitted: table.readmit(&node.id),
+                error: None,
+            },
+            Err(error) => RemoteProbeEvent {
+                node: node.id.clone(),
+                phase,
+                ok: false,
+                readmitted: false,
+                error: Some(error),
+            },
+        };
+        events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event);
     });
     let mut events = events
         .into_inner()
