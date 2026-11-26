@@ -9,6 +9,9 @@
 //!   - `409`：另一执行者持有该键（[`Claim::Pending`]）；
 //!   - `503`：账本已满或内部错误。
 //! - `POST /complete`，同一个头 + 一帧响应：登记完成；`204` 接受（重复完成幂等）。
+//! - `POST /renew`，同一个头、空体：把该键的占位租约重置为当前时间，`204`；
+//!   已完成返回 `204`，未知键返回 `404`。用于执行时间超过 `pending_ttl` 的任务，
+//!   避免另一个节点误判过期而并发执行。
 //!
 //! 占位有 TTL（默认 60s）：执行者崩溃后，过期占位可以被接管。账本只保存响应帧，
 //! 不执行任务；它是跨机重试的协调点，不是任务队列。
@@ -290,6 +293,19 @@ fn handle(
     };
 
     match path {
+        "/renew" => {
+            if !body.is_empty() {
+                return respond(&mut stream, 400, "Bad Request", b"");
+            }
+            let server = LedgerServerView { state, config };
+            match server.renew(&key) {
+                Ok(RenewOutcome::Renewed | RenewOutcome::AlreadyDone) => {
+                    respond(&mut stream, 204, "No Content", b"")
+                }
+                Ok(RenewOutcome::Unknown) => respond(&mut stream, 404, "Not Found", b""),
+                Err(()) => respond(&mut stream, 503, "Service Unavailable", b""),
+            }
+        }
         "/claim" => {
             let server = LedgerServerView { state, config };
             match server.claim(&key) {
@@ -330,7 +346,27 @@ struct LedgerServerView<'a> {
     config: &'a LedgerServerConfig,
 }
 
+enum RenewOutcome {
+    Renewed,
+    AlreadyDone,
+    Unknown,
+}
+
 impl LedgerServerView<'_> {
+    /// 延长占位租约；已完成视为成功，未知键返回 404。
+    fn renew(&self, key: &str) -> Result<RenewOutcome, ()> {
+        let now = Instant::now();
+        let mut state = self.state.lock().map_err(|_| ())?;
+        match state.entries.get_mut(key) {
+            Some(Entry::Pending { since }) => {
+                *since = now;
+                Ok(RenewOutcome::Renewed)
+            }
+            Some(Entry::Done { .. }) => Ok(RenewOutcome::AlreadyDone),
+            None => Ok(RenewOutcome::Unknown),
+        }
+    }
+
     fn claim(&self, key: &str) -> Result<Claim, ()> {
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| ())?;
@@ -672,6 +708,16 @@ pub fn claim(endpoint: &RemoteEndpoint, key: &str) -> Result<Claim, String> {
         200 => Ok(Claim::Done(body)),
         409 => Ok(Claim::Pending),
         other => Err(format!("ledger claim returned HTTP {other}")),
+    }
+}
+
+/// 账本客户端：延长一个占位租约。已完成或未知键不会延长，后者返回错误。
+pub fn renew(endpoint: &RemoteEndpoint, key: &str) -> Result<(), String> {
+    let (status, _) = post(endpoint, "/renew", key, None)?;
+    match status {
+        200 | 204 => Ok(()),
+        404 => Err("ledger renew: unknown key".into()),
+        other => Err(format!("ledger renew returned HTTP {other}")),
     }
 }
 

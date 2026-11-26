@@ -347,6 +347,87 @@ fn state_file_respects_byte_budget_and_compacts() {
 }
 
 #[test]
+fn renew_extends_pending_lease() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_millis(100)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::New
+    );
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(60));
+        remote_ledger::renew(&ledger_endpoint, "t1@0").unwrap();
+    }
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::Pending,
+        "renewed lease must still be owned"
+    );
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::New,
+        "lease must expire after renewals stop"
+    );
+    assert!(
+        remote_ledger::renew(&ledger_endpoint, "never-claimed").is_err(),
+        "unknown keys are not renewable"
+    );
+}
+
+#[test]
+fn slow_remote_execution_heartbeat_prevents_lease_takeover() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_millis(150)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let node = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(500)
+            .with_ledger(ledger_endpoint.clone())
+            .with_ledger_renew_interval(Duration::from_millis(40)),
+    )
+    .unwrap();
+    let url = format!("http://{}/run", node.addr().unwrap());
+    let server = thread::spawn(move || node.serve_once().unwrap());
+    let endpoint_for_call = endpoint(&url, None, 30);
+    let request_for_call = request();
+    let client = thread::spawn(move || run_remote_subagent(&endpoint_for_call, &request_for_call));
+
+    // 执行总耗时 500ms，占位 TTL 只有 150ms；心跳必须让 lease 一直有效。
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::Pending,
+        "a live execution must keep its ledger lease"
+    );
+    let result = client.join().unwrap().unwrap();
+    assert!(result.reusable(), "{:?}", result.status);
+    server.join().unwrap();
+    assert!(matches!(
+        remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap(),
+        Claim::Done(_)
+    ));
+    assert_eq!(ledger.completions(), 1);
+}
+
+#[test]
 fn unreachable_ledger_fails_closed_without_executing() {
     let dead_port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

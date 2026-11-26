@@ -29,7 +29,10 @@
 //!    取消进程跑法直接 kill 子进程。取消回合法 `Aborted` 帧，并照常登记
 //!    账本/本地缓存，避免后续重试再次执行同一键；
 //! 9. **连接有界**：`max_connections` 默认 64；超额连接直接 503，不排队、不 spawn，
-//!    防止慢客户端把服务端线程与内存堆爆。
+//!    防止慢客户端把服务端线程与内存堆爆；
+//! 10. **在途租约续约**：拿到账本占位后按 `ledger_renew_interval`（默认 10s）后台
+//!     调用 `/renew`，执行超过 `pending_ttl` 也不会被其他节点误判过期；完成/取消
+//!     时停止心跳。续约只延长当前占位，不做 owner token，网络分区下仍需人工兜底。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -57,6 +60,9 @@ const MAX_PRE_CANCELLED: usize = 1024;
 
 /// 同时在处理的连接上限（参考实现；可通过 `--max-connections` 调整）。
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
+/// 账本占位租约的默认续约间隔；应小于账本 `pending_ttl`。
+const DEFAULT_LEDGER_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 连接上的读写超时：防止半开的客户端长期占住服务线程。
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -178,6 +184,39 @@ impl Drop for ConnectionSlot {
     }
 }
 
+/// 账本租约心跳：Drop 时关闭通道，后台线程退出；不 join，避免卡住完成响应。
+struct LedgerHeartbeat {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Drop for LedgerHeartbeat {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+    }
+}
+
+fn start_ledger_heartbeat(
+    endpoint: RemoteEndpoint,
+    key: String,
+    interval: Duration,
+) -> Option<LedgerHeartbeat> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("trit-ledger-heartbeat".into())
+        .spawn(move || {
+            loop {
+                match receiver.recv_timeout(interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = remote_ledger::renew(&endpoint, &key);
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(LedgerHeartbeat { stop: Some(sender) })
+}
+
 /// 服务端应答模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteMode {
@@ -204,6 +243,8 @@ pub struct RemoteServerConfig {
     pub sleep_ms: u64,
     /// 可选的共享幂等账本；配置后带键请求以账本为准，本地缓存不再参与。
     pub ledger: Option<RemoteEndpoint>,
+    /// 账本占位租约的续约间隔；执行时间可能超过 `pending_ttl` 时必须小于它。
+    pub ledger_renew_interval: Duration,
     /// `Exec` 模式下的子 agent 进程配置；其他模式必须为空。
     pub exec: Option<SubagentProcessConfig>,
     /// `Exec` 模式下按任务隔离的 workspace 根：请求的任务 ID 作为子目录，
@@ -221,6 +262,7 @@ impl RemoteServerConfig {
             mode: RemoteMode::Echo,
             sleep_ms: 0,
             ledger: None,
+            ledger_renew_interval: DEFAULT_LEDGER_RENEW_INTERVAL,
             exec: None,
             exec_workspace_root: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -244,6 +286,11 @@ impl RemoteServerConfig {
 
     pub fn with_ledger(mut self, ledger: RemoteEndpoint) -> Self {
         self.ledger = Some(ledger);
+        self
+    }
+
+    pub fn with_ledger_renew_interval(mut self, interval: Duration) -> Self {
+        self.ledger_renew_interval = interval;
         self
     }
 
@@ -281,6 +328,12 @@ impl RemoteServer {
             ledger.validate().map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
             })?;
+        }
+        if config.ledger.is_some() && config.ledger_renew_interval.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ledger renew interval must be positive",
+            ));
         }
         match (config.mode, config.exec.is_some()) {
             (RemoteMode::Exec, false) => {
@@ -492,6 +545,14 @@ fn handle(
             return respond(&mut stream, 200, "OK", &frame);
         }
     }
+
+    let _heartbeat = if ledger_owned {
+        config.ledger.as_ref().and_then(|endpoint| {
+            start_ledger_heartbeat(endpoint.clone(), key.clone(), config.ledger_renew_interval)
+        })
+    } else {
+        None
+    };
 
     let cancelled = if config.sleep_ms > 0 {
         sleep_unless_cancelled(config.sleep_ms, token)

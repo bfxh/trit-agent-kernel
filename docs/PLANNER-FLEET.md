@@ -195,24 +195,30 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   只允许 ASCII 字母数字、`-`、`_`、`.`，含路径分隔符或为 `.`/`..` 时直接回
   `Failed`、不创建目录。同一计划内任务 ID 仍需唯一；不同计划靠 scope 隔离。
 - 共享幂等账本 `trit_host::remote_ledger`（CLI `trit-host remote-ledger`）：
-  `POST /claim` + `POST /complete`，键是 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`；
+  `POST /claim` + `POST /renew` + `POST /complete`，键是
+  `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`；
   complete 校验 `task@epoch` 后缀并保留 scope，因此同名任务在不同 scope 下各有
   独立的 claim/完成记录。
   claim 返回 `200` 空体 = 获得执行权，`200` + 帧 = 已完成、直接回放，`409` = 他人
   持有；complete 用同一帧登记（`204`，重复登记幂等）。占位 TTL 默认 60s，过期
-  允许接管；容量有键数（默认 4096）与字节（默认 64 MiB，`--max-state-bytes`）
+  允许接管；执行中的节点按 `ledger_renew_interval`（默认 10s，`--ledger-renew-ms`）
+  `POST /renew` 延长租约，未知键 404、已完成 204，因此长任务不会被误判过期；
+  续约没有 owner token，网络分区后的接管仍需人工兜底。
+  容量有键数（默认 4096）与字节（默认 64 MiB，`--max-state-bytes`）
   双重上限，超出按 key 顺序淘汰已完成项。`--state <path>` 打开追加日志，
   complete 先落盘再登记（写盘失败回 5xx），重启时回放最后 `max_entries` 条并
   按字节上限裁剪；物理日志超过逻辑上限 1.5 倍时压缩为当前快照（临时文件 +
   原子替换，启动时从残留 `.compact` 恢复），已完成任务不会再执行；占位不落盘，
   崩溃后按 TTL 语义重新可执行。
   `remote-echo --ledger <url>` 接入后，带键请求以账本为权威：账本不可达回 503
-  且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权。
+  且不执行；执行后 complete 失败也回 5xx。`--ledger-token` 用于 Bearer 鉴权，
+  `--ledger-renew-ms` 调整续约间隔（必须小于账本 TTL）。
 
 回归在 `crates/trit-host/tests/remote_subagent.rs`：loopback 服务端与真实
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
-503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、共享账本下双节点只执行一次、账本不可达
+503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
+慢执行期间不被接管、共享账本下双节点只执行一次、账本不可达
 时 fail-closed，以及落盘账本重启回放、字节上限淘汰与压缩；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
