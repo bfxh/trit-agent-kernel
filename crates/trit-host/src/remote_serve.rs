@@ -33,10 +33,11 @@
 //! 10. **在途租约续约与持有者令牌**：拿到账本占位后按 `ledger_renew_interval`
 //!     （默认 10s）后台调用 `/renew`，执行超过 `pending_ttl` 也不会被其他节点
 //!     误判过期；`/renew` 与 `/complete` 都携带 claim 返回的 `X-Trit-Lease`，
-//!     过期接管后旧持有者不能再续租或写完成。心跳收到 `403`/`404` 会立即置位
-//!     取消令牌：睡眠与 Exec 子进程都被中止，服务端回 `Aborted` 且不登记完成，
-//!     避免旧持有者继续做无效副作用。网络分区导致心跳请求完全无法送达时，旧
-//!     执行者仍可能在本地跑完，这部分需任务幂等兜底。
+//!     过期接管后旧持有者不能再续租或写完成。心跳收到 `403`/`404` 或已完成标记
+//!     会立即置位取消令牌：睡眠与 Exec 子进程都被中止，服务端回 `Aborted`（带
+//!     `X-Trit-Lease-Lost: 1`）且不登记完成，避免旧持有者继续做无效副作用。网络
+//!     分区导致心跳请求完全无法送达时，旧执行者仍可能在本地跑完，这部分需任务
+//!     幂等兜底。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -52,7 +53,7 @@ use trit_orch::{
 };
 
 use crate::remote_ledger::{self, Claim};
-use crate::remote_subagent::{CANCEL_PATH, idempotency_scope};
+use crate::remote_subagent::{CANCEL_PATH, LEASE_LOST_HEADER, idempotency_scope};
 use crate::subagent_process::{
     SubagentProcessConfig, run_subagent_reply, run_subagent_reply_cancellable,
 };
@@ -220,9 +221,10 @@ fn start_ledger_heartbeat(
                             Ok(()) => {}
                             Err(
                                 remote_ledger::RenewError::LeaseLost
-                                | remote_ledger::RenewError::UnknownKey,
+                                | remote_ledger::RenewError::UnknownKey
+                                | remote_ledger::RenewError::Completed,
                             ) => {
-                                // 租约已被接管或账本重启后遗忘：停止本地执行，避免重复副作用。
+                                // 租约被接管、账本遗忘该键或任务已完成：停止本地执行，避免重复副作用。
                                 lease_lost.store(true, Ordering::SeqCst);
                                 cancel.cancel();
                                 break;
@@ -686,6 +688,9 @@ fn handle(
         }
         guard.insert(key, response);
     }
+    if lease_lost_now {
+        return respond_lease_lost(&mut stream, &frame);
+    }
     respond(&mut stream, 200, "OK", &frame)
 }
 
@@ -791,6 +796,18 @@ fn respond_aborted(stream: &mut TcpStream, request: &SubagentRequest) -> std::io
     };
     let frame = encode_frame(&response).map_err(std::io::Error::other)?;
     respond(stream, 200, "OK", &frame)
+}
+
+/// 租约被接管后返回合法 `Aborted` 帧，并标记“不是节点故障”。
+fn respond_lease_lost(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{LEASE_LOST_HEADER}: 1\r\nConnection: close\r\n\r\n",
+        crate::remote_subagent::FRAME_CONTENT_TYPE,
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 /// 写一个带长度与 `Connection: close` 的响应。

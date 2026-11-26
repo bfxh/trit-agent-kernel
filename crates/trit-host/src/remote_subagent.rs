@@ -17,7 +17,10 @@
 //! 5. **不自动重试**：远程可能已经执行过，重试需要幂等键；本模块不做隐式重试；
 //! 6. **取消是通知**：可取消版本等待期间发现令牌置位，会向端点 origin 的
 //!    `/cancel` 发同一幂等键；最多等 2s 收尾后按 `Aborted` 返回。对端未实现
-//!    `/cancel` 时远端仍可能执行完，调用方不能把 `Aborted` 当作“一定没写”。
+//!    `/cancel` 时远端仍可能执行完，调用方不能把 `Aborted` 当作“一定没写”；
+//! 7. **租约丢失不是节点故障**：服务端因账本租约被接管而中止时，会在合法
+//!    `Aborted` 帧旁带 `X-Trit-Lease-Lost: 1`；[`RemoteReply::lease_lost`] 供
+//!    调度层区分“节点不可用”与“任务已由其他持有者接手”。
 
 use std::io::Read;
 use std::time::Duration;
@@ -39,6 +42,10 @@ pub const FRAME_CONTENT_TYPE: &str = "application/x-trit-frame";
 /// 首次响应）。没有这个头时服务端按普通请求处理，不去重。不同计划即使任务 ID
 /// 相同，也通过 `scope` 隔离，避免账本/缓存互相回放。
 pub const IDEMPOTENCY_HEADER: &str = "X-Trit-Idempotency";
+
+/// 租约丢失标记头：服务端因账本租约被接管而中止本机执行时置 `1`。
+/// 客户端据此区分“节点故障”与“同一任务已由其他持有者接手”，后者不应隔离节点。
+pub const LEASE_LOST_HEADER: &str = "X-Trit-Lease-Lost";
 
 /// 计划作用域与帧键之间的分隔符；作用域本身不允许包含它。
 pub const IDEMPOTENCY_SCOPE_SEPARATOR: char = '|';
@@ -109,6 +116,8 @@ pub const MAX_RESPONSE_BYTES: usize = MAX_FRAME_BYTES + 4;
 pub struct RemoteReply {
     pub result: DelegationResult,
     pub content: Vec<u8>,
+    /// 服务端因账本租约被其他持有者接管而中止：节点仍健康，任务应由当前持有者完成。
+    pub lease_lost: bool,
 }
 
 /// 把请求帧 POST 到 `endpoint`，把合法响应映射成稳定结果引用。
@@ -190,6 +199,7 @@ pub fn run_remote_subagent_reply_scoped(
             },
         ));
     }
+    let lease_lost_header = response.header(LEASE_LOST_HEADER) == Some("1");
 
     let mut body = Vec::new();
     // 读到一半断开同样算传输失败：对端是否执行过无法判定，按 Aborted 处理。
@@ -214,6 +224,8 @@ pub fn run_remote_subagent_reply_scoped(
     match decode_frame::<SubagentResponse>(&mut body) {
         Ok(Some(response)) => {
             response.validate_for(request)?;
+            let lease_lost =
+                lease_lost_header && matches!(&response.status, DelegationStatus::Aborted);
             let result = DelegationResult {
                 task: response.task,
                 epoch: response.epoch,
@@ -224,6 +236,7 @@ pub fn run_remote_subagent_reply_scoped(
             Ok(RemoteReply {
                 result,
                 content: response.content,
+                lease_lost,
             })
         }
         Ok(None) if body.is_empty() => Ok(unresolved_reply(
@@ -368,5 +381,6 @@ fn unresolved_reply(request: &SubagentRequest, status: DelegationStatus) -> Remo
     RemoteReply {
         result: unresolved(request, status),
         content: Vec::new(),
+        lease_lost: false,
     }
 }

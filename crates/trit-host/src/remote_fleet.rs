@@ -13,10 +13,13 @@
 //! - `results` 保留远端自报的精确状态：远端 `Aborted` 不会在汇总里被改写成
 //!   `Failed`（[`FleetReport::results`] 仍按 runtime 的 Ok/Err 视图记录）；
 //! - 节点级失败（传输/超时/协议违约/远端中止）按 `failure_threshold` 隔离该节点，
-//!   任务级失败（远端回了 `Failed`）不牵连节点健康度；
-//! - 节点级失败最多换节点重试 `retry_limit` 次（默认 0）。重试复用同一个幂等键
-//!   `X-Trit-Idempotency: task@epoch`，因此要求服务端去重；任务级失败与
-//!   `Deferred` 不重试。每次尝试（节点 + 结局）记进 [`RemotePlanReport::attempts`]。
+//!   任务级失败（远端回了 `Failed`）不牵连节点健康度；远端带
+//!   `X-Trit-Lease-Lost` 的 `Aborted` 表示任务已被其他账本持有者接手，记
+//!   `NodeOutcome::Superseded`，节点仍健康，任务按重试预算等待新结果；
+//! - 节点级失败与租约被接管最多换节点重试 `retry_limit` 次（默认 0）。重试复用
+//!   同一个幂等键 `X-Trit-Idempotency: task@epoch`，因此要求服务端去重；任务级
+//!   失败与 `Deferred` 不重试。每次尝试（节点 + 结局）记进
+//!   [`RemotePlanReport::attempts`]。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -49,10 +52,11 @@ pub struct RemotePlanConfig {
     pub workers: usize,
     /// 节点连续失败多少次后隔离（默认 1）。
     pub failure_threshold: u32,
-    /// 节点级失败后最多换节点重试几次（默认 0，即不重试）。
+    /// 节点级失败或租约被接管后最多换节点重试几次（默认 0，即不重试）。
     ///
     /// 只有在服务端按 `X-Trit-Idempotency: [scope|]task@epoch` 去重时，重试才是安全的；
-    /// 参考实现 `remote-echo` 会去重。任务级 `Failed` 永远不重试。
+    /// 参考实现 `remote-echo` 会去重。任务级 `Failed` 永远不重试；租约被接管的
+    /// 节点不记故障，重试会等待当前持有者完成并回放其结果。
     pub retry_limit: u32,
     /// 计划作用域：不同计划用不同值，避免同名任务在共享账本/workspace 中碰撞。
     /// `None` 保持旧的 `task@epoch` 键与 `<root>/<task>` 目录。
@@ -208,35 +212,43 @@ where
                         }
                         let status = reply.result.status.clone();
                         record_attempt(&attempts, &task_id, &node_id, &status);
-                        match &status {
-                            DelegationStatus::Completed => {
-                                lease.finish(NodeOutcome::Succeeded);
-                                return Ok(FleetOutput {
-                                    content: reply.content,
-                                    tokens: reply.result.tokens,
-                                });
-                            }
-                            // 对端明确回了 Failed：任务失败，但节点仍健康，不重试。
-                            DelegationStatus::Failed { message } => {
-                                lease.finish(NodeOutcome::TaskFailed);
-                                return Err(format!("remote node {node_id}: {message}"));
-                            }
-                            // 用户取消：不把节点判成故障，也不换节点重试。
-                            DelegationStatus::Aborted if cancel.is_cancelled() => {
-                                lease.finish(NodeOutcome::Abandoned);
-                                return Err("remote plan cancelled".into());
-                            }
-                            // 没有合法响应：节点是否还能服务无法确认，可换节点重试。
-                            DelegationStatus::Aborted => {
-                                lease.finish(NodeOutcome::NodeFailed);
-                                last_error = Some(format!(
-                                    "remote node {node_id} aborted without a response"
-                                ));
-                            }
-                            // 远端不该回 Deferred；按协议违约处理，不重试。
-                            DelegationStatus::Deferred => {
-                                lease.finish(NodeOutcome::NodeFailed);
-                                return Err(format!("remote node {node_id} returned Deferred"));
+                        if reply.lease_lost {
+                            // 同一任务已被其他持有者接管：节点健康，任务等待新持有者。
+                            lease.finish(NodeOutcome::Superseded);
+                            last_error = Some(format!(
+                                "remote node {node_id} lost the ledger lease to another owner"
+                            ));
+                        } else {
+                            match &status {
+                                DelegationStatus::Completed => {
+                                    lease.finish(NodeOutcome::Succeeded);
+                                    return Ok(FleetOutput {
+                                        content: reply.content,
+                                        tokens: reply.result.tokens,
+                                    });
+                                }
+                                // 对端明确回了 Failed：任务失败，但节点仍健康，不重试。
+                                DelegationStatus::Failed { message } => {
+                                    lease.finish(NodeOutcome::TaskFailed);
+                                    return Err(format!("remote node {node_id}: {message}"));
+                                }
+                                // 用户取消：不把节点判成故障，也不换节点重试。
+                                DelegationStatus::Aborted if cancel.is_cancelled() => {
+                                    lease.finish(NodeOutcome::Abandoned);
+                                    return Err("remote plan cancelled".into());
+                                }
+                                // 没有合法响应：节点是否还能服务无法确认，可换节点重试。
+                                DelegationStatus::Aborted => {
+                                    lease.finish(NodeOutcome::NodeFailed);
+                                    last_error = Some(format!(
+                                        "remote node {node_id} aborted without a response"
+                                    ));
+                                }
+                                // 远端不该回 Deferred；按协议违约处理，不重试。
+                                DelegationStatus::Deferred => {
+                                    lease.finish(NodeOutcome::NodeFailed);
+                                    return Err(format!("remote node {node_id} returned Deferred"));
+                                }
                             }
                         }
                     }
@@ -254,7 +266,8 @@ where
                     }
                 }
 
-                // 能走到这里只有节点级失败（Aborted / 传输错误）：隔离该节点后重试。
+                // 能走到这里只有节点级失败（Aborted / 传输错误）或租约被接管：
+                // 跳过本节点并重试，但 Superseded 已在节点表里按健康记账。
                 excluded.insert(node_id);
                 if retries_used >= retry_limit {
                     return Err(last_error.unwrap_or_else(|| "remote node failed".into()));

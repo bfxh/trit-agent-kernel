@@ -13,8 +13,9 @@
 //!   接受（已完成后重复登记为幂等 no-op，不覆盖原帧）；租约已失效或键未由该
 //!   令牌 claim 时 `403`。
 //! - `POST /renew`，同一个头 + `X-Trit-Lease`、空体：把该键的占位租约重置为
-//!   当前时间，`204`；已完成返回 `204`，未知键 `404`，令牌不匹配 `403`。用于
-//!   执行时间超过 `pending_ttl` 的任务，避免另一个节点误判过期而并发执行。
+//!   当前时间，`204`；已完成返回 `204` + `X-Trit-Lease-Done: 1`（当前令牌已
+//!   不再拥有该任务，调用方应立即停止在途执行），未知键 `404`，令牌不匹配 `403`。
+//!   用于执行时间超过 `pending_ttl` 的任务，避免另一个节点误判过期而并发执行。
 //!
 //! 占位有 TTL（默认 60s）：执行者崩溃后，过期占位可以被接管。账本只保存响应帧，
 //! 不执行任务；它是跨机重试的协调点，不是任务队列。租约令牌是随机生成的持有者
@@ -65,6 +66,9 @@ const MAX_STATE_LINE_BYTES: usize = MAX_LEDGER_BODY * 2 + 16 * 1024;
 
 /// 租约持有者令牌头：`/claim` 成功时返回，`/renew` 与 `/complete` 必须携带。
 const LEASE_HEADER: &str = "X-Trit-Lease";
+
+/// `/renew` 命中已完成键时的标记头：持有者应停止在途执行，当前结果已由别人提交。
+const LEASE_DONE_HEADER: &str = "X-Trit-Lease-Done";
 
 /// 租约令牌长度上限；正常令牌是 16 位十六进制。
 const MAX_LEASE_LEN: usize = 128;
@@ -361,9 +365,8 @@ fn handle(
             };
             let server = LedgerServerView { state, config };
             match server.renew(&key, lease) {
-                Ok(RenewOutcome::Renewed | RenewOutcome::AlreadyDone) => {
-                    respond(&mut stream, 204, "No Content", b"")
-                }
+                Ok(RenewOutcome::Renewed) => respond(&mut stream, 204, "No Content", b""),
+                Ok(RenewOutcome::AlreadyDone) => respond_lease_done(&mut stream, 204, "No Content"),
                 Ok(RenewOutcome::NotOwner) => respond(&mut stream, 403, "Forbidden", b""),
                 Ok(RenewOutcome::Unknown) => respond(&mut stream, 404, "Not Found", b""),
                 Err(()) => respond(&mut stream, 503, "Service Unavailable", b""),
@@ -573,6 +576,10 @@ fn respond_with_lease(
     lease: &str,
 ) -> std::io::Result<()> {
     write_response(stream, code, reason, &[(LEASE_HEADER, lease)], body)
+}
+
+fn respond_lease_done(stream: &mut TcpStream, code: u16, reason: &str) -> std::io::Result<()> {
+    write_response(stream, code, reason, &[(LEASE_DONE_HEADER, "1")], b"")
 }
 
 fn write_response(
@@ -961,7 +968,7 @@ pub fn claim(endpoint: &RemoteEndpoint, key: &str) -> Result<Claim, String> {
     }
 }
 
-/// 账本客户端：延长一个占位租约。已完成或未知键不会延长，后者返回错误。
+/// 账本客户端：延长一个占位租约。已完成或未知键都不会延长，返回错误。
 pub fn renew(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Result<(), String> {
     renew_checked(endpoint, key, lease).map_err(|error| error.to_string())
 }
@@ -970,8 +977,12 @@ pub fn renew(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Result<(), St
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenewError {
     InvalidLease,
+    /// 403：租约已被其他持有者接管。
     LeaseLost,
+    /// 404：账本已不认识该键（例如重启后未持久化占位）。
     UnknownKey,
+    /// `/renew` 命中已完成键：当前结果已由别人提交，本机执行应立即停止。
+    Completed,
     Http(u16),
     Transport(String),
 }
@@ -982,6 +993,7 @@ impl std::fmt::Display for RenewError {
             Self::InvalidLease => write!(formatter, "ledger renew: invalid lease"),
             Self::LeaseLost => write!(formatter, "ledger renew: lease not held"),
             Self::UnknownKey => write!(formatter, "ledger renew: unknown key"),
+            Self::Completed => write!(formatter, "ledger renew: already completed"),
             Self::Http(status) => write!(formatter, "ledger renew returned HTTP {status}"),
             Self::Transport(message) => write!(formatter, "{message}"),
         }
@@ -996,7 +1008,9 @@ pub fn renew_checked(endpoint: &RemoteEndpoint, key: &str, lease: &str) -> Resul
         return Err(RenewError::InvalidLease);
     }
     let reply = post(endpoint, "/renew", key, Some(lease), None).map_err(RenewError::Transport)?;
+    let completed = reply.done;
     match reply.status {
+        200 | 204 if completed => Err(RenewError::Completed),
         200 | 204 => Ok(()),
         403 => Err(RenewError::LeaseLost),
         404 => Err(RenewError::UnknownKey),
@@ -1026,6 +1040,7 @@ struct LedgerReply {
     status: u16,
     body: Vec<u8>,
     lease: Option<String>,
+    done: bool,
 }
 
 fn post(
@@ -1063,6 +1078,7 @@ fn post(
         Err(error) => return Err(format!("ledger transport: {error}")),
     };
     let lease = response.header(LEASE_HEADER).map(str::to_string);
+    let done = response.header(LEASE_DONE_HEADER) == Some("1");
     let mut body = Vec::new();
     response
         .into_reader()
@@ -1073,5 +1089,6 @@ fn post(
         status,
         body,
         lease,
+        done,
     })
 }

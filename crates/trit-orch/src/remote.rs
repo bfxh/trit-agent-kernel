@@ -67,6 +67,9 @@ pub enum NodeOutcome {
     NodeFailed,
     /// 调用方取消：归还容量，但既不算尝试也不影响节点健康。
     Abandoned,
+    /// 账本租约被其他持有者接管：本节点中止在途执行；节点仍健康，任务应等待
+    /// 当前持有者的结果或换节点重试。
+    Superseded,
 }
 
 /// 节点状态快照（用于报告与测试断言）。
@@ -276,6 +279,7 @@ impl NodeTable {
                     slot.healthy = false;
                 }
             }
+            NodeOutcome::Superseded => slot.consecutive_failures = 0,
             NodeOutcome::Abandoned => {}
         }
         self.cond.notify_all();

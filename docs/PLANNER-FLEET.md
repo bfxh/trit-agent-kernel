@@ -204,10 +204,11 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
   返回 `403`，因此过期接管后旧持有者不能再续租或写完成。complete 用同一帧登记
   （`204`；已完成后重复登记为幂等 no-op，不覆盖原帧）。占位 TTL 默认 60s，过期允许接管；执行中的
   节点按 `ledger_renew_interval`（默认 10s，`--ledger-renew-ms`）`POST /renew`
-  延长租约，未知键 404、已完成 204、非持有者 403。心跳收到 403/404 会立即取消
-  本机在途执行（睡眠或 Exec 子进程），服务端回 `Aborted` 且不登记完成，避免旧
-  持有者继续产生副作用；但网络分区使心跳完全不可达时，旧执行者仍可能跑完，
-  这部分需任务幂等兜底。
+  延长租约，未知键 404、已完成 204 + `X-Trit-Lease-Done: 1`、非持有者 403。
+  心跳收到 403/404 或已完成标记会立即取消本机在途执行（睡眠或 Exec 子进程），
+  服务端回 `Aborted`（带 `X-Trit-Lease-Lost: 1`）且不登记完成，避免旧持有者继续
+  产生副作用；但网络分区使心跳完全不可达时，旧执行者仍可能跑完，这部分需任务
+  幂等兜底。
   容量有键数（默认 4096）与字节（默认 64 MiB，`--max-state-bytes`）
   双重上限，键数含占位与完成项，字节按完成帧估算，超出按 key 顺序淘汰已完成项。
   `--state <path>` 打开追加日志：claim/续租先追加占位记录（key、令牌、绝对到期
@@ -225,7 +226,7 @@ HeadlessFleetRunner::new(workspace, dir, model_factory)
 `remote-echo` 子进程覆盖鉴权、重定向、非 2xx、空体/截断/超限、引用不匹配、
 超时与连接失败，以及幂等头发送、去重命中与键不一致拒绝、取消慢请求、连接上限
 503。`tests/remote_ledger.rs` 覆盖 claim/pending/完成回放/TTL 接管、租约续约、
-慢执行期间不被接管、租约丢失中止在途执行、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
+慢执行期间不被接管、租约丢失中止在途执行、租约被接管不隔离节点且换机重试回放完成、过期后旧持有者不能续租/完成、共享账本下双节点只执行一次、账本不可达
 时 fail-closed，以及落盘账本重启回放、占位租约跨重启恢复/过期丢弃、高频续租不挤掉完成帧、容量淘汰顺序回放一致、字节上限淘汰与压缩；`tests/remote_exec.rs` 覆盖 `remote-exec`
 真实写文件、`--workspace-root` 按任务隔离与非法任务 ID 拒绝、`run_remote_plan`
 派发到真实执行器。
@@ -243,10 +244,11 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
 - `NodeTable`：按负载比 `in_flight / max_in_flight` 选最轻节点（平手按 id 升序）；
   各节点容量独立，满载时阻塞等待并每 25ms 复查取消令牌；取消返回 `Ok(None)`；
   `acquire_excluding(cancel, excluded)` 在故障重试时跳过已失败的节点。
-- 故障隔离：`NodeOutcome::{Succeeded, TaskFailed, NodeFailed}`。连续
+- 故障隔离：`NodeOutcome::{Succeeded, TaskFailed, NodeFailed, Superseded}`。连续
   `failure_threshold`（默认 1）次节点级失败后该节点退出本轮调度；远端明确回
-  `Failed` 只算任务失败，不隔离节点；`NodeLease` 未 `finish` 就 drop 按节点级
-  失败记账，避免 panic 泄漏容量。
+  `Failed` 只算任务失败，不隔离节点；带 `X-Trit-Lease-Lost` 的 `Aborted` 记
+  `Superseded`，计入 attempts、不计失败并清零连续失败计数，不隔离节点；`NodeLease` 未
+  `finish` 就 drop 按节点级失败记账，避免 panic 泄漏容量。
 - `run_remote_plan(plan, nodes, config, cancel, build_request)`：在 fleet runner
   内申请节点 → 编码请求 → ureq POST → 归还；返回
   `RemotePlanReport { report, results, assignments, attempts, nodes }`：
@@ -254,16 +256,19 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   - `results`：远端自报的精确状态（`Aborted` 不会在汇总里被改写成 `Failed`）；
   - `attempts`：每次尝试的 `{ node, status }`，按发生顺序；
   - `nodes`：`attempts / failures / healthy` 快照。
-- **有界重试（默认 0，显式 opt-in）**：只有节点级失败（传输错误 / 超时 /
-  `Aborted` / 远端回 `Deferred`）才换节点重试，最多 `retry_limit` 次；任务级
-  `Failed` 不重试。重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
+- **有界重试（默认 0，显式 opt-in）**：节点级失败（传输错误 / 超时 / 没有
+  `X-Trit-Lease-Lost` 的 `Aborted` / 远端回 `Deferred`）或租约被接管
+  （`Superseded`）才换节点重试，最多 `retry_limit` 次；任务级 `Failed` 不重试。
+  `Superseded` 不隔离节点，重试请求会在账本上等待当前持有者并回放其完成帧。
+  重试复用同一幂等键 `X-Trit-Idempotency: [<scope>|]<task>@<epoch>`。
   未配置共享账本时，参考实现只在**单个端点**内缓存首次响应（上限 1024，FIFO
   淘汰）；换到一台从未见过该 key 的机器会再次执行，因此默认语义是
   **at-least-once**。配置 `remote-ledger` 后，所有节点共享 claim/renew/complete，
   换机重试也能做到**完成结果至多一次**：先 claim 的节点执行，其余节点等待完成帧回放；
   账本不可达时 fail-closed（503）。配合 `--state` 时完成帧与未过期占位都跨重启
-  保留；例外是 TTL 过期后的接管：老执行者可能仍在本地跑完（重复工作），但其
-  完成写入会被租约令牌拒绝，最终只记录当前持有者的结果。
+  保留；例外是 TTL 过期后的接管：老执行者可能仍在本地跑完（重复工作），但下一次
+  心跳会看到租约失效或已完成标记并中止，完成写入也会被租约令牌拒绝，最终只记录
+  当前持有者的结果。
 - **取消传播**：`run_remote_subagent_reply_cancellable` 在独立线程执行请求，
   等待期间每 25ms 检查取消令牌；置位后向端点 origin 的 `/cancel` 发同一幂等
   键，最多再等 2s 收尾，超时按 `Aborted` 返回。服务端按幂等键登记在途请求：

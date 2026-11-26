@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 use trit_host::remote_ledger::{self, Claim};
 use trit_host::{
-    LedgerServer, LedgerServerConfig, RemoteServer, RemoteServerConfig, run_remote_subagent,
+    LedgerServer, LedgerServerConfig, RemotePlanConfig, RemoteServer, RemoteServerConfig,
+    run_remote_plan_with_table, run_remote_subagent, run_remote_subagent_reply,
 };
 use trit_orch::{
-    AccessMode, CapsuleEntry, ContextCapsule, DelegationStatus, RemoteEndpoint, SubagentProfile,
-    SubagentRequest, SubagentResponse, Task, TaskSpec, decode_frame, encode_frame,
+    AccessMode, CancelToken, CapsuleEntry, ContextCapsule, DelegationStatus, NodeTable, Plan,
+    RemoteEndpoint, RemoteNode, SubagentProfile, SubagentRequest, SubagentResponse, Task, TaskSpec,
+    decode_frame, encode_frame,
 };
 
 fn task(id: &str) -> TaskSpec {
@@ -28,6 +30,10 @@ fn task(id: &str) -> TaskSpec {
 }
 
 fn request() -> SubagentRequest {
+    request_for(&task("t1"))
+}
+
+fn request_for(task: &TaskSpec) -> SubagentRequest {
     let capsule = ContextCapsule::inherit(
         vec![CapsuleEntry {
             key: "goal".into(),
@@ -44,7 +50,7 @@ fn request() -> SubagentRequest {
         tools: vec!["read_file".into()],
         max_tokens: 100,
     };
-    SubagentRequest::new(&task("t1"), capsule, profile)
+    SubagentRequest::new(task, capsule, profile)
 }
 
 fn endpoint(url: &str, token: Option<&str>, timeout_secs: u64) -> RemoteEndpoint {
@@ -112,6 +118,10 @@ fn ledger_claim_complete_and_pending_takeover() {
         "a stale owner must not write the completion"
     );
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease_two, &frame).unwrap();
+    assert!(
+        remote_ledger::renew(&ledger_endpoint, "t1@0", &lease_two).is_err(),
+        "a completed key must not be renewed"
+    );
     match remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() {
         Claim::Done(body) => {
             let mut buffer = body;
@@ -784,7 +794,8 @@ fn lease_loss_aborts_in_flight_execution() {
     let endpoint_for_call = endpoint(&url, None, 30);
     let request_for_call = request();
     let started = Instant::now();
-    let client = thread::spawn(move || run_remote_subagent(&endpoint_for_call, &request_for_call));
+    let client =
+        thread::spawn(move || run_remote_subagent_reply(&endpoint_for_call, &request_for_call));
 
     // 等节点拿到占位且其短 TTL 已过，再声称接管；下一次 800ms 心跳会拿到 403。
     thread::sleep(Duration::from_millis(500));
@@ -796,13 +807,17 @@ fn lease_loss_aborts_in_flight_execution() {
         }
     }
 
-    let result = client.join().unwrap().unwrap();
+    let reply = client.join().unwrap().unwrap();
     assert!(
-        matches!(result.status, DelegationStatus::Aborted),
-        "a lost lease must abort in-flight work, got {:?}",
-        result.status
+        reply.lease_lost,
+        "server must mark a lost lease so the scheduler does not blame the node"
     );
-    assert!(!result.reusable());
+    assert!(
+        matches!(reply.result.status, DelegationStatus::Aborted),
+        "a lost lease must abort in-flight work, got {:?}",
+        reply.result.status
+    );
+    assert!(!reply.result.reusable());
     assert!(
         started.elapsed() < Duration::from_millis(2800),
         "execution must abort before the 3s sleep completes, took {:?}",
@@ -813,6 +828,120 @@ fn lease_loss_aborts_in_flight_execution() {
         ledger.completions(),
         0,
         "the stale owner must not write a completion"
+    );
+}
+
+#[test]
+fn superseded_node_stays_healthy_and_retry_reads_completion() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_millis(100)),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let node_a = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_sleep_ms(3000)
+            .with_ledger(ledger_endpoint.clone())
+            .with_ledger_renew_interval(Duration::from_millis(800)),
+    )
+    .unwrap();
+    let node_b = RemoteServer::bind(
+        RemoteServerConfig::new("127.0.0.1:0")
+            .with_ledger(ledger_endpoint.clone())
+            .with_ledger_renew_interval(Duration::from_millis(800)),
+    )
+    .unwrap();
+    let url_a = format!("http://{}/run", node_a.addr().unwrap());
+    let url_b = format!("http://{}/run", node_b.addr().unwrap());
+    let server_a = thread::spawn(move || node_a.serve_once().unwrap());
+    let server_b = thread::spawn(move || node_b.serve_once().unwrap());
+
+    let table = Arc::new(
+        NodeTable::new(vec![
+            RemoteNode::new("node-a", endpoint(&url_a, None, 30)),
+            RemoteNode::new("node-b", endpoint(&url_b, None, 30)),
+        ])
+        .unwrap(),
+    );
+    let plan = Plan::new(1, vec![task("t1")]).unwrap();
+    let config = RemotePlanConfig::new(1)
+        .with_failure_threshold(1)
+        .with_retry_limit(1);
+    let table_for_run = Arc::clone(&table);
+    let started = Instant::now();
+    let runner = thread::spawn(move || {
+        run_remote_plan_with_table(
+            &plan,
+            table_for_run,
+            config,
+            CancelToken::new(),
+            request_for,
+        )
+    });
+
+    // node-a 先拿到占位并开始 3s 睡眠；外部持有者在 TTL 过期后接管并立刻完成。
+    thread::sleep(Duration::from_millis(500));
+    let lease = loop {
+        match remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() {
+            Claim::New { lease } => break lease,
+            Claim::Pending => thread::sleep(Duration::from_millis(25)),
+            Claim::Done(_) => panic!("unexpected completion before takeover"),
+        }
+    };
+    let external = SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"external-completion".to_vec(),
+        tokens: 7,
+    };
+    let frame = encode_frame(&external).unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+
+    let report = runner.join().unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "node-a must stop at its next heartbeat instead of sleeping 3s, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(report.report.completed, vec!["t1".to_string()]);
+    assert!(report.report.failed.is_none());
+
+    let attempts = &report.attempts["t1"];
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].node, "node-a");
+    assert!(matches!(attempts[0].status, DelegationStatus::Aborted));
+    assert_eq!(attempts[1].node, "node-b");
+    assert!(matches!(attempts[1].status, DelegationStatus::Completed));
+
+    let node_a = report
+        .nodes
+        .iter()
+        .find(|node| node.id == "node-a")
+        .unwrap();
+    assert!(node_a.healthy, "lease takeover is not a node failure");
+    assert_eq!(node_a.failures, 0);
+    assert_eq!(node_a.attempts, 1);
+    let node_b = report
+        .nodes
+        .iter()
+        .find(|node| node.id == "node-b")
+        .unwrap();
+    assert!(node_b.healthy);
+    assert_eq!(node_b.attempts, 1);
+
+    server_a.join().unwrap();
+    server_b.join().unwrap();
+    assert_eq!(
+        ledger.completions(),
+        1,
+        "only the new owner writes the completion"
     );
 }
 

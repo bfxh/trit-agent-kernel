@@ -70,6 +70,35 @@ fn abandoned_lease_releases_without_health_penalty() {
 }
 
 #[test]
+fn superseded_resets_failures_without_quarantining() {
+    let table = NodeTable::new(vec![node("a", 1)])
+        .unwrap()
+        .with_failure_threshold(2);
+    let cancel = CancelToken::new();
+
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    assert!(table.snapshot()[0].healthy);
+
+    // 租约被接管证明节点仍能服务：计入尝试，但不算失败，并清掉连续失败计数。
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::Superseded);
+    let snapshot = table.snapshot();
+    assert!(snapshot[0].healthy);
+    assert_eq!(snapshot[0].attempts, 2);
+    assert_eq!(snapshot[0].failures, 1);
+
+    // 前一次 NodeFailed 的连续计数已被 Superseded 清零，这次不会触发隔离。
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    assert!(table.snapshot()[0].healthy);
+
+    let lease = table.acquire(&cancel).unwrap().unwrap();
+    lease.finish(NodeOutcome::NodeFailed);
+    assert!(!table.snapshot()[0].healthy);
+}
+
+#[test]
 fn snapshots_restore_quarantine_and_counts() {
     let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
     let cancel = CancelToken::new();
