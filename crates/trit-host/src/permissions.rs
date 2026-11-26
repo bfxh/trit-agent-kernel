@@ -277,13 +277,57 @@ impl WriteClaim {
     }
 }
 
+/// 工具名白名单：只放行 `allowed` 里列出的工具，其余调用直接失败并留下回执。
+///
+/// 用于 `SubagentProfile.tools` 的执行侧强制：白名单不能只停留在元数据。
+pub struct ToolWhitelist<T> {
+    inner: T,
+    allowed: Vec<String>,
+}
+
+impl<T> ToolWhitelist<T> {
+    pub fn new(inner: T, allowed: Vec<String>) -> Self {
+        Self { inner, allowed }
+    }
+
+    pub fn allowed(&self) -> &[String] {
+        &self.allowed
+    }
+
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
+impl<T: ToolExecutor> ToolExecutor for ToolWhitelist<T> {
+    fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        if !self.allowed.iter().any(|tool| tool == &request.tool) {
+            return Ok(ToolOutcome {
+                call_id: request.call_id.clone(),
+                tool: request.tool.clone(),
+                passed: false,
+                output: format!("tool {} is not allowed by this profile", request.tool),
+                ..ToolOutcome::default()
+            });
+        }
+        self.inner.execute(request)
+    }
+
+    fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
+        self.inner.begin_turn(turn, objective)
+    }
+
+    fn end_turn(&mut self, complete: bool) -> Result<(), AgentError> {
+        self.inner.end_turn(complete)
+    }
+}
+
 pub struct ClaimingTools<T> {
     inner: T,
     claim: WriteClaim,
     lease: Option<OperationLease>,
     journal: Option<MutationJournal>,
 }
-
 /// 写入守卫：路径 claim + 可选跨进程租约 + 可选 mutation journal。
 #[derive(Debug)]
 pub struct WriteGuard {
