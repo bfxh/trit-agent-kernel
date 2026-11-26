@@ -1348,9 +1348,10 @@ fn usage() {
          journal-status: trit-host journal-status --workspace <dir> [--rollback]\n\
          prints the write-journal reconciliation; --rollback restores in-doubt writes;\n\
          exits 1 on remaining doubt or rollback failure.\n\
-         rewind-status: trit-host rewind-status --checkpoint-dir <dir>\n\
-         prints the checkpoint rewind journal; exits 1 when a rewind is unfinished or\n\
-         its rollback failed (a new rewind will refuse until this is resolved).\n\
+         rewind-status: trit-host rewind-status --checkpoint-dir <dir> [--recover --workspace <root>]\n\
+         prints the checkpoint rewind journal; --recover restores the pre-rewind state from\n\
+         backups. exits 1 when a rewind is still unfinished or rollback/recovery failed\n\
+         (a new rewind will refuse until this is resolved).\n\
          appcontainer-prune: trit-host appcontainer-prune --workspace <dir>\n\
          deletes AppContainer profiles recorded for the workspace.\n\n\
          rewind: trit-host rewind --session <jsonl> --checkpoint-dir <dir> --turn N \\\n\
@@ -1547,20 +1548,42 @@ fn run_journal_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     Ok(())
 }
 
-/// `rewind-status --checkpoint-dir <dir>`：只读检查回退 journal；
-/// 有未完成或回滚失败的操作时退出 1，供崩溃后先解释再决定下一步。
+/// `rewind-status --checkpoint-dir <dir> [--recover --workspace <root>]`：
+/// 默认只读检查回退 journal；加 `--recover` 则按 pre-rewind 备份恢复半写工作区，
+/// 恢复后仍有未闭合操作时退出 1。
 fn run_rewind_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut checkpoint_dir: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut recover = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--checkpoint-dir" => {
                 checkpoint_dir = Some(PathBuf::from(next(&mut args, "--checkpoint-dir")?));
             }
+            "--workspace" => {
+                workspace = Some(PathBuf::from(next(&mut args, "--workspace")?));
+            }
+            "--recover" => recover = true,
             other => return Err(fail(format!("unknown rewind-status argument: {other}"))),
         }
     }
     let dir = checkpoint_dir.ok_or_else(|| fail("rewind-status requires --checkpoint-dir"))?;
     let store = CheckpointStore::open(dir)?;
+    if recover {
+        let workspace =
+            workspace.ok_or_else(|| fail("rewind-status --recover requires --workspace"))?;
+        let recovery = store.recover_rewind(&workspace)?;
+        let status = store.rewind_status()?;
+        let payload = serde_json::json!({ "recovery": recovery, "status": status });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).map_err(|error| fail(error.to_string()))?
+        );
+        if status.has_in_doubt() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let report = store.rewind_status()?;
     println!(
         "{}",
