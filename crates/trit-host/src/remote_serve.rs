@@ -76,7 +76,7 @@ use crate::auth::{AUTH_DIGEST_LEN, authorization_matches, bearer_digest};
 use crate::connection_limit::{ConnectionSlots, DEFAULT_MAX_CONNECTIONS};
 use crate::http_read::{
     DEFAULT_REQUEST_READ_TIMEOUT, DeadlineStream, HeaderReadError, IO_TIMEOUT, MAX_HEADER_BYTES,
-    MAX_HEADER_LINE_BYTES, MAX_HEADERS, is_timeout, read_http_line,
+    MAX_HEADER_LINE_BYTES, MAX_HEADERS, finish_early_rejection, is_timeout, read_http_line,
 };
 use crate::remote_ledger::{self, Claim};
 use crate::remote_subagent::{
@@ -801,7 +801,9 @@ fn handle(
             return respond(&mut stream, 400, "Bad Request", b"");
         }
         Err(HeaderReadError::TooLarge) => {
-            return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+            respond(&mut stream, 431, "Request Header Fields Too Large", b"")?;
+            finish_early_rejection(&mut stream);
+            return Ok(());
         }
         Err(HeaderReadError::Io(error)) if is_timeout(&error) => {
             return respond(&mut stream, 408, "Request Timeout", b"");
@@ -831,7 +833,9 @@ fn handle(
                 return respond(&mut stream, 400, "Bad Request", b"");
             }
             Err(HeaderReadError::TooLarge) => {
-                return respond(&mut stream, 431, "Request Header Fields Too Large", b"");
+                respond(&mut stream, 431, "Request Header Fields Too Large", b"")?;
+                finish_early_rejection(&mut stream);
+                return Ok(());
             }
             Err(HeaderReadError::Io(error)) if is_timeout(&error) => {
                 return respond(&mut stream, 408, "Request Timeout", b"");

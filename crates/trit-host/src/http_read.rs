@@ -71,6 +71,26 @@ pub(crate) fn is_timeout(error: &io::Error) -> bool {
     )
 }
 
+/// 提前拒绝（431/408 等）后的收尾：先 shutdown 写端，再把对端仍在发送的字节
+/// 读干净，最后才关闭 socket。
+///
+/// 直接关闭还有未读数据的连接会触发 RST：客户端可能还没读到响应就被
+/// `ConnectionReset`，在 macOS 上尤其容易复现。`respond` 之后调用本函数，
+/// 让响应先到达客户端。
+pub(crate) fn finish_early_rejection(stream: &mut TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+    let mut sink = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained < MAX_HEADER_BYTES {
+        match stream.read(&mut sink) {
+            Ok(0) => break,
+            Ok(bytes) => drained = drained.saturating_add(bytes),
+            Err(_) => break,
+        }
+    }
+}
+
 /// 给底层 socket 的每次读取加上绝对截止点。
 ///
 /// 仅靠 `set_read_timeout` 只能约束“多久没有数据”；不断发一个字节的慢速客户端
