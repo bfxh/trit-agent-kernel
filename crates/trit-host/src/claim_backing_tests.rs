@@ -268,6 +268,7 @@ fn journal_with_in_doubt(path: &str) -> JournalReport {
             call_id: "crash".to_owned(),
             paths: vec![path.to_owned()],
             lease_epoch: None,
+            lease_locks: Vec::new(),
             passed: false,
             in_doubt: false,
             output: String::new(),

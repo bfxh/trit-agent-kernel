@@ -46,7 +46,7 @@
 | 8 | Checkpoint / rewind | `CHECKPOINTS.md`、`SPEC §3.4` | 已有（有界） | files/git 均已接持久 rewind journal、pre-rewind 备份与自动恢复；缺 operation lease 恢复边界 | B7.7 |
 | 9 | per-call 权限（ask/auto/yolo） | `SPEC §3.7`、`TOOL_APPROVAL_MODES.md` | 部分（首版） | `PermissionGate` 已有 ask/auto/yolo、deny 优先、无 approver fail-closed；缺交互审批 UI 与 MCP 策略映射 | B7.4 |
 | 10 | Write claim / 路径范围强制 | `SPEC §3.12`、`OPAQUE_WRITE_ADMISSION_SECURITY.md` | 部分（首版） | `WriteClaim` + `ClaimingTools` 限制 write_file 路径子树，shell 写入 fail-closed；缺 move 双端、mutation journal 对账 | B7.4 |
-| 11 | Mutation journal / OS lease | `MUTATION_COORDINATOR_SECURITY.md`、`ISOLATION_OPERATION_LEASE_SECURITY.md` | 缺口 | 宿主 mutation record 作为外部事实；内核不复制文件锁 | B7.4/B7.7 |
+| 11 | Mutation journal / OS lease | `MUTATION_COORDINATOR_SECURITY.md`、`ISOLATION_OPERATION_LEASE_SECURITY.md` | 部分（对账 + 租约恢复边界） | mutation journal 记录 begin/finish/rollback 与 pre-image，`journal-status` 对账并回滚；begin 记录 lease 锁，回滚前重取锁，活租约持有者会 blocked；内核不复制文件锁 | B7.7 |
 | 12 | 沙箱 / isolation runner | `ISOLATION_*`、`SPEC §3.7` | 部分 | 已有外部 sandbox wrapper；缺 runner 生命周期、fail-closed 矩阵 | B7.4 |
 | 13 | 宿主裁决完成声明 | `SPEC §3.11`、`complete_subtask` | 已有 | 已有 EvidenceRails/义务；需补齐“criterion → 回执”逐条降级与 write scope | B7.5 |
 | 14 | 双模型 planner / executor | `SPEC §3.5`、`COORDINATOR_ROOT_BUDGET.md` | 部分（原语 + 协议） | `ReadOnlyTools` + `ReadOnlyCatalog` + `SessionPaths` + 独立 `CacheLedger` + `PlanHandoff` + `submit_plan` 协议解析已实现；缺 provider 侧真实模型调用接线 | B7.6 |
@@ -200,7 +200,12 @@ B7.5 ─> B7.6 Delegation ─> B7.8 Surfaces / diagnostics
   对 `in_doubt` 操作执行 `read-tree --reset -u <backup>` 恢复整树，成功后补 `recover`。
   CLI 增加 `--checkpoint-backend files|git`（git 模式强制 `--workspace`）；文件后端与
   git 后端的恢复入口互斥，避免拿错备份类型。
-- 仍待补：JSONL 布局兼容矩阵；SQLite 投影重建；租约恢复边界；备份保留/清理策略
+- 已落地（第四刀，租约恢复边界）：mutation journal 的 `begin` 记录本次实际持有的
+  lease 锁文件（`lease_locks`）；`journal-status --rollback` 与
+  `run --write-journal-rollback` 在回滚前重新获取同一把锁，锁仍被活进程持有时
+  `blocked`（CLI 退出 1 / run 拒绝启动），不会踩掉对方正在写的文件；旧记录只有
+  `lease_epoch`、缺锁路径时不再自动回滚，无租约的旧记录行为不变。
+- 仍待补：JSONL 布局兼容矩阵；SQLite 投影重建；备份保留/清理策略
   （files 成功后删除、失败保留；git backup commit 目前不主动回收，等 `gc`）。
 - 依赖：B7.3；与 B7.4 联动。
 
