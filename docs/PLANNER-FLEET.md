@@ -390,6 +390,11 @@ DAG、worker 并发与失败传播仍由 `trit_orch::fleet`（`trit-schedule` ru
   的派发前 preflight。全隔离启动时周期监控来不及在首个 acquire 前放行，仍需先用
   `--probe` 做一次 preflight，否则派发会因没有健康节点立即失败。
 
+守护和计划可以串起来用：先 `remote-health --probe-all --once` 把健康条目刷新，
+再让 `remote-plan --health-max-age-ms` 用更短的窗口启动——守护负责新鲜度，计划负责
+派发前的最后一道隔离判定；`remote_plan_cli` 的端到端用例覆盖了「守护刷新后计划
+不再判超龄、也不再额外探测」这条链路。
+
 回归：`crates/trit-orch/tests/remote_nodes.rs`（容量、最轻负载、阻塞/取消、
 隔离阈值、排除集合、drop 记账、`Abandoned` 不记账、`OverBudget` 健康语义、
 快照恢复、更新时间随状态变更推进并在恢复时保留、显式 `readmit`、陈旧健康快照
@@ -406,6 +411,7 @@ preflight 探测重新放行隔离节点并返回 `probes`、超龄健康快照�
 文件跨运行隔离、计划写回保留节点表外的健康条目、运行期间用 `--health-flush-ms`
 写回健康、`--probe` 成功放行/失败保持隔离、`--probe-interval-ms` 演练期间恢复节点、
 `--health-max-age-ms` 把超龄健康条目先隔离并在探测后放行、参数校验、
+`remote-health --probe-all` 刷新后计划不再判超龄的跨进程链路、
 `--probe-concurrency` 参数校验、重复节点 ID 与非法 scope 拒绝）、
 `crates/trit-host/tests/remote_health.rs`（独立守护成功放行并保留累计计数、探测
 失败保持隔离、未知节点保留原快照、保存时合并未提及条目并按 `updated_at_ms`

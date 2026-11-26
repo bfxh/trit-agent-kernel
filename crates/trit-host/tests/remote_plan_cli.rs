@@ -134,6 +134,95 @@ fn remote_plan_cli_dispatches_across_nodes() {
 }
 
 #[test]
+fn remote_health_daemon_refresh_satisfies_plan_freshness_gate() {
+    let node = spawn_node("node-a", &[]);
+    let nodes_path = input_file("daemon-nodes", &serde_json::json!([node_json(&node, 1)]));
+    let health = std::env::temp_dir().join(format!(
+        "trit-remote-plan-daemon-health-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(
+        &health,
+        serde_json::to_vec(&serde_json::json!([
+            {"id": "node-a", "healthy": true, "in_flight": 0, "attempts": 0,
+             "failures": 0, "updated_at_ms": 1}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 守护先主动巡检一遍：健康条目必须被刷新。
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-health")
+        .arg("--nodes")
+        .arg(&nodes_path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--once")
+        .arg("--probe-all")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "remote-health --probe-all failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let probe_report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(probe_report["checked"], 1, "{probe_report}");
+    assert_eq!(
+        probe_report["readmitted"], 0,
+        "本来健康的节点不算重新入列: {probe_report}"
+    );
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&health).unwrap()).unwrap();
+    assert!(
+        stored[0]["updated_at_ms"].as_u64().unwrap() > 1,
+        "巡检成功必须推进 updated_at_ms: {stored}"
+    );
+
+    // 计划侧再按 60s 新鲜度门槛跑：刚刷新的快照不应被判超龄。
+    let input = serde_json::json!({
+        "revision": 1,
+        "workers": 1,
+        "failure_threshold": 1,
+        "tasks": [task("t1")],
+        "nodes": [node_json(&node, 1)],
+    });
+    let path = input_file("daemon-plan", &input);
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-plan")
+        .arg("--input")
+        .arg(&path)
+        .arg("--health")
+        .arg(&health)
+        .arg("--probe")
+        .arg("--health-max-age-ms")
+        .arg("60000")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&nodes_path);
+    let _ = std::fs::remove_file(&health);
+    assert!(
+        output.status.success(),
+        "remote-plan after daemon refresh failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["completed"].as_array().unwrap().len(), 1);
+    assert!(
+        report["stale"].as_array().unwrap().is_empty(),
+        "守护刷新后不应再有超龄节点: {report}"
+    );
+    assert!(
+        report["probes"].as_array().unwrap().is_empty(),
+        "没有超龄或隔离节点时不应额外探测: {report}"
+    );
+}
+
+#[test]
 fn remote_plan_cli_probe_readmits_a_recovered_node() {
     let node_a = spawn_node("node-a", &[]);
     let node_b = spawn_node("node-b", &[]);
