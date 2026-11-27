@@ -7,7 +7,7 @@
 use std::io::{Cursor, Read};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,6 +31,9 @@ pub struct HttpMcpSpec {
     pub headers: Vec<(String, String)>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// 工具列表缓存时间；服务端工具变更后最多等这么久。
+    #[serde(default = "default_tools_ttl_secs")]
+    pub tools_ttl_secs: u64,
 }
 
 impl Default for HttpMcpSpec {
@@ -40,6 +43,7 @@ impl Default for HttpMcpSpec {
             url: String::new(),
             headers: Vec::new(),
             timeout_secs: default_timeout_secs(),
+            tools_ttl_secs: default_tools_ttl_secs(),
         }
     }
 }
@@ -48,13 +52,17 @@ fn default_timeout_secs() -> u64 {
     30
 }
 
+fn default_tools_ttl_secs() -> u64 {
+    60
+}
+
 pub struct HttpMcpClient {
     spec: HttpMcpSpec,
     /// 复用连接池；不要每次请求新建 Agent。
     agent: ureq::Agent,
     next_id: AtomicU64,
     initialized: AtomicBool,
-    tools: Mutex<Option<Vec<McpTool>>>,
+    tools: Mutex<Option<(Instant, Vec<McpTool>)>>,
 }
 
 impl HttpMcpClient {
@@ -83,15 +91,20 @@ impl HttpMcpClient {
         &self.spec
     }
 
-    /// 发现工具；成功后缓存，失败不缓存。
+    /// 发现工具；成功后缓存 TTL 时间，失败不缓存。
     pub fn tools(&self) -> Result<Vec<McpTool>, AgentError> {
-        if let Some(cached) = self
-            .tools
-            .lock()
-            .map_err(|_| AgentError::Tool("HTTP MCP tool cache is poisoned".into()))?
-            .clone()
+        let now = Instant::now();
         {
-            return Ok(cached);
+            let cache = self
+                .tools
+                .lock()
+                .map_err(|_| AgentError::Tool("HTTP MCP tool cache is poisoned".into()))?;
+            if let Some((cached_at, tools)) = cache.as_ref()
+                && now.duration_since(*cached_at)
+                    < Duration::from_secs(self.spec.tools_ttl_secs.max(1))
+            {
+                return Ok(tools.clone());
+            }
         }
         self.initialize()?;
         let result = self.rpc("tools/list", json!({}))?;
@@ -109,8 +122,15 @@ impl HttpMcpClient {
             .tools
             .lock()
             .map_err(|_| AgentError::Tool("HTTP MCP tool cache is poisoned".into()))? =
-            Some(tools.clone());
+            Some((now, tools.clone()));
         Ok(tools)
+    }
+
+    /// 强制下次 `tools()` 重新请求；用于服务端工具变更后的手动刷新。
+    pub fn refresh(&self) {
+        if let Ok(mut cache) = self.tools.lock() {
+            *cache = None;
+        }
     }
 
     pub fn call(&self, tool: &str, arguments: Value) -> Result<Value, AgentError> {
@@ -289,6 +309,7 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/mcp"),
             headers: Vec::new(),
             timeout_secs: 5,
+            tools_ttl_secs: 60,
         });
         let tools = client.tools().unwrap();
         assert_eq!(tools.len(), 1);

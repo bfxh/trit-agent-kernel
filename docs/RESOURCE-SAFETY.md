@@ -18,7 +18,7 @@
 | 资源 | 上限 / 释放 |
 | --- | --- |
 | 响应体 | 8 MiB，超出截断 |
-| 工具缓存 | 4096 条；首次成功后缓存，失败不缓存 |
+| 工具缓存 | TTL 60s（`tools_ttl_secs` 可配）或显式 `refresh()`；最多 4096 条 |
 | 连接 | `ureq::Agent` 复用连接池，不每次 RPC 新建 |
 | 初始化 | `AtomicBool` 幂等，避免重复 `initialize` |
 
@@ -46,6 +46,6 @@
 ## 6. 已知边界与后续
 
 - `McpToolClient::routes()` 每次重建路由（临时分配，不是泄漏）；高频调用可加版本缓存。
-- HTTP MCP 工具缓存无 TTL，需要时增加 `refresh`。
+- HTTP MCP 工具缓存有 TTL（默认 60s）与 `refresh()`；服务端 `list_changed` 仍不会自动推送，需要重建客户端或调用 refresh。
 - 浏览器单页面；多标签/页面池是后续能力。
 - `background` 注册表没有条目上限，但条目随线程结束移除；长期服务应监控 `running()`。
