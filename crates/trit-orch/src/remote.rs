@@ -445,7 +445,10 @@ fn pick(slots: &[Slot], excluded: &BTreeSet<String>, cursor: usize) -> Option<us
         });
     }
     let best = best?;
-    // 等负载时从游标位置轮转，避免高并发下固定偏向某个节点。
+    // 等负载时不立刻按游标轮转：先把"最近没失败、尝试最少"的节点排前面。
+    // 刚被健康探测放行的节点保留了累计 attempts/failures，说明它上一次真正接活
+    // 时并不健康；让从未失败过的节点先接任务，避免把任务派给"探测能过、干活不行"
+    // 的节点后又立刻节点级失败。
     let tied: Vec<usize> = candidates
         .into_iter()
         .filter(|&index| {
@@ -456,10 +459,32 @@ fn pick(slots: &[Slot], excluded: &BTreeSet<String>, cursor: usize) -> Option<us
     if tied.len() <= 1 {
         return Some(best);
     }
+    let min_failures = tied
+        .iter()
+        .map(|&index| slots[index].consecutive_failures)
+        .min()
+        .unwrap_or(0);
+    let preferred: Vec<usize> = tied
+        .into_iter()
+        .filter(|&index| slots[index].consecutive_failures == min_failures)
+        .collect();
+    let min_attempts = preferred
+        .iter()
+        .map(|&index| slots[index].attempts)
+        .min()
+        .unwrap_or(0);
+    let preferred: Vec<usize> = preferred
+        .into_iter()
+        .filter(|&index| slots[index].attempts == min_attempts)
+        .collect();
+    if preferred.len() == 1 {
+        return Some(preferred[0]);
+    }
+    // 仍平手：从游标位置轮转，避免高并发下固定偏向某个节点。
     let start = cursor % slots.len();
     for offset in 0..slots.len() {
         let index = (start + offset) % slots.len();
-        if tied.contains(&index) {
+        if preferred.contains(&index) {
             return Some(index);
         }
     }
