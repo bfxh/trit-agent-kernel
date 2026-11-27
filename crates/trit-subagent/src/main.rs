@@ -89,6 +89,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         status,
         content: outcome.render_markdown().into_bytes(),
         tokens: outcome.usage.total()?,
+        model: None,
+        usage: Some(trit_orch::SubagentUsage {
+            fresh: outcome.usage.fresh,
+            cached: outcome.usage.cached,
+            output: outcome.usage.output,
+            estimated: outcome.usage.estimated,
+        }),
+        dissent: None,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;

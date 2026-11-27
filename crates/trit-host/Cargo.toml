@@ -38,3 +38,23 @@ harness = false
 [[bench]]
 name = "session_scan"
 harness = false
+
+[[bench]]
+name = "protocol_matrix"
+harness = false
+
+[[bench]]
+name = "permission_matrix"
+harness = false
+
+[[bench]]
+name = "tech_stack_matrix"
+harness = false
+
+[[bench]]
+name = "tools_batch"
+harness = false
+
+[[bench]]
+name = "journal_bench"
+harness = false
