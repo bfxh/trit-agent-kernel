@@ -674,6 +674,7 @@ mod tests {
                 },
             ],
             dropped: Vec::new(),
+            duplicates: Vec::new(),
             degradations: Vec::new(),
             budget_tokens: 100,
             estimated_tokens: 20,
@@ -804,6 +805,8 @@ mod tests {
                 in_doubt: false,
                 written_paths: vec!["a.txt".into()],
                 chars: 5,
+                content_fingerprint: None,
+                duplicate_of: None,
             }],
             last_compaction: None,
         });

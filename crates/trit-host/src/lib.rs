@@ -1247,6 +1247,7 @@ pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
 pub mod extensions;
+mod fingerprint;
 pub mod fleet_runner;
 pub mod frontend_compat;
 pub mod git_checkpoint;

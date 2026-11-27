@@ -4,6 +4,8 @@
 //! `canonical[visible_start..]`。压缩不会删除历史，只会移动可见起点、
 //! 创建新的 epoch/generation，并把 freshness 降为 Unknown。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use trit_orch::Ternary;
@@ -52,6 +54,12 @@ pub struct ProjectionEntry {
     #[serde(default)]
     pub written_paths: Vec<String>,
     pub chars: usize,
+    /// 输出内容的稳定指纹；空输出为 None。
+    #[serde(default)]
+    pub content_fingerprint: Option<String>,
+    /// 同一可见窗口内已出现相同输出时，首个 `call_id`。
+    #[serde(default)]
+    pub duplicate_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +112,8 @@ pub struct ContextProjection {
     generation: u64,
     freshness: Ternary,
     boundaries: Vec<CompactionBoundary>,
+    /// 当前可见窗口内 输出指纹 -> 首个 call_id；`begin_turn` 清空。
+    visible_fingerprints: BTreeMap<String, String>,
 }
 
 impl Default for ContextProjection {
@@ -115,6 +125,7 @@ impl Default for ContextProjection {
             generation: 0,
             freshness: Ternary::True,
             boundaries: Vec::new(),
+            visible_fingerprints: BTreeMap::new(),
         }
     }
 }
@@ -127,10 +138,22 @@ impl ContextProjection {
     /// 新 turn 只让本 turn 新追加的 entry 进入可见投影；canonical 仍保留历史。
     pub fn begin_turn(&mut self) {
         self.visible_start = self.canonical.len();
+        self.visible_fingerprints.clear();
     }
 
     pub fn append(&mut self, step: usize, outcome: &ToolOutcome) -> usize {
         let index = self.canonical.len();
+        let fingerprint = (!outcome.output.is_empty())
+            .then(|| crate::fingerprint::fnv1a64(outcome.output.as_bytes()));
+        let duplicate_of = fingerprint
+            .as_ref()
+            .and_then(|fingerprint| self.visible_fingerprints.get(fingerprint))
+            .filter(|existing| existing.as_str() != outcome.call_id)
+            .cloned();
+        if let (Some(fingerprint), None) = (&fingerprint, &duplicate_of) {
+            self.visible_fingerprints
+                .insert(fingerprint.clone(), outcome.call_id.clone());
+        }
         self.canonical.push(ProjectionEntry {
             call_id: outcome.call_id.clone(),
             tool: outcome.tool.clone(),
@@ -140,6 +163,8 @@ impl ContextProjection {
             in_doubt: outcome.in_doubt,
             written_paths: outcome.written_paths.clone(),
             chars: outcome.output.chars().count(),
+            content_fingerprint: fingerprint,
+            duplicate_of,
         });
         index
     }
@@ -358,6 +383,37 @@ mod tests {
         projection.begin_turn();
         assert_eq!(projection.canonical().len(), 3);
         assert_eq!(projection.visible().len(), 0);
+    }
+
+    #[test]
+    fn duplicate_tool_outputs_are_flagged_within_a_turn() {
+        let mut projection = ContextProjection::new();
+        projection.begin_turn();
+        projection.append(0, &outcome("a", 10));
+        projection.append(1, &outcome("b", 10));
+        projection.append(2, &outcome("c", 20));
+
+        assert_eq!(projection.canonical()[1].duplicate_of.as_deref(), Some("a"));
+        assert!(projection.canonical()[2].duplicate_of.is_none());
+        assert_eq!(
+            projection.canonical()[0].content_fingerprint,
+            projection.canonical()[1].content_fingerprint
+        );
+
+        // 跨 turn 的相同输出是合法重跑，不标记。
+        projection.begin_turn();
+        projection.append(3, &outcome("d", 10));
+        assert!(projection.canonical()[3].duplicate_of.is_none());
+    }
+
+    #[test]
+    fn empty_outputs_are_not_treated_as_duplicates() {
+        let mut projection = ContextProjection::new();
+        projection.begin_turn();
+        projection.append(0, &outcome("a", 0));
+        projection.append(1, &outcome("b", 0));
+        assert!(projection.canonical()[0].content_fingerprint.is_none());
+        assert!(projection.canonical()[1].duplicate_of.is_none());
     }
 
     #[test]

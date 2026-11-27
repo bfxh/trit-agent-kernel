@@ -1037,3 +1037,106 @@ fn cache_ledger_compress_retains_confidence_and_respects_budget() {
     assert!(budgeted.summary.contains("p|m|high"));
     assert!(budgeted.summary.contains("p|m|none"));
 }
+
+#[test]
+fn optional_duplicate_content_is_dropped_and_recorded() {
+    let mut context = InMemoryContext::default();
+    for id in ["a", "b"] {
+        let mut reference = reference(id, ContextScope::Project, Some("p1"), None);
+        reference.content_hash = Some("same-hash".into());
+        context
+            .insert(reference, document(id, "same text", None, Some(5)))
+            .unwrap();
+    }
+
+    let plan = assemble_context(
+        &request(
+            model(true, false),
+            ReasoningEffort::Low,
+            vec![
+                selection("a", false, Some(10)),
+                selection("b", false, Some(9)),
+            ],
+        ),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(plan.items.len(), 1);
+    assert_eq!(plan.items[0].id, "a");
+    assert!(
+        plan.dropped
+            .iter()
+            .any(|drop| drop.id == "b" && drop.reason == ContextDropReason::Duplicate)
+    );
+    assert!(
+        plan.duplicates
+            .iter()
+            .any(|dup| dup.id == "b" && dup.duplicate_of == "a" && !dup.retained)
+    );
+}
+
+#[test]
+fn required_duplicate_is_retained_and_flagged() {
+    let mut context = InMemoryContext::default();
+    for id in ["a", "b"] {
+        let mut reference = reference(id, ContextScope::Project, Some("p1"), None);
+        reference.content_hash = Some("same-hash".into());
+        context
+            .insert(reference, document(id, "same text", None, Some(5)))
+            .unwrap();
+    }
+
+    let plan = assemble_context(
+        &request(
+            model(true, false),
+            ReasoningEffort::Low,
+            vec![selection("a", true, None), selection("b", true, None)],
+        ),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(plan.items.len(), 2);
+    assert!(
+        plan.duplicates
+            .iter()
+            .any(|dup| dup.id == "b" && dup.duplicate_of == "a" && dup.retained)
+    );
+}
+
+#[test]
+fn duplicate_text_without_content_hash_is_still_suppressed() {
+    let mut context = InMemoryContext::default();
+    for id in ["a", "b"] {
+        let mut reference = reference(id, ContextScope::Project, Some("p1"), None);
+        reference.content_hash = None;
+        context
+            .insert(reference, document(id, "identical body", None, Some(5)))
+            .unwrap();
+    }
+    let mut distinct = reference("c", ContextScope::Project, Some("p1"), None);
+    distinct.content_hash = None;
+    context
+        .insert(distinct, document("c", "different body", None, Some(5)))
+        .unwrap();
+
+    let plan = assemble_context(
+        &request(
+            model(true, false),
+            ReasoningEffort::Low,
+            vec![
+                selection("a", false, Some(10)),
+                selection("b", false, Some(9)),
+                selection("c", false, Some(8)),
+            ],
+        ),
+        &context,
+    )
+    .unwrap();
+    let ids: Vec<&str> = plan.items.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, vec!["a", "c"]);
+    assert!(
+        plan.dropped
+            .iter()
+            .any(|drop| drop.id == "b" && drop.reason == ContextDropReason::Duplicate)
+    );
+}

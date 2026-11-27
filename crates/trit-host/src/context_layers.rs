@@ -427,12 +427,24 @@ pub enum ContextDropReason {
     NoUsableForm,
     AutonomyDenied,
     AutonomyUnknown,
+    /// 内容指纹与已选上下文相同，避免重复注入。
+    Duplicate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DroppedContext {
     pub id: String,
     pub reason: ContextDropReason,
+}
+
+/// 内容重复的上下文；与 `dropped` 分开记录，`required` 重复时仍保留但会被标记。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateContext {
+    pub id: String,
+    /// 被保留的原始上下文 id。
+    pub duplicate_of: String,
+    /// `true` 表示因为 `required` 没有丢弃，仍注入给模型。
+    pub retained: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1101,6 +1113,9 @@ pub struct ContextPlan {
     pub reasoning: ReasoningEffort,
     pub items: Vec<ContextItem>,
     pub dropped: Vec<DroppedContext>,
+    /// 内容指纹重复的候选；可选重复项进 `dropped`，required 重复项保留。
+    #[serde(default)]
+    pub duplicates: Vec<DuplicateContext>,
     pub degradations: Vec<ContextDegradation>,
     pub budget_tokens: u64,
     pub estimated_tokens: u64,
@@ -1457,8 +1472,31 @@ pub fn assemble_context(
     let mut items = Vec::new();
     let mut used = 0u64;
     let mut invalidated = Vec::new();
+    let mut duplicates = Vec::new();
+    let mut seen_content: BTreeMap<String, String> = BTreeMap::new();
     let mut deltas: BTreeMap<String, (CacheClass, ImpressionDelta)> = BTreeMap::new();
     for (selection, resolved, delta, cache) in candidates {
+        if let Some(fingerprint) = content_fingerprint(&resolved) {
+            if let Some(existing) = seen_content.get(&fingerprint) {
+                duplicates.push(DuplicateContext {
+                    id: selection.id.clone(),
+                    duplicate_of: existing.clone(),
+                    retained: selection.required,
+                });
+                if selection.required {
+                    // required 不能丢，但把指纹归属更新到最新 id，后续可选重复项仍会被抑制。
+                    seen_content.insert(fingerprint, selection.id.clone());
+                } else {
+                    dropped.push(DroppedContext {
+                        id: selection.id.clone(),
+                        reason: ContextDropReason::Duplicate,
+                    });
+                    continue;
+                }
+            } else {
+                seen_content.insert(fingerprint, selection.id.clone());
+            }
+        }
         let preferred = if selection.required {
             ContextDetail::Full
         } else {
@@ -1581,6 +1619,7 @@ pub fn assemble_context(
         reasoning,
         items,
         dropped,
+        duplicates,
         degradations,
         budget_tokens: budget,
         estimated_tokens: used,
@@ -1778,6 +1817,22 @@ impl<R: ContextCatalog> AgentContext<R> {
             .ok_or_else(|| ContextError::UnknownRef(item.id.clone()))?;
         Ok((item.clone(), resolved.document.full))
     }
+}
+
+/// 内容指纹：优先用宿主声明的 `content_hash`，否则对全文做 FNV-1a 64。
+///
+/// 只用于同一轮组装内的重复抑制，不承担跨版本稳定性承诺。
+fn content_fingerprint(resolved: &ResolvedContext) -> Option<String> {
+    if let Some(hash) = &resolved.reference.content_hash
+        && !hash.is_empty()
+    {
+        return Some(hash.clone());
+    }
+    let full = resolved.document.full.as_bytes();
+    if full.is_empty() {
+        return None;
+    }
+    Some(crate::fingerprint::fnv1a64(full))
 }
 
 fn impression_delta(reference: &ContextRef, prior: Option<&PriorImpression>) -> ImpressionDelta {
