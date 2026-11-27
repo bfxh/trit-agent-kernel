@@ -1412,7 +1412,7 @@ fn usage() {
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
          session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
-         [--workspace <dir>] [--max-steps N] [--apply] [--compact]\n\
+         [--workspace <dir>] [--max-steps N] [--retry N] [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
@@ -1513,6 +1513,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let mut workers = 4usize;
     let mut workspace: Option<PathBuf> = None;
     let mut max_steps = 20usize;
+    let mut retries = 0usize;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
@@ -1528,6 +1529,11 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                 max_steps = next(&mut args, "--max-steps")?
                     .parse()
                     .map_err(|_| fail("--max-steps must be a positive integer"))?;
+            }
+            "--retry" => {
+                retries = next(&mut args, "--retry")?
+                    .parse()
+                    .map_err(|_| fail("--retry must be a non-negative integer"))?;
             }
             "--apply" => apply = true,
             "--compact" => compact = true,
@@ -1546,6 +1552,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
             "workers": fleet.workers,
             "workspace": workspace.display().to_string(),
             "max_steps": max_steps,
+            "retry": retries,
             "tasks": fleet.tasks,
             "layers": fleet.layers,
             "skipped": fleet.skipped,
@@ -1566,16 +1573,29 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
         &workspace,
         &root,
         config,
-        trit_host::FleetRunOptions { workers, max_steps },
+        trit_host::FleetRunOptions {
+            workers,
+            max_steps,
+            retries,
+        },
     )?;
+    // 执行会话已写 `<task>.jsonl.meta`（parent），扫描后自动回填结果侧车。
+    let scanned = trit_host::scan_sessions(&root)?;
+    let callbacks =
+        trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: false })?;
+    let failed = outcome.failed.is_some();
+    let report = serde_json::json!({
+        "fleet": outcome,
+        "callbacks": callbacks,
+    });
     let text = if compact {
-        serde_json::to_string(&outcome)
+        serde_json::to_string(&report)
     } else {
-        serde_json::to_string_pretty(&outcome)
+        serde_json::to_string_pretty(&report)
     }
     .map_err(|error| fail(error.to_string()))?;
     println!("{text}");
-    if outcome.failed.is_some() {
+    if failed {
         return Err(fail("fleet failed; see failed task above"));
     }
     Ok(())

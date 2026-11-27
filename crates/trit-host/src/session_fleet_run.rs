@@ -28,11 +28,17 @@ pub const SESSION_FLEET_RUN_SCHEMA: u32 = 1;
 pub struct FleetRunOptions {
     pub workers: usize,
     pub max_steps: usize,
+    /// 失败后重跑未完成任务（deferred + 失败任务）的次数上限。
+    #[serde(default)]
+    pub retries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetRunOutcome {
     pub schema: u32,
+    /// 实际执行轮数（首次 + 重试）。
+    #[serde(default)]
+    pub attempts: usize,
     pub completed: Vec<String>,
     #[serde(default)]
     pub failed: Option<String>,
@@ -81,6 +87,55 @@ pub fn execute_fleet(
     config: OpenAiConfig,
     options: FleetRunOptions,
 ) -> Result<FleetRunOutcome, AgentError> {
+    let cancel = CancelToken::new();
+    // Ctrl-C 只做协作式取消；安装失败（例如已安装）不阻止执行。
+    let _ = crate::cancel_guard::install(cancel.clone());
+
+    let mut outcome = execute_once(
+        report,
+        workspace,
+        session_dir,
+        config.clone(),
+        &options,
+        cancel.clone(),
+    )?;
+    let mut attempts = 1usize;
+    while outcome.failed.is_some() && attempts <= options.retries {
+        let mut ids = std::collections::BTreeSet::new();
+        ids.extend(outcome.deferred.iter().cloned());
+        if let Some(failed) = &outcome.failed {
+            ids.insert(failed.clone());
+        }
+        if ids.is_empty() {
+            break;
+        }
+        let subset = retry_subset(report, &ids);
+        if subset.tasks.is_empty() {
+            break;
+        }
+        let next = execute_once(
+            &subset,
+            workspace,
+            session_dir,
+            config.clone(),
+            &options,
+            cancel.clone(),
+        )?;
+        attempts += 1;
+        outcome = merge_outcomes(outcome, next, attempts);
+    }
+    outcome.attempts = attempts;
+    Ok(outcome)
+}
+
+fn execute_once(
+    report: &SessionFleetReport,
+    workspace: &Path,
+    session_dir: &Path,
+    config: OpenAiConfig,
+    options: &FleetRunOptions,
+    cancel: CancelToken,
+) -> Result<FleetRunOutcome, AgentError> {
     let plan = build_plan(report)?;
     let config = std::sync::Arc::new(config);
     let fallback_workspace = workspace.to_path_buf();
@@ -91,6 +146,15 @@ pub fn execute_fleet(
             task.workspace
                 .as_ref()
                 .map(|workspace| (task.id.clone(), PathBuf::from(workspace)))
+        })
+        .collect();
+    let parents: BTreeMap<String, String> = report
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            task.parent
+                .as_ref()
+                .map(|parent| (task.id.clone(), parent.clone()))
         })
         .collect();
     let session_dir = session_dir.to_path_buf();
@@ -105,10 +169,19 @@ pub fn execute_fleet(
             .get(&task.task.id)
             .cloned()
             .unwrap_or_else(|| fallback_workspace.clone());
+        let session = session_dir.join(format!("{}.jsonl", task.task.id));
+        if let Some(parent) = parents.get(&task.task.id) {
+            let mut meta_path = session.as_os_str().to_os_string();
+            meta_path.push(".meta");
+            let meta = serde_json::json!({"id": task.task.id, "parent": parent});
+            if let Ok(bytes) = serde_json::to_vec(&meta) {
+                let _ = std::fs::write(meta_path, bytes);
+            }
+        }
         let headless = HeadlessConfig {
             workspace: WorkspaceConfig::new(&workspace),
             max_steps,
-            session: Some(session_dir.join(format!("{}.jsonl", task.task.id))),
+            session: Some(session),
             context: ContextPolicy::default(),
             write_guard: None,
         };
@@ -120,9 +193,6 @@ pub fn execute_fleet(
             tokens,
         })
     };
-    let cancel = CancelToken::new();
-    // Ctrl-C 只做协作式取消；安装失败（例如已安装）不阻止执行。
-    let _ = crate::cancel_guard::install(cancel.clone());
     let report = execute(
         &plan,
         FleetConfig::new(options.workers.max(1)),
@@ -137,12 +207,56 @@ pub fn execute_fleet(
         .collect();
     Ok(FleetRunOutcome {
         schema: SESSION_FLEET_RUN_SCHEMA,
+        attempts: 1,
         completed: report.completed,
         failed: report.failed.map(|failure| failure.task),
         deferred: report.deferred,
         cancelled: report.cancelled,
         references,
     })
+}
+
+/// 只保留 `ids` 中的任务；指向集合外的依赖被移除，再重新分层。
+fn retry_subset(
+    report: &SessionFleetReport,
+    ids: &std::collections::BTreeSet<String>,
+) -> SessionFleetReport {
+    let tasks: Vec<crate::session_fleet::FleetTask> = report
+        .tasks
+        .iter()
+        .filter(|task| ids.contains(&task.id))
+        .map(|task| {
+            let mut task = task.clone();
+            task.deps.retain(|dep| ids.contains(dep));
+            task
+        })
+        .collect();
+    let (layers, cyclic) = crate::session_fleet::topological_layers(&tasks);
+    SessionFleetReport {
+        schema: report.schema,
+        workers: report.workers,
+        tasks,
+        layers,
+        skipped: Vec::new(),
+        cyclic,
+    }
+}
+
+/// 合并重试结果：completed 累加，failed/deferred/cancelled 以最后一轮为准。
+fn merge_outcomes(
+    mut target: FleetRunOutcome,
+    next: FleetRunOutcome,
+    attempts: usize,
+) -> FleetRunOutcome {
+    target.attempts = attempts;
+    target.completed.extend(next.completed);
+    target.completed.sort();
+    target.completed.dedup();
+    target.failed = next.failed;
+    target.deferred = next.deferred;
+    target.cancelled = next.cancelled;
+    target.references.extend(next.references);
+    target
 }
 
 #[cfg(test)]
@@ -161,12 +275,14 @@ mod tests {
                     task: "do parent".into(),
                     deps: Vec::new(),
                     workspace: None,
+                    parent: None,
                 },
                 FleetTask {
                     id: "child".into(),
                     task: "do child".into(),
                     deps: vec!["parent".into()],
                     workspace: None,
+                    parent: Some("parent".into()),
                 },
             ],
             layers: vec![vec!["parent".into()], vec!["child".into()]],
@@ -193,12 +309,14 @@ mod tests {
                     task: "a".into(),
                     deps: vec!["b".into()],
                     workspace: None,
+                    parent: Some("b".into()),
                 },
                 FleetTask {
                     id: "b".into(),
                     task: "b".into(),
                     deps: vec!["a".into()],
                     workspace: None,
+                    parent: Some("a".into()),
                 },
             ],
             layers: Vec::new(),
@@ -206,5 +324,49 @@ mod tests {
             cyclic: vec!["a".into(), "b".into()],
         };
         assert!(build_plan(&report).is_err());
+    }
+
+    #[test]
+    fn retry_subset_filters_external_deps_and_rebuilds_layers() {
+        let report = SessionFleetReport {
+            schema: SESSION_FLEET_SCHEMA,
+            workers: 2,
+            tasks: vec![
+                FleetTask {
+                    id: "a".into(),
+                    task: "a".into(),
+                    deps: Vec::new(),
+                    workspace: None,
+                    parent: None,
+                },
+                FleetTask {
+                    id: "b".into(),
+                    task: "b".into(),
+                    deps: vec!["a".into()],
+                    workspace: None,
+                    parent: Some("a".into()),
+                },
+                FleetTask {
+                    id: "c".into(),
+                    task: "c".into(),
+                    deps: vec!["b".into()],
+                    workspace: None,
+                    parent: Some("b".into()),
+                },
+            ],
+            layers: vec![vec!["a".into()], vec!["b".into()], vec!["c".into()]],
+            skipped: Vec::new(),
+            cyclic: Vec::new(),
+        };
+        let ids: std::collections::BTreeSet<String> =
+            ["b", "c"].into_iter().map(str::to_owned).collect();
+        let subset = retry_subset(&report, &ids);
+        assert_eq!(subset.tasks.len(), 2);
+        let b = subset.tasks.iter().find(|task| task.id == "b").unwrap();
+        assert!(b.deps.is_empty(), "external dep must be dropped");
+        assert_eq!(
+            subset.layers,
+            vec![vec!["b".to_owned()], vec!["c".to_owned()]]
+        );
     }
 }

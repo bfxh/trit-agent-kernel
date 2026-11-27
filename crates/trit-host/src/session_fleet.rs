@@ -26,6 +26,9 @@ pub struct FleetTask {
     /// 该任务的写根；来自会话 meta 的 project/project_path，缺省时由执行层回退。
     #[serde(default)]
     pub workspace: Option<String>,
+    /// 第一个父会话 id；执行完成后用于把结果回填到 parent 的 delegations.jsonl。
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +81,7 @@ pub fn plan_fleet(
             task,
             deps: Vec::new(),
             workspace: entry.project.clone(),
+            parent: None,
         });
     }
 
@@ -95,6 +99,9 @@ pub fn plan_fleet(
             continue;
         }
         if let Some(task) = tasks.iter_mut().find(|task| task.id == dependent) {
+            if task.parent.is_none() {
+                task.parent = Some(dependency.clone());
+            }
             task.deps.push(dependency);
         }
     }
@@ -114,7 +121,7 @@ pub fn plan_fleet(
     }
 }
 
-fn topological_layers(tasks: &[FleetTask]) -> (Vec<Vec<String>>, Vec<String>) {
+pub(crate) fn topological_layers(tasks: &[FleetTask]) -> (Vec<Vec<String>>, Vec<String>) {
     let mut remaining: BTreeSet<String> = tasks.iter().map(|task| task.id.clone()).collect();
     let deps: BTreeMap<&str, &[String]> = tasks
         .iter()
@@ -223,6 +230,7 @@ mod tests {
             vec![vec!["parent".to_owned()], vec!["child".to_owned()]]
         );
         assert_eq!(fleet.tasks[1].deps, vec!["parent".to_owned()]);
+        assert_eq!(fleet.tasks[1].parent.as_deref(), Some("parent"));
     }
 
     #[test]
