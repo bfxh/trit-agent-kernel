@@ -1601,7 +1601,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
         },
     )?;
     // 执行会话已写 `<task>.jsonl.meta`（parent），扫描后自动回填结果侧车。
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let callbacks =
         trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: false })?;
     let verification = trit_host::verify_callbacks(&scanned)?;
