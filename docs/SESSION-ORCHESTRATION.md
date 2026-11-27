@@ -103,7 +103,7 @@ DelegationResult（parent 目录 delegations.jsonl）
 - 连接池：OpenAI provider 与 remote ledger/subagent 按 timeout 复用 `ureq::Agent`。
 - 句柄复用：`LocalTools` 缓存 workspace `Dir`；`SessionLog` 缓存追加文件句柄。
 - 工具目录：`default_tools()` 用 `OnceLock` 缓存。
-- 基准：`cargo bench -p trit-host --bench session_scan`（200 会话 × 20 turn，全量 ~33 ms、缓存命中 ~13 ms）。
+- 基准：`cargo bench -p trit-host --bench session_scan`（200 会话 × 20 turn；全量约 62 ms、缓存命中约 27 ms；4 root × 50 会话并行扫描约 23 ms；200 文件写批量约 65 ms；数字随机器变化，仅作回归参照）。
 
 ## 8. 测试
 

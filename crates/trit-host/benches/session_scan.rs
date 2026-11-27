@@ -7,7 +7,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use trit_host::{SessionEvent, SessionLog, scan_sessions, scan_sessions_cached};
+use trit_host::{
+    SessionEvent, SessionLog, ToolExecutor, scan_sessions, scan_sessions_cached,
+    scan_sessions_roots,
+};
 
 const FILES: usize = 200;
 const EVENTS: usize = 20;
@@ -86,6 +89,55 @@ fn main() {
 
     let (hit, sessions) = timed(|| scan_sessions_cached(&root, &cache).unwrap().sessions.len());
     report("cache_hit", FILES, hit, sessions);
+
+    // 多 root 并行扫描：4 个 root × 50 会话。
+    let mut multi_roots = Vec::new();
+    for root_index in 0..4 {
+        let multi = temp();
+        for index in 0..50 {
+            let mut log = SessionLog::open(multi.join(format!("m{index:03}.jsonl"))).unwrap();
+            log.append(SessionEvent::TurnStarted {
+                task: format!("root-{root_index}-{index}"),
+                objective: "bench".into(),
+                max_steps: 1,
+            })
+            .unwrap();
+        }
+        multi_roots.push(multi);
+    }
+    let (multi, sessions) = timed(|| scan_sessions_roots(&multi_roots).unwrap().sessions.len());
+    report("multi_root_parallel", 200, multi, sessions);
+    for multi in &multi_roots {
+        let _ = fs::remove_dir_all(multi);
+    }
+
+    // 写批量：200 个不同路径，验证按路径分段并行。
+    let write_root = temp();
+    let mut config = trit_host::tools::WorkspaceConfig::new(&write_root);
+    config.allow_write = true;
+    let mut tools = trit_host::tools::LocalTools::new(config).unwrap();
+    let requests: Vec<trit_host::ToolRequest> = (0..200)
+        .map(|index| trit_host::ToolRequest {
+            call_id: format!("write-{index}"),
+            tool: "write_file".into(),
+            read_only: false,
+            command: None,
+            paths: vec![format!("w{index:03}.txt")],
+            operation: None,
+            content: Some(format!("bench {index}")),
+            span: None,
+            arguments: None,
+        })
+        .collect();
+    let (writes, ok) = timed(|| {
+        tools
+            .execute_batch(&requests)
+            .iter()
+            .filter(|outcome| outcome.is_ok())
+            .count()
+    });
+    report("write_batch_parallel", 200, writes, ok);
+    let _ = fs::remove_dir_all(write_root);
 
     println!("scan: ok");
     let _ = fs::remove_dir_all(root);
