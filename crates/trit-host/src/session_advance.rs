@@ -134,36 +134,37 @@ fn fleet_from_dispatch(
         .iter()
         .map(|item| item.source_session.clone())
         .collect();
-    let task_id = |source: &str| format!("{source}.run");
-    let tasks: Vec<FleetTask> = dispatch
-        .items
-        .iter()
-        .map(|item| {
-            let entry = scan
-                .sessions
-                .iter()
-                .find(|entry| entry.session_id == item.source_session);
-            let parent = scan
-                .links
-                .iter()
-                .find(|link| link.to == item.source_session && selected.contains(&link.from))
-                .map(|link| link.from.clone());
-            let deps = scan
-                .links
-                .iter()
-                .filter(|link| link.to == item.source_session && selected.contains(&link.from))
-                .map(|link| task_id(&link.from))
-                .collect();
-            FleetTask {
-                id: task_id(&item.source_session),
-                task: item.task.clone(),
-                deps,
-                workspace: entry.and_then(|entry| entry.project.clone()),
-                parent,
-                max_tokens: 0,
-            }
-        })
-        .collect();
+    let mut seen = BTreeSet::new();
+    let mut tasks = Vec::new();
+    for item in &dispatch.items {
+        let id = task_id(&item.source_session);
+        if !seen.insert(safe_id(&id)) {
+            return Err(format!("duplicate fleet task id after sanitization: {id}"));
+        }
+        let entry = scan
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id == item.source_session);
+        let parent = scan
+            .links
+            .iter()
+            .find(|link| link.to == item.source_session && selected.contains(&link.from))
+            .map(|link| link.from.clone());
+        let deps = scan
+            .links
+            .iter()
+            .filter(|link| link.to == item.source_session && selected.contains(&link.from))
+            .map(|link| task_id(&link.from))
+            .collect();
+        tasks.push(FleetTask {
+            id,
+            task: item.task.clone(),
+            deps,
+            workspace: entry.and_then(|entry| entry.project.clone()),
+            parent,
+            max_tokens: 0,
+        });
+    }
     let (layers, cyclic) = topological_layers(&tasks);
     let mut report = SessionFleetReport {
         schema: SESSION_FLEET_SCHEMA,
@@ -180,6 +181,22 @@ fn fleet_from_dispatch(
 /// 从扫描报告重新生成计划；CLI 用它把 scan/plan 两步收敛。
 pub fn plan_from_scan(scan: &SessionScanReport) -> SessionPlanReport {
     plan_sessions(scan)
+}
+
+fn task_id(source: &str) -> String {
+    format!("{source}.run")
+}
+
+fn safe_id(id: &str) -> String {
+    id.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

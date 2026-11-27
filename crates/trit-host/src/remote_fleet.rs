@@ -863,6 +863,12 @@ fn acquire_health_write_lock(path: &Path) -> Result<SingleInstanceLock, AgentErr
 
 /// 直接把给定快照写成健康文件；调用方负责持有写锁与合并旧条目。
 fn write_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentError> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(AgentError::Io(format!(
+            "refusing symlink health file {}",
+            path.display()
+        )));
+    }
     let text = serde_json::to_string_pretty(nodes)
         .map_err(|error| AgentError::Io(format!("encode health file: {error}")))?;
     if let Some(parent) = path.parent()
