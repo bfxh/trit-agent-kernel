@@ -49,6 +49,8 @@ fn dry_run_lists_tasks_and_nodes_without_network() {
             dir.to_str().unwrap(),
             "--nodes",
             nodes.to_str().unwrap(),
+            "--budget-tokens",
+            "100",
             "--compact",
         ])
         .output()
@@ -62,6 +64,7 @@ fn dry_run_lists_tasks_and_nodes_without_network() {
     assert_eq!(report["dry_run"], true);
     assert_eq!(report["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(report["nodes"][0], "node-1");
+    assert_eq!(report["budget_tokens"], 100);
     assert!(report["completed"].as_array().unwrap().is_empty());
     let _ = fs::remove_dir_all(dir);
 }

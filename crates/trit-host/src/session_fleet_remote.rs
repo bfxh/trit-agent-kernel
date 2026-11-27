@@ -49,6 +49,8 @@ pub struct RemoteFleetOutcome {
     pub tasks: Vec<String>,
     pub nodes: Vec<String>,
     #[serde(default)]
+    pub budget_tokens: u64,
+    #[serde(default)]
     pub completed: Vec<String>,
     #[serde(default)]
     pub failed: Option<String>,
@@ -66,12 +68,14 @@ pub fn run_remote_fleet(
 ) -> Result<RemoteFleetOutcome, AgentError> {
     let tasks: Vec<String> = report.tasks.iter().map(|task| task.id.clone()).collect();
     let node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+    let budget_tokens: u64 = report.tasks.iter().map(|task| task.max_tokens).sum();
     if options.dry_run {
         return Ok(RemoteFleetOutcome {
             schema: SESSION_FLEET_REMOTE_SCHEMA,
             dry_run: true,
             tasks,
             nodes: node_ids,
+            budget_tokens,
             completed: Vec::new(),
             failed: None,
             deferred: Vec::new(),
@@ -129,6 +133,7 @@ fn outcome_from_report(report: RemotePlanReport) -> RemoteFleetOutcome {
         dry_run: false,
         tasks: report.results.keys().cloned().collect(),
         nodes: report.nodes.iter().map(|node| node.id.clone()).collect(),
+        budget_tokens: report.results.values().map(|result| result.tokens).sum(),
         completed: report.report.completed,
         failed: report.report.failed.map(|failure| failure.task),
         deferred: report.report.deferred,

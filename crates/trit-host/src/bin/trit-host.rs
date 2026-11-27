@@ -1439,7 +1439,8 @@ fn usage() {
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          session-fleet-remote: trit-host session-fleet-remote --root <dir> --nodes <node-table.json>\n\
-         [--workers N] [--retry N] [--health-probe] [--cache <path>] [--apply] [--compact]\n\
+         [--workers N] [--retry N] [--budget-tokens N] [--health-probe] [--cache <path>]\n\
+         [--apply] [--compact]\n\
          dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
@@ -1541,6 +1542,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let mut nodes_path: Option<PathBuf> = None;
     let mut workers = 4usize;
     let mut retry_limit = 0u32;
+    let mut budget_tokens = 0u64;
     let mut health_probe = false;
     let mut cache: Option<PathBuf> = None;
     let mut apply = false;
@@ -1559,6 +1561,11 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
                     .parse()
                     .map_err(|_| fail("--retry must be a non-negative integer"))?;
             }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+            }
             "--health-probe" => health_probe = true,
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--apply" => apply = true,
@@ -1576,7 +1583,10 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
     let scanned = scan_for(&root, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
-    let fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    if budget_tokens > 0 {
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+    }
     let outcome = trit_host::run_remote_fleet(
         &fleet,
         nodes,
