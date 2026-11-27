@@ -67,6 +67,9 @@ pub struct FleetRunOutcome {
     /// 人读告警文本（预算告警、未知模型等）。
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// 每个任务的设计评分（按任务 id）；只报告，不影响完成裁决。
+    #[serde(default)]
+    pub design: BTreeMap<String, crate::DesignReport>,
 }
 
 /// 把调度报告映射成 `trit_orch::Plan`，依赖一律 `True`（必需）。
@@ -305,6 +308,8 @@ fn execute_once(
     let max_steps = options.max_steps;
     let usage_acc = Arc::new(Mutex::new(TokenUsage::default()));
     let usage_for_runner = Arc::clone(&usage_acc);
+    let design_acc: Arc<Mutex<BTreeMap<String, crate::DesignReport>>> = Arc::default();
+    let design_for_runner = Arc::clone(&design_acc);
     let runner = move |task: &TaskSpec, cancel: &CancelToken| -> Result<FleetOutput, String> {
         if cancel.is_cancelled() {
             return Err("cancelled before start".to_owned());
@@ -355,6 +360,9 @@ fn execute_once(
         let mut content = outcome.render_markdown();
         // 设计分随任务输出一起回报；不影响完成裁决。
         let design = crate::score_written_paths(&workspace, &outcome.receipts);
+        if let Ok(mut map) = design_for_runner.lock() {
+            map.insert(task.task.id.clone(), design.clone());
+        }
         content.push_str(&crate::render_design_markdown(&design));
         Ok(FleetOutput {
             content: content.into_bytes(),
@@ -388,6 +396,10 @@ fn execute_once(
         cost: None,
         budget_alert: None,
         warnings: Vec::new(),
+        design: design_acc
+            .lock()
+            .map(|guard| (*guard).clone())
+            .unwrap_or_default(),
     })
 }
 
@@ -585,6 +597,7 @@ mod tests {
             cost: None,
             budget_alert: None,
             warnings: Vec::new(),
+            design: BTreeMap::new(),
         };
         let merged = merge_outcomes(outcome(10, 3, 7), outcome(5, 1, 2), 2);
         assert_eq!(merged.usage.fresh, 15);
