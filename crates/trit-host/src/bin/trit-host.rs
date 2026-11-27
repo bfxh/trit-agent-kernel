@@ -53,6 +53,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-plan" {
         return run_session_plan(args);
     }
+    if command == "session-dispatch" {
+        return run_session_dispatch(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1377,6 +1380,9 @@ fn usage() {
          session-plan: trit-host session-plan --root <dir> [--compact]\n\
          scans sessions and prints a deterministic resume/inspect/idle plan with\n\
          links and unassigned parent ids.\n\
+         session-dispatch: trit-host session-dispatch --root <dir> [--apply] [--compact]\n\
+         dispatches resume items into new trit session files; dry-run by default,\n\
+         --apply writes one TurnStarted per item and never overwrites targets.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1465,6 +1471,40 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if blocked {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `session-dispatch --root <dir> [--apply] [--compact]`：
+/// 默认 dry-run；`--apply` 才为新会话写 TurnStarted，且拒绝覆盖已有目标。
+fn run_session_dispatch(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-dispatch argument: {other}"))),
+        }
+    }
+    let scanned = trit_host::scan_sessions(&root)?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let report = trit_host::dispatch_sessions(
+        &scanned,
+        &plan,
+        &trit_host::DispatchOptions {
+            dry_run: !apply,
+            max_steps: 16,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 
