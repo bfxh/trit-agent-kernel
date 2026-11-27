@@ -245,7 +245,7 @@ impl GitCheckpointStore {
 
     /// 只读检查 git 后端回退 journal。
     pub fn rewind_status(&self) -> Result<RewindJournalReport, AgentError> {
-        RewindJournal::open(&self.dir)?.report()
+        RewindJournal::open_readonly(&self.dir)?.report()
     }
 
     /// 用 `begin` 记录的整树 backup commit 恢复半写工作区。

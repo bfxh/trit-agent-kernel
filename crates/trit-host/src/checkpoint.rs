@@ -22,6 +22,7 @@ pub const CHECKPOINT_SCHEMA: u32 = 1;
 pub const REWIND_SCHEMA: u32 = 1;
 pub const REWIND_JOURNAL: &str = "rewind-journal.jsonl";
 pub const REWIND_BACKUP_DIR: &str = "rewind-backups";
+pub const REWIND_LOCK: &str = "rewind.lock";
 /// 单个文件快照上限；超过即 fail-closed，避免把大文件读进内存/检查点。
 const MAX_CHECKPOINT_FILE_BYTES: u64 = 8 * 1024 * 1024;
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -132,7 +133,7 @@ impl CheckpointStore {
 
     /// 只读检查回退 journal：未完成/回滚失败的 rewind 会让新回退 fail-closed。
     pub fn rewind_status(&self) -> Result<RewindJournalReport, AgentError> {
-        RewindJournal::open(&self.dir)?.report()
+        RewindJournal::open_readonly(&self.dir)?.report()
     }
 
     /// 把未完成的 rewind 恢复到 pre-rewind 状态。
@@ -492,12 +493,37 @@ pub(crate) struct RewindJournal {
     dir: PathBuf,
     path: PathBuf,
     seq: u64,
+    /// 写路径持有的独占锁；只读打开时为 `None`。进程退出（含崩溃）由内核释放。
+    _lock: Option<crate::lease::SingleInstanceLock>,
 }
 
 impl RewindJournal {
+    /// 写路径：持独占锁。两个进程同时回退会共用 `seq`/`op_id`，后一条 `begin` 覆盖前一条，
+    /// 导致 `in_doubt` 漏报；这里直接拒绝而不是静默交错。
     pub(crate) fn open(dir: &Path) -> Result<Self, AgentError> {
         std::fs::create_dir_all(dir)
             .map_err(|error| AgentError::Io(format!("rewind journal dir: {error}")))?;
+        let lock = crate::lease::SingleInstanceLock::acquire(dir.join(REWIND_LOCK))
+            .map_err(|error| AgentError::SessionState(format!("rewind journal lock: {error}")))?
+            .ok_or_else(|| {
+                AgentError::SessionState(
+                    "rewind journal is locked by another rewind/recover operation".into(),
+                )
+            })?;
+        Self::open_locked(dir, Some(lock))
+    }
+
+    /// 只读路径（`rewind_status`）：不持锁，状态查询不会与进行中的回退互斥。
+    pub(crate) fn open_readonly(dir: &Path) -> Result<Self, AgentError> {
+        std::fs::create_dir_all(dir)
+            .map_err(|error| AgentError::Io(format!("rewind journal dir: {error}")))?;
+        Self::open_locked(dir, None)
+    }
+
+    fn open_locked(
+        dir: &Path,
+        lock: Option<crate::lease::SingleInstanceLock>,
+    ) -> Result<Self, AgentError> {
         let path = dir.join(REWIND_JOURNAL);
         let records = read_rewind_records(&path)?;
         let seq = records.last().map_or(0, |record| record.seq);
@@ -505,6 +531,7 @@ impl RewindJournal {
             dir: dir.to_path_buf(),
             path,
             seq,
+            _lock: lock,
         })
     }
 
@@ -1465,6 +1492,21 @@ mod tests {
                 .exists()
         );
         let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn second_writer_is_rejected_while_journal_is_held() {
+        let store_dir = temp_root("journal-lock");
+        let _holder = RewindJournal::open(&store_dir).unwrap();
+        // 同一 checkpoint 目录的第二个写者必须被拒绝，而不是共用 seq/op_id。
+        let second = RewindJournal::open(&store_dir);
+        assert!(second.is_err(), "second writer must be rejected");
+        // 只读状态查询不受影响。
+        assert!(RewindJournal::open_readonly(&store_dir).unwrap().report().is_ok());
+        drop(_holder);
+        // 持有者释放后可再次获得写锁。
+        assert!(RewindJournal::open(&store_dir).is_ok());
         let _ = std::fs::remove_dir_all(store_dir);
     }
 
