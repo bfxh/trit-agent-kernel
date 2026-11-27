@@ -123,7 +123,7 @@ cargo bench -p trit-host --bench session_scan
 
 ## 9. 当前边界
 
-- `session-advance` 是唯一的自动闭环命令；`session-auto` 只生成派发单，不自动接 `session-fleet-run`。
+- `session-advance --apply` 在本地执行前检查写日志：存在未闭合的 `begin`（上次崩溃）时 fail closed，提示先运行 `journal-status --rollback`；`--nodes` 跨机分支不检查本地 workspace。
 - `session-advance` 的任务 id 使用 `<source>.run`，执行会话写到独立 `<source>.run.jsonl`，不覆盖原会话或派发单。
 - `session-fleet-remote` 复用 `NodeTable` + `run_remote_plan_with_table`：节点容量、失败隔离、换节点重试与幂等键由现有层负责；跨机预算在 ledger 服务端生效。
 - `--scope S` 把幂等键变成 `[scope|]task@epoch`：不同计划必须用不同 scope，否则同名任务会在共享 ledger 中互相去重；`session-advance` 会把 scope 透传到远程 fleet 阶段。

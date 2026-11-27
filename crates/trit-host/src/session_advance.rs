@@ -125,6 +125,20 @@ pub fn advance(
         return Ok(report);
     }
 
+    // 上一次进程若在写操作中途崩溃，journal 会留下未闭合的 begin。
+    // 本地执行前 fail closed，避免在状态不明的工作区上继续写。
+    if nodes.is_none() {
+        let journal = crate::journal::inspect(workspace)
+            .map_err(|error| AgentError::SessionState(format!("write journal: {error}")))?;
+        if journal.has_in_doubt() {
+            return Err(AgentError::SessionState(format!(
+                "write journal has {} in-doubt operation(s); run `trit-host journal-status --workspace {} --rollback` before advancing",
+                journal.in_doubt.len(),
+                workspace.display()
+            )));
+        }
+    }
+
     if let Some(nodes) = nodes {
         let remote = run_remote_fleet(
             &report.fleet,
