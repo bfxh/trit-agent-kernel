@@ -895,13 +895,23 @@ impl ToolExecutor for LocalTools {
                     .collect()
             });
         }
-        // 写工具：同一首路径串行，不同路径并行；没有路径的请求单独成组串行。
-        let mut groups: BTreeMap<Option<&str>, Vec<usize>> = BTreeMap::new();
+        // 写工具：路径冲突（含 move 的源/目标）必须串行，互不冲突的组并行。
+        let mut parent: Vec<usize> = (0..requests.len()).collect();
+        let mut owner: BTreeMap<&str, usize> = BTreeMap::new();
         for (index, request) in requests.iter().enumerate() {
-            groups
-                .entry(request.paths.first().map(String::as_str))
-                .or_default()
-                .push(index);
+            for path in &request.paths {
+                if let Some(&other) = owner.get(path.as_str()) {
+                    union(&mut parent, other, index);
+                }
+            }
+            for path in &request.paths {
+                owner.insert(path.as_str(), index);
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for index in 0..requests.len() {
+            let root = find(&mut parent, index);
+            groups.entry(root).or_default().push(index);
         }
         let mut results: Vec<Option<Result<ToolOutcome, AgentError>>> =
             (0..requests.len()).map(|_| None).collect();
@@ -1044,6 +1054,22 @@ pub fn is_parallel_tool(tool: &str) -> bool {
         tool,
         "read_file" | "search_code" | "glob" | "write_file" | "move_path"
     )
+}
+
+fn find(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
+}
+
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left = find(parent, left);
+    let right = find(parent, right);
+    if left != right {
+        parent[right] = left;
+    }
 }
 
 fn is_cross_device(error: &std::io::Error) -> bool {
@@ -1270,6 +1296,38 @@ mod tests {
             std::fs::read_to_string(root.join("same.txt")).unwrap(),
             "second"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_batch_serializes_crossing_source_and_target_paths() {
+        let root = temp("move-batch");
+        let mut config = WorkspaceConfig::new(&root);
+        config.allow_write = true;
+        let mut tools = LocalTools::new(config).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        let mv = |call_id: &str, from: &str, to: &str| ToolRequest {
+            call_id: call_id.into(),
+            tool: "move_path".into(),
+            read_only: false,
+            command: None,
+            paths: vec![from.into(), to.into()],
+            operation: None,
+            content: None,
+            span: None,
+            arguments: None,
+        };
+        let outcomes = tools.execute_batch(&[
+            mv("call-1", "a.txt", "b.txt"),
+            mv("call-2", "b.txt", "c.txt"),
+        ]);
+        assert!(
+            outcomes.iter().all(|outcome| outcome.is_ok()),
+            "{outcomes:?}"
+        );
+        assert!(!root.join("a.txt").exists());
+        assert!(!root.join("b.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("c.txt")).unwrap(), "alpha");
         let _ = std::fs::remove_dir_all(root);
     }
 }
