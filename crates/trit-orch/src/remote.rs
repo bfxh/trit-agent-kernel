@@ -17,6 +17,7 @@
 //! - **不自动重试**：远程可能已经执行过，重试需要幂等键；本层不做隐式重试。
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -124,6 +125,8 @@ pub struct NodeTable {
     inner: Mutex<Vec<Slot>>,
     cond: Condvar,
     failure_threshold: u32,
+    /// 等负载时的轮转游标，避免总是偏向 id 最小的节点。
+    cursor: AtomicUsize,
 }
 
 impl NodeTable {
@@ -174,6 +177,7 @@ impl NodeTable {
             ),
             cond: Condvar::new(),
             failure_threshold: 1,
+            cursor: AtomicUsize::new(0),
         })
     }
 
@@ -231,7 +235,8 @@ impl NodeTable {
             if cancel.is_cancelled() {
                 return Ok(None);
             }
-            if let Some(index) = pick(&slots, excluded) {
+            let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
+            if let Some(index) = pick(&slots, excluded, cursor) {
                 slots[index].in_flight += 1;
                 let node = slots[index].node.clone();
                 return Ok(Some(NodeLease {
@@ -392,7 +397,8 @@ impl std::fmt::Debug for NodeTable {
     }
 }
 
-fn pick(slots: &[Slot], excluded: &BTreeSet<String>) -> Option<usize> {
+fn pick(slots: &[Slot], excluded: &BTreeSet<String>, cursor: usize) -> Option<usize> {
+    let mut candidates = Vec::new();
     let mut best: Option<usize> = None;
     for (index, slot) in slots.iter().enumerate() {
         if !slot.healthy
@@ -401,31 +407,43 @@ fn pick(slots: &[Slot], excluded: &BTreeSet<String>) -> Option<usize> {
         {
             continue;
         }
+        candidates.push(index);
         best = Some(match best {
             None => index,
             Some(current) => {
-                let candidate = slot;
-                let incumbent = &slots[current];
                 // 负载比比较用交叉相乘，避免浮点误差。
                 let candidate_load =
-                    candidate.in_flight as u128 * incumbent.node.max_in_flight as u128;
+                    slot.in_flight as u128 * slots[current].node.max_in_flight as u128;
                 let incumbent_load =
-                    incumbent.in_flight as u128 * candidate.node.max_in_flight as u128;
-                match candidate_load.cmp(&incumbent_load) {
-                    std::cmp::Ordering::Less => index,
-                    std::cmp::Ordering::Greater => current,
-                    std::cmp::Ordering::Equal => {
-                        if candidate.node.id < incumbent.node.id {
-                            index
-                        } else {
-                            current
-                        }
-                    }
+                    slots[current].in_flight as u128 * slot.node.max_in_flight as u128;
+                if candidate_load < incumbent_load {
+                    index
+                } else {
+                    current
                 }
             }
         });
     }
-    best
+    let best = best?;
+    // 等负载时从游标位置轮转，避免高并发下固定偏向某个节点。
+    let tied: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&index| {
+            slots[index].in_flight as u128 * slots[best].node.max_in_flight as u128
+                == slots[best].in_flight as u128 * slots[index].node.max_in_flight as u128
+        })
+        .collect();
+    if tied.len() <= 1 {
+        return Some(best);
+    }
+    let start = cursor % slots.len();
+    for offset in 0..slots.len() {
+        let index = (start + offset) % slots.len();
+        if tied.contains(&index) {
+            return Some(index);
+        }
+    }
+    Some(best)
 }
 
 /// 一次准入的占用凭据。

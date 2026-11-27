@@ -460,3 +460,16 @@ fn remote_node_json_uses_documented_defaults() {
     assert!(node.endpoint.auth_token.is_none());
     assert!(NodeTable::new(vec![node]).is_ok());
 }
+
+#[test]
+fn equal_load_picks_rotate_across_nodes() {
+    let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
+    let cancel = CancelToken::new();
+    let first = table.acquire(&cancel).unwrap().unwrap();
+    let first_id = first.node().id.clone();
+    first.finish(NodeOutcome::Succeeded);
+    let second = table.acquire(&cancel).unwrap().unwrap();
+    let second_id = second.node().id.clone();
+    second.finish(NodeOutcome::Succeeded);
+    assert_ne!(first_id, second_id, "equal-load picks must rotate");
+}
