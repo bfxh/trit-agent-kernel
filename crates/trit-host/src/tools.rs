@@ -309,15 +309,38 @@ impl Drop for ShellSession {
     }
 }
 
+fn cached_workspace(root: &Path) -> Result<(PathBuf, Dir), AgentError> {
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, (PathBuf, Dir)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((canonical, dir)) = cache.get(root) {
+        let dir = dir
+            .try_clone()
+            .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+        return Ok((canonical.clone(), dir));
+    }
+    let canonical = std::fs::canonicalize(root)
+        .map_err(|error| AgentError::Io(format!("workspace root: {error}")))?;
+    if !canonical.is_dir() {
+        return Err(AgentError::Tool("workspace root is not a directory".into()));
+    }
+    let dir = Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())
+        .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+    let cached = dir
+        .try_clone()
+        .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+    cache.insert(root.to_path_buf(), (canonical.clone(), cached));
+    Ok((canonical, dir))
+}
+
 impl LocalTools {
     pub fn new(config: WorkspaceConfig) -> Result<Self, AgentError> {
-        let root = std::fs::canonicalize(&config.root)
-            .map_err(|error| AgentError::Io(format!("workspace root: {error}")))?;
-        if !root.is_dir() {
-            return Err(AgentError::Tool("workspace root is not a directory".into()));
-        }
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority())
-            .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+        let (root, dir) = cached_workspace(&config.root)?;
         let forbid = config
             .forbid
             .into_iter()

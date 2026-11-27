@@ -129,10 +129,22 @@ pub enum GateChainPhase {
     Post,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionLog {
     path: PathBuf,
     seq: u64,
+    /// 懒打开的追加句柄；避免每个事件都重新 open/create_dir。
+    file: Option<std::fs::File>,
+}
+
+impl Clone for SessionLog {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            seq: self.seq,
+            file: None,
+        }
+    }
 }
 
 impl SessionLog {
@@ -141,7 +153,11 @@ impl SessionLog {
         let path = path.into();
         let records = read_records(&path)?;
         let seq = records.last().map_or(0, |record| record.seq);
-        Ok(Self { path, seq })
+        Ok(Self {
+            path,
+            seq,
+            file: None,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -149,10 +165,18 @@ impl SessionLog {
     }
 
     pub fn append(&mut self, event: SessionEvent) -> Result<u64, AgentError> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
+        if self.file.is_none() {
+            if let Some(parent) = self.path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|error| self.io(error))?;
+            self.file = Some(file);
         }
         self.seq = self.seq.saturating_add(1);
         let record = SessionRecord {
@@ -164,12 +188,8 @@ impl SessionLog {
             path: self.path.display().to_string(),
             message: error.to_string(),
         })?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
+        writeln!(self.file.as_mut().expect("opened above"), "{line}")
             .map_err(|error| self.io(error))?;
-        writeln!(file, "{line}").map_err(|error| self.io(error))?;
         Ok(self.seq)
     }
 
@@ -179,6 +199,7 @@ impl SessionLog {
 
     /// 截断到 `turn` 之前；保留前面完整的 turn，返回删除的事件数。
     pub fn truncate_before_turn(&mut self, turn: usize) -> Result<usize, AgentError> {
+        self.file = None;
         let records = self.load()?;
         let mut seen = 0;
         let mut cut = None;
