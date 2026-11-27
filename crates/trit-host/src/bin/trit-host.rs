@@ -194,6 +194,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut mcp_sampling_model: Option<String> = None;
     // 人类面默认输出 Markdown；需要机器消费时显式 `--output-format json`。
     let mut output_format = String::from("md");
+    let mut design_score_enabled = true;
+    let mut design_block_below: Option<u8> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -241,6 +243,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
+            "--no-design-score" => design_score_enabled = false,
+            "--design-block-below" => {
+                design_block_below = Some(
+                    next(&mut args, "--design-block-below")?
+                        .parse()
+                        .map_err(|error| fail(format!("bad --design-block-below: {error}")))?,
+                );
+            }
             "--output-format" => {
                 output_format = match next(&mut args, "--output-format")?.as_str() {
                     "md" | "markdown" => "md".into(),
@@ -914,13 +924,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         eprintln!("cache ledger: {text}");
     }
+    let design =
+        design_score_enabled.then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
     let mut stdout = std::io::stdout().lock();
     let rendered = if output_format == "json" {
-        serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
+        let mut value =
+            serde_json::to_value(&outcome).map_err(|error| fail(error.to_string()))?;
+        if let Some(design) = &design {
+            value["design"] =
+                serde_json::to_value(design).map_err(|error| fail(error.to_string()))?;
+        }
+        serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
     } else {
-        outcome.render_markdown()
+        let mut text = outcome.render_markdown();
+        if let Some(design) = &design {
+            text.push_str(&trit_host::render_design_markdown(design));
+        }
+        text
     };
     writeln!(stdout, "{rendered}")?;
+    if let (Some(design), Some(threshold)) = (&design, design_block_below)
+        && design.overall < threshold
+    {
+        return Err(fail(format!(
+            "design score {} below --design-block-below {threshold}",
+            design.overall
+        )));
+    }
     if gate_chain_post || gate_chain_post_report.is_some() {
         let mut exclude: Vec<&Path> = Vec::new();
         if let Some(path) = gate_chain_report.as_deref() {
@@ -1366,6 +1396,7 @@ fn usage() {
          [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
          [--provider scripted|openai|anthropic|gemini|deepseek] [--protocol <name>] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
+         [--no-design-score] [--design-block-below N] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
          [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \

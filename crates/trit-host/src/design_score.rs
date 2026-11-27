@@ -4,6 +4,7 @@
 //! 供模型据此改进。评分是启发式，不替代测试与证据裁决。
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -124,6 +125,65 @@ pub fn score_artifacts(artifacts: &[Artifact<'_>]) -> DesignReport {
         overall,
         files: artifacts.len(),
     }
+}
+
+/// 从回执声明的写入路径读回产物并评分。
+///
+/// 跳过读不到、超过 512 KiB、或 canonicalize 后逃出 `root` 的路径（防符号链接逃逸）。
+pub fn score_written_paths(root: &Path, receipts: &[crate::ToolOutcome]) -> DesignReport {
+    let mut owned: Vec<(String, String)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let Ok(root_canonical) = root.canonicalize() else {
+        return score_artifacts(&[]);
+    };
+    for receipt in receipts {
+        for path in &receipt.written_paths {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            let Ok(canonical) = root.join(path).canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&root_canonical) {
+                continue;
+            }
+            let Ok(metadata) = canonical.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() > 512 * 1024 {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&canonical) else {
+                continue;
+            };
+            owned.push((path.clone(), content));
+        }
+    }
+    let artifacts: Vec<Artifact<'_>> = owned
+        .iter()
+        .map(|(path, content)| Artifact { path, content })
+        .collect();
+    score_artifacts(&artifacts)
+}
+
+/// 渲染设计分摘要（Markdown）。
+pub fn render_design_markdown(report: &DesignReport) -> String {
+    let mut out = String::new();
+    out.push_str("\n## Design score\n\n");
+    out.push_str(&format!(
+        "- overall: **{}**（{} 个文件）\n",
+        report.overall, report.files
+    ));
+    for axis in &report.axes {
+        out.push_str(&format!("- {}: {}\n", axis.axis.as_str(), axis.score));
+        for finding in &axis.findings {
+            out.push_str(&format!(
+                "  - {} (−{}): {}\n",
+                finding.rule, finding.penalty, finding.detail
+            ));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

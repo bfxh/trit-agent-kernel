@@ -1671,7 +1671,8 @@ pub use context_tools::{
     ContextReadRecord, ContextReadTools, LowHitPolicy,
 };
 pub use design_score::{
-    Artifact, DesignAxis, DesignAxisScore, DesignFinding, DesignReport, score_artifacts,
+    Artifact, DesignAxis, DesignAxisScore, DesignFinding, DesignReport, render_design_markdown,
+    score_artifacts, score_written_paths,
 };
 pub use diagnostics::{
     DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions, LiveMcpDiagnostics,
