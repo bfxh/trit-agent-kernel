@@ -726,6 +726,8 @@ impl LocalTools {
         let to = self.resolve_relative(to_raw)?;
         self.reject_symlink(&from, from_raw)?;
         self.reject_symlink(&to, to_raw)?;
+        // 移动的落点同样受语言用途约束（不能把 .py 挪到生产路径）。
+        crate::tech_stack::validate_write_path(to_raw).map_err(AgentError::Tool)?;
         let metadata = self
             .dir
             .symlink_metadata(&from)
@@ -787,6 +789,10 @@ impl LocalTools {
             .command
             .as_deref()
             .ok_or_else(|| AgentError::Tool("command is required".into()))?;
+        // 语言用途硬约束：shell 里的写入目标也要检查（重定向 / tee / cp / mv）。
+        for target in crate::tech_stack::shell_write_targets(command) {
+            crate::tech_stack::validate_write_path(&target).map_err(AgentError::Tool)?;
+        }
         if self.persistent_shell && self.sandbox.is_none() && self.allow_unsandboxed_shell {
             let mut guard = self
                 .shell_session

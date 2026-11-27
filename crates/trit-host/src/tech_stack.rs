@@ -33,6 +33,40 @@ pub fn validate_write_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 从 shell 命令里粗略提取写入目标（重定向、`tee`、`cp`/`mv` 目标）。
+///
+/// 启发式：能挡住"顺手 `> src/x.py`"这类常见写法，但无法覆盖所有 shell 语法
+/// （变量展开、`eval`、脚本内部写文件等）。只用于拦截明显越界，不作为安全边界。
+pub fn shell_write_targets(command: &str) -> Vec<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut targets: Vec<String> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(position) = token.find('>') {
+            let rest = token[position + 1..].trim_start_matches('>');
+            if !rest.is_empty() && !rest.starts_with('&') {
+                targets.push(rest.to_owned());
+            } else if let Some(next) = tokens.get(index + 1)
+                && !next.starts_with('&')
+            {
+                targets.push((*next).to_owned());
+            }
+        }
+        if *token == "tee"
+            && let Some(next) = tokens.get(index + 1)
+            && !next.starts_with('-')
+        {
+            targets.push((*next).to_owned());
+        }
+        if (*token == "cp" || *token == "mv")
+            && let Some(last) = tokens.last()
+            && last != token
+        {
+            targets.push((*last).to_owned());
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +97,25 @@ mod tests {
     fn windows_separators_are_normalized() {
         assert!(validate_write_path("tests\\test_unit.py").is_ok());
         assert!(validate_write_path("src\\main.py").is_err());
+    }
+
+    #[test]
+    fn shell_write_targets_catch_common_forms() {
+        for command in [
+            "echo x > src/a.py",
+            "echo x >> src/a.py",
+            "echo x 2> src/a.py",
+            "echo x >src/a.py",
+        ] {
+            assert!(
+                shell_write_targets(command).contains(&"src/a.py".to_owned()),
+                "{command}"
+            );
+        }
+        assert!(shell_write_targets("cat x | tee src/a.py").contains(&"src/a.py".to_owned()));
+        assert!(shell_write_targets("cp tests/a.py src/a.py").contains(&"src/a.py".to_owned()));
+        assert!(shell_write_targets("ls -la").is_empty());
+        // 测试路径的写入允许。
+        assert!(validate_write_path("tests/test_a.py").is_ok());
     }
 }
