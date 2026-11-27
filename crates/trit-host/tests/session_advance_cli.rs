@@ -83,3 +83,37 @@ fn unknown_arguments_fail_closed() {
         "{stderr}"
     );
 }
+
+#[test]
+fn nodes_are_accepted_in_dry_run_without_network() {
+    let dir = temp_dir("nodes");
+    open_session(&dir.join("session.jsonl"), "remote");
+    let nodes = dir.join("nodes.json");
+    fs::write(
+        &nodes,
+        r#"[{"id":"node-1","max_in_flight":1,"endpoint":{"url":"http://127.0.0.1:9","auth_token":null,"timeout_secs":1}}]"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "session-advance",
+            "--root",
+            dir.to_str().unwrap(),
+            "--nodes",
+            nodes.to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["fleet"]["tasks"].as_array().unwrap().len(), 1);
+    assert!(report["remote"].is_null());
+    let _ = fs::remove_dir_all(dir);
+}

@@ -1412,10 +1412,11 @@ fn usage() {
          scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
-         [--cache <path>] [--max-items N] [--workers N] [--max-steps N] [--retry N]\n\
-         [--budget-tokens N] [--apply] [--compact]\n\
+         [--cache <path>] [--nodes <node-table.json>] [--max-items N] [--workers N]\n\
+         [--max-steps N] [--retry N] [--budget-tokens N] [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
+         With --nodes, the fleet phase dispatches through the remote node table instead.\n\
          session-callback: trit-host session-callback --root <dir> [--cache <path>]\n\
          [--apply] [--compact]\n\
          writes parent/child results into delegations.jsonl; dry-run by default,\n\
@@ -1840,6 +1841,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut root = PathBuf::from(".");
     let mut workspace: Option<PathBuf> = None;
     let mut cache: Option<PathBuf> = None;
+    let mut nodes_path: Option<PathBuf> = None;
     let mut max_items = 4usize;
     let mut workers = 4usize;
     let mut max_steps = 20usize;
@@ -1852,6 +1854,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             "--root" => root = PathBuf::from(next(&mut args, "--root")?),
             "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--nodes" => nodes_path = Some(PathBuf::from(next(&mut args, "--nodes")?)),
             "--max-items" => {
                 max_items = next(&mut args, "--max-items")?
                     .parse()
@@ -1887,10 +1890,17 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let scanned = scan_for(&root, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let workspace = workspace.unwrap_or_else(|| root.clone());
-    let config = if apply {
+    let config = if apply && nodes_path.is_none() {
         Some(trit_host::OpenAiConfig::from_env()?)
     } else {
         None
+    };
+    let nodes = match nodes_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)?;
+            Some(serde_json::from_str::<Vec<trit_host::RemoteNode>>(&text)?)
+        }
+        None => None,
     };
     let report = trit_host::advance(
         &scanned,
@@ -1899,6 +1909,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
         &root,
         cache.as_deref(),
         config,
+        nodes,
         &trit_host::AdvanceOptions {
             max_items,
             workers,

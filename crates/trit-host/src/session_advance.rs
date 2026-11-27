@@ -8,6 +8,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use trit_orch::RemoteNode;
+
 use crate::AgentError;
 use crate::openai::OpenAiConfig;
 use crate::session_callback::{CallbackOptions, CallbackReport, callback_sessions};
@@ -15,6 +17,7 @@ use crate::session_dispatch::{AutoDispatchOptions, DispatchReport, auto_dispatch
 use crate::session_fleet::{
     FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, apply_budget, topological_layers,
 };
+use crate::session_fleet_remote::{RemoteFleetOptions, RemoteFleetOutcome, run_remote_fleet};
 use crate::session_fleet_run::{FleetRunOptions, FleetRunOutcome, execute_fleet};
 use crate::session_plan::{SessionPlanReport, plan_sessions};
 use crate::session_scan::{SessionScanReport, scan_sessions, scan_sessions_cached};
@@ -55,6 +58,9 @@ pub struct AdvanceReport {
     pub fleet: SessionFleetReport,
     #[serde(default)]
     pub run: Option<FleetRunOutcome>,
+    /// 提供 `--nodes` 时的跨机执行摘要；此时不做本地回填。
+    #[serde(default)]
+    pub remote: Option<RemoteFleetOutcome>,
     #[serde(default)]
     pub callbacks: Option<CallbackReport>,
     #[serde(default)]
@@ -69,6 +75,7 @@ pub fn advance(
     session_dir: &Path,
     cache: Option<&Path>,
     config: Option<OpenAiConfig>,
+    nodes: Option<Vec<RemoteNode>>,
     options: &AdvanceOptions,
 ) -> Result<AdvanceReport, AgentError> {
     let dispatch = auto_dispatch(
@@ -89,10 +96,26 @@ pub fn advance(
         dispatch,
         fleet,
         run: None,
+        remote: None,
         callbacks: None,
         verification: None,
     };
     if options.dry_run {
+        return Ok(report);
+    }
+
+    if let Some(nodes) = nodes {
+        let remote = run_remote_fleet(
+            &report.fleet,
+            nodes,
+            &RemoteFleetOptions {
+                workers: options.workers,
+                retry_limit: options.retries as u32,
+                health_probe: false,
+                dry_run: false,
+            },
+        )?;
+        report.remote = Some(remote);
         return Ok(report);
     }
 
@@ -274,6 +297,7 @@ mod tests {
             &root,
             None,
             None,
+            None,
             &AdvanceOptions {
                 max_items: 2,
                 ..AdvanceOptions::default()
@@ -302,6 +326,7 @@ mod tests {
             &plan,
             &root,
             &root,
+            None,
             None,
             None,
             &AdvanceOptions {
