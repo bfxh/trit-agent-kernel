@@ -21,7 +21,7 @@ pub fn install(cancel: CancelToken) -> Result<(), String> {
     #[cfg(unix)]
     {
         unsafe {
-            libc::signal(libc::SIGINT, handle_unix as libc::sighandler_t);
+            libc::signal(libc::SIGINT, handle_unix as *const () as libc::sighandler_t);
         }
     }
     #[cfg(windows)]
