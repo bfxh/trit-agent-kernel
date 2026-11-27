@@ -1527,8 +1527,8 @@ pub use session_callback::{
     DelegationResult, SESSION_CALLBACK_SCHEMA, callback_sessions,
 };
 pub use session_dispatch::{
-    DispatchAction, DispatchItem, DispatchOptions, DispatchReport, SESSION_DISPATCH_SCHEMA,
-    dispatch_sessions,
+    AutoDispatchOptions, DispatchAction, DispatchItem, DispatchOptions, DispatchReport,
+    SESSION_DISPATCH_SCHEMA, auto_dispatch, dispatch_sessions,
 };
 pub use session_fleet::{
     FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, apply_budget, plan_fleet,

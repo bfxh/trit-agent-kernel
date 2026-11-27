@@ -56,6 +56,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-dispatch" {
         return run_session_dispatch(args);
     }
+    if command == "session-auto" {
+        return run_session_auto(args);
+    }
     if command == "session-callback" {
         return run_session_callback(args);
     }
@@ -1398,6 +1401,9 @@ fn usage() {
          session-dispatch: trit-host session-dispatch --root <dir> [--apply] [--compact]\n\
          dispatches resume items into new trit session files; dry-run by default,\n\
          --apply writes one TurnStarted per item and never overwrites targets.\n\
+         session-auto: trit-host session-auto --root <dir> [--max-items N] [--apply] [--compact]\n\
+         scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
+         dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-callback: trit-host session-callback --root <dir> [--apply] [--compact]\n\
          writes parent/child results into delegations.jsonl; dry-run by default,\n\
          idempotent on child records+modified time, and never edits session logs.\n\
@@ -1736,6 +1742,46 @@ fn run_session_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     if !status.success() {
         return Err(fail(format!("run exited with {status}")));
     }
+    Ok(())
+}
+
+/// `session-auto --root <dir> [--max-items N] [--apply] [--compact]`：
+/// 扫描 + 分配 + 只自动派发 Resume 项；默认 dry-run。
+fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut max_items = 4usize;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--max-items" => {
+                max_items = next(&mut args, "--max-items")?
+                    .parse()
+                    .map_err(|_| fail("--max-items must be a non-negative integer"))?;
+            }
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-auto argument: {other}"))),
+        }
+    }
+    let scanned = trit_host::scan_sessions(&root)?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let report = trit_host::auto_dispatch(
+        &scanned,
+        &plan,
+        &trit_host::AutoDispatchOptions {
+            max_items,
+            dry_run: !apply,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 

@@ -883,6 +883,7 @@ fn load_entries(
                         path.display()
                     )));
                 }
+                state.tokens_used = state.tokens_used.saturating_add(response.tokens);
                 if let Some(Entry::Done { frame, lease }) = state.entries.get(&key) {
                     state.bytes =
                         state

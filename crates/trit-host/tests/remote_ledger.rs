@@ -1324,3 +1324,55 @@ fn token_budget_blocks_new_claims_after_spend() {
     let error = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap_err();
     assert!(error.contains("503"), "{error}");
 }
+
+#[test]
+fn token_budget_survives_restart() {
+    let path = state_file("budget-restart");
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_state_path(&path)
+                .with_token_budget(10),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let running = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        running.serve_once().unwrap();
+        running.serve_once().unwrap();
+    });
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected first claim");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"done".to_vec(),
+        tokens: 10,
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+    handle.join().unwrap();
+    drop(ledger);
+
+    // 重启后从状态文件回放 tokens，预算仍然耗尽。
+    let restarted = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_state_path(&path)
+                .with_token_budget(10),
+        )
+        .unwrap(),
+    );
+    let address = restarted.addr().unwrap();
+    let restarted_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || server.serve_once().unwrap());
+    let error = remote_ledger::claim(&restarted_endpoint, "t2@0").unwrap_err();
+    assert!(error.contains("503"), "{error}");
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(path);
+}

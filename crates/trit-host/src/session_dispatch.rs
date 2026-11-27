@@ -62,6 +62,43 @@ pub struct DispatchReport {
     pub skipped: Vec<String>,
 }
 
+/// 自动派发策略：只取 `Resume` 项，按计划顺序最多 `max_items` 个（0 = 不限）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDispatchOptions {
+    pub max_items: usize,
+    pub dry_run: bool,
+}
+
+/// 自动派发：先按策略截断计划，再复用 `dispatch_sessions` 的格式/覆盖/写入门。
+pub fn auto_dispatch(
+    scan: &SessionScanReport,
+    plan: &SessionPlanReport,
+    options: &AutoDispatchOptions,
+) -> Result<DispatchReport, AgentError> {
+    let mut selected = Vec::new();
+    for item in &plan.items {
+        if item.action != SessionAction::Resume {
+            continue;
+        }
+        if options.max_items != 0 && selected.len() >= options.max_items {
+            break;
+        }
+        selected.push(item.clone());
+    }
+    let filtered = SessionPlanReport {
+        items: selected,
+        ..plan.clone()
+    };
+    dispatch_sessions(
+        scan,
+        &filtered,
+        &DispatchOptions {
+            dry_run: options.dry_run,
+            max_steps: 16,
+        },
+    )
+}
+
 /// 生成（并在 `--apply` 时执行）派发计划。
 pub fn dispatch_sessions(
     scan: &SessionScanReport,
@@ -325,5 +362,65 @@ mod tests {
         let report = dispatch_sessions(&scan, &plan, &DispatchOptions::default()).unwrap();
         assert!(report.items.is_empty());
         assert_eq!(report.skipped.len(), 1);
+    }
+
+    #[test]
+    fn auto_dispatch_limits_resume_items() {
+        let root = temp("auto");
+        let mut scan = SessionScanReport {
+            schema: 1,
+            root: root.display().to_string(),
+            scanned: 2,
+            sessions: Vec::new(),
+            links: Vec::new(),
+            warnings: Vec::new(),
+        };
+        for id in ["a", "b"] {
+            let path = root.join(format!("{id}.jsonl"));
+            let mut log = SessionLog::open(&path).unwrap();
+            log.append(SessionEvent::TurnStarted {
+                task: format!("task-{id}"),
+                objective: "o".into(),
+                max_steps: 1,
+            })
+            .unwrap();
+            scan.sessions.push(SessionEntry {
+                path: path.display().to_string(),
+                session_id: id.into(),
+                project: None,
+                role: SessionRole::Primary,
+                format: SessionFormat::Trit,
+                meta: None,
+                bytes: 1,
+                modified_ms: 0,
+                records: 1,
+                corrupt_lines: 0,
+                tasks: vec![SessionTask {
+                    index: 1,
+                    task: format!("task-{id}"),
+                    objective: "o".into(),
+                    steps: 0,
+                    complete: false,
+                    finished: false,
+                }],
+                open_turn: true,
+                in_doubt: 0,
+                last_gate: None,
+            });
+        }
+        let plan = plan_sessions(&scan);
+        let report = auto_dispatch(
+            &scan,
+            &plan,
+            &AutoDispatchOptions {
+                max_items: 1,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].source_session, "a");
+        assert!(!report.items[0].applied);
+        let _ = fs::remove_dir_all(&root);
     }
 }
