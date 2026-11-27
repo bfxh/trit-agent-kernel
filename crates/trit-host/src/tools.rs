@@ -275,10 +275,10 @@ impl ShellSession {
                 None => (text.as_str(), None),
             };
             if !truncated && !body.is_empty() {
-                if output.len() + body.len() <= max.saturating_mul(4) {
+                if output.len() + body.len() <= max.saturating_mul(8) {
                     output.push_str(body);
                 } else {
-                    let remaining = max.saturating_mul(4).saturating_sub(output.len());
+                    let remaining = max.saturating_mul(8).saturating_sub(output.len());
                     if remaining > 0 {
                         let mut end = remaining;
                         while end > 0 && !body.is_char_boundary(end) {
@@ -297,7 +297,7 @@ impl ShellSession {
                 break;
             }
         }
-        Ok((status.map(|status| status == 0), truncate(output, max)))
+        Ok((status.map(|status| status == 0), summarize(output, max)))
     }
 }
 
@@ -808,7 +808,7 @@ impl LocalTools {
             assertions: 0,
             written_paths: Vec::new(),
             in_doubt: false,
-            output: truncate(text, self.max_output_bytes),
+            output: summarize(text, self.max_output_bytes),
         })
     }
 }
@@ -927,6 +927,29 @@ fn normalize_absolute(path: &Path) -> PathBuf {
 
 fn glob_matches(matcher: &GlobMatcher, path: &Path) -> bool {
     matcher.is_match(path)
+}
+
+/// 头尾摘要：超过预算时保留前 60% 与后 40%，中间标注丢弃字节数。
+fn summarize(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let head_limit = max.saturating_mul(6) / 10;
+    let tail_limit = max.saturating_sub(head_limit);
+    let mut head_end = head_limit.min(text.len());
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(tail_limit);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let dropped = tail_start.saturating_sub(head_end);
+    let mut out = String::with_capacity(max + 48);
+    out.push_str(&text[..head_end]);
+    out.push_str(&format!("\n...(truncated {dropped} bytes)...\n"));
+    out.push_str(&text[tail_start..]);
+    out
 }
 
 fn truncate(mut text: String, max: usize) -> String {

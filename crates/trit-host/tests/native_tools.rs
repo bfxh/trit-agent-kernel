@@ -438,6 +438,6 @@ fn persistent_shell_truncates_large_output() {
         .execute(&ToolRequest::shell("s1", "printf 'abcdefghijklmnop'"))
         .unwrap();
     assert!(outcome.passed);
-    assert!(outcome.output.ends_with("...(truncated)"));
+    assert!(outcome.output.contains("(truncated"));
     let _ = std::fs::remove_dir_all(&root);
 }

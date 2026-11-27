@@ -458,7 +458,12 @@ pub enum ContextDegradation {
     CalibrationModelMismatch,
     PrefixChangeRequiresApproval,
     DynamicPrefixOverride,
-    BudgetReduced { requested: u64, available: u64 },
+    BudgetReduced {
+        requested: u64,
+        available: u64,
+    },
+    /// 项目噪声文件（构建产物/日志）默认只给句柄或摘要，不注入全文。
+    NoiseDeferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1497,8 +1502,18 @@ pub fn assemble_context(
                 seen_content.insert(fingerprint, selection.id.clone());
             }
         }
+        let noise = is_project_noise(&resolved.reference);
         let preferred = if selection.required {
             ContextDetail::Full
+        } else if noise {
+            degradations.push(ContextDegradation::NoiseDeferred);
+            if can_read_handles {
+                ContextDetail::Handle
+            } else if resolved.document.summary.is_some() {
+                ContextDetail::Summary
+            } else {
+                ContextDetail::Full
+            }
         } else {
             preferred_detail(can_read_handles, reasoning, &resolved.document)
         };
@@ -1927,6 +1942,20 @@ fn reasoning_reserve(effort: ReasoningEffort) -> u64 {
         ReasoningEffort::Medium => 2_048,
         ReasoningEffort::High => 8_192,
     }
+}
+
+/// 项目噪声：构建产物、运行日志、会话 JSONL 等，默认不注入全文。
+///
+/// 规则是代码里的物理表，不依赖文档；命中后只给句柄（无句柄能力时给摘要）。
+fn is_project_noise(reference: &ContextRef) -> bool {
+    let id = reference.id.to_ascii_lowercase();
+    const NOISE_SUFFIXES: &[&str] = &[
+        ".jsonl", ".log", ".rlib", ".rmeta", ".o", ".obj", ".dll", ".exe", ".pdb", ".zip", ".tar",
+        ".gz", ".bin", ".d",
+    ];
+    const NOISE_SEGMENTS: &[&str] = &["target/", "node_modules/", "dist/", "build/", ".git/"];
+    NOISE_SUFFIXES.iter().any(|suffix| id.ends_with(suffix))
+        || NOISE_SEGMENTS.iter().any(|segment| id.contains(segment))
 }
 
 fn preferred_detail(

@@ -1140,3 +1140,108 @@ fn duplicate_text_without_content_hash_is_still_suppressed() {
             .any(|drop| drop.id == "b" && drop.reason == ContextDropReason::Duplicate)
     );
 }
+
+#[test]
+fn noise_files_are_deferred_to_handles() {
+    let mut context = InMemoryContext::default();
+    let mut log = reference(
+        "target/debug/app.log",
+        ContextScope::Project,
+        Some("p1"),
+        None,
+    );
+    log.content_hash = Some("log-hash".into());
+    context
+        .insert(
+            log,
+            document(
+                "target/debug/app.log",
+                "huge log",
+                Some("summary"),
+                Some(100),
+            ),
+        )
+        .unwrap();
+
+    let plan = assemble_context(
+        &request(
+            model(true, true),
+            ReasoningEffort::Medium,
+            vec![selection("target/debug/app.log", false, None)],
+        ),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(plan.items[0].detail, ContextDetail::Handle);
+    assert!(
+        plan.degradations
+            .contains(&ContextDegradation::NoiseDeferred)
+    );
+}
+
+#[test]
+fn required_noise_files_are_not_deferred() {
+    let mut context = InMemoryContext::default();
+    let mut log = reference(
+        "target/debug/app.log",
+        ContextScope::Project,
+        Some("p1"),
+        None,
+    );
+    log.content_hash = Some("log-hash".into());
+    context
+        .insert(
+            log,
+            document(
+                "target/debug/app.log",
+                "huge log",
+                Some("summary"),
+                Some(100),
+            ),
+        )
+        .unwrap();
+
+    let plan = assemble_context(
+        &request(
+            model(true, true),
+            ReasoningEffort::Medium,
+            vec![selection("target/debug/app.log", true, None)],
+        ),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(plan.items[0].detail, ContextDetail::Full);
+    assert!(
+        !plan
+            .degradations
+            .contains(&ContextDegradation::NoiseDeferred)
+    );
+}
+
+#[test]
+fn normal_source_files_are_not_treated_as_noise() {
+    let mut context = InMemoryContext::default();
+    let source = reference("src/lib.rs", ContextScope::Project, Some("p1"), None);
+    context
+        .insert(
+            source,
+            document("src/lib.rs", "pub fn main() {}", Some("summary"), Some(100)),
+        )
+        .unwrap();
+
+    let plan = assemble_context(
+        &request(
+            model(true, true),
+            ReasoningEffort::Medium,
+            vec![selection("src/lib.rs", false, None)],
+        ),
+        &context,
+    )
+    .unwrap();
+    assert_eq!(plan.items[0].detail, ContextDetail::Summary);
+    assert!(
+        !plan
+            .degradations
+            .contains(&ContextDegradation::NoiseDeferred)
+    );
+}
