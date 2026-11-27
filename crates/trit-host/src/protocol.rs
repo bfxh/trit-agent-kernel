@@ -313,7 +313,7 @@ impl ProtocolStream for AnthropicProtocolStream {
                     && let Some(usage) = self.usage.as_mut()
                 {
                     usage.completion_tokens = output;
-                    out.push(ProviderStreamEvent::Usage(usage.clone()));
+                    out.push(ProviderStreamEvent::Usage(*usage));
                 }
             }
             "message_stop" => {
@@ -397,7 +397,7 @@ impl ProtocolStream for GeminiProtocolStream {
         }
         if let Some(usage) = value.get("usageMetadata") {
             let usage = gemini_usage(Some(usage));
-            self.usage = Some(usage.clone());
+            self.usage = Some(usage);
             out.push(ProviderStreamEvent::Usage(usage));
         }
         let parts = value
@@ -448,9 +448,9 @@ impl ProtocolStream for GeminiProtocolStream {
 
     fn finish(self: Box<Self>, tools: &[ToolSpec]) -> Result<ProviderResponse, AgentError> {
         if !self.saw_finish && self.calls.is_empty() && self.text.is_empty() {
-            return Err(AgentError::Provider(format!(
-                "gemini stream ended without any content"
-            )));
+            return Err(AgentError::Provider(
+                "gemini stream ended without any content".into(),
+            ));
         }
         let calls = self
             .calls

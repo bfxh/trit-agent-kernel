@@ -30,7 +30,7 @@ pub struct Settings {
     pub recording: RecordingSettings,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StartupSettings {
     /// 应用随系统登录启动；由前端/安装器实现，内核不写注册表。
@@ -101,15 +101,6 @@ impl Default for Settings {
             browser: BrowserSettings::default(),
             diagnostics: DiagnosticsSettings::default(),
             recording: RecordingSettings::default(),
-        }
-    }
-}
-
-impl Default for StartupSettings {
-    fn default() -> Self {
-        Self {
-            app_autostart: false,
-            agent_autostart: false,
         }
     }
 }

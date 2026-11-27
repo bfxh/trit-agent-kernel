@@ -97,17 +97,33 @@ pub struct CostSummary {
     pub currency: String,
 }
 
-/// 编排一次推进；`config` 只在 `dry_run = false` 时需要。
+/// 会话推进的运行时接线：扫描缓存、provider 配置、远端节点。
+///
+/// 三者都只在非 `dry_run` 路径用到，合在一起避免 `advance` 的参数列表继续膨胀。
+#[derive(Default)]
+pub struct AdvanceDial<'a> {
+    /// 扫描缓存文件；`None` 表示每次都全量扫描。
+    pub cache: Option<&'a Path>,
+    /// 实际调用模型时的 provider 配置；`dry_run` 下可为 `None`。
+    pub config: Option<OpenAiConfig>,
+    /// 远端节点；`None` 表示只用本地。
+    pub nodes: Option<Vec<RemoteNode>>,
+}
+
+/// 编排一次推进；`dial.config` 只在 `dry_run = false` 且不跑远端时需要。
 pub fn advance(
     scan: &SessionScanReport,
     plan: &SessionPlanReport,
     workspace: &Path,
     session_dir: &Path,
-    cache: Option<&Path>,
-    config: Option<OpenAiConfig>,
-    nodes: Option<Vec<RemoteNode>>,
+    dial: AdvanceDial<'_>,
     options: &AdvanceOptions,
 ) -> Result<AdvanceReport, AgentError> {
+    let AdvanceDial {
+        cache,
+        config,
+        nodes,
+    } = dial;
     let dispatch = auto_dispatch(
         scan,
         plan,
@@ -392,9 +408,7 @@ mod tests {
             &plan,
             &root,
             &root,
-            None,
-            None,
-            None,
+            AdvanceDial::default(),
             &AdvanceOptions {
                 max_items: 2,
                 ..AdvanceOptions::default()
@@ -423,9 +437,7 @@ mod tests {
             &plan,
             &root,
             &root,
-            None,
-            None,
-            None,
+            AdvanceDial::default(),
             &AdvanceOptions {
                 max_items: 1,
                 ..AdvanceOptions::default()

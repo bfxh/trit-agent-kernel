@@ -265,11 +265,8 @@ pub fn live_mcp_diagnostics(probe: &LiveMcpProbe, workspace: &Path) -> LiveMcpDi
     let _ = child.wait();
 
     let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(line) => result.stderr_lines.push(redact_line(&line, workspace)),
-            Err(_) => break,
-        }
+    while let Ok(line) = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        result.stderr_lines.push(redact_line(&line, workspace));
         if Instant::now() >= deadline {
             break;
         }

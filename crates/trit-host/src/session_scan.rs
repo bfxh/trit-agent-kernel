@@ -16,6 +16,11 @@ use crate::session_migration::SessionRole;
 
 pub const SESSION_SCAN_SCHEMA: u32 = 1;
 
+/// 单个会话的扫描原料与结果：文件序号、绝对路径、大小、mtime、解析结果。
+///
+/// 并行分段时每段产出同形状的向量，最后按序号归位，保证报告顺序确定。
+type ScannedSession = (usize, PathBuf, u64, u64, Result<SessionEntry, String>);
+
 /// 单文件读取上限；超过时只报 warning，不把整个文件读进内存。
 const MAX_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 /// 扫描缓存上限；超过时忽略缓存并回退全量扫描。
@@ -220,7 +225,7 @@ fn scan_sessions_inner(
         .unwrap_or(4)
         .min(8)
         .min(pending.len().max(1));
-    let scanned: Vec<(usize, PathBuf, u64, u64, Result<SessionEntry, String>)> = if workers <= 1 {
+    let scanned: Vec<ScannedSession> = if workers <= 1 {
         pending
             .into_iter()
             .map(|(index, path, size, modified_ms)| {
@@ -230,28 +235,26 @@ fn scan_sessions_inner(
             .collect()
     } else {
         let chunk = pending.len().div_ceil(workers);
-        let batches: Vec<Vec<(usize, PathBuf, u64, u64, Result<SessionEntry, String>)>> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = pending
-                    .chunks(chunk)
-                    .map(|chunk| {
-                        scope.spawn(move || {
-                            chunk
-                                .iter()
-                                .map(|(index, path, size, modified_ms)| {
-                                    let result =
-                                        scan_session(path).map_err(|error| error.to_string());
-                                    (*index, path.clone(), *size, *modified_ms, result)
-                                })
-                                .collect()
-                        })
+        let batches: Vec<Vec<ScannedSession>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = pending
+                .chunks(chunk)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|(index, path, size, modified_ms)| {
+                                let result = scan_session(path).map_err(|error| error.to_string());
+                                (*index, path.clone(), *size, *modified_ms, result)
+                            })
+                            .collect()
                     })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().unwrap_or_default())
-                    .collect()
-            });
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
         batches.into_iter().flatten().collect()
     };
     for (index, path, size, modified_ms, result) in scanned {

@@ -48,7 +48,7 @@ fn test_paths(n: usize) -> Vec<String> {
             0 => format!("tests/integration/case_{index}.rs"),
             1 => format!("src/feature/test_{index}.py"),
             2 => format!("spec/unit/case_{index}_test.py"),
-            _ => format!("conftest.py"),
+            _ => "conftest.py".to_string(),
         })
         .collect()
 }

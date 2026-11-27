@@ -1751,7 +1751,7 @@ pub use session::{
     resume_turn,
 };
 pub use session_advance::{
-    AdvanceOptions, AdvanceReport, SESSION_ADVANCE_SCHEMA, advance, plan_from_scan,
+    AdvanceDial, AdvanceOptions, AdvanceReport, SESSION_ADVANCE_SCHEMA, advance, plan_from_scan,
 };
 pub use session_callback::{
     CallbackItem, CallbackOptions, CallbackReport, CallbackStatus, DELEGATIONS_FILE,

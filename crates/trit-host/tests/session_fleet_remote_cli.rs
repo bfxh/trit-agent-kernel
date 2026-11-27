@@ -250,7 +250,7 @@ fn advance_sends_the_scoped_idempotency_key() {
     let nodes = dir.join("nodes.json");
     fs::write(
         &nodes,
-        serde_json::to_string(&[capture.node.clone()]).unwrap(),
+        serde_json::to_string(std::slice::from_ref(&capture.node)).unwrap(),
     )
     .unwrap();
 

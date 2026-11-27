@@ -1668,7 +1668,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
-        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(fail)?;
     }
     let outcome = trit_host::run_remote_fleet(
         &fleet,
@@ -1789,7 +1789,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
-        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(fail)?;
     }
     let workspace = workspace.unwrap_or_else(|| roots[0].clone());
     if !apply {
@@ -1883,7 +1883,7 @@ fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
-        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(fail)?;
     }
     let text = if compact {
         serde_json::to_string(&fleet)
@@ -2115,9 +2115,11 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
         &plan,
         &workspace,
         &roots[0],
-        cache.as_deref(),
-        config,
-        nodes,
+        trit_host::AdvanceDial {
+            cache: cache.as_deref(),
+            config,
+            nodes,
+        },
         &trit_host::AdvanceOptions {
             max_items,
             workers,
@@ -2465,11 +2467,11 @@ fn run_settings(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Er
         let (key, value) = pair
             .split_once('=')
             .ok_or_else(|| fail("--set requires KEY=VALUE"))?;
-        trit_host::settings::set(&mut settings, key, value).map_err(|error| fail(error))?;
+        trit_host::settings::set(&mut settings, key, value).map_err(fail)?;
         trit_host::settings::save(&root, &settings)?;
     }
     let output = match get {
-        Some(key) => trit_host::settings::get(&settings, &key).map_err(|error| fail(error))?,
+        Some(key) => trit_host::settings::get(&settings, &key).map_err(fail)?,
         None => serde_json::to_value(&settings)?,
     };
     let text = if compact {
@@ -3398,8 +3400,7 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     if let Some(ms) = request_read_timeout_ms {
         config = config.with_request_read_timeout(std::time::Duration::from_millis(ms));
     }
-    config =
-        config.with_prices(trit_host::cost::PriceTable::from_env().map_err(|error| fail(error))?);
+    config = config.with_prices(trit_host::cost::PriceTable::from_env().map_err(fail)?);
     let server = trit_host::LedgerServer::bind(config)?;
     let addr = server.addr()?;
     println!("{}", serde_json::json!({ "bind": addr.to_string() }));

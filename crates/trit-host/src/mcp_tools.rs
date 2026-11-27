@@ -34,8 +34,11 @@ pub struct McpToolClient {
     recovery: Arc<Mutex<RecoveryContext>>,
     timeout: Duration,
     /// 路由缓存；高频 `route()`/`tools()` 调用不重复重建。
-    routes_cache: Arc<Mutex<Option<(Instant, Vec<McpToolRoute>)>>>,
+    routes_cache: RoutesCache,
 }
+
+/// 路由缓存：构建时刻 + 当时的完整路由表。
+type RoutesCache = Arc<Mutex<Option<(Instant, Vec<McpToolRoute>)>>>;
 
 impl McpToolClient {
     pub(crate) fn new(

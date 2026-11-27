@@ -630,7 +630,7 @@ fn completion(paths: &[&str]) -> Proposal {
 /// 穷举截断点：日志停在每个位置时，恢复都不得重放已经拿到回执的工具。
 #[test]
 fn resume_from_every_truncation_never_replays_settled_tools() {
-    let events = vec![
+    let events = [
         SessionEvent::TurnStarted {
             task: "headless".into(),
             objective: "write".into(),
