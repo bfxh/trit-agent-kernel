@@ -39,12 +39,20 @@ impl Default for BrowserConfig {
     }
 }
 
+/// 一个标签页（CDP target + flatten session）。
+#[derive(Debug, Clone)]
+pub struct BrowserTab {
+    pub target_id: String,
+    pub session_id: String,
+    pub url: String,
+}
+
 /// 一个受控的浏览器实例。
 pub struct Browser {
     child: Option<Child>,
     socket: WebSocket,
-    session_id: Option<String>,
-    target_id: Option<String>,
+    tabs: Vec<BrowserTab>,
+    active: usize,
     next_id: u64,
     user_data_dir: Option<PathBuf>,
 }
@@ -93,25 +101,23 @@ impl Browser {
         Ok(Self {
             child: guard.child.take(),
             socket,
-            session_id: None,
-            target_id: None,
+            tabs: Vec::new(),
+            active: 0,
             next_id: 0,
             user_data_dir: guard.dir.take(),
         })
     }
 
-    /// 打开 URL：创建 target、附加 flatten session，再导航。
-    pub fn open(&mut self, url: &str) -> Result<(), AgentError> {
-        if let Some(target) = self.target_id.take() {
-            let _ = self.command("Target.closeTarget", json!({"targetId": target}));
-        }
-        self.session_id = None;
-        let created = self.command("Target.createTarget", json!({"url": "about:blank"}))?;
+    /// 新建标签页并导航；返回标签下标（0 起）。不关闭已有标签。
+    pub fn open(&mut self, url: &str) -> Result<usize, AgentError> {
+        let created =
+            self.command_with(None, "Target.createTarget", json!({"url": "about:blank"}))?;
         let target_id = created["targetId"]
             .as_str()
             .ok_or_else(|| AgentError::Tool("CDP createTarget returned no targetId".into()))?
             .to_owned();
-        let attached = self.command(
+        let attached = self.command_with(
+            None,
             "Target.attachToTarget",
             json!({"targetId": target_id, "flatten": true}),
         )?;
@@ -119,22 +125,59 @@ impl Browser {
             .as_str()
             .ok_or_else(|| AgentError::Tool("CDP attachToTarget returned no sessionId".into()))?
             .to_owned();
-        self.target_id = Some(target_id);
-        self.session_id = Some(session_id);
-        self.command("Page.enable", json!({}))?;
-        self.command("Runtime.enable", json!({}))?;
-        self.navigate_and_wait(url)?;
+        self.command_with(Some(&session_id), "Page.enable", json!({}))?;
+        self.command_with(Some(&session_id), "Runtime.enable", json!({}))?;
+        self.navigate_and_wait(&session_id, url)?;
+        self.tabs.push(BrowserTab {
+            target_id,
+            session_id,
+            url: url.to_owned(),
+        });
+        self.active = self.tabs.len() - 1;
+        Ok(self.active)
+    }
+
+    /// 当前标签列表（下标、URL）。
+    pub fn tabs(&self) -> Vec<(usize, String)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| (index, tab.url.clone()))
+            .collect()
+    }
+
+    /// 切换活动标签。
+    pub fn select(&mut self, index: usize) -> Result<(), AgentError> {
+        if index >= self.tabs.len() {
+            return Err(AgentError::Tool(format!("unknown tab: {index}")));
+        }
+        self.active = index;
+        Ok(())
+    }
+
+    /// 关闭标签；`Target.closeTarget` 是浏览器级命令，不需要 session。
+    pub fn close_tab(&mut self, index: usize) -> Result<(), AgentError> {
+        if index >= self.tabs.len() {
+            return Err(AgentError::Tool(format!("unknown tab: {index}")));
+        }
+        let tab = self.tabs.remove(index);
+        let _ = self.command_with(
+            None,
+            "Target.closeTarget",
+            json!({"targetId": tab.target_id}),
+        );
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
         Ok(())
     }
 
     /// 导航并等待 `Page.loadEventFired`；超时 fail closed，避免在未加载页面上 eval。
-    fn navigate_and_wait(&mut self, url: &str) -> Result<(), AgentError> {
+    fn navigate_and_wait(&mut self, session: &str, url: &str) -> Result<(), AgentError> {
         self.next_id += 1;
         let id = self.next_id;
         let mut message = json!({"id": id, "method": "Page.navigate", "params": {"url": url}});
-        if let Some(session) = &self.session_id {
-            message["sessionId"] = json!(session);
-        }
+        message["sessionId"] = json!(session);
         self.socket.send_text(&message.to_string())?;
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -199,10 +242,26 @@ impl Browser {
     }
 
     fn command(&mut self, method: &str, params: Value) -> Result<Value, AgentError> {
+        let session = self.active_session().map(str::to_owned);
+        self.command_with(session.as_deref(), method, params)
+    }
+
+    fn active_session(&self) -> Option<&str> {
+        self.tabs
+            .get(self.active)
+            .map(|tab| tab.session_id.as_str())
+    }
+
+    fn command_with(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, AgentError> {
         self.next_id += 1;
         let id = self.next_id;
         let mut message = json!({"id": id, "method": method, "params": params});
-        if let Some(session) = &self.session_id {
+        if let Some(session) = session {
             message["sessionId"] = json!(session);
         }
         self.socket.send_text(&message.to_string())?;
@@ -603,5 +662,35 @@ mod tests {
                 .unwrap(),
             serde_json::json!("hello")
         );
+    }
+
+    #[test]
+    #[ignore = "requires Chrome/Chromium (set TRIT_CHROME or install Chrome/Edge)"]
+    fn multiple_tabs_are_independent() {
+        let mut browser = Browser::launch(&BrowserConfig::default()).expect("launch chrome");
+        let first = browser
+            .open("data:text/html,<h1>one</h1>")
+            .expect("open first");
+        let second = browser
+            .open("data:text/html,<h1>two</h1>")
+            .expect("open second");
+        assert_ne!(first, second);
+        assert_eq!(browser.tabs().len(), 2);
+        // 新标签自动成为活动页。
+        assert_eq!(
+            browser
+                .eval("document.querySelector('h1').textContent")
+                .unwrap(),
+            serde_json::json!("two")
+        );
+        browser.select(first).unwrap();
+        assert_eq!(
+            browser
+                .eval("document.querySelector('h1').textContent")
+                .unwrap(),
+            serde_json::json!("one")
+        );
+        browser.close_tab(second).unwrap();
+        assert_eq!(browser.tabs().len(), 1);
     }
 }

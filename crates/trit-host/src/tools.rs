@@ -993,10 +993,33 @@ impl LocalTools {
                 let url = args["url"]
                     .as_str()
                     .ok_or_else(|| AgentError::Tool("browser open requires url".into()))?;
-                browser.open(url)?;
-                (format!("opened {url}"), Vec::new())
+                let tab = browser.open(url)?;
+                (format!("opened tab {tab} {url}"), Vec::new())
+            }
+            "tabs" => {
+                let tabs = browser.tabs();
+                (serde_json::to_string(&tabs).unwrap_or_default(), Vec::new())
+            }
+            "select" => {
+                let index = args["tab"]
+                    .as_u64()
+                    .ok_or_else(|| AgentError::Tool("browser select requires tab".into()))?
+                    as usize;
+                browser.select(index)?;
+                (format!("selected tab {index}"), Vec::new())
+            }
+            "close_tab" => {
+                let index = args["tab"]
+                    .as_u64()
+                    .ok_or_else(|| AgentError::Tool("browser close_tab requires tab".into()))?
+                    as usize;
+                browser.close_tab(index)?;
+                (format!("closed tab {index}"), Vec::new())
             }
             "eval" => {
+                if let Some(index) = args["tab"].as_u64() {
+                    browser.select(index as usize)?;
+                }
                 let expression = args["expression"]
                     .as_str()
                     .ok_or_else(|| AgentError::Tool("browser eval requires expression".into()))?;
@@ -1011,6 +1034,9 @@ impl LocalTools {
                     return Err(AgentError::Tool(
                         "browser screenshot requires allow-write".into(),
                     ));
+                }
+                if let Some(index) = args["tab"].as_u64() {
+                    browser.select(index as usize)?;
                 }
                 let raw = args["path"].as_str().unwrap_or("screenshot.png");
                 let relative = self.resolve_relative(raw)?;

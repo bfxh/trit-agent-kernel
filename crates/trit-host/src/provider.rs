@@ -217,10 +217,11 @@ fn build_default_tools() -> Vec<ToolSpec> {
             input_schema: Some(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["open", "eval", "screenshot", "close"]},
+                    "action": {"type": "string", "enum": ["open", "eval", "screenshot", "tabs", "select", "close_tab", "close"]},
                     "url": {"type": "string"},
                     "expression": {"type": "string"},
-                    "path": {"type": "string"}
+                    "path": {"type": "string"},
+                    "tab": {"type": "integer"}
                 },
                 "required": ["action"]
             })),
