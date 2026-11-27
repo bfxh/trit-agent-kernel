@@ -47,6 +47,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-index" {
         return run_session_index(args);
     }
+    if command == "session-scan" {
+        return run_session_scan(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1365,6 +1368,9 @@ fn usage() {
          maintains the SQLite projection of a session log; --rebuild deletes the old\n\
          projection and rebuilds it from JSONL, --verify rebuilds into a scratch db and\n\
          compares rows (exits 1 when the projection is missing or differs).\n\
+         session-scan: trit-host session-scan --root <dir> [--compact]\n\
+         scans session JSONL files under a directory and prints tasks, links and\n\
+         per-session health (open turns, corrupt lines, in-doubt tools, last gate).\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1453,6 +1459,28 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if blocked {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `session-scan --root <dir> [--compact]`：只读扫描会话目录，输出清单/任务/链接。
+fn run_session_scan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-scan argument: {other}"))),
+        }
+    }
+    let report = trit_host::scan_sessions(&root)?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 
