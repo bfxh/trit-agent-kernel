@@ -24,6 +24,8 @@ pub struct OpenAiConfig {
     pub api_key: String,
     pub model: String,
     pub timeout: Duration,
+    /// 建连超时：DNS/TCP/TLS 握手；与整次请求超时分开。
+    pub connect_timeout: Duration,
     pub max_output_tokens: Option<u64>,
     /// 流式请求是否发送 `stream_options.include_usage`；不支持该字段的兼容网关可关闭。
     pub stream_include_usage: bool,
@@ -36,6 +38,7 @@ impl fmt::Debug for OpenAiConfig {
             .field("model", &self.model)
             .field("api_key", &"<redacted>")
             .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("stream_include_usage", &self.stream_include_usage)
             .finish()
@@ -53,9 +56,15 @@ impl OpenAiConfig {
             api_key: api_key.into(),
             model: model.into(),
             timeout: Duration::from_secs(120),
+            connect_timeout: Duration::from_secs(10),
             max_output_tokens: None,
             stream_include_usage: true,
         }
+    }
+
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     pub fn with_stream_include_usage(mut self, include: bool) -> Self {
@@ -70,7 +79,12 @@ impl OpenAiConfig {
             .map_err(|_| AgentError::Provider("OPENAI_MODEL is not set".into()))?;
         let base_url =
             std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        Ok(Self::new(base_url, api_key, model))
+        let connect_timeout = std::env::var("TRIT_OPENAI_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(10));
+        Ok(Self::new(base_url, api_key, model).with_connect_timeout(connect_timeout))
     }
 }
 
@@ -100,7 +114,10 @@ fn read_response_text(response: ureq::Response) -> Result<String, AgentError> {
 
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> Self {
-        let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(config.timeout)
+            .timeout_connect(config.connect_timeout)
+            .build();
         Self { config, agent }
     }
 
@@ -997,5 +1014,12 @@ mod tests {
             parse_response(body, &[]),
             Err(AgentError::Provider(message)) if message.contains("unknown tool")
         ));
+    }
+
+    #[test]
+    fn config_has_separate_connect_timeout() {
+        let config = OpenAiConfig::new("http://127.0.0.1:9/v1", "k", "m");
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.timeout, Duration::from_secs(120));
     }
 }

@@ -184,6 +184,7 @@ FeatureGroupSpec { id, members[] }
 | `budget.cny` | f64，`0` = 不限 | `0` | `--budget-cny` |
 | `cost.usd_cny` | f64 | `7.2` | `TRIT_USD_CNY` |
 | `cost.model_prices` | path | 内置价目表 | `TRIT_MODEL_PRICES` |
+| `provider.connect_timeout` | duration | `10s` | `TRIT_OPENAI_CONNECT_TIMEOUT_SECS` |
 
 - `concurrency.max` 是**总并发上限**：`--workers` 与它取小；多会话、多 root、跨机任务叠加时不会超过它。
 - 预算耗尽 fail-closed：token 预算小于任务数直接拒绝；人民币预算达到 80% 写 warning、超过标记 `exceeded`；跨机 ledger 达到预算后 `/claim` 返回 503。
