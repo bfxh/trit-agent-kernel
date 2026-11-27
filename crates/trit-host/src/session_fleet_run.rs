@@ -129,6 +129,35 @@ pub fn execute_fleet(
     Ok(outcome)
 }
 
+/// 任务 id 只允许 `[A-Za-z0-9._-]`，避免 meta 里的 `../` 把 session 写出目录。
+fn safe_task_path(dir: &Path, id: &str) -> PathBuf {
+    let safe: String = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = if safe.is_empty() {
+        "task"
+    } else {
+        safe.as_str()
+    };
+    dir.join(format!("{name}.jsonl"))
+}
+
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(format!("refusing symlink target {}", path.display()));
+    }
+    Ok(())
+}
+
 fn execute_once(
     report: &SessionFleetReport,
     workspace: &Path,
@@ -170,10 +199,12 @@ fn execute_once(
             .get(&task.task.id)
             .cloned()
             .unwrap_or_else(|| fallback_workspace.clone());
-        let session = session_dir.join(format!("{}.jsonl", task.task.id));
+        let session = safe_task_path(&session_dir, &task.task.id);
+        reject_symlink(&session)?;
         if let Some(parent) = parents.get(&task.task.id) {
             let mut meta_path = session.as_os_str().to_os_string();
             meta_path.push(".meta");
+            reject_symlink(Path::new(&meta_path))?;
             let meta = serde_json::json!({"id": task.task.id, "parent": parent});
             if let Ok(bytes) = serde_json::to_vec(&meta) {
                 let _ = std::fs::write(meta_path, bytes);
@@ -376,5 +407,15 @@ mod tests {
             subset.layers,
             vec![vec!["b".to_owned()], vec!["c".to_owned()]]
         );
+    }
+
+    #[test]
+    fn task_id_cannot_escape_session_dir() {
+        let path = safe_task_path(Path::new("root"), "../../evil");
+        assert_eq!(path.parent(), Some(Path::new("root")));
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert!(!name.contains('/'), "{name}");
+        assert!(!name.contains('\\'), "{name}");
+        assert!(name.ends_with("evil.jsonl"), "{name}");
     }
 }

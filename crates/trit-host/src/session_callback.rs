@@ -18,6 +18,8 @@ use crate::session_scan::{LinkKind, SessionEntry, SessionFormat, SessionScanRepo
 
 pub const SESSION_CALLBACK_SCHEMA: u32 = 1;
 pub const DELEGATIONS_FILE: &str = "delegations.jsonl";
+/// 回填侧车读取上限；超过时 fail closed，避免恶意放大文件拖垮扫描。
+const MAX_DELEGATIONS_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallbackOptions {
@@ -176,6 +178,12 @@ pub(crate) fn classify(child: &SessionEntry) -> CallbackStatus {
 }
 
 fn already_written(target: &Path, result: &DelegationResult) -> Result<bool, AgentError> {
+    if fs::metadata(target).is_ok_and(|metadata| metadata.len() > MAX_DELEGATIONS_BYTES) {
+        return Err(AgentError::Io(format!(
+            "delegations file too large: {}",
+            target.display()
+        )));
+    }
     let Ok(text) = fs::read_to_string(target) else {
         return Ok(false);
     };
@@ -201,6 +209,14 @@ fn already_written(target: &Path, result: &DelegationResult) -> Result<bool, Age
 }
 
 fn append_result(target: &Path, result: &DelegationResult) -> Result<(), AgentError> {
+    if let Ok(metadata) = fs::symlink_metadata(target)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(AgentError::Io(format!(
+            "refusing symlink delegation target {}",
+            target.display()
+        )));
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)

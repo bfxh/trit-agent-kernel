@@ -13,6 +13,8 @@ use crate::session_callback::{CallbackStatus, DELEGATIONS_FILE, DelegationResult
 use crate::session_scan::{LinkKind, SessionScanReport};
 
 pub const SESSION_VERIFY_SCHEMA: u32 = 1;
+/// 与 `session_callback` 保持一致的回填侧车读取上限。
+const MAX_DELEGATIONS_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +140,12 @@ fn last_record(
     parent: &str,
     child: &str,
 ) -> Result<Option<DelegationResult>, AgentError> {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_DELEGATIONS_BYTES) {
+        return Err(AgentError::Io(format!(
+            "delegations file too large: {}",
+            path.display()
+        )));
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return Ok(None);
     };

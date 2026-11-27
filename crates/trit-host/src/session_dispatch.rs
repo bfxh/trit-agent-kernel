@@ -196,7 +196,7 @@ fn write_resume_session(
     source: &str,
     max_steps: usize,
 ) -> Result<(), AgentError> {
-    if target.exists() {
+    if std::fs::symlink_metadata(target).is_ok() {
         return Err(AgentError::SessionState(format!(
             "refusing to overwrite {}",
             target.display()

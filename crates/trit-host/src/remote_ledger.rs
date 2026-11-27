@@ -883,6 +883,15 @@ fn load_entries(
                         path.display()
                     )));
                 }
+                if let Some(Entry::Done {
+                    frame: old_frame, ..
+                }) = state.entries.get(&key)
+                {
+                    let mut buffer = old_frame.clone();
+                    if let Ok(Some(old)) = decode_frame::<SubagentResponse>(&mut buffer) {
+                        state.tokens_used = state.tokens_used.saturating_sub(old.tokens);
+                    }
+                }
                 state.tokens_used = state.tokens_used.saturating_add(response.tokens);
                 if let Some(Entry::Done { frame, lease }) = state.entries.get(&key) {
                     state.bytes =
