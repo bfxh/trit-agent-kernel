@@ -165,7 +165,11 @@ fn collect_session_files(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
-            if matches!(name, "target" | "node_modules" | ".git") {
+            if matches!(name, "target" | "node_modules" | ".git")
+                || name.ends_with(".outputs")
+                || name.ends_with(".ckpt")
+                || name.ends_with(".inbox")
+            {
                 continue;
             }
             collect_session_files(&path, depth + 1, out)?;
@@ -584,6 +588,20 @@ mod tests {
         assert!(entry.tasks[0].finished);
         assert_eq!(entry.tasks[1].task, "second task");
         assert!(entry.open_turn, "last user message has no assistant reply");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auxiliary_directories_are_skipped() {
+        let root = temp("skipdirs");
+        fs::create_dir_all(root.join("a.jsonl.outputs")).unwrap();
+        fs::write(root.join("a.jsonl.outputs/big.jsonl"), "{}").unwrap();
+        fs::create_dir_all(root.join("x.ckpt")).unwrap();
+        fs::write(root.join("x.ckpt/state.jsonl"), "{}").unwrap();
+        fs::write(root.join("real.jsonl"), "{}").unwrap();
+        let report = scan_sessions(&root).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.sessions[0].session_id, "real");
         let _ = fs::remove_dir_all(&root);
     }
 }
