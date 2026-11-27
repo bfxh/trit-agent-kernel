@@ -85,6 +85,7 @@ DelegationResult（parent 目录 delegations.jsonl）
   - `--budget-cny F` 在已花达到 80% 时写 `warnings` 与结构化 `budget_alert`，不改变执行行为；超过预算时 `exceeded = true`。
   - 默认货币为人民币：价目表仍按美元/百万 token 维护，展示与预算按 `TRIT_USD_CNY`（默认 7.2）折算；`--budget-usd` 保留为兼容别名。
   - 跨机：子 agent 帧可选携带 `model` + `usage`（`SubagentUsage`）；宿主 `RemoteFleetOutcome` 输出 `usage` / `cost_usd` / `warnings`，ledger 用同一价目表累计美元。
+  - `AdvanceReport.cost` 汇总本地 `run.cost` 与跨机 `remote.cost_cny`（人民币）；两者都无定价时为 `null`。
 
 ## 6. 结果回填与对账
 

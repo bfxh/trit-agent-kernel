@@ -73,6 +73,18 @@ pub struct AdvanceReport {
     pub callbacks: Option<CallbackReport>,
     #[serde(default)]
     pub verification: Option<CallbackVerifyReport>,
+    /// 本次推进的成本汇总（人民币）；没有任何可定价用量时为 None。
+    #[serde(default)]
+    pub cost: Option<CostSummary>,
+}
+
+/// 本地 + 跨机成本汇总；金额单位固定为人民币。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostSummary {
+    pub local_cny: f64,
+    pub remote_cny: f64,
+    pub total_cny: f64,
+    pub currency: String,
 }
 
 /// 编排一次推进；`config` 只在 `dry_run = false` 时需要。
@@ -107,6 +119,7 @@ pub fn advance(
         remote: None,
         callbacks: None,
         verification: None,
+        cost: None,
     };
     if options.dry_run {
         return Ok(report);
@@ -125,6 +138,7 @@ pub fn advance(
             },
         )?;
         report.remote = Some(remote);
+        summarize_cost(&mut report);
         return Ok(report);
     }
 
@@ -152,7 +166,31 @@ pub fn advance(
     report.run = Some(run);
     report.callbacks = Some(callbacks);
     report.verification = Some(verification);
+    summarize_cost(&mut report);
     Ok(report)
+}
+
+/// 汇总本地 run 与跨机 remote 的成本；两者都无定价时不生成汇总。
+fn summarize_cost(report: &mut AdvanceReport) {
+    let local_cny = report
+        .run
+        .as_ref()
+        .and_then(|run| run.cost.as_ref())
+        .map(|cost| cost.cny)
+        .unwrap_or(0.0);
+    let remote_cny = report
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.cost_cny)
+        .unwrap_or(0.0);
+    if local_cny > 0.0 || remote_cny > 0.0 {
+        report.cost = Some(CostSummary {
+            local_cny,
+            remote_cny,
+            total_cny: local_cny + remote_cny,
+            currency: "CNY".into(),
+        });
+    }
 }
 
 /// 只把已派发（或 dry-run 将派发）的 resume 项映射成 fleet 任务。
