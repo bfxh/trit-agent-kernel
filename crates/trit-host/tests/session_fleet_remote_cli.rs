@@ -215,6 +215,7 @@ fn spawn_header_capture_node() -> CaptureNode {
                 output: 1_000_000,
                 estimated: false,
             }),
+            dissent: None,
         })
         .unwrap();
         write!(

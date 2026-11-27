@@ -274,6 +274,7 @@ fn ledger_claim_complete_and_pending_takeover() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     assert!(
@@ -379,6 +380,7 @@ fn completed_records_survive_restart() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
 
@@ -461,6 +463,7 @@ fn pending_renewal_records_do_not_evict_done_on_restart() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     let server = Arc::clone(&ledger);
@@ -568,6 +571,7 @@ fn capacity_evictions_replay_in_the_same_key_order() {
             tokens: 0,
             model: None,
             usage: None,
+            dissent: None,
         })
         .unwrap();
         remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
@@ -612,6 +616,7 @@ fn legacy_done_only_state_still_loads() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     let hex: String = frame.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -708,6 +713,7 @@ fn pending_lease_survives_restart_and_expires() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     let server = Arc::clone(&renewed);
@@ -737,6 +743,7 @@ fn pending_lease_survives_restart_and_expires() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
 
@@ -787,6 +794,7 @@ fn scoped_ledger_keys_isolate_plans() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
 
@@ -840,6 +848,7 @@ fn state_file_respects_byte_budget_and_compacts() {
             tokens: 0,
             model: None,
             usage: None,
+            dissent: None,
         })
         .unwrap();
         remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
@@ -1077,6 +1086,7 @@ fn stale_completion_is_aborted_instead_of_returned() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     };
     let frame = encode_frame(&winner).unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1244,6 +1254,7 @@ fn superseded_node_stays_healthy_and_retry_reads_completion() {
         tokens: 7,
         model: None,
         usage: None,
+        dissent: None,
     };
     let frame = encode_frame(&external).unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1340,6 +1351,7 @@ fn token_budget_blocks_new_claims_after_spend() {
         tokens: 10,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1378,6 +1390,7 @@ fn token_budget_survives_restart() {
         tokens: 10,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1560,6 +1573,7 @@ fn ledger_budget_exhaustion_fails_closed_without_execution() {
         tokens: 1,
         model: None,
         usage: None,
+        dissent: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "warm@0", &lease, &frame).unwrap();
@@ -1643,6 +1657,7 @@ fn usd_budget_blocks_new_claims_after_spend() {
             output: 0,
             estimated: false,
         }),
+        dissent: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();

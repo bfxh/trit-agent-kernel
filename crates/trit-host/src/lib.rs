@@ -1637,6 +1637,7 @@ pub mod session_scan;
 pub mod session_verify;
 pub mod settings;
 pub mod state_layer;
+pub mod subagent_cli;
 pub mod subagent_process;
 pub mod supervisor;
 pub mod tools;
@@ -1790,6 +1791,7 @@ pub use state_layer::{
     AgentState, CompactionState, InProgressState, StateIssue, StateIssueCode, StateIssueSeverity,
     StateLayer, StateValidation, state_layer,
 };
+pub use subagent_cli::{CLI_AGENTS, CliAgentRun, CliAgentSpec, parse_cli_output, run_cli_agent};
 pub use subagent_process::{
     SubagentProcessConfig, SubagentReply, run_subagent, run_subagent_reply,
     run_subagent_reply_cancellable,

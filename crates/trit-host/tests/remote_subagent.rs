@@ -68,6 +68,7 @@ fn response(request: &SubagentRequest, status: DelegationStatus) -> SubagentResp
         tokens: 7,
         model: None,
         usage: None,
+        dissent: None,
     }
 }
 
@@ -668,6 +669,7 @@ fn cache_byte_budget_evicts_the_oldest_response() {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     };
     let frame_bytes = encode_frame(&expected_first).unwrap().len();
     let one_entry = format!("{}@{}", first.task, first.epoch).len() + frame_bytes;

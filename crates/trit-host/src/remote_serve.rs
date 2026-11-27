@@ -1119,6 +1119,7 @@ fn handle(
         tokens,
         model,
         usage,
+        dissent: None,
     };
     let frame = match encode_frame(&response) {
         Ok(frame) => frame,
@@ -1283,6 +1284,7 @@ fn aborted_frame(request: &SubagentRequest) -> std::io::Result<Vec<u8>> {
         tokens: 0,
         model: None,
         usage: None,
+        dissent: None,
     };
     encode_frame(&response).map_err(std::io::Error::other)
 }

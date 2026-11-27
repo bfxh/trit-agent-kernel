@@ -589,6 +589,7 @@ fn retry_switches_node_and_reuses_idempotency_key() {
                     tokens: 0,
                     model: None,
                     usage: None,
+                    dissent: None,
                 };
                 let frame = encode_frame(&response).unwrap();
                 let _ = write!(

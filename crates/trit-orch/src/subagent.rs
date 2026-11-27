@@ -64,6 +64,20 @@ pub struct SubagentUsage {
     pub estimated: bool,
 }
 
+/// 子智能体对主智能体决定的异议。
+///
+/// 只在"按现在的做法对项目不利"时提出；主智能体必须显式处理（采纳或说明驳回理由），
+/// 不能静默丢弃。这是运行时字段，不进 settings。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dissent {
+    /// 反对的对象：任务 / 决定 / 方案。
+    pub target: String,
+    /// 理由：为什么按现在的做法对项目不好。
+    pub reason: String,
+    /// 更好的做法。
+    pub suggestion: String,
+}
+
 /// 子 agent 返回的响应帧。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentResponse {
@@ -85,6 +99,9 @@ pub struct SubagentResponse {
     /// 远端自报的 token 明细；旧节点不返回时为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SubagentUsage>,
+    /// 对主智能体决定的异议；不影响响应有效性，但必须被上层显式处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dissent: Option<Dissent>,
 }
 
 impl SubagentResponse {

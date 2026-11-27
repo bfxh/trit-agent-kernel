@@ -108,6 +108,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "subagent-run" {
         return run_subagent_run(args);
     }
+    if command == "subagent-fanout" {
+        return run_subagent_fanout(args);
+    }
     if command == "plan-exec" {
         return run_plan_exec(args);
     }
@@ -2909,6 +2912,7 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         tokens: 1,
         model: None,
         usage: None,
+        dissent: None,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;
@@ -3767,6 +3771,200 @@ fn plan_exec_model(
 /// 权限映射：`ReadOnly` → `ReadOnlyTools` 包 `LocalTools` 且 `allow_write = false`；
 /// `ReadWrite` → 直接用 `LocalTools` 且 `allow_write = true`。响应状态只有
 /// `judgment.is_complete()` 为 true 时才是 `Completed`。
+/// 子智能体最大嵌套深度：超过即拒绝，避免递归无限派发。
+const MAX_SUBAGENT_DEPTH: u32 = 3;
+
+/// `subagent-fanout --workspace <dir> --agents codex,claude-code [--tasks <json|->]
+///   [--workers N] [--depth N] [--timeout-ms N] [--dry-run]`
+///
+/// 并行驱动外部编码智能体 CLI；每个任务可指定 `agent`，否则按 `--agents` 轮转。
+/// 汇总结果与异议（dissent）；异议必须由调用方显式处理，不能静默丢弃。
+fn run_subagent_fanout(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    let mut agents = String::from("codex");
+    let mut tasks_path: Option<PathBuf> = None;
+    let mut workers = 2usize;
+    let mut depth: u32 = std::env::var("TRIT_SUBAGENT_DEPTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let mut timeout_ms: u64 = 900_000;
+    let mut dry_run = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--agents" => agents = next(&mut args, "--agents")?,
+            "--tasks" => tasks_path = Some(PathBuf::from(next(&mut args, "--tasks")?)),
+            "--workers" => workers = next(&mut args, "--workers")?.parse()?,
+            "--depth" => depth = next(&mut args, "--depth")?.parse()?,
+            "--timeout-ms" => timeout_ms = next(&mut args, "--timeout-ms")?.parse()?,
+            "--dry-run" => dry_run = true,
+            other => return Err(fail(format!("unknown subagent-fanout argument: {other}"))),
+        }
+    }
+    if !(1..=MAX_SUBAGENT_DEPTH).contains(&depth) {
+        return Err(fail(format!(
+            "subagent depth {depth} must be 1..={MAX_SUBAGENT_DEPTH}"
+        )));
+    }
+    let specs: Vec<_> = agents
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            trit_host::CliAgentSpec::resolve(id).ok_or_else(|| {
+                fail(format!(
+                    "unknown subagent backend {id}; supported: {:?}",
+                    trit_host::CliAgentSpec::ids()
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    if specs.is_empty() {
+        return Err(fail("subagent-fanout requires --agents"));
+    }
+
+    let text = match tasks_path.as_ref() {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => {
+            let mut buffer = String::new();
+            std::io::stdin().read_to_string(&mut buffer)?;
+            buffer
+        }
+    };
+    let raw: serde_json::Value = serde_json::from_str(&text)?;
+    let mut tasks: Vec<(String, String, Option<String>)> = Vec::new();
+    for item in raw
+        .as_array()
+        .ok_or_else(|| fail("subagent-fanout tasks must be a JSON array"))?
+    {
+        let id = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| fail("task id required"))?
+            .to_owned();
+        let prompt = item
+            .get("prompt")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| fail("task prompt required"))?
+            .to_owned();
+        let agent = item
+            .get("agent")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        tasks.push((id, prompt, agent));
+    }
+    if tasks.is_empty() {
+        return Err(fail("subagent-fanout requires at least one task"));
+    }
+
+    if dry_run {
+        let mut plan = Vec::new();
+        for (index, (id, prompt, agent)) in tasks.iter().enumerate() {
+            let spec = match agent.as_deref() {
+                Some(id) => trit_host::CliAgentSpec::resolve(id)
+                    .ok_or_else(|| fail(format!("unknown subagent backend {id}")))?,
+                None => specs[index % specs.len()],
+            };
+            let (program, argv, stdin) = spec.command(prompt);
+            plan.push(serde_json::json!({
+                "id": id,
+                "agent": spec.id,
+                "program": program,
+                "args": argv,
+                "stdin": stdin.is_some(),
+                "depth": depth,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": plan,
+                "workers": workers,
+                "depth": depth,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<serde_json::Value>>> =
+        tasks.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let lane = workers.max(1).min(tasks.len());
+    std::thread::scope(|scope| {
+        for _ in 0..lane {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((id, prompt, agent)) = tasks.get(index) else {
+                        break;
+                    };
+                    let spec = match agent.as_deref() {
+                        Some(agent_id) => match trit_host::CliAgentSpec::resolve(agent_id) {
+                            Some(spec) => spec,
+                            None => {
+                                if let Ok(mut slot) = slots[index].lock() {
+                                    *slot = Some(serde_json::json!({
+                                        "id": id,
+                                        "agent": agent_id,
+                                        "error": format!("unknown backend {agent_id}"),
+                                    }));
+                                }
+                                continue;
+                            }
+                        },
+                        None => specs[index % specs.len()],
+                    };
+                    let value = match trit_host::run_cli_agent(spec, prompt, &workspace, timeout) {
+                        Ok(run) => serde_json::json!({
+                            "id": id,
+                            "agent": spec.id,
+                            "exit": run.exit,
+                            "timed_out": run.timed_out,
+                            "content_chars": run.content.chars().count(),
+                            "dissent": run.dissent,
+                            "stderr_tail": run.stderr_tail,
+                        }),
+                        Err(error) => serde_json::json!({
+                            "id": id,
+                            "agent": spec.id,
+                            "error": error.to_string(),
+                        }),
+                    };
+                    if let Ok(mut slot) = slots[index].lock() {
+                        *slot = Some(value);
+                    }
+                }
+            });
+        }
+    });
+    let results: Vec<serde_json::Value> = slots
+        .into_iter()
+        .filter_map(|slot| slot.into_inner().unwrap_or(None))
+        .collect();
+    let dissents: Vec<serde_json::Value> = results
+        .iter()
+        .filter(|result| result.get("dissent").is_some_and(|value| !value.is_null()))
+        .map(|result| {
+            serde_json::json!({
+                "task": result.get("id"),
+                "dissent": result.get("dissent"),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "results": results,
+            "dissents": dissents,
+            "workers": workers,
+            "depth": depth,
+        }))?
+    );
+    Ok(())
+}
+
 fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut workspace = PathBuf::from(".");
     let mut script: Option<PathBuf> = None;
@@ -3865,6 +4063,7 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
             output: outcome.usage.output,
             estimated: outcome.usage.estimated,
         }),
+        dissent: None,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;
