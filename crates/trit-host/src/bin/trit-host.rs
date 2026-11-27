@@ -3846,6 +3846,8 @@ fn run_subagent_fanout(mut args: impl Iterator<Item = String>) -> Result<(), Box
             "subagent depth {depth} must be 1..={MAX_SUBAGENT_DEPTH}"
         )));
     }
+    // 并发上限：避免一个 --workers 参数就开上千线程。
+    let workers = workers.clamp(1, 32);
     let specs: Vec<_> = agents
         .split(',')
         .map(str::trim)
