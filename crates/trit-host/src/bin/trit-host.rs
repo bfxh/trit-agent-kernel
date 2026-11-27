@@ -56,6 +56,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-dispatch" {
         return run_session_dispatch(args);
     }
+    if command == "session-callback" {
+        return run_session_callback(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1383,6 +1386,9 @@ fn usage() {
          session-dispatch: trit-host session-dispatch --root <dir> [--apply] [--compact]\n\
          dispatches resume items into new trit session files; dry-run by default,\n\
          --apply writes one TurnStarted per item and never overwrites targets.\n\
+         session-callback: trit-host session-callback --root <dir> [--apply] [--compact]\n\
+         writes parent/child results into delegations.jsonl; dry-run by default,\n\
+         idempotent on child records+modified time, and never edits session logs.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1471,6 +1477,33 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if blocked {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `session-callback --root <dir> [--apply] [--compact]`：
+/// 默认 dry-run；`--apply` 才把 parent/child 结果追加到 delegations.jsonl。
+fn run_session_callback(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-callback argument: {other}"))),
+        }
+    }
+    let scanned = trit_host::scan_sessions(&root)?;
+    let report =
+        trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: !apply })?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 

@@ -1402,6 +1402,7 @@ pub mod sampling;
 pub mod separation;
 pub mod serve;
 pub mod session;
+pub mod session_callback;
 pub mod session_dispatch;
 pub mod session_index;
 pub mod session_migration;
@@ -1515,6 +1516,10 @@ pub use serve::{Route, ServeConfig, ServeError, ServeHeaders, authorize, route};
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
     SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
+};
+pub use session_callback::{
+    CallbackItem, CallbackOptions, CallbackReport, CallbackStatus, DELEGATIONS_FILE,
+    DelegationResult, SESSION_CALLBACK_SCHEMA, callback_sessions,
 };
 pub use session_dispatch::{
     DispatchAction, DispatchItem, DispatchOptions, DispatchReport, SESSION_DISPATCH_SCHEMA,
