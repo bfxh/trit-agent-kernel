@@ -1446,7 +1446,7 @@ fn usage() {
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
          [--pending-ttl-ms N] [--max-entries N] [--max-state-bytes N] [--state <path>] \\\n\
-         [--max-connections N] [--request-read-timeout-ms N] [--once]\n\
+         [--max-connections N] [--request-read-timeout-ms N] [--token-budget N] [--once]\n\
          shared idempotency ledger: POST /claim, /renew and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
@@ -2821,6 +2821,9 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
             "--request-read-timeout-ms" => {
                 request_read_timeout_ms =
                     Some(next(&mut args, "--request-read-timeout-ms")?.parse()?)
+            }
+            "--token-budget" => {
+                config = config.with_token_budget(next(&mut args, "--token-budget")?.parse()?)
             }
             "--once" => once = true,
             other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),

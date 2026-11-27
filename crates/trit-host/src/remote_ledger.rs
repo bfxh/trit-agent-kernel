@@ -112,6 +112,8 @@ pub struct LedgerServerConfig {
     /// 请求行 + 头部 + 请求体的总读取时限；`None` 不限制。
     /// 到点回 `408`，避免慢速滴流客户端长期占住连接。
     pub request_read_timeout: Option<Duration>,
+    /// 可选跨机 token 预算；达到后 `/claim` 返回 503。仅内存累计，重启清零。
+    pub token_budget: Option<u64>,
 }
 
 impl LedgerServerConfig {
@@ -125,6 +127,7 @@ impl LedgerServerConfig {
             state_path: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             request_read_timeout: Some(DEFAULT_REQUEST_READ_TIMEOUT),
+            token_budget: None,
         }
     }
 
@@ -161,6 +164,12 @@ impl LedgerServerConfig {
     /// 设置请求行 + 头部 + 请求体的总读取时限；`Duration::ZERO` 表示不限制。
     pub fn with_request_read_timeout(mut self, timeout: Duration) -> Self {
         self.request_read_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// 设置跨机 token 预算；达到后 `/claim` 返回 503。
+    pub fn with_token_budget(mut self, budget: u64) -> Self {
+        self.token_budget = Some(budget);
         self
     }
 }
@@ -228,6 +237,8 @@ struct LedgerState {
     entries: BTreeMap<String, Entry>,
     /// 所有 `Done` 记录的逻辑字节数（按保守估算，见 `record_bytes`）。
     bytes: usize,
+    /// 已完成帧自报的 token 总量；仅内存累计，重启清零。
+    tokens_used: u64,
 }
 
 /// 已绑定的账本服务端。
@@ -513,6 +524,20 @@ fn handle(
             }
         }
         "/claim" => {
+            if let Some(budget) = config.token_budget {
+                let used = match state.lock() {
+                    Ok(state) => state.tokens_used,
+                    Err(_) => return respond(&mut stream, 503, "Service Unavailable", b""),
+                };
+                if used >= budget {
+                    return respond(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        b"token budget exhausted",
+                    );
+                }
+            }
             let server = LedgerServerView { state, config };
             match server.claim(&key) {
                 Ok(Claim::New { lease }) => respond_with_lease(&mut stream, 200, "OK", b"", &lease),
@@ -541,6 +566,11 @@ fn handle(
             match view.complete(&key, lease, frame) {
                 Ok(CompleteOutcome::Completed) => {
                     completions.fetch_add(1, Ordering::SeqCst);
+                    if response.tokens > 0
+                        && let Ok(mut state) = state.lock()
+                    {
+                        state.tokens_used = state.tokens_used.saturating_add(response.tokens);
+                    }
                     respond(&mut stream, 204, "No Content", b"")
                 }
                 Ok(CompleteOutcome::Duplicate) => respond(&mut stream, 204, "No Content", b""),

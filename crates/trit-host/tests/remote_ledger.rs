@@ -1291,3 +1291,36 @@ fn unreachable_ledger_fails_closed_without_executing() {
     assert!(!result.reusable());
     server.join().unwrap();
 }
+
+#[test]
+fn token_budget_blocks_new_claims_after_spend() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_token("t")
+                .with_token_budget(10),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), Some("t"), 5);
+
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected first claim to win");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"done".to_vec(),
+        tokens: 10,
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+
+    // 预算已用尽：新键 claim 直接 503，客户端报错。
+    let error = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap_err();
+    assert!(error.contains("503"), "{error}");
+}
