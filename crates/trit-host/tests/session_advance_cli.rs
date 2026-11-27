@@ -117,3 +117,85 @@ fn nodes_are_accepted_in_dry_run_without_network() {
     assert!(report["remote"].is_null());
     let _ = fs::remove_dir_all(dir);
 }
+
+struct EchoNode {
+    child: std::process::Child,
+}
+
+impl Drop for EchoNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_echo_node() -> (EchoNode, trit_host::RemoteNode) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-echo")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let base = format!("http://{}", value["bind"].as_str().unwrap());
+    let node = trit_host::RemoteNode::new(
+        "node-echo",
+        trit_orch::RemoteEndpoint {
+            url: format!("{base}/run"),
+            auth_token: None,
+            timeout_secs: 5,
+        },
+    );
+    (EchoNode { child }, node)
+}
+
+#[test]
+fn apply_with_nodes_reaches_remote_echo() {
+    let dir = temp_dir("remote-apply");
+    open_session(&dir.join("session.jsonl"), "remote");
+    let (child, node) = spawn_echo_node();
+    let nodes = dir.join("nodes.json");
+    fs::write(&nodes, serde_json::to_string(&[node]).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "session-advance",
+            "--root",
+            dir.to_str().unwrap(),
+            "--nodes",
+            nodes.to_str().unwrap(),
+            "--apply",
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["dry_run"], false);
+    assert!(report["run"].is_null());
+    assert!(
+        report["remote"]["completed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task == "session.run"),
+        "{}",
+        report["remote"]
+    );
+    assert_eq!(report["remote"]["assignments"]["session.run"], "node-echo");
+    drop(child);
+    let _ = fs::remove_dir_all(dir);
+}
