@@ -904,6 +904,11 @@ fn restore_rewind_backups(
                 failures.push(format!("{raw}: missing backup file"));
                 continue;
             };
+            // 账本是外部可读文本：备份名只能是 `begin` 写下的纯序号，不能做路径跳转。
+            if !safe_backup_name(name) {
+                failures.push(format!("{raw}: unsafe backup name"));
+                continue;
+            }
             let bytes = match std::fs::read(backup_dir.join(name)) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -925,6 +930,11 @@ fn restore_rewind_backups(
         }
     }
     failures
+}
+
+/// 与 `journal.rs` 同口径：备份文件名不得为空、不得是 `.`/`..`、不得含路径分隔符。
+fn safe_backup_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\'])
 }
 
 fn now_secs() -> u64 {
@@ -1484,6 +1494,43 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(store_dir);
+    }
+
+    #[test]
+    fn recover_rejects_backup_name_that_escapes_backup_dir() {
+        let root = temp_root("journal-recover-traversal");
+        let store_dir = temp_root("journal-recover-traversal-store");
+        std::fs::write(root.join("a.txt"), "half-a").unwrap();
+        // 攻击者希望被写进工作区的文件，放在备份目录之外。
+        let secret = store_dir.with_extension("secret");
+        std::fs::write(&secret, "pwned").unwrap();
+
+        let mut journal = RewindJournal::open(&store_dir).unwrap();
+        let op_id = journal
+            .begin(0, &[("a.txt".to_owned(), Some(b"before-a".to_vec()))])
+            .unwrap();
+        journal.applying(op_id, 0, "a.txt").unwrap();
+        // 篡改账本：把备份名改成相对路径跳转。
+        let text = std::fs::read_to_string(store_dir.join(REWIND_JOURNAL))
+            .unwrap()
+            .replace(
+                "\"backup\":\"0\"",
+                "\"backup\":\"..\\\\..\\\\journal-recover-traversal-store.secret\"",
+            );
+        std::fs::write(store_dir.join(REWIND_JOURNAL), text).unwrap();
+
+        let store = CheckpointStore::open(&store_dir).unwrap();
+        let recovery = store.recover_rewind(&root).unwrap();
+        assert_eq!(recovery.recovered, 0, "{recovery:?}");
+        assert!(recovery.has_failures(), "{recovery:?}");
+        assert!(store.rewind_status().unwrap().has_in_doubt());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "half-a"
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(store_dir);
+        let _ = std::fs::remove_file(secret);
     }
 
     #[test]
