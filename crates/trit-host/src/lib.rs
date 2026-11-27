@@ -1593,7 +1593,6 @@ pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
 pub mod cost;
-pub mod design_score;
 pub mod diagnostics;
 pub mod extensions;
 pub mod fleet_runner;
@@ -1603,7 +1602,6 @@ mod http_read;
 pub mod journal;
 pub mod jsonl_layout;
 pub mod lease;
-pub mod lint_score;
 pub mod mcp_http;
 pub mod mcp_tools;
 pub mod memory;
@@ -1622,7 +1620,6 @@ pub mod remote_ledger;
 pub mod remote_serve;
 pub mod remote_subagent;
 pub mod sampling;
-pub mod scoring;
 pub mod separation;
 pub mod serve;
 pub mod session;
@@ -1671,10 +1668,6 @@ pub use context_projection::{
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
-};
-pub use design_score::{
-    Artifact, DesignAxis, DesignAxisScore, DesignFinding, DesignReport, render_design_markdown,
-    score_artifacts, score_written_paths,
 };
 pub use diagnostics::{
     DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions, LiveMcpDiagnostics,
@@ -1747,7 +1740,6 @@ pub use remote_subagent::{
     validate_idempotency_scope,
 };
 pub use sampling::OpenAiSamplingHandler;
-pub use scoring::{BLOCK_THRESHOLD, Surface, SurfaceScore, score_turn};
 pub use separation::{
     PLAN_TOOL, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
     plan_handoff_from_proposal, planner_tool_specs,

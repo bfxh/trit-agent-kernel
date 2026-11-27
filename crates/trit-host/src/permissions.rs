@@ -264,7 +264,12 @@ impl WriteClaim {
         // shell 无法从命令文本证明路径范围；claim 存在时 fail-closed。
         // 这条判断必须在 read_only 快路径之前，否则模型自报 read_only 就能绕过 claim。
         if request.tool == "bash" {
-            return false;
+            let Some(command) = request.command.as_deref() else {
+                return false;
+            };
+            // 升级：能提取到写入目标时，要求全部落在 claim 内；提取不到仍 fail closed。
+            let targets = crate::tech_stack::shell_write_targets(command);
+            return !targets.is_empty() && targets.iter().all(|path| self.allows_path(path));
         }
         if request.read_only {
             return true;
@@ -809,6 +814,38 @@ mod tests {
         assert!(claim.allows_request(&ToolRequest::move_path("m1", "src/a.txt", "src/b.txt")));
         assert!(!claim.allows_request(&ToolRequest::move_path("m1", "src/a.txt", "other/b.txt")));
         assert!(!claim.allows_request(&ToolRequest::move_path("m1", "other/a.txt", "src/b.txt")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bash_writes_must_stay_inside_the_claim() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-claim-bash-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let claim = WriteClaim::new(&root, vec![PathBuf::from("out")]).unwrap();
+        let bash = |command: &str| ToolRequest {
+            call_id: "c".into(),
+            tool: "bash".into(),
+            read_only: false,
+            command: Some(command.into()),
+            ..ToolRequest::default()
+        };
+        assert!(
+            claim.allows_request(&bash("echo x > out/a.txt")),
+            "claim 内的 shell 写入应放行"
+        );
+        assert!(
+            !claim.allows_request(&bash("echo x > ../evil.txt")),
+            "claim 外的 shell 写入必须拒绝"
+        );
+        assert!(
+            !claim.allows_request(&bash("ls -la")),
+            "无法证明写入目标时 fail closed"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

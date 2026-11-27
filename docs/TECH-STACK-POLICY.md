@@ -53,12 +53,7 @@
 这对帧协议子智能体与外部 CLI 子智能体（codex / claude-code / qoder / zcode / 豆包）同样生效：
 适配层把 CLI 自报的技术栈填进 `stack`，越权新增一样被拒。
 
-## 5. 与评分的配合
-
-前后端评分（`docs/SCORING.md`）可以看"是否遵守技术栈策略"作为扣分项；是否让评分参与
-决策由设置 `scoring.participate_in_decision` 控制（默认关闭）。
-
-## 6. 检查
+## 5. 检查
 
 ```bash
 cargo test -p trit-host --test tech_stack_policy
