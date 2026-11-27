@@ -84,6 +84,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
+    if command == "tools" {
+        return run_tools(args);
+    }
     if command == "settings" {
         return run_settings(args);
     }
@@ -1449,6 +1452,9 @@ fn usage() {
          [--workers N] [--max-concurrency N] [--retry N] [--budget-tokens N] [--scope S] [--health-probe]\n\
          [--cache <path>] [--apply] [--compact]\n\
          dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
+         tools: trit-host tools [--mcp-config <json>] [--compact]\n\
+         lists built-in tools; with --mcp-config starts MCP servers and lists external tools\n\
+         (server/tool/description/read_only_hint) without entering the tool loop.\n\
          settings: trit-host settings [--root <dir>] [--get KEY] [--set KEY=VALUE] [--compact]\n\
          reads/writes <root>/.agent/settings.json; keys follow docs/FRONTEND-CONTRACT.md §10.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
@@ -2333,6 +2339,60 @@ fn run_session_index(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         }))
         .map_err(|error| fail(error.to_string()))?
     );
+    Ok(())
+}
+
+/// `tools [--mcp-config <json>] [--compact]`：
+/// 列出内置工具；给了 MCP 配置时启动服务器并列出外部工具。
+fn run_tools(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut mcp_config: Option<PathBuf> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--mcp-config" => mcp_config = Some(PathBuf::from(next(&mut args, "--mcp-config")?)),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown tools argument: {other}"))),
+        }
+    }
+    let builtin = default_tools();
+    let mut report = serde_json::json!({
+        "builtin": builtin
+            .iter()
+            .map(|tool| serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "read_only": tool.read_only,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(path) = mcp_config {
+        let text = std::fs::read_to_string(&path)?;
+        let config: trit_host::SupervisorConfig = serde_json::from_str(&text)?;
+        let runtime =
+            trit_host::SupervisorRuntime::start(&config, trit_host::RecoveryContext::default())
+                .map_err(|error| fail(format!("start MCP runtime: {error}")))?;
+        let routes: Vec<_> = runtime
+            .tool_client()
+            .routes()
+            .into_iter()
+            .map(|route| {
+                serde_json::json!({
+                    "exposed_name": route.exposed_name,
+                    "server": route.server,
+                    "tool": route.tool,
+                    "description": route.description,
+                    "declared_read_only": route.declared_read_only,
+                })
+            })
+            .collect();
+        report["mcp"] = serde_json::Value::Array(routes);
+    }
+    let text = if compact {
+        serde_json::to_string(&report)?
+    } else {
+        serde_json::to_string_pretty(&report)?
+    };
+    println!("{text}");
     Ok(())
 }
 
