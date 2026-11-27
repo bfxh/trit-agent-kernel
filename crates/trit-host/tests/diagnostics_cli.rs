@@ -164,7 +164,7 @@ fn live_mcp_probe_collects_redacted_stderr() {
     #[cfg(not(windows))]
     let (program, script) = ("sh", format!("echo {line} >&2; sleep 2"));
 
-    let mut extra = vec![
+    let extra = vec![
         "--live-mcp",
         program,
         "--live-mcp-arg",

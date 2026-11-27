@@ -1550,6 +1550,7 @@ pub mod permissions;
 pub mod plan_exec;
 pub mod planner;
 pub mod port_bridge;
+pub mod protocol;
 pub mod provider;
 pub mod provider_health;
 pub mod provider_stream;
@@ -1643,6 +1644,7 @@ pub use plan_exec::{
 };
 pub use planner::{PlanCollectingTools, plan_from_capture, planner_catalog_specs, planner_tools};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
+pub use protocol::{Protocol, ProtocolStream};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
     ToolCatalog, ToolSpec, default_tools,

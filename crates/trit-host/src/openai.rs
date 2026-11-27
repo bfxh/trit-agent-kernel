@@ -11,10 +11,9 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::protocol::Protocol;
 use crate::provider_health::{ConnectionFailureKind, ConnectionHealth, ConnectionHealthPolicy};
-use crate::provider_stream::{
-    OpenAiStreamAssembler, ProviderStreamEvent, StreamingProvider, read_sse_events,
-};
+use crate::provider_stream::{ProviderStreamEvent, StreamingProvider, read_sse_events};
 use crate::{
     AgentError, CacheObservation, ContextReceipt, PrefixSignal, Provider, ProviderRequest,
     ProviderResponse, ToolRequest, ToolSpec,
@@ -26,6 +25,8 @@ pub struct OpenAiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// 模型协议：决定端点、认证头、请求体与响应/流式解析。
+    pub protocol: Protocol,
     pub timeout: Duration,
     /// 建连超时：DNS/TCP/TLS 握手；与整次请求超时分开。
     pub connect_timeout: Duration,
@@ -39,6 +40,7 @@ impl fmt::Debug for OpenAiConfig {
         f.debug_struct("OpenAiConfig")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("protocol", &self.protocol)
             .field("api_key", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("connect_timeout", &self.connect_timeout)
@@ -58,6 +60,7 @@ impl OpenAiConfig {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
+            protocol: Protocol::default(),
             timeout: Duration::from_secs(120),
             connect_timeout: Duration::from_secs(10),
             max_output_tokens: None,
@@ -75,20 +78,74 @@ impl OpenAiConfig {
         self
     }
 
+    /// 选择模型协议；决定端点、认证头、请求体与响应/流式解析。
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// 默认协议（OpenAI Chat）的配置；等价于 `from_env_for(Protocol::OpenAiChat)`。
     pub fn from_env() -> Result<Self, AgentError> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| AgentError::Provider("OPENAI_API_KEY is not set".into()))?;
-        let model = std::env::var("OPENAI_MODEL")
-            .map_err(|_| AgentError::Provider("OPENAI_MODEL is not set".into()))?;
+        Self::from_env_for(Protocol::OpenAiChat)
+    }
+
+    /// 按协议读环境变量：`TRIT_*` 通用优先，其次该协议的厂商前缀。
+    ///
+    /// 缺 key / 缺 model 一律 fail closed，并在报错里点明该配哪个变量，
+    /// 不会悄悄回落到别的厂商凭据。
+    pub fn from_env_for(protocol: Protocol) -> Result<Self, AgentError> {
+        let protocol = match std::env::var("TRIT_PROTOCOL") {
+            Ok(name) if !name.trim().is_empty() => Protocol::parse(&name)?,
+            _ if protocol == Protocol::OpenAiChat => {
+                // 没显式指定协议时按 base_url 主机推断；显式协议优先。
+                let hinted = env_first(&["TRIT_BASE_URL", "OPENAI_BASE_URL"]).unwrap_or_default();
+                Protocol::from_base_url(&hinted)
+            }
+            _ => protocol,
+        };
+        let (base_env, key_env, model_env, default_base) = match protocol {
+            Protocol::OpenAiChat => (
+                "OPENAI_BASE_URL",
+                "OPENAI_API_KEY",
+                "OPENAI_MODEL",
+                "https://api.openai.com/v1",
+            ),
+            Protocol::AnthropicMessages => (
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_MODEL",
+                "https://api.anthropic.com",
+            ),
+            Protocol::GeminiGenerateContent => (
+                "GEMINI_BASE_URL",
+                "GEMINI_API_KEY",
+                "GEMINI_MODEL",
+                "https://generativelanguage.googleapis.com",
+            ),
+        };
+        let api_key = env_first(&["TRIT_API_KEY", key_env]).ok_or_else(|| {
+            AgentError::Provider(format!(
+                "{key_env} is not set for protocol {}; set {key_env} or TRIT_API_KEY",
+                protocol.as_str()
+            ))
+        })?;
+        let model = env_first(&["TRIT_MODEL", model_env]).ok_or_else(|| {
+            AgentError::Provider(format!(
+                "{model_env} is not set for protocol {}; set {model_env} or TRIT_MODEL",
+                protocol.as_str()
+            ))
+        })?;
         let base_url =
-            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+            env_first(&["TRIT_BASE_URL", base_env]).unwrap_or_else(|| default_base.to_owned());
         let connect_timeout = std::env::var("TRIT_OPENAI_CONNECT_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(10));
         let model = Self::resolve_model(model);
-        Ok(Self::new(base_url, api_key, model).with_connect_timeout(connect_timeout))
+        Ok(Self::new(base_url, api_key, model)
+            .with_connect_timeout(connect_timeout)
+            .with_protocol(protocol))
     }
 
     /// `TRIT_MODEL_ALIASES`（JSON 对象）命中时替换模型名；非法 JSON 保持原名。
@@ -113,6 +170,16 @@ pub struct OpenAiProvider {
 
 /// 单次 HTTP 响应的读取上限；超过时 fail closed，避免恶意/异常网关拖垮进程。
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 依次读取多个环境变量，取第一个非空值。
+fn env_first(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
 
 fn apply_model_alias(aliases: &BTreeMap<String, String>, model: &str) -> String {
     aliases
@@ -188,22 +255,25 @@ impl OpenAiProvider {
         }
     }
 
-    fn post_chat(&self, body: &Value) -> Result<String, AgentError> {
+    /// 发一次请求；`stream` 决定端点（Gemini 用 `:streamGenerateContent`）与 Accept 头。
+    fn post_raw(&self, body: &Value, stream: bool) -> Result<ureq::Response, AgentError> {
         let _permit = crate::concurrency_limit::acquire();
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-        match self
-            .agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.config.api_key))
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string())
-        {
+        let url = self
+            .config
+            .protocol
+            .endpoint(&self.config.base_url, &self.config.model, stream);
+        let mut request = self.agent.post(&url);
+        for (name, value) in self.config.protocol.headers(&self.config.api_key) {
+            request = request.set(name, &value);
+        }
+        request = request.set("Content-Type", "application/json");
+        if stream {
+            request = request.set("Accept", "text/event-stream");
+        }
+        match request.send_string(&body.to_string()) {
             Ok(response) => {
                 self.record_success();
-                read_response_text(response)
+                Ok(response)
             }
             Err(ureq::Error::Status(code, response)) => {
                 let text = read_response_text(response).unwrap_or_default();
@@ -217,6 +287,10 @@ impl OpenAiProvider {
         }
     }
 
+    fn post_chat(&self, body: &Value) -> Result<String, AgentError> {
+        read_response_text(self.post_raw(body, false)?)
+    }
+
     /// 原始 chat completion：供 MCP sampling 等非工具循环调用。
     pub fn complete_chat(&self, body: &Value) -> Result<Value, AgentError> {
         let text = self.post_chat(body)?;
@@ -227,9 +301,9 @@ impl OpenAiProvider {
 
 impl Provider for OpenAiProvider {
     fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
-        let body = build_request_body(&self.config, request);
+        let body = self.config.protocol.build_body(&self.config, request);
         let text = self.post_chat(&body)?;
-        let mut response = parse_response(&text, &request.tools)?;
+        let mut response = self.config.protocol.parse_body(&text, &request.tools)?;
         attach_context_receipt(&mut response, request);
         Ok(response)
     }
@@ -241,53 +315,28 @@ impl StreamingProvider for OpenAiProvider {
         request: &ProviderRequest,
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<(), AgentError>,
     ) -> Result<ProviderResponse, AgentError> {
-        let _permit = crate::concurrency_limit::acquire();
-        let mut body = build_request_body(&self.config, request);
-        body["stream"] = json!(true);
-        if self.config.stream_include_usage {
-            body["stream_options"] = json!({"include_usage": true});
+        let mut body = self.config.protocol.build_body(&self.config, request);
+        if self.config.protocol == Protocol::OpenAiChat {
+            body["stream"] = json!(true);
+            if self.config.stream_include_usage {
+                body["stream_options"] = json!({"include_usage": true});
+            }
         }
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-        let response = self
-            .agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.config.api_key))
-            .set("Content-Type", "application/json")
-            .set("Accept", "text/event-stream")
-            .send_string(&body.to_string());
-        let response = match response {
-            Ok(response) => {
-                self.record_success();
-                response
-            }
-            Err(ureq::Error::Status(code, response)) => {
-                let text = read_response_text(response).unwrap_or_default();
-                self.record_failure(classify_status(code, &text));
-                return Err(AgentError::Provider(format!("HTTP {code}: {text}")));
-            }
-            Err(error) => {
-                self.record_failure(ConnectionFailureKind::Transport);
-                return Err(AgentError::Provider(format!("transport: {error}")));
-            }
-        };
-
-        let mut assembler = OpenAiStreamAssembler::new();
+        let response = self.post_raw(&body, true)?;
+        let mut decoder = self.config.protocol.stream_decoder();
         read_sse_events(BufReader::new(response.into_reader()), |event| {
-            for delta in assembler.push_sse(&event)? {
+            for delta in decoder.push(&event)? {
                 on_event(delta)?;
             }
             Ok(())
         })?;
-        let mut response = assembler.finish(&request.tools)?;
+        let mut response = decoder.finish(&request.tools)?;
         attach_context_receipt(&mut response, request);
         Ok(response)
     }
 }
 
-fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value {
+pub(crate) fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value {
     let mut system = format!(
         "{}\n\nYou are a headless coding agent. Use the provided tools. \
          Only claim completion with complete_subtask. Every criterion must be backed \
@@ -332,7 +381,7 @@ fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value
     body
 }
 
-fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
+pub(crate) fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
@@ -420,7 +469,10 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-fn parse_response(body: &str, tools: &[ToolSpec]) -> Result<ProviderResponse, AgentError> {
+pub(crate) fn parse_response(
+    body: &str,
+    tools: &[ToolSpec],
+) -> Result<ProviderResponse, AgentError> {
     let value: Value = serde_json::from_str(body)
         .map_err(|error| AgentError::Provider(format!("bad json: {error}")))?;
     if let Some(error) = value.get("error") {

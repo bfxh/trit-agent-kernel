@@ -11,9 +11,9 @@ use trit_host::{
     ContextPolicy, ContextRequest, ExecutorSetup, GitCheckpointStore, GitCheckpointingTools,
     HeadlessConfig, InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile,
     MutationJournal, OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler, OperationLease,
-    PlanExecuteConfig, Proposal, ProviderModel, ReasoningEffort, RecoveryContext, ResolvedContext,
-    RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure, Session,
-    SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, ToolSpec, WriteClaim,
+    PlanExecuteConfig, Proposal, Protocol, ProviderModel, ReasoningEffort, RecoveryContext,
+    ResolvedContext, RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure,
+    Session, SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, ToolSpec, WriteClaim,
     WriteGuard, default_tools, planner_catalog_specs, recovery_context_for_session,
     rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
     run_plan_then_execute_with,
@@ -153,6 +153,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut allow_shell = false;
     let mut session = None;
     let mut provider = "scripted".to_owned();
+    let mut protocol_arg: Option<String> = None;
     let mut sandbox: Option<PathBuf> = None;
     let mut sandbox_args: Vec<String> = Vec::new();
     let mut allow_unsandboxed_shell = false;
@@ -232,6 +233,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--allow-shell" => allow_shell = true,
             "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
             "--provider" => provider = next(&mut args, "--provider")?,
+            "--protocol" => protocol_arg = Some(next(&mut args, "--protocol")?),
             "--sandbox" => sandbox = Some(PathBuf::from(next(&mut args, "--sandbox")?)),
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
@@ -400,14 +402,25 @@ fn run() -> Result<(), Box<dyn Error>> {
     if checkpoint_backend == "git" && checkpoint_dir.is_none() {
         return Err(fail("--checkpoint-backend git requires --checkpoint-dir"));
     }
-    if context_catalog.is_some() && provider != "openai" {
-        return Err(fail("--context-catalog requires --provider openai"));
+    if protocol_arg.is_some() && provider == "scripted" {
+        return Err(fail("--protocol requires a non-scripted --provider"));
+    }
+    let protocol = match protocol_arg.as_deref() {
+        Some(name) => Protocol::parse(name).map_err(|error| fail(error.to_string()))?,
+        None => match provider.as_str() {
+            "anthropic" => Protocol::AnthropicMessages,
+            "gemini" => Protocol::GeminiGenerateContent,
+            _ => Protocol::OpenAiChat,
+        },
+    };
+    if context_catalog.is_some() && provider == "scripted" {
+        return Err(fail("--context-catalog requires a real provider"));
     }
     if mcp_sampling_model.is_some() && !mcp_sampling {
         return Err(fail("--mcp-sampling-model requires --mcp-sampling"));
     }
-    if mcp_sampling && provider != "openai" {
-        return Err(fail("--mcp-sampling requires --provider openai"));
+    if mcp_sampling && provider == "scripted" {
+        return Err(fail("--mcp-sampling requires a real provider"));
     }
     if handoff_packet.is_none() && !handoff_state_hash.trim().is_empty() {
         return Err(fail("--handoff-state-hash requires --handoff-packet"));
@@ -619,23 +632,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .map_err(|error| fail(format!("parse script: {error}")))?,
             )
         }
-        "openai" => {
+        "openai" | "anthropic" | "gemini" => {
             if script.is_some() {
-                return Err(fail("--script is not used with --provider openai"));
+                return Err(fail(format!(
+                    "--script is not used with --provider {provider}"
+                )));
             }
             None
         }
         other => return Err(fail(format!("unknown provider: {other}"))),
     };
-    let openai_config = if provider == "openai" {
-        Some(OpenAiConfig::from_env()?)
-    } else {
+    let openai_config = if provider == "scripted" {
         None
+    } else {
+        Some(OpenAiConfig::from_env_for(protocol)?)
     };
     let sampling_handler: Option<Arc<dyn SamplingHandler>> = if mcp_sampling {
         let config = openai_config
             .as_ref()
-            .ok_or_else(|| fail("--mcp-sampling requires --provider openai"))?;
+            .ok_or_else(|| fail("--mcp-sampling requires a real provider"))?;
         let mut sampling_config = config.clone();
         if sampling_config.max_output_tokens.is_none() {
             sampling_config.max_output_tokens = Some(model_max_output);
@@ -652,7 +667,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(path) => {
             let config = openai_config
                 .as_ref()
-                .ok_or_else(|| fail("--context-catalog requires --provider openai"))?;
+                .ok_or_else(|| fail("--context-catalog requires a real provider"))?;
             let catalog = load_context_catalog(path)?;
             let project = context_project
                 .clone()
@@ -965,7 +980,7 @@ fn build_model(
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
-    let config = config.ok_or_else(|| fail("--provider openai requires OPENAI_* env"))?;
+    let config = config.ok_or_else(|| fail("--provider requires a configured provider"))?;
     let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), default_tools());
     if let Some(catalog) = tool_catalog {
         model = model.with_tool_catalog(catalog);
@@ -1331,7 +1346,7 @@ fn usage() {
          [--alignment-changed <path>] [--alignment-changed-set] \\\n    \
          [--alignment-no-git-changed] [--gate-chain-post] \\\n    \
          [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
-         [--provider scripted|openai] [--script <proposals.json>] \\\n    \
+         [--provider scripted|openai|anthropic|gemini] [--protocol <name>] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
@@ -1353,10 +1368,16 @@ fn usage() {
          --planner-script <proposals.json> --script <proposals.json> \\\n    \
          [--allow-write [--write-journal]] \\\n    \
          [--max-plan-steps N] [--max-exec-steps N] [--capsule-budget N] \\\n    \
-         [--output-format md|json]\n\n\
+         [--protocol <name>] [--output-format md|json]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
+         anthropic: Anthropic Messages API; set ANTHROPIC_API_KEY / ANTHROPIC_MODEL\n\
+         (optionally ANTHROPIC_BASE_URL).\n\
+         gemini:   Gemini generateContent; set GEMINI_API_KEY / GEMINI_MODEL\n\
+         (optionally GEMINI_BASE_URL).\n\
+         --protocol overrides the protocol otherwise inferred from --provider;\n\
+         TRIT_PROTOCOL / TRIT_API_KEY / TRIT_MODEL / TRIT_BASE_URL work for any protocol.\n\
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
          --output-format: md (default) renders a Markdown turn report; json keeps TurnOutcome.\n\
          --repo-identity: fail closed unless .agent/repo.json is valid; --repo-expected\n\
@@ -3500,7 +3521,7 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     Ok(())
 }
 
-/// `plan-exec --task <t> --workspace <dir> (--planner-script P --script E | --provider openai)`：
+/// `plan-exec --task <t> --workspace <dir> (--planner-script P --script E | --provider openai|anthropic|gemini [--protocol <name>])`：
 ///
 /// 一键跑 planner → executor 两阶段。planner 只读产出 `PlanHandoff`；executor 的工具与
 /// `WriteClaim` 在计划校验通过后才按 `plan.profile.write_roots` 构造，计划和缓存都不跨阶段共享。
@@ -3510,6 +3531,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
     let mut planner_script: Option<PathBuf> = None;
     let mut executor_script: Option<PathBuf> = None;
     let mut provider = "scripted".to_owned();
+    let mut protocol_arg: Option<String> = None;
     let mut planner_model_name: Option<String> = None;
     let mut executor_model_name: Option<String> = None;
     let mut allow_write = false;
@@ -3530,6 +3552,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
                 executor_script = Some(PathBuf::from(next(&mut args, "--script")?));
             }
             "--provider" => provider = next(&mut args, "--provider")?,
+            "--protocol" => protocol_arg = Some(next(&mut args, "--protocol")?),
             "--planner-model" => planner_model_name = Some(next(&mut args, "--planner-model")?),
             "--executor-model" => executor_model_name = Some(next(&mut args, "--executor-model")?),
             "--allow-write" => allow_write = true,
@@ -3560,9 +3583,26 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
         }
     }
     let task = task.ok_or_else(|| fail("plan-exec requires --task"))?;
-    if provider != "scripted" && provider != "openai" {
+    if provider != "scripted"
+        && provider != "openai"
+        && provider != "anthropic"
+        && provider != "gemini"
+    {
         return Err(fail(format!("plan-exec: bad --provider {provider}")));
     }
+    if protocol_arg.is_some() && provider == "scripted" {
+        return Err(fail(
+            "plan-exec: --protocol requires a non-scripted --provider",
+        ));
+    }
+    let protocol = match protocol_arg.as_deref() {
+        Some(name) => Protocol::parse(name).map_err(|error| fail(error.to_string()))?,
+        None => match provider.as_str() {
+            "anthropic" => Protocol::AnthropicMessages,
+            "gemini" => Protocol::GeminiGenerateContent,
+            _ => Protocol::OpenAiChat,
+        },
+    };
 
     // planner 侧只读：即便脚本里塞了写调用，也会被 ReadOnlyTools 拒绝。
     let mut planner_config = WorkspaceConfig::new(&workspace);
@@ -3571,6 +3611,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
 
     let planner_model = plan_exec_model(
         &provider,
+        protocol,
         planner_script.as_deref(),
         "--planner-script",
         planner_model_name.as_deref(),
@@ -3578,6 +3619,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
     )?;
     let executor_model = plan_exec_model(
         &provider,
+        protocol,
         executor_script.as_deref(),
         "--script",
         executor_model_name.as_deref(),
@@ -3677,6 +3719,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
 
 fn plan_exec_model(
     provider: &str,
+    protocol: Protocol,
     script: Option<&Path>,
     flag: &str,
     model_name: Option<&str>,
@@ -3688,7 +3731,8 @@ fn plan_exec_model(
         let proposals: Vec<Proposal> = serde_json::from_str(&text)?;
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
-    let mut config = OpenAiConfig::from_env().map_err(|error| fail(error.to_string()))?;
+    let mut config =
+        OpenAiConfig::from_env_for(protocol).map_err(|error| fail(error.to_string()))?;
     if let Some(model) = model_name {
         config.model = model.to_owned();
     }
