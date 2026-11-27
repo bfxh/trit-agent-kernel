@@ -77,6 +77,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-fleet-run" {
         return run_session_fleet_run(args);
     }
+    if command == "session-fleet-remote" {
+        return run_session_fleet_remote(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1434,6 +1437,9 @@ fn usage() {
          [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
+         session-fleet-remote: trit-host session-fleet-remote --root <dir> --nodes <node-table.json>\n\
+         [--workers N] [--retry N] [--health-probe] [--cache <path>] [--apply] [--compact]\n\
+         dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1527,6 +1533,69 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
 
 /// `session-fleet-run --root <dir> [--workers N] [--workspace <dir>] [--max-steps N] [--apply]`：
 /// dry-run 只打印计划；`--apply` 用环境里的 OpenAI 兼容 provider 执行。
+/// `session-fleet-remote --root <dir> --nodes <node-table.json> [...]`：
+/// 把 session-fleet 任务图按节点表跨机派发；默认 dry-run。
+fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut nodes_path: Option<PathBuf> = None;
+    let mut workers = 4usize;
+    let mut retry_limit = 0u32;
+    let mut health_probe = false;
+    let mut cache: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--nodes" => nodes_path = Some(PathBuf::from(next(&mut args, "--nodes")?)),
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--retry" => {
+                retry_limit = next(&mut args, "--retry")?
+                    .parse()
+                    .map_err(|_| fail("--retry must be a non-negative integer"))?;
+            }
+            "--health-probe" => health_probe = true,
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!(
+                    "unknown session-fleet-remote argument: {other}"
+                )));
+            }
+        }
+    }
+    let nodes_path = nodes_path
+        .ok_or_else(|| fail("session-fleet-remote requires --nodes <node-table.json>"))?;
+    let text = std::fs::read_to_string(&nodes_path)?;
+    let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    let outcome = trit_host::run_remote_fleet(
+        &fleet,
+        nodes,
+        &trit_host::RemoteFleetOptions {
+            workers,
+            retry_limit,
+            health_probe,
+            dry_run: !apply,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&outcome)
+    } else {
+        serde_json::to_string_pretty(&outcome)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
 fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
     let mut workers = 4usize;

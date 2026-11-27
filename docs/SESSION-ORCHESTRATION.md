@@ -23,6 +23,7 @@
 | `session-callback-verify --root <dir>` | 对账回填记录与 child 当前状态 | 只读 |
 | `session-fleet --root <dir> [--workers N] [--budget-tokens N] [--cache <path>]` | 生成依赖分层 + 预算 | 只读 |
 | `session-fleet-run --root <dir> [--workers N] [--retry N] [--budget-tokens N] [--cache <path>]` | 并发执行 + 自动回填 + 对账 | dry-run |
+| `session-fleet-remote --root <dir> --nodes <node-table.json> [--retry N] [--apply]` | 把 fleet 任务按节点表跨机派发 | dry-run |
 | `remote-ledger --token-budget N` | 跨机 claim/complete 的 token 预算 | 预算不设则不限 |
 
 ## 2. 数据流
@@ -112,6 +113,7 @@ cargo bench -p trit-host --bench session_scan
 
 - `session-advance` 是唯一的自动闭环命令；`session-auto` 只生成派发单，不自动接 `session-fleet-run`。
 - `session-advance` 的任务 id 使用 `<source>.run`，执行会话写到独立 `<source>.run.jsonl`，不覆盖原会话或派发单。
+- `session-fleet-remote` 复用 `NodeTable` + `run_remote_plan_with_table`：节点容量、失败隔离、换节点重试与幂等键由现有层负责；跨机预算在 ledger 服务端生效。
 - 扫描缓存是 JSON 侧车，不是 SQLite 投影；`session_index` 仍只服务单个会话。
 - 跨机预算只在 ledger 端累计，不把 usage 写回 remote-exec 的本地账本。
 - UI/设置栏只消费这些 JSON，不参与内核判定。

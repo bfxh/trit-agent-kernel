@@ -1407,6 +1407,7 @@ pub mod session_advance;
 pub mod session_callback;
 pub mod session_dispatch;
 pub mod session_fleet;
+pub mod session_fleet_remote;
 pub mod session_fleet_run;
 pub mod session_index;
 pub mod session_migration;
@@ -1418,7 +1419,7 @@ pub mod state_layer;
 pub mod subagent_process;
 pub mod supervisor;
 pub mod tools;
-pub use trit_orch::SelectionPressure;
+pub use trit_orch::{RemoteNode, SelectionPressure};
 
 pub use checkpoint::{
     CHECKPOINT_SCHEMA, Checkpoint, CheckpointRecorder, CheckpointStore, CheckpointingTools,
@@ -1536,6 +1537,9 @@ pub use session_dispatch::{
 };
 pub use session_fleet::{
     FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, apply_budget, plan_fleet,
+};
+pub use session_fleet_remote::{
+    RemoteFleetOptions, RemoteFleetOutcome, SESSION_FLEET_REMOTE_SCHEMA, run_remote_fleet,
 };
 pub use session_fleet_run::{
     FleetRunOptions, FleetRunOutcome, SESSION_FLEET_RUN_SCHEMA, build_plan, execute_fleet,
