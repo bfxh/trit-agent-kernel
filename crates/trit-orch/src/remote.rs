@@ -301,6 +301,26 @@ impl NodeTable {
             .map(|slot| slot.node.clone())
     }
 
+    /// 运行期调整节点容量；`0` 拒绝。已占用的 `in_flight` 不回收。
+    pub fn set_capacity(&self, id: &str, max_in_flight: usize) -> Result<(), Error> {
+        if max_in_flight == 0 {
+            return Err(Error::RemoteNodes {
+                message: format!("remote node {id} has zero capacity"),
+            });
+        }
+        let mut slots = self.lock();
+        let Some(slot) = slots.iter_mut().find(|slot| slot.node.id == id) else {
+            return Err(Error::RemoteNodes {
+                message: format!("unknown remote node: {id}"),
+            });
+        };
+        slot.node.max_in_flight = max_in_flight;
+        touch_state(slot);
+        drop(slots);
+        self.cond.notify_all();
+        Ok(())
+    }
+
     /// 显式健康探测成功后重新放行一个已隔离节点。
     ///
     /// 保留累计 `attempts/failures` 作为历史，只清零连续失败计数并恢复 `healthy`。

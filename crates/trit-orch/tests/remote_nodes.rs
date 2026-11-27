@@ -473,3 +473,12 @@ fn equal_load_picks_rotate_across_nodes() {
     second.finish(NodeOutcome::Succeeded);
     assert_ne!(first_id, second_id, "equal-load picks must rotate");
 }
+
+#[test]
+fn set_capacity_changes_admission() {
+    let table = NodeTable::new(vec![node("a", 1), node("b", 1)]).unwrap();
+    table.set_capacity("a", 2).unwrap();
+    assert_eq!(table.node("a").unwrap().max_in_flight, 2);
+    assert!(table.set_capacity("a", 0).is_err());
+    assert!(table.set_capacity("missing", 1).is_err());
+}
