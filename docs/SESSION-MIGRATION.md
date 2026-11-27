@@ -1,7 +1,9 @@
 # 会话迁移与网关/MCP 重启
 
 > 状态：迁移计划已实现为 `crates/trit-host/src/session_migration.rs`；
-> 网关/MCP supervisor 是**契约提案**，当前仓库还没有网关或 MCP 运行时。
+> 网关与 MCP supervisor 也已落地：`supervisor.rs`（进程监管、`McpHandshake` 与恢复包）、
+> `mcp_tools.rs` / `mcp_http.rs`（stdio 与 HTTP MCP 路由）、`serve.rs` / `remote_serve.rs`
+> （本地与跨机服务端）。本文的 bundle 契约就是这些实现的输入/输出格式。
 
 ## 1. 迁移什么
 
