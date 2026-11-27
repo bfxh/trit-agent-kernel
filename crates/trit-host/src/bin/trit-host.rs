@@ -50,6 +50,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-scan" {
         return run_session_scan(args);
     }
+    if command == "session-plan" {
+        return run_session_plan(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1371,6 +1374,9 @@ fn usage() {
          session-scan: trit-host session-scan --root <dir> [--compact]\n\
          scans session JSONL files under a directory and prints tasks, links and\n\
          per-session health (open turns, corrupt lines, in-doubt tools, last gate).\n\
+         session-plan: trit-host session-plan --root <dir> [--compact]\n\
+         scans sessions and prints a deterministic resume/inspect/idle plan with\n\
+         links and unassigned parent ids.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1459,6 +1465,29 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if blocked {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `session-plan --root <dir> [--compact]`：扫描会话并生成确定性的任务分配。
+fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-plan argument: {other}"))),
+        }
+    }
+    let scanned = trit_host::scan_sessions(&root)?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let text = if compact {
+        serde_json::to_string(&plan)
+    } else {
+        serde_json::to_string_pretty(&plan)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 

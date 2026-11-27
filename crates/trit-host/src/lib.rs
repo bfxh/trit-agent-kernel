@@ -1404,6 +1404,7 @@ pub mod serve;
 pub mod session;
 pub mod session_index;
 pub mod session_migration;
+pub mod session_plan;
 pub mod session_scan;
 pub mod state_layer;
 pub mod subagent_process;
@@ -1519,6 +1520,9 @@ pub use session_migration::{
     CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,
     MigrationPolicy, MigrationReport, MigrationTarget, SESSION_MIGRATION_SCHEMA,
     SessionMigrationBundle, SessionRole, plan_migration,
+};
+pub use session_plan::{
+    SESSION_PLAN_SCHEMA, SessionAction, SessionPlanItem, SessionPlanReport, plan_sessions,
 };
 pub use session_scan::{
     LinkKind, SESSION_SCAN_SCHEMA, SessionEntry, SessionFormat, SessionGate, SessionLink,
