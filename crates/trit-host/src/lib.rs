@@ -1408,6 +1408,7 @@ pub fn run_headless<M: Model>(
 pub mod appcontainer;
 mod auth;
 pub mod background;
+pub mod browser;
 mod cancel_guard;
 pub mod checkpoint;
 pub mod child_env;

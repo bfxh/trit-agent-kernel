@@ -209,6 +209,23 @@ fn build_default_tools() -> Vec<ToolSpec> {
             })),
         },
         ToolSpec {
+            name: "browser".into(),
+            description:
+                "Drive a headless Chrome/Chromium page via CDP: open, eval, screenshot, close."
+                    .into(),
+            read_only: false,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["open", "eval", "screenshot", "close"]},
+                    "url": {"type": "string"},
+                    "expression": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "required": ["action"]
+            })),
+        },
+        ToolSpec {
             name: "context_search".into(),
             description: "Search the context catalog and return candidate ids/labels.".into(),
             read_only: true,

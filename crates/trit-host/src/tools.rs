@@ -169,6 +169,7 @@ pub struct LocalTools {
     persistent_shell: bool,
     max_search_file_bytes: usize,
     shell_session: Mutex<Option<ShellSession>>,
+    browser: Mutex<Option<crate::browser::Browser>>,
 }
 
 fn persistent_shell_candidates() -> Vec<(PathBuf, Vec<&'static str>)> {
@@ -367,6 +368,7 @@ impl LocalTools {
             persistent_shell: config.persistent_shell,
             max_search_file_bytes: config.max_search_file_bytes,
             shell_session: Mutex::new(None),
+            browser: Mutex::new(None),
         })
     }
 
@@ -855,6 +857,7 @@ impl ToolExecutor for LocalTools {
             "search_code" => self.search_code(request),
             "glob" => self.glob(request),
             "bash" => self.bash(request),
+            "browser" => self.browser(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
     }
@@ -897,6 +900,83 @@ impl LocalTools {
             "search_code" => self.search_code(request),
             "glob" => self.glob(request),
             other => Err(AgentError::Tool(format!("tool {other} is not read-only"))),
+        }
+    }
+
+    /// 浏览器动作：open / eval / screenshot / close；按需启动 headless Chrome。
+    fn browser(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let args = request
+            .arguments
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let action = args["action"].as_str().unwrap_or("open");
+        let mut guard = self
+            .browser
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if action == "close" {
+            *guard = None;
+            return Ok(self.browser_outcome(request, "browser closed".into(), Vec::new()));
+        }
+        if guard.is_none() {
+            *guard = Some(crate::browser::Browser::launch(
+                &crate::browser::BrowserConfig::default(),
+            )?);
+        }
+        let browser = guard.as_mut().expect("browser was just launched");
+        let (output, written_paths) = match action {
+            "open" => {
+                let url = args["url"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::Tool("browser open requires url".into()))?;
+                browser.open(url)?;
+                (format!("opened {url}"), Vec::new())
+            }
+            "eval" => {
+                let expression = args["expression"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::Tool("browser eval requires expression".into()))?;
+                let value = browser.eval(expression)?;
+                (
+                    serde_json::to_string(&value).unwrap_or_default(),
+                    Vec::new(),
+                )
+            }
+            "screenshot" => {
+                if !self.allow_write {
+                    return Err(AgentError::Tool(
+                        "browser screenshot requires allow-write".into(),
+                    ));
+                }
+                let raw = args["path"].as_str().unwrap_or("screenshot.png");
+                let relative = self.resolve_relative(raw)?;
+                browser.screenshot(&self.root.join(&relative))?;
+                let written = relative.display().to_string();
+                (format!("screenshot {written}"), vec![written])
+            }
+            other => {
+                return Err(AgentError::Tool(format!("unknown browser action: {other}")));
+            }
+        };
+        drop(guard);
+        Ok(self.browser_outcome(request, output, written_paths))
+    }
+
+    fn browser_outcome(
+        &self,
+        request: &ToolRequest,
+        output: String,
+        written_paths: Vec<String>,
+    ) -> ToolOutcome {
+        ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed: true,
+            assertions: 0,
+            written_paths,
+            in_doubt: false,
+            output: truncate(output, self.max_output_bytes),
         }
     }
 }
