@@ -3,15 +3,17 @@
 //! 只负责 HTTP 传输、工具 schema 与响应解析；不让内核接触网络。
 //! API key 只在 Authorization 头里出现，Debug 输出会脱敏。
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::provider_stream::{
-    OpenAiStreamAssembler, ProviderStreamEvent, StreamingProvider, read_sse_events,
-};
+use crate::protocol::Protocol;
+use crate::provider_health::{ConnectionFailureKind, ConnectionHealth, ConnectionHealthPolicy};
+use crate::provider_stream::{ProviderStreamEvent, StreamingProvider, read_sse_events};
 use crate::{
     AgentError, CacheObservation, ContextReceipt, PrefixSignal, Provider, ProviderRequest,
     ProviderResponse, ToolRequest, ToolSpec,
@@ -23,7 +25,11 @@ pub struct OpenAiConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// 模型协议：决定端点、认证头、请求体与响应/流式解析。
+    pub protocol: Protocol,
     pub timeout: Duration,
+    /// 建连超时：DNS/TCP/TLS 握手；与整次请求超时分开。
+    pub connect_timeout: Duration,
     pub max_output_tokens: Option<u64>,
     /// 流式请求是否发送 `stream_options.include_usage`；不支持该字段的兼容网关可关闭。
     pub stream_include_usage: bool,
@@ -34,8 +40,10 @@ impl fmt::Debug for OpenAiConfig {
         f.debug_struct("OpenAiConfig")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("protocol", &self.protocol)
             .field("api_key", &"<redacted>")
             .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("stream_include_usage", &self.stream_include_usage)
             .finish()
@@ -52,10 +60,17 @@ impl OpenAiConfig {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model: model.into(),
+            protocol: Protocol::default(),
             timeout: Duration::from_secs(120),
+            connect_timeout: Duration::from_secs(10),
             max_output_tokens: None,
             stream_include_usage: true,
         }
+    }
+
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
     }
 
     pub fn with_stream_include_usage(mut self, include: bool) -> Self {
@@ -63,49 +78,223 @@ impl OpenAiConfig {
         self
     }
 
+    /// 选择模型协议；决定端点、认证头、请求体与响应/流式解析。
+    pub fn with_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// 默认协议（OpenAI Chat）的配置；等价于 `from_env_for(Protocol::OpenAiChat)`。
     pub fn from_env() -> Result<Self, AgentError> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| AgentError::Provider("OPENAI_API_KEY is not set".into()))?;
-        let model = std::env::var("OPENAI_MODEL")
-            .map_err(|_| AgentError::Provider("OPENAI_MODEL is not set".into()))?;
+        Self::from_env_for(Protocol::OpenAiChat)
+    }
+
+    /// 按协议读环境变量：`TRIT_*` 通用优先，其次该协议的厂商前缀。
+    ///
+    /// 缺 key / 缺 model 一律 fail closed，并在报错里点明该配哪个变量，
+    /// 不会悄悄回落到别的厂商凭据。
+    pub fn from_env_for(protocol: Protocol) -> Result<Self, AgentError> {
+        let protocol = match std::env::var("TRIT_PROTOCOL") {
+            Ok(name) if !name.trim().is_empty() => Protocol::parse(&name)?,
+            _ if protocol == Protocol::OpenAiChat => {
+                // 没显式指定协议时按 base_url 主机推断；显式协议优先。
+                let hinted = env_first(&["TRIT_BASE_URL", "OPENAI_BASE_URL"]).unwrap_or_default();
+                Protocol::from_base_url(&hinted)
+            }
+            _ => protocol,
+        };
+        let (base_env, key_env, model_env, default_base) = match protocol {
+            Protocol::OpenAiChat => (
+                "OPENAI_BASE_URL",
+                "OPENAI_API_KEY",
+                "OPENAI_MODEL",
+                "https://api.openai.com/v1",
+            ),
+            Protocol::DeepSeekChat => (
+                "DEEPSEEK_BASE_URL",
+                "DEEPSEEK_API_KEY",
+                "DEEPSEEK_MODEL",
+                "https://api.deepseek.com",
+            ),
+            Protocol::AnthropicMessages => (
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_MODEL",
+                "https://api.anthropic.com",
+            ),
+            Protocol::GeminiGenerateContent => (
+                "GEMINI_BASE_URL",
+                "GEMINI_API_KEY",
+                "GEMINI_MODEL",
+                "https://generativelanguage.googleapis.com",
+            ),
+        };
+        let api_key = env_first(&["TRIT_API_KEY", key_env]).ok_or_else(|| {
+            AgentError::Provider(format!(
+                "{key_env} is not set for protocol {}; set {key_env} or TRIT_API_KEY",
+                protocol.as_str()
+            ))
+        })?;
+        let model = env_first(&["TRIT_MODEL", model_env]).ok_or_else(|| {
+            AgentError::Provider(format!(
+                "{model_env} is not set for protocol {}; set {model_env} or TRIT_MODEL",
+                protocol.as_str()
+            ))
+        })?;
         let base_url =
-            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-        Ok(Self::new(base_url, api_key, model))
+            env_first(&["TRIT_BASE_URL", base_env]).unwrap_or_else(|| default_base.to_owned());
+        let connect_timeout = std::env::var("TRIT_OPENAI_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(10));
+        let model = Self::resolve_model(model);
+        Ok(Self::new(base_url, api_key, model)
+            .with_connect_timeout(connect_timeout)
+            .with_protocol(protocol))
+    }
+
+    /// `TRIT_MODEL_ALIASES`（JSON 对象）命中时替换模型名；非法 JSON 保持原名。
+    fn resolve_model(model: String) -> String {
+        let Ok(raw) = std::env::var("TRIT_MODEL_ALIASES") else {
+            return model;
+        };
+        let Ok(aliases) = serde_json::from_str::<BTreeMap<String, String>>(&raw) else {
+            return model;
+        };
+        apply_model_alias(&aliases, &model)
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     agent: ureq::Agent,
+    health: Arc<Mutex<ConnectionHealth>>,
+    health_policy: ConnectionHealthPolicy,
+}
+
+/// 单次 HTTP 响应的读取上限；超过时 fail closed，避免恶意/异常网关拖垮进程。
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 依次读取多个环境变量，取第一个非空值。
+fn env_first(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn apply_model_alias(aliases: &BTreeMap<String, String>, model: &str) -> String {
+    aliases
+        .get(model)
+        .cloned()
+        .unwrap_or_else(|| model.to_owned())
+}
+
+/// 把 HTTP 状态码映射到连接失败类型；配额文案优先按 Quota 处理。
+fn classify_status(code: u16, body: &str) -> ConnectionFailureKind {
+    match code {
+        429 => ConnectionFailureKind::RateLimit,
+        401 | 403 => ConnectionFailureKind::Auth,
+        402 => ConnectionFailureKind::Quota,
+        500..=599 => ConnectionFailureKind::Server,
+        400..=499 => {
+            if body.to_ascii_lowercase().contains("quota") {
+                ConnectionFailureKind::Quota
+            } else {
+                ConnectionFailureKind::Protocol
+            }
+        }
+        _ => ConnectionFailureKind::Unknown,
+    }
+}
+
+fn read_response_text(response: ureq::Response) -> Result<String, AgentError> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_RESPONSE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| AgentError::Provider(format!("read response: {error}")))?;
+    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(AgentError::Provider(format!(
+            "response exceeds {MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> Self {
-        let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
-        Self { config, agent }
+        let agent = ureq::AgentBuilder::new()
+            .timeout(config.timeout)
+            .timeout_connect(config.connect_timeout)
+            .build();
+        Self {
+            config,
+            agent,
+            health: Arc::new(Mutex::new(ConnectionHealth::new())),
+            health_policy: ConnectionHealthPolicy::default(),
+        }
+    }
+
+    /// 当前连接健康快照。
+    pub fn health(&self) -> ConnectionHealth {
+        self.health
+            .lock()
+            .map(|health| health.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_success(&self) {
+        if let Ok(mut health) = self.health.lock() {
+            health.record_success();
+        }
+    }
+
+    fn record_failure(&self, kind: ConnectionFailureKind) {
+        if let Ok(mut health) = self.health.lock() {
+            health.record_failure(kind, self.health_policy);
+        }
+    }
+
+    /// 发一次请求；`stream` 决定端点（Gemini 用 `:streamGenerateContent`）与 Accept 头。
+    fn post_raw(&self, body: &Value, stream: bool) -> Result<ureq::Response, AgentError> {
+        let _permit = crate::concurrency_limit::acquire();
+        let url = self
+            .config
+            .protocol
+            .endpoint(&self.config.base_url, &self.config.model, stream);
+        let mut request = self.agent.post(&url);
+        for (name, value) in self.config.protocol.headers(&self.config.api_key) {
+            request = request.set(name, &value);
+        }
+        request = request.set("Content-Type", "application/json");
+        if stream {
+            request = request.set("Accept", "text/event-stream");
+        }
+        match request.send_string(&body.to_string()) {
+            Ok(response) => {
+                self.record_success();
+                Ok(response)
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let text = read_response_text(response).unwrap_or_default();
+                self.record_failure(classify_status(code, &text));
+                Err(AgentError::Provider(format!("HTTP {code}: {text}")))
+            }
+            Err(error) => {
+                self.record_failure(ConnectionFailureKind::Transport);
+                Err(AgentError::Provider(format!("transport: {error}")))
+            }
+        }
     }
 
     fn post_chat(&self, body: &Value) -> Result<String, AgentError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-        let response = self
-            .agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.config.api_key))
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string());
-        match response {
-            Ok(response) => response
-                .into_string()
-                .map_err(|error| AgentError::Provider(format!("read response: {error}"))),
-            Err(ureq::Error::Status(code, response)) => {
-                let text = response.into_string().unwrap_or_default();
-                Err(AgentError::Provider(format!("HTTP {code}: {text}")))
-            }
-            Err(error) => Err(AgentError::Provider(format!("transport: {error}"))),
-        }
+        read_response_text(self.post_raw(body, false)?)
     }
 
     /// 原始 chat completion：供 MCP sampling 等非工具循环调用。
@@ -118,9 +307,9 @@ impl OpenAiProvider {
 
 impl Provider for OpenAiProvider {
     fn complete(&mut self, request: &ProviderRequest) -> Result<ProviderResponse, AgentError> {
-        let body = build_request_body(&self.config, request);
+        let body = self.config.protocol.build_body(&self.config, request);
         let text = self.post_chat(&body)?;
-        let mut response = parse_response(&text, &request.tools)?;
+        let mut response = self.config.protocol.parse_body(&text, &request.tools)?;
         attach_context_receipt(&mut response, request);
         Ok(response)
     }
@@ -132,53 +321,46 @@ impl StreamingProvider for OpenAiProvider {
         request: &ProviderRequest,
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<(), AgentError>,
     ) -> Result<ProviderResponse, AgentError> {
-        let mut body = build_request_body(&self.config, request);
-        body["stream"] = json!(true);
-        if self.config.stream_include_usage {
-            body["stream_options"] = json!({"include_usage": true});
+        let mut body = self.config.protocol.build_body(&self.config, request);
+        if self.config.protocol == Protocol::OpenAiChat {
+            body["stream"] = json!(true);
+            if self.config.stream_include_usage {
+                body["stream_options"] = json!({"include_usage": true});
+            }
         }
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
-        let response = self
-            .agent
-            .post(&url)
-            .set("Authorization", &format!("Bearer {}", self.config.api_key))
-            .set("Content-Type", "application/json")
-            .set("Accept", "text/event-stream")
-            .send_string(&body.to_string());
-        let response = match response {
-            Ok(response) => response,
-            Err(ureq::Error::Status(code, response)) => {
-                let text = response.into_string().unwrap_or_default();
-                return Err(AgentError::Provider(format!("HTTP {code}: {text}")));
-            }
-            Err(error) => {
-                return Err(AgentError::Provider(format!("transport: {error}")));
-            }
-        };
-
-        let mut assembler = OpenAiStreamAssembler::new();
+        let response = self.post_raw(&body, true)?;
+        let mut decoder = self.config.protocol.stream_decoder();
         read_sse_events(BufReader::new(response.into_reader()), |event| {
-            for delta in assembler.push_sse(&event)? {
+            for delta in decoder.push(&event)? {
                 on_event(delta)?;
             }
             Ok(())
         })?;
-        let mut response = assembler.finish(&request.tools)?;
+        let mut response = decoder.finish(&request.tools)?;
         attach_context_receipt(&mut response, request);
         Ok(response)
     }
 }
 
-fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value {
+pub(crate) fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value {
     let mut system = format!(
         "{}\n\nYou are a headless coding agent. Use the provided tools. \
          Only claim completion with complete_subtask. Every criterion must be backed \
          by a tool result (a command that ran or paths that were written). \
          Manual notes are never evidence.",
         request.brief.render()
+    );
+    system.push_str(
+        "\n\nFollow the project's existing programming language, framework, build tooling and \
+         package manager. Do not introduce a new language, framework or package manager unless \
+         the task brief explicitly authorizes it as an explicit_override.",
+    );
+    system.push_str(
+        "\n\nDesign quality is scored. Keep module boundaries and naming clear, handle errors \
+         explicitly instead of unwrap/panic, give network calls timeouts and bounded responses, \
+         and design the frontend with accessibility (aria/label/alt), loading/empty/error states, \
+         responsive breakpoints and a restrained design-token palette (few colors, few font sizes, \
+         consistent spacing).",
     );
     let mut context_tail = String::new();
     let mut context_fingerprint = String::new();
@@ -189,6 +371,16 @@ fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value
         }
         context_tail = plan.render_tail();
         context_fingerprint = plan.cache.prefix_fingerprint.clone();
+    }
+    if request
+        .verification
+        .as_ref()
+        .is_some_and(|signal| signal.repeated > 0)
+    {
+        system.push_str(
+            "\n\nSome commands were re-run with identical arguments. \
+             Do not repeat a verification command that already has a receipt; reuse its result.",
+        );
     }
     let mut user = json!({
         "step": request.step,
@@ -201,6 +393,10 @@ fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value
     });
     if let Some(projection) = &request.projection {
         user["projection"] = serde_json::to_value(projection).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(verification) = &request.verification {
+        user["verification"] =
+            serde_json::to_value(verification).unwrap_or(serde_json::Value::Null);
     }
     let mut body = json!({
         "model": config.model,
@@ -217,7 +413,7 @@ fn build_request_body(config: &OpenAiConfig, request: &ProviderRequest) -> Value
     body
 }
 
-fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
+pub(crate) fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
@@ -305,7 +501,10 @@ fn tool_schemas(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-fn parse_response(body: &str, tools: &[ToolSpec]) -> Result<ProviderResponse, AgentError> {
+pub(crate) fn parse_response(
+    body: &str,
+    tools: &[ToolSpec],
+) -> Result<ProviderResponse, AgentError> {
     let value: Value = serde_json::from_str(body)
         .map_err(|error| AgentError::Provider(format!("bad json: {error}")))?;
     if let Some(error) = value.get("error") {
@@ -711,6 +910,7 @@ mod tests {
             context_digest: None,
             context: None,
             projection: None,
+            verification: None,
         }
     }
 
@@ -746,6 +946,9 @@ mod tests {
                 "search_code",
                 "trit_search",
                 "glob",
+                "browser",
+                "download",
+                "tools_batch",
                 "context_search",
                 "context_add",
                 "context_read",
@@ -978,5 +1181,91 @@ mod tests {
             parse_response(body, &[]),
             Err(AgentError::Provider(message)) if message.contains("unknown tool")
         ));
+    }
+
+    #[test]
+    fn config_has_separate_connect_timeout() {
+        let config = OpenAiConfig::new("http://127.0.0.1:9/v1", "k", "m");
+        assert_eq!(config.connect_timeout, Duration::from_secs(10));
+        assert_eq!(config.timeout, Duration::from_secs(120));
+    }
+
+    fn mock_status_server(
+        status: u16,
+        body: &'static str,
+        count: usize,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut request_body = vec![0u8; content_length];
+                reader.read_exact(&mut request_body).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn server_errors_degrade_health() {
+        use crate::provider_health::ConnectionState;
+        let (port, handle) = mock_status_server(500, "{}", 3);
+        let provider = OpenAiProvider::new(OpenAiConfig::new(
+            format!("http://127.0.0.1:{port}/v1"),
+            "k",
+            "m",
+        ));
+        for _ in 0..3 {
+            assert!(provider.complete_chat(&json!({})).is_err());
+        }
+        assert_eq!(provider.health().state, ConnectionState::Unavailable);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn auth_error_is_immediately_unavailable() {
+        use crate::provider_health::ConnectionState;
+        let (port, handle) = mock_status_server(401, "{}", 1);
+        let provider = OpenAiProvider::new(OpenAiConfig::new(
+            format!("http://127.0.0.1:{port}/v1"),
+            "k",
+            "m",
+        ));
+        assert!(provider.complete_chat(&json!({})).is_err());
+        assert_eq!(provider.health().state, ConnectionState::Unavailable);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn model_alias_maps_and_falls_back() {
+        let aliases = BTreeMap::from([
+            ("fast".to_owned(), "gpt-4o-mini".to_owned()),
+            ("smart".to_owned(), "gpt-4o".to_owned()),
+        ]);
+        assert_eq!(apply_model_alias(&aliases, "fast"), "gpt-4o-mini");
+        assert_eq!(apply_model_alias(&aliases, "gpt-4o"), "gpt-4o");
     }
 }

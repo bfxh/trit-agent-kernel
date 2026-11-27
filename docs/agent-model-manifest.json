@@ -170,6 +170,14 @@
     "human_doc": "docs/LANGUAGE-POLICY.md",
     "conformance_test": "crates/trit-host/tests/agent_policy.rs"
   },
+  "tech_stack_policy": {
+    "contract": "docs/agent-tech-stack-policy.json",
+    "schema": "trit.agent-tech-stack-policy/v1",
+    "principle": "stack-follows-project-not-model-preference",
+    "applies_to_subagents": true,
+    "human_doc": "docs/TECH-STACK-POLICY.md",
+    "conformance_test": "crates/trit-host/tests/tech_stack_policy.rs"
+  },
   "model_neutrality": {
     "applies_to": "every current and future model and provider",
     "forbidden": [

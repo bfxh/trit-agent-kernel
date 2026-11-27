@@ -47,6 +47,81 @@ impl SubagentRequest {
     }
 }
 
+/// 子 agent 自报的 token 用量明细；旧节点不返回时整体为 `None`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentUsage {
+    /// 新输入 token（cache miss）。
+    #[serde(default)]
+    pub fresh: u64,
+    /// 缓存命中输入 token。
+    #[serde(default)]
+    pub cached: u64,
+    /// 输出 token。
+    #[serde(default)]
+    pub output: u64,
+    /// 供应商未返回精确用量。
+    #[serde(default)]
+    pub estimated: bool,
+}
+
+/// 项目技术栈约束：现有栈 + 本次显式授权的例外。
+///
+/// 默认 `allowed_additions` 为空：子智能体不得自行引入新语言/框架/包管理器。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPolicy {
+    #[serde(default)]
+    pub existing: Vec<String>,
+    #[serde(default)]
+    pub allowed_additions: Vec<String>,
+}
+
+/// 子智能体自报的技术栈使用情况。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackReport {
+    #[serde(default)]
+    pub used: Vec<String>,
+    #[serde(default)]
+    pub added: Vec<String>,
+}
+
+/// 校验子智能体自报的技术栈：`added` 必须是授权集合的子集。
+///
+/// 用于帧协议子智能体与外部 CLI 子智能体；越权新增直接判协议违约。
+pub fn validate_stack(report: &StackReport, policy: &StackPolicy) -> Result<(), Error> {
+    // 用到的技术必须落在项目现有栈或显式授权里：否则就是"用新语言但不报新增"的绕过。
+    for used in &report.used {
+        let allowed = policy.existing.iter().any(|item| item == used)
+            || policy.allowed_additions.iter().any(|item| item == used);
+        if !allowed {
+            return Err(Error::SubagentProtocol {
+                message: format!("subagent used tech {used} outside the project stack"),
+            });
+        }
+    }
+    for added in &report.added {
+        if !policy.allowed_additions.iter().any(|item| item == added) {
+            return Err(Error::SubagentProtocol {
+                message: format!("subagent added tech {added} without authorization"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 子智能体对主智能体决定的异议。
+///
+/// 只在"按现在的做法对项目不利"时提出；主智能体必须显式处理（采纳或说明驳回理由），
+/// 不能静默丢弃。这是运行时字段，不进 settings。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dissent {
+    /// 反对的对象：任务 / 决定 / 方案。
+    pub target: String,
+    /// 理由：为什么按现在的做法对项目不好。
+    pub reason: String,
+    /// 更好的做法。
+    pub suggestion: String,
+}
+
 /// 子 agent 返回的响应帧。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentResponse {
@@ -62,6 +137,15 @@ pub struct SubagentResponse {
     /// 实际消耗的 token。
     #[serde(default)]
     pub tokens: u64,
+    /// 远端自报的模型名；用于成本折算。旧节点不返回时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 远端自报的 token 明细；旧节点不返回时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SubagentUsage>,
+    /// 对主智能体决定的异议；不影响响应有效性，但必须被上层显式处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dissent: Option<Dissent>,
 }
 
 impl SubagentResponse {

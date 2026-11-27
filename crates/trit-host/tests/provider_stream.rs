@@ -68,6 +68,7 @@ fn provider_request() -> ProviderRequest {
         context_digest: None,
         context: None,
         projection: None,
+        verification: None,
     }
 }
 

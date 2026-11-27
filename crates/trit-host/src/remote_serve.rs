@@ -725,6 +725,7 @@ impl RemoteServer {
             let executions = Arc::clone(&self.executions);
             workers.push(std::thread::spawn(move || {
                 let _slot = slot;
+                let _task = crate::background::register("remote-serve-conn");
                 let _ = handle(
                     stream,
                     &config,
@@ -764,6 +765,7 @@ impl RemoteServer {
             let executions = Arc::clone(&self.executions);
             std::thread::spawn(move || {
                 let _slot = slot;
+                let _task = crate::background::register("remote-serve-conn");
                 let _ = handle(
                     stream,
                     &config,
@@ -1032,14 +1034,16 @@ fn handle(
         token.is_cancelled()
     };
 
-    let (status, content, tokens) = if cancelled {
-        (DelegationStatus::Aborted, Vec::new(), 0)
+    let (status, content, tokens, model, usage) = if cancelled {
+        (DelegationStatus::Aborted, Vec::new(), 0, None, None)
     } else {
         match config.mode {
             RemoteMode::Echo => (
                 DelegationStatus::Completed,
                 format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
                 0,
+                None,
+                None,
             ),
             RemoteMode::Fail => (
                 DelegationStatus::Failed {
@@ -1047,10 +1051,12 @@ fn handle(
                 },
                 format!("remote echo {}@{}", request.task, request.epoch).into_bytes(),
                 0,
+                None,
+                None,
             ),
             RemoteMode::Silent => {
                 if lease_lost.load(Ordering::SeqCst) || timed_out.load(Ordering::SeqCst) {
-                    (DelegationStatus::Aborted, Vec::new(), 0)
+                    (DelegationStatus::Aborted, Vec::new(), 0, None, None)
                 } else {
                     return respond(&mut stream, 200, "OK", b"");
                 }
@@ -1068,17 +1074,31 @@ fn handle(
                     Ok(exec) => {
                         let reply = run_subagent_reply_cancellable(&exec, &request, &token);
                         match reply {
-                            Ok(reply) => (reply.result.status, reply.content, reply.result.tokens),
+                            Ok(reply) => (
+                                reply.result.status,
+                                reply.content,
+                                reply.result.tokens,
+                                reply.model,
+                                reply.usage,
+                            ),
                             Err(error) => (
                                 DelegationStatus::Failed {
                                     message: error.to_string(),
                                 },
                                 Vec::new(),
                                 0,
+                                None,
+                                None,
                             ),
                         }
                     }
-                    Err(message) => (DelegationStatus::Failed { message }, Vec::new(), 0),
+                    Err(message) => (
+                        DelegationStatus::Failed { message },
+                        Vec::new(),
+                        0,
+                        None,
+                        None,
+                    ),
                 }
             }
         }
@@ -1086,10 +1106,10 @@ fn handle(
     let lease_lost_now = lease_lost.load(Ordering::SeqCst);
     let timed_out_now = timed_out.load(Ordering::SeqCst);
     let aborted_now = lease_lost_now || timed_out_now;
-    let (status, content, tokens) = if aborted_now {
-        (DelegationStatus::Aborted, Vec::new(), 0)
+    let (status, content, tokens, model, usage) = if aborted_now {
+        (DelegationStatus::Aborted, Vec::new(), 0, None, None)
     } else {
-        (status, content, tokens)
+        (status, content, tokens, model, usage)
     };
     let response = SubagentResponse {
         task: request.task.clone(),
@@ -1097,6 +1117,9 @@ fn handle(
         status,
         content,
         tokens,
+        model,
+        usage,
+        dissent: None,
     };
     let frame = match encode_frame(&response) {
         Ok(frame) => frame,
@@ -1259,6 +1282,9 @@ fn aborted_frame(request: &SubagentRequest) -> std::io::Result<Vec<u8>> {
         status: DelegationStatus::Aborted,
         content: Vec::new(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     };
     encode_frame(&response).map_err(std::io::Error::other)
 }

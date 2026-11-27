@@ -4,9 +4,11 @@
 //! 打开后在校验过的句柄上计数硬链接；文件创建/覆盖不再依赖“先检查路径再写路径”。
 //! shell 默认关闭；开启后优先走宿主提供的 OS 沙箱，否则必须显式允许无沙箱。
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -168,7 +170,8 @@ pub struct LocalTools {
     max_output_bytes: usize,
     persistent_shell: bool,
     max_search_file_bytes: usize,
-    shell_session: Option<ShellSession>,
+    shell_session: Mutex<Option<ShellSession>>,
+    browser: Mutex<Option<crate::browser::Browser>>,
 }
 
 fn persistent_shell_candidates() -> Vec<(PathBuf, Vec<&'static str>)> {
@@ -310,15 +313,38 @@ impl Drop for ShellSession {
     }
 }
 
+fn cached_workspace(root: &Path) -> Result<(PathBuf, Dir), AgentError> {
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, (PathBuf, Dir)>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((canonical, dir)) = cache.get(root) {
+        let dir = dir
+            .try_clone()
+            .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+        return Ok((canonical.clone(), dir));
+    }
+    let canonical = std::fs::canonicalize(root)
+        .map_err(|error| AgentError::Io(format!("workspace root: {error}")))?;
+    if !canonical.is_dir() {
+        return Err(AgentError::Tool("workspace root is not a directory".into()));
+    }
+    let dir = Dir::open_ambient_dir(&canonical, cap_std::ambient_authority())
+        .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+    let cached = dir
+        .try_clone()
+        .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+    cache.insert(root.to_path_buf(), (canonical.clone(), cached));
+    Ok((canonical, dir))
+}
+
 impl LocalTools {
     pub fn new(config: WorkspaceConfig) -> Result<Self, AgentError> {
-        let root = std::fs::canonicalize(&config.root)
-            .map_err(|error| AgentError::Io(format!("workspace root: {error}")))?;
-        if !root.is_dir() {
-            return Err(AgentError::Tool("workspace root is not a directory".into()));
-        }
-        let dir = Dir::open_ambient_dir(&root, cap_std::ambient_authority())
-            .map_err(|error| AgentError::Io(format!("open workspace: {error}")))?;
+        let (root, dir) = cached_workspace(&config.root)?;
         let forbid = config
             .forbid
             .into_iter()
@@ -343,7 +369,8 @@ impl LocalTools {
             max_output_bytes: config.max_output_bytes,
             persistent_shell: config.persistent_shell,
             max_search_file_bytes: config.max_search_file_bytes,
-            shell_session: None,
+            shell_session: Mutex::new(None),
+            browser: Mutex::new(None),
         })
     }
 
@@ -788,6 +815,8 @@ impl LocalTools {
         let raw = self.first_path(request)?;
         let relative = self.resolve_relative(raw)?;
         self.reject_symlink(&relative, raw)?;
+        // 语言用途硬约束：test-only 语言（默认 Python）只能写测试路径。
+        crate::tech_stack::validate_write_path(raw).map_err(AgentError::Tool)?;
         if let Some(parent) = relative.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -850,6 +879,8 @@ impl LocalTools {
         let to = self.resolve_relative(to_raw)?;
         self.reject_symlink(&from, from_raw)?;
         self.reject_symlink(&to, to_raw)?;
+        // 移动的落点同样受语言用途约束（不能把 .py 挪到生产路径）。
+        crate::tech_stack::validate_write_path(to_raw).map_err(AgentError::Tool)?;
         let metadata = self
             .dir
             .symlink_metadata(&from)
@@ -911,15 +942,26 @@ impl LocalTools {
             .command
             .as_deref()
             .ok_or_else(|| AgentError::Tool("command is required".into()))?;
+        // 语言用途硬约束：shell 里的写入目标也要检查（重定向 / tee / cp / mv）。
+        for target in crate::tech_stack::shell_write_targets(command) {
+            crate::tech_stack::validate_write_path(&target).map_err(AgentError::Tool)?;
+        }
         if self.persistent_shell && self.sandbox.is_none() && self.allow_unsandboxed_shell {
-            if self.shell_session.is_none() {
-                self.shell_session = ShellSession::spawn(&self.root).ok();
+            let mut guard = self
+                .shell_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.is_none() {
+                *guard = ShellSession::spawn(&self.root).ok();
             }
-            if let Some(session) = self.shell_session.as_mut() {
-                let (status, output) = session.run(command, self.max_output_bytes)?;
+            let run = guard
+                .as_mut()
+                .map(|session| session.run(command, self.max_output_bytes))
+                .transpose()?;
+            if let Some((status, output)) = run {
                 let in_doubt = status.is_none();
                 if in_doubt {
-                    self.shell_session = None;
+                    *guard = None;
                 }
                 return Ok(ToolOutcome {
                     call_id: request.call_id.clone(),
@@ -978,8 +1020,379 @@ impl ToolExecutor for LocalTools {
             "trit_search" => self.trit_search(request),
             "glob" => self.glob(request),
             "bash" => self.bash(request),
+            "browser" => self.browser(request),
+            "download" => self.download(request),
+            "tools_batch" => self.tools_batch(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
+    }
+
+    /// 同一批全是可并行工具时并行执行：只读直接并行，写工具按首路径分组。
+    fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
+        if requests.len() < 2
+            || !requests
+                .iter()
+                .all(|request| is_parallel_tool(&request.tool))
+        {
+            return requests
+                .iter()
+                .map(|request| self.execute(request))
+                .collect();
+        }
+        let tools: &LocalTools = self;
+        if requests
+            .iter()
+            .all(|request| is_readonly_tool(&request.tool))
+        {
+            return std::thread::scope(|scope| {
+                let handles: Vec<_> = requests
+                    .iter()
+                    .map(|request| scope.spawn(move || tools.execute_readonly(request)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(AgentError::Tool("readonly tool worker panicked".into()))
+                        })
+                    })
+                    .collect()
+            });
+        }
+        // 写工具：路径冲突（含 move 的源/目标）必须串行，互不冲突的组并行。
+        let mut parent: Vec<usize> = (0..requests.len()).collect();
+        let mut owner: BTreeMap<&str, usize> = BTreeMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            for path in &request.paths {
+                if let Some(&other) = owner.get(path.as_str()) {
+                    union(&mut parent, other, index);
+                }
+            }
+            for path in &request.paths {
+                owner.insert(path.as_str(), index);
+            }
+        }
+        let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for index in 0..requests.len() {
+            let root = find(&mut parent, index);
+            groups.entry(root).or_default().push(index);
+        }
+        let mut results: Vec<Option<Result<ToolOutcome, AgentError>>> =
+            (0..requests.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = groups
+                .into_values()
+                .map(|indices| {
+                    scope.spawn(move || {
+                        indices
+                            .into_iter()
+                            .map(|index| (index, tools.execute_write(&requests[index])))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for handle in handles {
+                if let Ok(batch) = handle.join() {
+                    for (index, outcome) in batch {
+                        results[index] = Some(outcome);
+                    }
+                }
+            }
+        });
+        results
+            .into_iter()
+            .map(|outcome| {
+                outcome
+                    .unwrap_or_else(|| Err(AgentError::Tool("parallel batch lost a result".into())))
+            })
+            .collect()
+    }
+}
+
+impl LocalTools {
+    /// 只读工具的无副作用执行入口；并行 batch 只允许走这里。
+    fn execute_readonly(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        match request.tool.as_str() {
+            "read_file" => self.read_file(request),
+            "search_code" => self.search_code(request),
+            "glob" => self.glob(request),
+            other => Err(AgentError::Tool(format!("tool {other} is not read-only"))),
+        }
+    }
+
+    /// 写工具的分段执行入口；同一首路径由 batch 串行化。
+    fn execute_write(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        match request.tool.as_str() {
+            "write_file" => self.write_file(request),
+            "move_path" => self.move_path(request),
+            other => Err(AgentError::Tool(format!("tool {other} is not writable"))),
+        }
+    }
+
+    /// 浏览器动作：open / eval / screenshot / close；按需启动 headless Chrome。
+    fn browser(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let args = request
+            .arguments
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let action = args["action"].as_str().unwrap_or("open");
+        let mut guard = self
+            .browser
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if action == "close" {
+            *guard = None;
+            return Ok(self.browser_outcome(request, "browser closed".into(), Vec::new()));
+        }
+        if guard.is_none() {
+            *guard = Some(crate::browser::Browser::launch(
+                &crate::browser::BrowserConfig::default(),
+            )?);
+        }
+        let browser = guard.as_mut().expect("browser was just launched");
+        let (output, written_paths) = match action {
+            "open" => {
+                let url = args["url"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::Tool("browser open requires url".into()))?;
+                let tab = browser.open(url)?;
+                (format!("opened tab {tab} {url}"), Vec::new())
+            }
+            "tabs" => {
+                let tabs = browser.tabs();
+                (serde_json::to_string(&tabs).unwrap_or_default(), Vec::new())
+            }
+            "select" => {
+                let index = args["tab"]
+                    .as_u64()
+                    .ok_or_else(|| AgentError::Tool("browser select requires tab".into()))?
+                    as usize;
+                browser.select(index)?;
+                (format!("selected tab {index}"), Vec::new())
+            }
+            "close_tab" => {
+                let index = args["tab"]
+                    .as_u64()
+                    .ok_or_else(|| AgentError::Tool("browser close_tab requires tab".into()))?
+                    as usize;
+                browser.close_tab(index)?;
+                (format!("closed tab {index}"), Vec::new())
+            }
+            "eval" => {
+                if let Some(index) = args["tab"].as_u64() {
+                    browser.select(index as usize)?;
+                }
+                let expression = args["expression"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::Tool("browser eval requires expression".into()))?;
+                let value = browser.eval(expression)?;
+                (
+                    serde_json::to_string(&value).unwrap_or_default(),
+                    Vec::new(),
+                )
+            }
+            "screenshot" => {
+                if !self.allow_write {
+                    return Err(AgentError::Tool(
+                        "browser screenshot requires allow-write".into(),
+                    ));
+                }
+                if let Some(index) = args["tab"].as_u64() {
+                    browser.select(index as usize)?;
+                }
+                let raw = args["path"].as_str().unwrap_or("screenshot.png");
+                let relative = self.resolve_relative(raw)?;
+                browser.screenshot(&self.root.join(&relative))?;
+                let written = relative.display().to_string();
+                (format!("screenshot {written}"), vec![written])
+            }
+            other => {
+                return Err(AgentError::Tool(format!("unknown browser action: {other}")));
+            }
+        };
+        drop(guard);
+        Ok(self.browser_outcome(request, output, written_paths))
+    }
+
+    fn browser_outcome(
+        &self,
+        request: &ToolRequest,
+        output: String,
+        written_paths: Vec<String>,
+    ) -> ToolOutcome {
+        ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed: true,
+            assertions: 0,
+            written_paths,
+            in_doubt: false,
+            output: truncate(output, self.max_output_bytes),
+        }
+    }
+
+    /// 一次调用执行多个只读工具，返回紧凑结果，减少模型往返与上下文开销。
+    fn tools_batch(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let args = request
+            .arguments
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let calls = args
+            .get("calls")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| AgentError::Tool("tools_batch requires calls[]".into()))?;
+        if calls.is_empty() || calls.len() > 64 {
+            return Err(AgentError::Tool(
+                "tools_batch calls must contain 1..=64 entries".into(),
+            ));
+        }
+        let mut requests = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let tool = call
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    AgentError::Tool(format!("tools_batch calls[{index}] requires tool"))
+                })?;
+            if !BATCH_ALLOWED.contains(&tool) {
+                return Err(AgentError::Tool(format!(
+                    "tools_batch does not allow {tool}; allowed: {}",
+                    BATCH_ALLOWED.join(", ")
+                )));
+            }
+            requests.push(ToolRequest {
+                call_id: format!("{}#{index}", request.call_id),
+                tool: tool.into(),
+                read_only: tool != "download",
+                command: call
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                paths: call
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(|path| path.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                operation: None,
+                content: None,
+                span: None,
+                arguments: call.get("arguments").cloned(),
+            });
+        }
+        let outcomes = self.execute_batch(&requests);
+        let budget = (self.max_output_bytes / calls.len()).max(1024);
+        let mut passed = true;
+        let mut results = Vec::with_capacity(outcomes.len());
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let (ok, output) = match outcome {
+                Ok(outcome) => {
+                    let ok = outcome.passed && !outcome.in_doubt;
+                    passed &= ok;
+                    (ok, truncate(outcome.output, budget))
+                }
+                Err(error) => {
+                    passed = false;
+                    (false, error.to_string())
+                }
+            };
+            results.push(serde_json::json!({
+                "index": index,
+                "tool": requests[index].tool,
+                "passed": ok,
+                "output": output,
+            }));
+        }
+        let output = serde_json::to_string(&serde_json::json!({
+            "passed": passed,
+            "calls": results,
+        }))
+        .unwrap_or_else(|_| "{}".into());
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed,
+            assertions: 0,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: truncate(output, self.max_output_bytes),
+        })
+    }
+
+    /// 调用外部下载器（默认 FluxDown）创建下载任务；未安装时 fail closed。
+    fn download(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let args = request
+            .arguments
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let url = args["url"]
+            .as_str()
+            .ok_or_else(|| AgentError::Tool("download requires url".into()))?;
+        let command = std::env::var("TRIT_FLUXDOWN").unwrap_or_else(|_| "fluxdown".into());
+        let output = std::process::Command::new(&command)
+            .args(["add", "--local", url])
+            .output()
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "spawn {command}: {error}; install FluxDown or set TRIT_FLUXDOWN"
+                ))
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(AgentError::Tool(format!(
+                "{command} add failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: Some(format!("{command} add --local {url}")),
+            passed: true,
+            assertions: 0,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: truncate(format!("{stdout}{stderr}"), self.max_output_bytes),
+        })
+    }
+}
+
+/// 只读工具可以在同一批内并行执行（无写副作用）。
+pub fn is_readonly_tool(tool: &str) -> bool {
+    matches!(tool, "read_file" | "search_code" | "glob")
+}
+
+/// 可在同一批内分段并行的工具：只读，或按路径隔离的写。
+pub fn is_parallel_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file" | "search_code" | "glob" | "write_file" | "move_path"
+    )
+}
+
+/// 允许进入 `tools_batch` 的工具：只读检索 + 外部下载；写工具与 bash 不走批量，避免绕过 claim。
+const BATCH_ALLOWED: &[&str] = &["read_file", "search_code", "glob", "download"];
+
+fn find(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
+}
+
+fn union(parent: &mut [usize], left: usize, right: usize) {
+    let left = find(parent, left);
+    let right = find(parent, right);
+    if left != right {
+        parent[right] = left;
     }
 }
 
@@ -1144,5 +1557,164 @@ mod tests {
             )));
             assert!(!is_cross_device(&std::io::Error::from_raw_os_error(17)));
         }
+    }
+
+    #[test]
+    fn readonly_batch_preserves_request_order() {
+        let root = temp("readonly-batch");
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.join("b.txt"), "beta").unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut tools = LocalTools::new(config).unwrap();
+        let request = |call_id: &str, path: &str| ToolRequest {
+            call_id: call_id.into(),
+            tool: "read_file".into(),
+            read_only: true,
+            command: None,
+            paths: vec![path.into()],
+            operation: None,
+            content: None,
+            span: None,
+            arguments: None,
+        };
+        let outcomes =
+            tools.execute_batch(&[request("call-1", "a.txt"), request("call-2", "b.txt")]);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].as_ref().unwrap().output.contains("alpha"));
+        assert!(outcomes[1].as_ref().unwrap().output.contains("beta"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_batch_serializes_same_path_and_parallelizes_distinct_paths() {
+        let root = temp("write-batch");
+        let mut config = WorkspaceConfig::new(&root);
+        config.allow_write = true;
+        let mut tools = LocalTools::new(config).unwrap();
+        let write = |call_id: &str, path: &str, content: &str| ToolRequest {
+            call_id: call_id.into(),
+            tool: "write_file".into(),
+            read_only: false,
+            command: None,
+            paths: vec![path.into()],
+            operation: None,
+            content: Some(content.into()),
+            span: None,
+            arguments: None,
+        };
+        let outcomes = tools.execute_batch(&[
+            write("call-1", "a.txt", "one"),
+            write("call-2", "b.txt", "two"),
+        ]);
+        assert!(outcomes.iter().all(|outcome| outcome.is_ok()));
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "two");
+
+        // 同一路径在同一批内串行：后一个请求覆盖前一个。
+        let outcomes = tools.execute_batch(&[
+            write("call-3", "same.txt", "first"),
+            write("call-4", "same.txt", "second"),
+        ]);
+        assert!(outcomes.iter().all(|outcome| outcome.is_ok()));
+        assert_eq!(
+            std::fs::read_to_string(root.join("same.txt")).unwrap(),
+            "second"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn move_batch_serializes_crossing_source_and_target_paths() {
+        let root = temp("move-batch");
+        let mut config = WorkspaceConfig::new(&root);
+        config.allow_write = true;
+        let mut tools = LocalTools::new(config).unwrap();
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        let mv = |call_id: &str, from: &str, to: &str| ToolRequest {
+            call_id: call_id.into(),
+            tool: "move_path".into(),
+            read_only: false,
+            command: None,
+            paths: vec![from.into(), to.into()],
+            operation: None,
+            content: None,
+            span: None,
+            arguments: None,
+        };
+        let outcomes = tools.execute_batch(&[
+            mv("call-1", "a.txt", "b.txt"),
+            mv("call-2", "b.txt", "c.txt"),
+        ]);
+        assert!(
+            outcomes.iter().all(|outcome| outcome.is_ok()),
+            "{outcomes:?}"
+        );
+        assert!(!root.join("a.txt").exists());
+        assert!(!root.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("c.txt")).unwrap(),
+            "alpha"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_requires_url() {
+        let root = temp("download");
+        let config = WorkspaceConfig::new(&root);
+        let tools = LocalTools::new(config).unwrap();
+        let request = ToolRequest {
+            call_id: "d1".into(),
+            tool: "download".into(),
+            read_only: false,
+            command: None,
+            paths: Vec::new(),
+            operation: None,
+            content: None,
+            span: None,
+            arguments: None,
+        };
+        assert!(tools.download(&request).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tools_batch_runs_readonly_calls() {
+        let root = temp("batch-readonly");
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.join("b.txt"), "beta").unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut tools = LocalTools::new(config).unwrap();
+        let request = ToolRequest {
+            call_id: "batch".into(),
+            tool: "tools_batch".into(),
+            read_only: true,
+            command: None,
+            paths: Vec::new(),
+            operation: None,
+            content: None,
+            span: None,
+            arguments: Some(serde_json::json!({"calls": [
+                {"tool": "read_file", "paths": ["a.txt"]},
+                {"tool": "read_file", "paths": ["b.txt"]}
+            ]})),
+        };
+        let outcome = tools.tools_batch(&request).unwrap();
+        assert!(outcome.passed);
+        let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(value["calls"].as_array().unwrap().len(), 2);
+        assert!(
+            value["calls"][0]["output"]
+                .as_str()
+                .unwrap()
+                .contains("alpha")
+        );
+        assert!(
+            value["calls"][1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("beta")
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

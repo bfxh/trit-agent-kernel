@@ -389,8 +389,10 @@ TokUI（JBoltAI，MIT）提供了“后端 DSL → SSE/WebSocket → 前端增�
 > 稳定前缀/动态尾段、`PriorImpression` 对比、三值 autonomy 闸门与真实 usage 校准。
 > 语义分数仍由宿主传入（`ContextSelection.score`）。`ContextPlan` 已经进入
 > `ProviderRequest`/OpenAI provider；宿主可通过 `ContextPlanner` 每轮提供计划，
-> `ProviderResponse.context` 记录 inclusion receipt 与实际 cache 观察。CLI 还没配置
-> catalog/planner，所以“自动组装”尚未成为默认路径；语义判断也仍是外部输入。
+> `ProviderResponse.context` 记录 inclusion receipt 与实际 cache 观察。CLI 已接
+> `--context-catalog <json> [--context-project <id>] [--context-session-id <id>]`：
+> 传入后由 `AgentContext::assemble` 生成计划，并把 `context_read` 能力挂到
+> `AgentContextTools`；不传则保持"不自动组装"。这是显式开关而非缺口。语义判断仍是外部输入。
 
 | 现有能力 | 可复用的部分 | 需要新增/扩展 |
 | --- | --- | --- |

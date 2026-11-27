@@ -19,6 +19,8 @@ use crate::{
 };
 
 pub const CHECKPOINT_SCHEMA: u32 = 1;
+/// 单个 checkpoint / rewind 日志读取上限；超过时 fail closed。
+const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub const REWIND_SCHEMA: u32 = 1;
 pub const REWIND_JOURNAL: &str = "rewind-journal.jsonl";
 pub const REWIND_BACKUP_DIR: &str = "rewind-backups";
@@ -97,6 +99,14 @@ impl CheckpointStore {
                 || !name.to_string_lossy().ends_with(".json")
             {
                 continue;
+            }
+            if std::fs::metadata(entry.path())
+                .is_ok_and(|metadata| metadata.len() > MAX_STATE_FILE_BYTES)
+            {
+                return Err(AgentError::SessionState(format!(
+                    "checkpoint too large: {}",
+                    entry.path().display()
+                )));
             }
             let text = std::fs::read_to_string(entry.path()).map_err(|error| {
                 AgentError::Io(format!("checkpoint {}: {error}", entry.path().display()))
@@ -723,6 +733,14 @@ fn read_rewind_records(path: &Path) -> Result<Vec<RewindRecord>, AgentError> {
             return Err(AgentError::Io(format!("open {}: {error}", path.display())));
         }
     };
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() > MAX_STATE_FILE_BYTES
+    {
+        return Err(AgentError::Io(format!(
+            "read {}: file too large",
+            path.display()
+        )));
+    }
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|error| AgentError::Io(format!("read {}: {error}", path.display())))?;

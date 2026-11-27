@@ -51,11 +51,14 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
+use trit_orch::{
+    MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, TokenUsage, decode_frame, encode_frame,
+};
 
+use crate::cost::PriceTable;
 use crate::lease::SingleInstanceLock;
 
 use crate::auth::{AUTH_DIGEST_LEN, authorization_matches, bearer_digest};
@@ -112,6 +115,13 @@ pub struct LedgerServerConfig {
     /// 请求行 + 头部 + 请求体的总读取时限；`None` 不限制。
     /// 到点回 `408`，避免慢速滴流客户端长期占住连接。
     pub request_read_timeout: Option<Duration>,
+    /// 可选跨机 token 预算；达到后 `/claim` 返回 503。仅内存累计，重启清零。
+    pub token_budget: Option<u64>,
+    /// 可选跨机美元预算；按完成帧的 `model + usage` 折算累计，达到后 `/claim` 返回 503。
+    /// 仅内存累计，重启清零。
+    pub usd_budget: Option<f64>,
+    /// 成本折算价目表；默认内置表，CLI 可用 `TRIT_MODEL_PRICES` 覆盖。
+    pub prices: PriceTable,
 }
 
 impl LedgerServerConfig {
@@ -125,6 +135,9 @@ impl LedgerServerConfig {
             state_path: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             request_read_timeout: Some(DEFAULT_REQUEST_READ_TIMEOUT),
+            token_budget: None,
+            usd_budget: None,
+            prices: PriceTable::builtin(),
         }
     }
 
@@ -161,6 +174,24 @@ impl LedgerServerConfig {
     /// 设置请求行 + 头部 + 请求体的总读取时限；`Duration::ZERO` 表示不限制。
     pub fn with_request_read_timeout(mut self, timeout: Duration) -> Self {
         self.request_read_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// 设置跨机 token 预算；达到后 `/claim` 返回 503。
+    pub fn with_token_budget(mut self, budget: u64) -> Self {
+        self.token_budget = Some(budget);
+        self
+    }
+
+    /// 设置跨机美元预算；达到后 `/claim` 返回 503。
+    pub fn with_usd_budget(mut self, budget: f64) -> Self {
+        self.usd_budget = Some(budget);
+        self
+    }
+
+    /// 替换成本折算价目表。
+    pub fn with_prices(mut self, prices: PriceTable) -> Self {
+        self.prices = prices;
         self
     }
 }
@@ -228,6 +259,10 @@ struct LedgerState {
     entries: BTreeMap<String, Entry>,
     /// 所有 `Done` 记录的逻辑字节数（按保守估算，见 `record_bytes`）。
     bytes: usize,
+    /// 已完成帧自报的 token 总量；仅内存累计，重启清零。
+    tokens_used: u64,
+    /// 已完成帧折算的美元总量；仅内存累计，重启清零。
+    usd_used: f64,
 }
 
 /// 已绑定的账本服务端。
@@ -308,6 +343,7 @@ impl LedgerServer {
                     config.pending_ttl,
                     config.max_entries,
                     config.max_state_bytes,
+                    &config.prices,
                 )?;
                 if std::fs::metadata(path)
                     .is_ok_and(|meta| meta.len() > config.max_state_bytes as u64)
@@ -367,6 +403,7 @@ impl LedgerServer {
             let completions = Arc::clone(&self.completions);
             std::thread::spawn(move || {
                 let _slot = slot;
+                let _task = crate::background::register("remote-ledger-conn");
                 let _ = handle(stream, &config, auth.as_ref(), &state, &completions);
             });
         }
@@ -541,6 +578,17 @@ fn handle(
             match view.complete(&key, lease, frame) {
                 Ok(CompleteOutcome::Completed) => {
                     completions.fetch_add(1, Ordering::SeqCst);
+                    if response.tokens > 0
+                        && let Ok(mut state) = state.lock()
+                    {
+                        state.tokens_used = state.tokens_used.saturating_add(response.tokens);
+                    }
+                    let usd = frame_usd(&config.prices, &response);
+                    if usd > 0.0
+                        && let Ok(mut state) = state.lock()
+                    {
+                        state.usd_used += usd;
+                    }
                     respond(&mut stream, 204, "No Content", b"")
                 }
                 Ok(CompleteOutcome::Duplicate) => respond(&mut stream, 204, "No Content", b""),
@@ -610,6 +658,16 @@ impl LedgerServerView<'_> {
     fn claim(&self, key: &str) -> Result<Claim, ()> {
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| ())?;
+        if let Some(budget) = self.config.token_budget
+            && state.tokens_used >= budget
+        {
+            return Err(());
+        }
+        if let Some(budget) = self.config.usd_budget
+            && state.usd_used >= budget
+        {
+            return Err(());
+        }
         if let Some(entry) = state.entries.get_mut(key) {
             match entry {
                 Entry::Done { frame, .. } => return Ok(Claim::Done(frame.clone())),
@@ -730,6 +788,23 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> std:
     write_response(stream, code, reason, &[], body)
 }
 
+/// 按帧自报的 `model + usage` 折算美元；缺任一字段返回 0（不计价）。
+fn frame_usd(prices: &PriceTable, response: &SubagentResponse) -> f64 {
+    let (Some(model), Some(usage)) = (response.model.as_deref(), response.usage) else {
+        return 0.0;
+    };
+    let usage = TokenUsage {
+        fresh: usage.fresh,
+        cached: usage.cached,
+        output: usage.output,
+        estimated: usage.estimated,
+    };
+    prices
+        .estimate(model, &usage)
+        .map(|estimate| estimate.usd)
+        .unwrap_or(0.0)
+}
+
 fn respond_with_lease(
     stream: &mut TcpStream,
     code: u16,
@@ -793,6 +868,7 @@ fn load_entries(
     pending_ttl: Duration,
     max_entries: usize,
     max_state_bytes: usize,
+    prices: &PriceTable,
 ) -> std::io::Result<LedgerState> {
     if !path.exists() {
         return Ok(LedgerState::default());
@@ -853,6 +929,18 @@ fn load_entries(
                         path.display()
                     )));
                 }
+                if let Some(Entry::Done {
+                    frame: old_frame, ..
+                }) = state.entries.get(&key)
+                {
+                    let mut buffer = old_frame.clone();
+                    if let Ok(Some(old)) = decode_frame::<SubagentResponse>(&mut buffer) {
+                        state.tokens_used = state.tokens_used.saturating_sub(old.tokens);
+                        state.usd_used = (state.usd_used - frame_usd(prices, &old)).max(0.0);
+                    }
+                }
+                state.tokens_used = state.tokens_used.saturating_add(response.tokens);
+                state.usd_used += frame_usd(prices, &response);
                 if let Some(Entry::Done { frame, lease }) = state.entries.get(&key) {
                     state.bytes =
                         state
@@ -1277,6 +1365,24 @@ struct LedgerReply {
     done: bool,
 }
 
+/// 按 endpoint timeout 复用 ureq 连接池；claim/renew/complete 共享同一 agent。
+fn ledger_agent(timeout_secs: u64) -> ureq::Agent {
+    static AGENTS: OnceLock<Mutex<BTreeMap<u64, ureq::Agent>>> = OnceLock::new();
+    let agents = AGENTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut agents = agents
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    agents
+        .entry(timeout_secs)
+        .or_insert_with(|| {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(timeout_secs))
+                .redirects(0)
+                .build()
+        })
+        .clone()
+}
+
 fn post(
     endpoint: &RemoteEndpoint,
     path: &str,
@@ -1285,10 +1391,7 @@ fn post(
     body: Option<&[u8]>,
 ) -> Result<LedgerReply, String> {
     endpoint.validate().map_err(|error| error.to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(endpoint.timeout_secs))
-        .redirects(0)
-        .build();
+    let agent = ledger_agent(endpoint.timeout_secs);
     let url = format!("{}{path}", endpoint.url.trim().trim_end_matches('/'));
     let mut request = agent
         .post(&url)

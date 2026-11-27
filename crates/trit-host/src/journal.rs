@@ -15,8 +15,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::lease::{LeaseError, OperationLease};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::check_ancestors;
@@ -26,6 +28,8 @@ use crate::{ToolOutcome, ToolRequest};
 pub const JOURNAL_SCHEMA: u32 = 1;
 /// 账本相对 root 的路径。
 pub const JOURNAL_PATH: &str = ".agent/write-journal.jsonl";
+/// journal 读取上限；超过时 fail closed，避免回滚时把巨型文件读进内存。
+const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 /// 单条记录里保留的工具输出上限（字符）；账本不复制完整日志。
 const MAX_OUTPUT: usize = 512;
 
@@ -552,6 +556,74 @@ pub fn inspect(root: impl AsRef<Path>) -> Result<JournalReport, JournalError> {
     report_records(read_records(&path)?)
 }
 
+/// 安全回滚 `in_doubt` 记录：需要租约锁时先取锁；仍被他人持有的记录进 `blocked`。
+pub fn rollback_in_doubt(
+    journal: &mut MutationJournal,
+    workspace: &Path,
+    records: &[JournalRecord],
+    owned: Option<&OperationLease>,
+) -> Result<(Vec<RollbackOutcome>, Vec<serde_json::Value>), JournalError> {
+    let owned_keys: Vec<String> = owned
+        .map(|lease| {
+            lease
+                .lock_paths()
+                .into_iter()
+                .map(|path| lock_key(workspace, path))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut outcomes = Vec::new();
+    let mut blocked = Vec::new();
+    for record in records {
+        let mut guard: Option<OperationLease> = None;
+        if record.lease_locks.is_empty() {
+            if record.lease_epoch.is_some() {
+                blocked.push(serde_json::json!({
+                    "op_id": record.op_id,
+                    "reason": "lease epoch recorded without lock paths; refuse automatic rollback",
+                }));
+                continue;
+            }
+        } else {
+            let missing: Vec<PathBuf> = record
+                .lease_locks
+                .iter()
+                .filter(|lock| !owned_keys.contains(&lock_key(workspace, Path::new(lock))))
+                .map(PathBuf::from)
+                .collect();
+            if !missing.is_empty() {
+                match OperationLease::acquire_lock_files(workspace, "journal-rollback", &missing) {
+                    Ok(lease) => guard = Some(lease),
+                    Err(LeaseError::Busy { owner, epoch }) => {
+                        blocked.push(serde_json::json!({
+                            "op_id": record.op_id,
+                            "reason": format!("lease still held: owner={owner} epoch={epoch}"),
+                        }));
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(JournalError::Io(format!("journal rollback lease: {error}")));
+                    }
+                }
+            }
+        }
+        let outcome = journal.rollback(record);
+        journal.record_rollback(record.op_id, &outcome)?;
+        drop(guard);
+        outcomes.push(outcome);
+    }
+    Ok((outcomes, blocked))
+}
+
+fn lock_key(workspace: &Path, lock: &Path) -> String {
+    let full = if lock.is_absolute() {
+        lock.to_path_buf()
+    } else {
+        workspace.join(lock)
+    };
+    full.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
 fn report_records(records: Vec<JournalRecord>) -> Result<JournalReport, JournalError> {
     let mut report = JournalReport::default();
     let mut open: BTreeMap<u64, JournalRecord> = BTreeMap::new();
@@ -665,6 +737,14 @@ fn read_records(path: &Path) -> Result<Vec<JournalRecord>, JournalError> {
             )));
         }
     };
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() > MAX_JOURNAL_BYTES
+    {
+        return Err(JournalError::Io(format!(
+            "read {}: file too large",
+            path.display()
+        )));
+    }
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|error| JournalError::Io(format!("read {}: {error}", path.display())))?;

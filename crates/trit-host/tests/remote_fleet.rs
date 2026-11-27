@@ -587,6 +587,9 @@ fn retry_switches_node_and_reuses_idempotency_key() {
                     status: DelegationStatus::Completed,
                     content: b"retried".to_vec(),
                     tokens: 0,
+                    model: None,
+                    usage: None,
+                    dissent: None,
                 };
                 let frame = encode_frame(&response).unwrap();
                 let _ = write!(

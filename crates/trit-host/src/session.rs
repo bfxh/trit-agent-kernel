@@ -15,15 +15,17 @@ use trit_orch::{EvidenceVerdict, Ternary, TokenUsage};
 use trit_reasonix::{CriterionRequest, HostUsage, TurnSpec};
 
 pub const SESSION_SCHEMA: u32 = 1;
+/// 单个会话日志读取上限；超过时 fail closed，避免巨型文件拖垮进程。
+const MAX_SESSION_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub schema: u32,
     pub seq: u64,
     pub event: SessionEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     TurnStarted {
@@ -129,10 +131,22 @@ pub enum GateChainPhase {
     Post,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SessionLog {
     path: PathBuf,
     seq: u64,
+    /// 懒打开的追加句柄；避免每个事件都重新 open/create_dir。
+    file: Option<std::fs::File>,
+}
+
+impl Clone for SessionLog {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            seq: self.seq,
+            file: None,
+        }
+    }
 }
 
 impl SessionLog {
@@ -141,7 +155,11 @@ impl SessionLog {
         let path = path.into();
         let records = read_records(&path)?;
         let seq = records.last().map_or(0, |record| record.seq);
-        Ok(Self { path, seq })
+        Ok(Self {
+            path,
+            seq,
+            file: None,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -149,10 +167,18 @@ impl SessionLog {
     }
 
     pub fn append(&mut self, event: SessionEvent) -> Result<u64, AgentError> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
+        if self.file.is_none() {
+            if let Some(parent) = self.path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).map_err(|error| self.io(error))?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|error| self.io(error))?;
+            self.file = Some(file);
         }
         self.seq = self.seq.saturating_add(1);
         let record = SessionRecord {
@@ -164,12 +190,8 @@ impl SessionLog {
             path: self.path.display().to_string(),
             message: error.to_string(),
         })?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
+        writeln!(self.file.as_mut().expect("opened above"), "{line}")
             .map_err(|error| self.io(error))?;
-        writeln!(file, "{line}").map_err(|error| self.io(error))?;
         Ok(self.seq)
     }
 
@@ -179,6 +201,7 @@ impl SessionLog {
 
     /// 截断到 `turn` 之前；保留前面完整的 turn，返回删除的事件数。
     pub fn truncate_before_turn(&mut self, turn: usize) -> Result<usize, AgentError> {
+        self.file = None;
         let records = self.load()?;
         let mut seen = 0;
         let mut cut = None;
@@ -276,6 +299,14 @@ fn gate_chain_record(event: &SessionEvent) -> Option<GateChainRecord> {
 }
 
 fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > MAX_SESSION_LOG_BYTES
+    {
+        return Err(AgentError::SessionState(format!(
+            "session log too large: {} bytes",
+            metadata.len()
+        )));
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -320,7 +351,7 @@ fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
 }
 
 /// 从已有事件恢复出的多轮会话状态。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionState {
     pub turns: Vec<TurnRecord>,
     pub usage: TokenUsage,
@@ -356,7 +387,7 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnRecord {
     pub task: String,
     pub objective: String,
@@ -369,6 +400,138 @@ pub struct TurnRecord {
     pub tool_calls: usize,
     pub criteria: usize,
     pub metrics: Option<TurnMetrics>,
+}
+
+/// 崩溃恢复点：最后一个没有 `TurnFinished` 的 turn 的中间状态。
+///
+/// 只携带「确定发生过」的事实：已发出的请求、按 `call_id` 索引的确定回执、
+/// 已消耗 token、以及重放出来的上下文投影。请求发出但没落回执的那一条
+/// 不在 `outcomes` 里——调用方必须把它当成结果未知（`in_doubt`），
+/// 不能重放、也不能算成功。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnResume {
+    pub task: String,
+    pub objective: String,
+    /// 已发出的工具请求，按事件顺序。
+    pub requests: Vec<ToolRequest>,
+    /// 按 `call_id` 索引的确定回执；缺项表示该请求结果未知。
+    pub outcomes: std::collections::BTreeMap<String, ToolOutcome>,
+    /// 该 turn 已消耗的 token。
+    pub usage: TokenUsage,
+    /// 下一个要执行的 step 序号。
+    pub next_step: usize,
+    /// 断点所在的 step（`next_step` 是它重跑还是推进，取决于是否有未确定的请求）。
+    pub step: usize,
+    /// 本 turn 早期步骤的提议历史，回放给模型。
+    pub history: Vec<crate::TurnStepRecord>,
+    /// 从事件重放出来的上下文投影。
+    pub projection: crate::context_projection::ContextProjection,
+}
+
+impl TurnResume {
+    /// 结果确定的回执，按请求顺序。
+    pub fn receipts(&self) -> Vec<ToolOutcome> {
+        self.requests
+            .iter()
+            .filter_map(|request| self.outcomes.get(&request.call_id).cloned())
+            .collect()
+    }
+
+    /// 发出后崩溃、结果未知的请求，按请求顺序。
+    pub fn unsettled(&self) -> Vec<&ToolRequest> {
+        self.requests
+            .iter()
+            .filter(|request| !self.outcomes.contains_key(&request.call_id))
+            .collect()
+    }
+}
+
+/// 找出最后一个未完成 turn 的恢复点；没有未完成 turn 时返回 `None`。
+///
+/// 只有最后一个 `TurnStarted` 之后完全没有 `TurnFinished` 才可恢复：
+/// 中途夹着已收尾的 turn 会让「同一 turn 的中间状态」失去意义。
+pub fn resume_turn(records: &[SessionRecord]) -> Result<Option<TurnResume>, AgentError> {
+    let Some(start) = records
+        .iter()
+        .rposition(|record| matches!(record.event, SessionEvent::TurnStarted { .. }))
+    else {
+        return Ok(None);
+    };
+    let tail = &records[start..];
+    if tail
+        .iter()
+        .any(|record| matches!(record.event, SessionEvent::TurnFinished { .. }))
+    {
+        return Ok(None);
+    }
+    let Some(SessionEvent::TurnStarted {
+        task,
+        objective,
+        max_steps: _,
+    }) = tail.first().map(|record| &record.event)
+    else {
+        return Ok(None);
+    };
+
+    let mut resume = TurnResume {
+        task: task.clone(),
+        objective: objective.clone(),
+        projection: crate::context_projection::replay(records)
+            .map_err(|error| AgentError::SessionState(format!("context projection: {error}")))?,
+        ..TurnResume::default()
+    };
+    let mut last_step = 0usize;
+    let mut history: Vec<crate::TurnStepRecord> = Vec::new();
+    for record in tail {
+        match &record.event {
+            SessionEvent::Proposal { step, usage, .. } => {
+                last_step = *step;
+                add_usage(&mut resume.usage, usage.into_token_usage());
+            }
+            SessionEvent::ToolRequested { step, request } => {
+                last_step = *step;
+                resume.requests.push(request.clone());
+                match history.iter_mut().find(|record| record.step == *step) {
+                    Some(record) => record.requests.push(request.clone()),
+                    None => history.push(crate::TurnStepRecord {
+                        step: *step,
+                        requests: vec![request.clone()],
+                        claimed: false,
+                    }),
+                }
+            }
+            SessionEvent::CompletionClaimed { step, .. } => {
+                last_step = *step;
+                match history.iter_mut().find(|record| record.step == *step) {
+                    Some(record) => record.claimed = true,
+                    None => history.push(crate::TurnStepRecord {
+                        step: *step,
+                        requests: Vec::new(),
+                        claimed: true,
+                    }),
+                }
+            }
+            SessionEvent::ToolCompleted { step, outcome } => {
+                last_step = *step;
+                resume
+                    .outcomes
+                    .entry(outcome.call_id.clone())
+                    .or_insert_with(|| outcome.clone());
+            }
+            _ => {}
+        }
+    }
+    history.sort_by_key(|record| record.step);
+    resume.history = history;
+    // 断点落在某个 step 的工具执行中间：该 step 还没跑完，重跑它的 proposal，
+    // 模型会看到结果未知的那条请求，再由它决定是否重试。
+    resume.step = last_step;
+    resume.next_step = if resume.unsettled().is_empty() {
+        last_step.saturating_add(1)
+    } else {
+        last_step
+    };
+    Ok(Some(resume))
 }
 
 /// 从 JSONL 事件重建会话；未收到 `TurnFinished` 的 turn 标记为未完成。

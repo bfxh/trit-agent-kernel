@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 
 /// 租约文件相对 root 的路径。
 pub const LEASE_PATH: &str = ".agent/write-lease";
+/// lease 文件读取上限；lease 只承载小 JSON。
+const MAX_LEASE_BYTES: u64 = 1024 * 1024;
 
 /// 获取租约失败的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +323,14 @@ fn read_lease(path: &Path) -> Result<LeaseFile, LeaseError> {
     // byte 0 被 OS 锁占用（Windows）；内容从 offset 1 开始，读时跳过锁区。
     file.seek(SeekFrom::Start(1))
         .map_err(|error| LeaseError::Io(format!("seek {}: {error}", path.display())))?;
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() > MAX_LEASE_BYTES
+    {
+        return Err(LeaseError::Io(format!(
+            "read {}: file too large",
+            path.display()
+        )));
+    }
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|error| LeaseError::Io(format!("read {}: {error}", path.display())))?;

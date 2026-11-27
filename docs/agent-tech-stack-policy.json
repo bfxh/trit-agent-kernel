@@ -1,0 +1,57 @@
+{
+  "schema": "trit.agent-tech-stack-policy/v1",
+  "scope": "主智能体、子智能体、外部 CLI 子智能体产出的所有代码与配置",
+  "principle": "stack-follows-project-not-model-preference",
+  "rule": "默认编程语言、框架、包管理器与构建工具由项目现状决定；模型偏好、厂商标识、训练语料都不是依据",
+  "detect": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "pyproject.toml",
+    "requirements.txt",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "*.csproj",
+    "Gemfile",
+    "composer.json"
+  ],
+  "forbidden": [
+    "introduce-new-language-without-user-authorization",
+    "introduce-new-framework-or-package-manager-without-reason",
+    "rewrite-existing-code-into-model-preferred-language",
+    "add-dependency-not-needed-for-the-task",
+    "switch-build-tooling-silently"
+  ],
+  "exception": "只有在任务 brief 里由用户显式授权才允许新增；授权必须记为 explicit_override",
+  "applies_to": [
+    "main-agent",
+    "subagent",
+    "external-cli-subagent"
+  ],
+  "test_only_languages": {
+    "python": [
+      "tests/**",
+      "**/test_*.py",
+      "**/*_test.py",
+      "**/conftest.py"
+    ],
+    "note": "测试代码可以用；生产代码里出现即被 write_file 硬拒绝（不是扣分，是拒绝写入）"
+  },
+  "subagent_contract": {
+    "request": "StackPolicy{existing,allowed_additions}",
+    "response": "StackReport{used,added}",
+    "rule": "response.added 必须是 request.allowed_additions 的子集，否则协议违约"
+  },
+  "natural_language": {
+    "note": "自然语言（文档/注释/文案的语言）由 docs/LANGUAGE-POLICY.md 管理，可在设置里调整；编程语言不在设置里放开",
+    "policy": "docs/agent-language-policy.json"
+  },
+  "enforcement": {
+    "contract_test": "crates/trit-host/tests/tech_stack_policy.rs",
+    "human_doc": "docs/TECH-STACK-POLICY.md",
+    "manifest_binding": "docs/agent-model-manifest.json#tech_stack_policy"
+  }
+}

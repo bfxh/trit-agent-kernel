@@ -17,6 +17,7 @@
 //! - **不自动重试**：远程可能已经执行过，重试需要幂等键；本层不做隐式重试。
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -124,6 +125,8 @@ pub struct NodeTable {
     inner: Mutex<Vec<Slot>>,
     cond: Condvar,
     failure_threshold: u32,
+    /// 等负载时的轮转游标，避免总是偏向 id 最小的节点。
+    cursor: AtomicUsize,
 }
 
 impl NodeTable {
@@ -174,6 +177,7 @@ impl NodeTable {
             ),
             cond: Condvar::new(),
             failure_threshold: 1,
+            cursor: AtomicUsize::new(0),
         })
     }
 
@@ -231,7 +235,8 @@ impl NodeTable {
             if cancel.is_cancelled() {
                 return Ok(None);
             }
-            if let Some(index) = pick(&slots, excluded) {
+            let cursor = self.cursor.fetch_add(1, Ordering::Relaxed);
+            if let Some(index) = pick(&slots, excluded, cursor) {
                 slots[index].in_flight += 1;
                 let node = slots[index].node.clone();
                 return Ok(Some(NodeLease {
@@ -294,6 +299,26 @@ impl NodeTable {
             .iter()
             .find(|slot| slot.node.id == id)
             .map(|slot| slot.node.clone())
+    }
+
+    /// 运行期调整节点容量；`0` 拒绝。已占用的 `in_flight` 不回收。
+    pub fn set_capacity(&self, id: &str, max_in_flight: usize) -> Result<(), Error> {
+        if max_in_flight == 0 {
+            return Err(Error::RemoteNodes {
+                message: format!("remote node {id} has zero capacity"),
+            });
+        }
+        let mut slots = self.lock();
+        let Some(slot) = slots.iter_mut().find(|slot| slot.node.id == id) else {
+            return Err(Error::RemoteNodes {
+                message: format!("unknown remote node: {id}"),
+            });
+        };
+        slot.node.max_in_flight = max_in_flight;
+        touch_state(slot);
+        drop(slots);
+        self.cond.notify_all();
+        Ok(())
     }
 
     /// 显式健康探测成功后重新放行一个已隔离节点。
@@ -392,7 +417,8 @@ impl std::fmt::Debug for NodeTable {
     }
 }
 
-fn pick(slots: &[Slot], excluded: &BTreeSet<String>) -> Option<usize> {
+fn pick(slots: &[Slot], excluded: &BTreeSet<String>, cursor: usize) -> Option<usize> {
+    let mut candidates = Vec::new();
     let mut best: Option<usize> = None;
     for (index, slot) in slots.iter().enumerate() {
         if !slot.healthy
@@ -401,31 +427,68 @@ fn pick(slots: &[Slot], excluded: &BTreeSet<String>) -> Option<usize> {
         {
             continue;
         }
+        candidates.push(index);
         best = Some(match best {
             None => index,
             Some(current) => {
-                let candidate = slot;
-                let incumbent = &slots[current];
                 // 负载比比较用交叉相乘，避免浮点误差。
                 let candidate_load =
-                    candidate.in_flight as u128 * incumbent.node.max_in_flight as u128;
+                    slot.in_flight as u128 * slots[current].node.max_in_flight as u128;
                 let incumbent_load =
-                    incumbent.in_flight as u128 * candidate.node.max_in_flight as u128;
-                match candidate_load.cmp(&incumbent_load) {
-                    std::cmp::Ordering::Less => index,
-                    std::cmp::Ordering::Greater => current,
-                    std::cmp::Ordering::Equal => {
-                        if candidate.node.id < incumbent.node.id {
-                            index
-                        } else {
-                            current
-                        }
-                    }
+                    slots[current].in_flight as u128 * slot.node.max_in_flight as u128;
+                if candidate_load < incumbent_load {
+                    index
+                } else {
+                    current
                 }
             }
         });
     }
-    best
+    let best = best?;
+    // 等负载时不立刻按游标轮转：先把"最近没失败、尝试最少"的节点排前面。
+    // 刚被健康探测放行的节点保留了累计 attempts/failures，说明它上一次真正接活
+    // 时并不健康；让从未失败过的节点先接任务，避免把任务派给"探测能过、干活不行"
+    // 的节点后又立刻节点级失败。
+    let tied: Vec<usize> = candidates
+        .into_iter()
+        .filter(|&index| {
+            slots[index].in_flight as u128 * slots[best].node.max_in_flight as u128
+                == slots[best].in_flight as u128 * slots[index].node.max_in_flight as u128
+        })
+        .collect();
+    if tied.len() <= 1 {
+        return Some(best);
+    }
+    let min_failures = tied
+        .iter()
+        .map(|&index| slots[index].consecutive_failures)
+        .min()
+        .unwrap_or(0);
+    let preferred: Vec<usize> = tied
+        .into_iter()
+        .filter(|&index| slots[index].consecutive_failures == min_failures)
+        .collect();
+    let min_attempts = preferred
+        .iter()
+        .map(|&index| slots[index].attempts)
+        .min()
+        .unwrap_or(0);
+    let preferred: Vec<usize> = preferred
+        .into_iter()
+        .filter(|&index| slots[index].attempts == min_attempts)
+        .collect();
+    if preferred.len() == 1 {
+        return Some(preferred[0]);
+    }
+    // 仍平手：从游标位置轮转，避免高并发下固定偏向某个节点。
+    let start = cursor % slots.len();
+    for offset in 0..slots.len() {
+        let index = (start + offset) % slots.len();
+        if preferred.contains(&index) {
+            return Some(index);
+        }
+    }
+    Some(best)
 }
 
 /// 一次准入的占用凭据。

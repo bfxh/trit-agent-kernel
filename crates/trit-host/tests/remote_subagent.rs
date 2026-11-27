@@ -66,6 +66,9 @@ fn response(request: &SubagentRequest, status: DelegationStatus) -> SubagentResp
         status,
         content: b"remote output".to_vec(),
         tokens: 7,
+        model: None,
+        usage: None,
+        dissent: None,
     }
 }
 
@@ -664,6 +667,9 @@ fn cache_byte_budget_evicts_the_oldest_response() {
         status: DelegationStatus::Completed,
         content: format!("remote echo {}@{}", first.task, first.epoch).into_bytes(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     };
     let frame_bytes = encode_frame(&expected_first).unwrap().len();
     let one_entry = format!("{}@{}", first.task, first.epoch).len() + frame_bytes;

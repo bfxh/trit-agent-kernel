@@ -73,6 +73,12 @@ pub struct RemoteAttempt {
     pub node: String,
     /// 本次尝试的结局；协议级错误记为 `Failed`（带错误文本）。
     pub status: DelegationStatus,
+    /// 远端自报的模型名；用于成本折算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 远端自报的 token 明细；旧节点不返回时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<trit_orch::SubagentUsage>,
 }
 
 /// 跨机派发配置。
@@ -103,6 +109,10 @@ pub struct RemotePlanConfig {
     /// `None` 完全信任传入快照（保持旧行为）。配置后仍需 preflight / 周期探测
     /// 才能把超龄节点重新放行；未配探测时超龄节点不会参与派发。
     pub health_max_age: Option<Duration>,
+    /// 换节点重试前的指数退避基数；`Duration::ZERO` 表示不等待。
+    pub retry_backoff: Duration,
+    /// 退避上限。
+    pub retry_backoff_max: Duration,
 }
 
 impl RemotePlanConfig {
@@ -116,6 +126,8 @@ impl RemotePlanConfig {
             health_probe_interval: None,
             health_probe_concurrency: 1,
             health_max_age: None,
+            retry_backoff: Duration::ZERO,
+            retry_backoff_max: Duration::from_secs(30),
         }
     }
 
@@ -126,6 +138,13 @@ impl RemotePlanConfig {
 
     pub fn with_retry_limit(mut self, retry_limit: u32) -> Self {
         self.retry_limit = retry_limit;
+        self
+    }
+
+    /// 设置换节点重试的指数退避；`base` 为 0 表示不等待。
+    pub fn with_retry_backoff(mut self, base: Duration, max: Duration) -> Self {
+        self.retry_backoff = base;
+        self.retry_backoff_max = if max.is_zero() { base } else { max };
         self
     }
 
@@ -297,6 +316,8 @@ where
     }
     let scope = config.scope.clone();
     let retry_limit = config.retry_limit;
+    let retry_backoff_base = config.retry_backoff;
+    let retry_backoff_max = config.retry_backoff_max;
     let replies: Arc<Mutex<BTreeMap<String, DelegationResult>>> = Arc::default();
     let assignments: Arc<Mutex<BTreeMap<String, String>>> = Arc::default();
     let attempts: Arc<Mutex<BTreeMap<String, Vec<RemoteAttempt>>>> = Arc::default();
@@ -344,7 +365,14 @@ where
                             map.insert(task_id.clone(), reply.result.clone());
                         }
                         let status = reply.result.status.clone();
-                        record_attempt(&attempts, &task_id, &node_id, &status);
+                        record_attempt(
+                            &attempts,
+                            &task_id,
+                            &node_id,
+                            &status,
+                            reply.model.clone(),
+                            reply.usage,
+                        );
                         if reply.lease_lost {
                             // 同一任务已被其他持有者接管：节点健康，任务等待新持有者。
                             lease.finish(NodeOutcome::Superseded);
@@ -395,7 +423,7 @@ where
                         let status = DelegationStatus::Failed {
                             message: error.to_string(),
                         };
-                        record_attempt(&attempts, &task_id, &node_id, &status);
+                        record_attempt(&attempts, &task_id, &node_id, &status, None, None);
                         if cancel.is_cancelled() {
                             lease.finish(NodeOutcome::Abandoned);
                             return Err("remote plan cancelled".into());
@@ -412,6 +440,10 @@ where
                     return Err(last_error.unwrap_or_else(|| "remote node failed".into()));
                 }
                 retries_used += 1;
+                let backoff = retry_backoff(retries_used, retry_backoff_base, retry_backoff_max);
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
             }
         }
     };
@@ -780,6 +812,13 @@ pub fn spawn_remote_health_flusher(
 }
 
 fn load_remote_health_file(path: &Path) -> Result<Vec<NodeSnapshot>, AgentError> {
+    const MAX_HEALTH_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_HEALTH_FILE_BYTES) {
+        return Err(AgentError::Io(format!(
+            "health file too large: {}",
+            path.display()
+        )));
+    }
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|error| {
             AgentError::Io(format!("parse health file {}: {error}", path.display()))
@@ -856,6 +895,12 @@ fn acquire_health_write_lock(path: &Path) -> Result<SingleInstanceLock, AgentErr
 
 /// 直接把给定快照写成健康文件；调用方负责持有写锁与合并旧条目。
 fn write_health_file(path: &Path, nodes: &[NodeSnapshot]) -> Result<(), AgentError> {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(AgentError::Io(format!(
+            "refusing symlink health file {}",
+            path.display()
+        )));
+    }
     let text = serde_json::to_string_pretty(nodes)
         .map_err(|error| AgentError::Io(format!("encode health file: {error}")))?;
     if let Some(parent) = path.parent()
@@ -993,11 +1038,23 @@ fn spawn_health_monitor(
 }
 
 /// 追加一条尝试记录。
+/// 第 `attempt` 次重试前的等待：base * 2^(attempt-1)，封顶 max。
+fn retry_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = attempt.saturating_sub(1).min(10);
+    let factor = 1u32 << shift;
+    base.saturating_mul(factor).min(max)
+}
+
 fn record_attempt(
     attempts: &Mutex<BTreeMap<String, Vec<RemoteAttempt>>>,
     task: &str,
     node: &str,
     status: &DelegationStatus,
+    model: Option<String>,
+    usage: Option<trit_orch::SubagentUsage>,
 ) {
     if let Ok(mut map) = attempts.lock() {
         map.entry(task.to_string())
@@ -1005,6 +1062,24 @@ fn record_attempt(
             .push(RemoteAttempt {
                 node: node.to_string(),
                 status: status.clone(),
+                model,
+                usage,
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_backoff_grows_and_caps() {
+        let base = Duration::from_millis(10);
+        let max = Duration::from_millis(50);
+        assert_eq!(retry_backoff(1, base, max), Duration::from_millis(10));
+        assert_eq!(retry_backoff(2, base, max), Duration::from_millis(20));
+        assert_eq!(retry_backoff(3, base, max), Duration::from_millis(40));
+        assert_eq!(retry_backoff(4, base, max), Duration::from_millis(50));
+        assert_eq!(retry_backoff(10, Duration::ZERO, max), Duration::ZERO);
     }
 }

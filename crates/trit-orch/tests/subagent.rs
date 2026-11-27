@@ -51,6 +51,9 @@ fn response(task: &str, epoch: u64, status: DelegationStatus) -> SubagentRespons
         status,
         content: b"done".to_vec(),
         tokens: 5,
+        model: None,
+        usage: None,
+        dissent: None,
     }
 }
 

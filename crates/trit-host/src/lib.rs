@@ -257,6 +257,15 @@ pub struct PrefixSignal {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnStepRecord {
+    pub step: usize,
+    /// 该步提出过的工具调用，按提出顺序。
+    pub requests: Vec<ToolRequest>,
+    /// 该步是否已声明完成（`CompletionClaimed`）。
+    pub claimed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnContext {
     pub task: String,
@@ -267,6 +276,8 @@ pub struct TurnContext {
     pub digest: Option<String>,
     /// 当前 append-only 投影的模型可见视图。
     pub projection: Option<crate::context_projection::ProjectionView>,
+    /// 崩溃续跑时回放的本 turn 早期步骤；新 turn 为空。
+    pub history: Vec<TurnStepRecord>,
 }
 
 pub trait Model {
@@ -290,6 +301,14 @@ impl<T: Model + ?Sized> Model for Box<T> {
 pub trait ToolExecutor {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError>;
 
+    /// 批量执行；默认逐条串行。实现可对无副作用的只读工具并行。
+    fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
+        requests
+            .iter()
+            .map(|request| self.execute(request))
+            .collect()
+    }
+
     /// 新一轮开始；检查点/审计工具可在这里准备状态。
     fn begin_turn(&mut self, _turn: usize, _objective: &str) -> Result<(), AgentError> {
         Ok(())
@@ -304,6 +323,10 @@ pub trait ToolExecutor {
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Box<T> {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
         (**self).execute(request)
+    }
+
+    fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
+        (**self).execute_batch(requests)
     }
 
     fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
@@ -359,11 +382,51 @@ impl ToolExecutor for ScriptedTools {
     }
 }
 
+/// 给模型的校验摘要：本 turn 已执行哪些命令、重复了多少次。
+///
+/// 这是"训练信号"：让模型看到自己在重复校验，从而减少无意义的重复执行。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationSignal {
+    pub calls: usize,
+    pub unique: usize,
+    pub repeated: usize,
+    /// 去重后的命令（最多 8 条），供模型判断哪些已经跑过。
+    pub commands: Vec<String>,
+}
+
+impl VerificationSignal {
+    /// 从回执里提炼；没有任何命令时返回 `None`（不注入空信号）。
+    pub fn from_receipts(receipts: &[ToolOutcome]) -> Option<Self> {
+        let mut unique: Vec<String> = Vec::new();
+        let mut calls = 0usize;
+        for outcome in receipts {
+            let Some(command) = outcome.command.as_deref() else {
+                continue;
+            };
+            calls += 1;
+            if !unique.iter().any(|seen| seen == command) {
+                unique.push(command.to_owned());
+            }
+        }
+        if calls == 0 {
+            return None;
+        }
+        let unique_count = unique.len();
+        unique.truncate(8);
+        Some(Self {
+            calls,
+            unique: unique_count,
+            repeated: calls.saturating_sub(unique_count),
+            commands: unique,
+        })
+    }
+}
+
 /// 单轮次工作效率指标：只描述这一轮实际发生了什么，不参与完成裁决。
 ///
 /// 比率统一用 basis point（万分之一，`10000` = 100%），避免浮点比较；
 /// 分母为 0 时对应字段为 `None`，不伪造 0% 或 100%。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnMetrics {
     /// 实际用掉的模型回合数（每个 step 一次 proposal）。
     pub steps: usize,
@@ -389,8 +452,20 @@ pub struct TurnMetrics {
     pub tokens_total: u64,
     /// 总 token / steps；成功结束的轮次至少 1 step。
     pub tokens_per_step: u64,
+    /// 总 token / 墙钟秒；耗时不足 1µs 时为 None。
+    #[serde(default)]
+    pub tokens_per_second: Option<f64>,
     /// provider 未给精确用量时为 true；此时 token 指标只作估算。
     pub tokens_estimated: bool,
+    /// 本 turn 执行过的命令数（带 `command` 的回执）。
+    #[serde(default)]
+    pub verification_calls: usize,
+    /// 去重后的命令数。
+    #[serde(default)]
+    pub unique_verifications: usize,
+    /// 重复执行的命令数（`verification_calls - unique_verifications`）。
+    #[serde(default)]
+    pub repeated_verifications: usize,
     /// 从进入 turn 到完成裁决的墙钟耗时。
     pub elapsed_ms: u64,
     /// 完成裁决是否通过。
@@ -416,11 +491,22 @@ impl TurnMetrics {
             .filter(|outcome| !outcome.passed && !outcome.in_doubt)
             .count();
         let in_doubt_tools = receipts.iter().filter(|outcome| outcome.in_doubt).count();
+        // 校验次数：带命令的回执按命令去重，差额就是重复校验。
+        let commands: Vec<&str> = receipts
+            .iter()
+            .filter_map(|outcome| outcome.command.as_deref())
+            .collect();
+        let verification_calls = commands.len();
+        let unique_verifications = commands.iter().copied().collect::<BTreeSet<&str>>().len();
+        let repeated_verifications = verification_calls.saturating_sub(unique_verifications);
         let tokens_total = usage
             .fresh
             .saturating_add(usage.cached)
             .saturating_add(usage.output);
         let input_tokens = usage.fresh.saturating_add(usage.cached);
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let tokens_per_second = (elapsed.as_micros() > 0)
+            .then(|| tokens_total as f64 / elapsed.as_secs_f64().max(1e-6));
         Self {
             steps,
             max_steps,
@@ -434,8 +520,12 @@ impl TurnMetrics {
             cache_hit_bp: ratio_bp(usage.cached, input_tokens),
             tokens_total,
             tokens_per_step: tokens_total / steps.max(1) as u64,
+            tokens_per_second,
             tokens_estimated: usage.estimated,
-            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            verification_calls,
+            unique_verifications,
+            repeated_verifications,
+            elapsed_ms,
             completed,
         }
     }
@@ -448,7 +538,7 @@ fn ratio_bp(numerator: u64, denominator: u64) -> Option<u32> {
     Some(((numerator as u128 * 10_000) / denominator as u128).min(10_000) as u32)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnOutcome {
     pub task: String,
     pub steps: usize,
@@ -695,7 +785,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
     }
 
     pub fn run_turn(&mut self, turn: &TurnSpec) -> Result<TurnOutcome, AgentError> {
-        self.run_turn_inner(turn, None)
+        self.run_turn_inner(turn, None, None)
     }
 
     pub fn run_turn_with_session(
@@ -703,15 +793,98 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         turn: &TurnSpec,
         session: &mut SessionLog,
     ) -> Result<TurnOutcome, AgentError> {
-        self.run_turn_inner(turn, Some(session))
+        self.run_turn_inner(turn, Some(session), None)
+    }
+
+    /// 从崩溃点续跑：注入 `resume` 里的确定事实，从断点 step 继续。
+    ///
+    /// 恢复语义刻意保守：只有拿到确定回执的请求按原样计入证据；发出但没有
+    /// 回执的请求补记为 `in_doubt`，既不当作成功也不重跑，由模型在重跑的那
+    /// 一步决定是否重试。
+    pub fn run_turn_resume_with_session(
+        &mut self,
+        turn: &TurnSpec,
+        session: &mut SessionLog,
+        resume: crate::session::TurnResume,
+    ) -> Result<TurnOutcome, AgentError> {
+        self.run_turn_inner(turn, Some(session), Some(resume))
     }
 
     fn run_turn_inner(
         &mut self,
         turn: &TurnSpec,
         mut session: Option<&mut SessionLog>,
+        resume: Option<crate::session::TurnResume>,
     ) -> Result<TurnOutcome, AgentError> {
         let started = Instant::now();
+        let mut ledger = Ledger::new();
+        let mut receipts: Vec<ToolOutcome> = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut start_step = 0usize;
+        let mut history: Vec<TurnStepRecord> = Vec::new();
+        let resumed = resume.is_some();
+        match resume {
+            Some(resume) => {
+                if resume.task != turn.task {
+                    return Err(AgentError::SessionState(format!(
+                        "resume task {} does not match turn {}",
+                        resume.task, turn.task
+                    )));
+                }
+                // 投影整体替换为日志重放结果：它已包含前面所有 turn 的历史，
+                // 且 visible_start 正落在该 turn 的起点上，不能再 `begin_turn`。
+                self.context_projection = resume.projection.clone();
+                self.receipt_epochs = self
+                    .context_projection
+                    .canonical()
+                    .iter()
+                    .map(|entry| (entry.call_id.clone(), entry.epoch))
+                    .collect();
+                self.last_prefix_fingerprint = None;
+                receipts = resume.receipts();
+                usage = resume.usage;
+                start_step = resume.next_step;
+                history = resume.history.clone();
+                for request in resume.unsettled() {
+                    let outcome = ToolOutcome {
+                        call_id: request.call_id.clone(),
+                        tool: request.tool.clone(),
+                        command: request.command.clone(),
+                        passed: false,
+                        assertions: 0,
+                        written_paths: Vec::new(),
+                        in_doubt: true,
+                        output: "resumed after crash: outcome unknown".into(),
+                    };
+                    log_session(
+                        &mut session,
+                        SessionEvent::ToolCompleted {
+                            step: resume.step,
+                            outcome: outcome.clone(),
+                        },
+                    )?;
+                    self.context_projection.append(resume.step, &outcome);
+                    receipts.push(outcome);
+                }
+                for request in &resume.requests {
+                    let Some(effect) = request.host_call(&turn.task).effect_spec() else {
+                        continue;
+                    };
+                    let attempt = ledger.prepare(&turn.task, 0, &effect.operation, 1)?;
+                    ledger.mark_sending(&attempt, 1)?;
+                    match resume.outcomes.get(&request.call_id) {
+                        Some(outcome) if !outcome.in_doubt => {
+                            ledger.record_result(&attempt, outcome.passed)?;
+                        }
+                        _ => ledger.mark_unknown(&attempt)?,
+                    }
+                }
+            }
+            None => {
+                self.context_projection.begin_turn();
+                self.receipt_epochs.clear();
+            }
+        }
         let mut spec = turn.task_spec();
         spec.epoch = self.context_projection.epoch();
         let task_epoch = spec.epoch;
@@ -753,30 +926,28 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 task: turn.task.clone(),
             })?;
 
-        log_session(
-            &mut session,
-            SessionEvent::TurnStarted {
-                task: turn.task.clone(),
-                objective: turn.objective.clone(),
-                max_steps: self.max_steps,
-            },
-        )?;
-        self.context_projection.begin_turn();
-        self.receipt_epochs.clear();
-        let mut ledger = Ledger::new();
-        let mut receipts = Vec::new();
-        let mut usage = TokenUsage::default();
+        if !resumed {
+            log_session(
+                &mut session,
+                SessionEvent::TurnStarted {
+                    task: turn.task.clone(),
+                    objective: turn.objective.clone(),
+                    max_steps: self.max_steps,
+                },
+            )?;
+        }
         let mut rebasis: Vec<AdmissionObligation> = Vec::new();
         let mut context = TurnContext {
             task: turn.task.clone(),
-            step: 0,
+            step: start_step,
             usage,
             receipts: Vec::new(),
             digest: None,
             projection: None,
+            history,
         };
 
-        for step in 0..self.max_steps {
+        for step in start_step..self.max_steps {
             context.step = step;
             context.usage = usage;
             let compacted = compact_receipts(&receipts, &self.context);
@@ -926,7 +1097,21 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 return Err(AgentError::EmptyProposal);
             }
 
-            for request in &proposal.tool_calls {
+            let parallel_batch = proposal.tool_calls.len() > 1
+                && proposal
+                    .tool_calls
+                    .iter()
+                    .all(|request| crate::tools::is_parallel_tool(&request.tool));
+            let mut batched = if parallel_batch {
+                self.tools
+                    .execute_batch(&proposal.tool_calls)
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for (index, request) in proposal.tool_calls.iter().enumerate() {
                 log_session(
                     &mut session,
                     SessionEvent::ToolRequested {
@@ -964,7 +1149,14 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     }
                     None => None,
                 };
-                let outcome = self.tools.execute(request)?;
+                let outcome = if parallel_batch {
+                    match batched.get_mut(index).and_then(Option::take) {
+                        Some(outcome) => outcome,
+                        None => self.tools.execute(request),
+                    }
+                } else {
+                    self.tools.execute(request)
+                }?;
                 if outcome.call_id != request.call_id {
                     return Err(AgentError::ToolMismatch {
                         expected: request.call_id.clone(),
@@ -1341,6 +1533,22 @@ pub struct HeadlessConfig {
     pub context: ContextPolicy,
     /// 可选的写入守卫（路径 claim + 跨进程租约）。
     pub write_guard: Option<crate::permissions::WriteGuard>,
+    /// 续跑：session 里最后一个 turn 未收尾时，从它的中间状态继续，而不是新起 turn。
+    #[doc(hidden)]
+    pub resume: bool,
+}
+
+impl HeadlessConfig {
+    pub fn new(workspace: crate::tools::WorkspaceConfig) -> Self {
+        Self {
+            workspace,
+            max_steps: 8,
+            session: None,
+            context: ContextPolicy::default(),
+            write_guard: None,
+            resume: false,
+        }
+    }
 }
 
 /// 无头运行：本地工具 + 模型提议 + 内核裁决。
@@ -1358,6 +1566,12 @@ pub fn run_headless<M: Model>(
         .with_write_claim(claim);
     if let Some(path) = config.session {
         let mut log = SessionLog::open(path)?;
+        if config.resume
+            && let Some(resume) = crate::session::resume_turn(&log.load()?)?
+            && resume.task == turn.task
+        {
+            return host.run_turn_resume_with_session(&turn, &mut log, resume);
+        }
         host.run_turn_with_session(&turn, &mut log)
     } else {
         host.run_turn(&turn)
@@ -1367,13 +1581,19 @@ pub fn run_headless<M: Model>(
 #[cfg(windows)]
 pub mod appcontainer;
 mod auth;
+pub mod background;
+pub mod browser;
+mod cancel_guard;
 pub mod checkpoint;
 pub mod child_env;
+pub mod concurrency_limit;
 mod connection_limit;
 pub mod context;
 pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
+pub mod cost;
+pub mod design_score;
 pub mod diagnostics;
 pub mod extensions;
 pub mod fleet_runner;
@@ -1383,6 +1603,8 @@ mod http_read;
 pub mod journal;
 pub mod jsonl_layout;
 pub mod lease;
+pub mod lint_score;
+pub mod mcp_http;
 pub mod mcp_tools;
 pub mod memory;
 pub mod openai;
@@ -1390,6 +1612,7 @@ pub mod permissions;
 pub mod plan_exec;
 pub mod planner;
 pub mod port_bridge;
+pub mod protocol;
 pub mod provider;
 pub mod provider_health;
 pub mod provider_stream;
@@ -1399,16 +1622,30 @@ pub mod remote_ledger;
 pub mod remote_serve;
 pub mod remote_subagent;
 pub mod sampling;
+pub mod scoring;
 pub mod separation;
 pub mod serve;
 pub mod session;
+pub mod session_advance;
+pub mod session_callback;
+pub mod session_dispatch;
+pub mod session_fleet;
+pub mod session_fleet_remote;
+pub mod session_fleet_run;
 pub mod session_index;
 pub mod session_migration;
+pub mod session_plan;
+pub mod session_run;
+pub mod session_scan;
+pub mod session_verify;
+pub mod settings;
 pub mod state_layer;
+pub mod subagent_cli;
 pub mod subagent_process;
 pub mod supervisor;
+pub mod tech_stack;
 pub mod tools;
-pub use trit_orch::SelectionPressure;
+pub use trit_orch::{RemoteNode, SelectionPressure};
 
 pub use checkpoint::{
     CHECKPOINT_SCHEMA, Checkpoint, CheckpointRecorder, CheckpointStore, CheckpointingTools,
@@ -1435,9 +1672,14 @@ pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
 };
+pub use design_score::{
+    Artifact, DesignAxis, DesignAxisScore, DesignFinding, DesignReport, render_design_markdown,
+    score_artifacts, score_written_paths,
+};
 pub use diagnostics::{
-    DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions,
-    ProjectionDiagnostics, SessionDiagnostics, TOOL_CAPABILITIES, ToolCapability, diagnose,
+    DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions, LiveMcpDiagnostics,
+    LiveMcpProbe, ProjectionDiagnostics, SessionDiagnostics, TOOL_CAPABILITIES, ToolCapability,
+    diagnose, live_mcp_diagnostics, redact_line,
 };
 pub use extensions::{
     CommandRegistry, CommandSpec, HookEvent, HookRegistry, HookSpec, ParsedCommand, SkillIndex,
@@ -1471,6 +1713,7 @@ pub use plan_exec::{
 };
 pub use planner::{PlanCollectingTools, plan_from_capture, planner_catalog_specs, planner_tools};
 pub use port_bridge::{PortBridge, PortBridgeSpec};
+pub use protocol::{Protocol, ProtocolStream};
 pub use provider::{
     ContextPlanner, Provider, ProviderModel, ProviderRequest, ProviderResponse, ScriptedProvider,
     ToolCatalog, ToolSpec, default_tools,
@@ -1504,6 +1747,7 @@ pub use remote_subagent::{
     validate_idempotency_scope,
 };
 pub use sampling::OpenAiSamplingHandler;
+pub use scoring::{BLOCK_THRESHOLD, Surface, SurfaceScore, score_turn};
 pub use separation::{
     PLAN_TOOL, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
     plan_handoff_from_proposal, planner_tool_specs,
@@ -1511,7 +1755,28 @@ pub use separation::{
 pub use serve::{Route, ServeConfig, ServeError, ServeHeaders, authorize, route};
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
-    SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
+    SessionRecord, SessionState, TurnRecord, TurnResume, recover, recovery_context_for_session,
+    resume_turn,
+};
+pub use session_advance::{
+    AdvanceOptions, AdvanceReport, SESSION_ADVANCE_SCHEMA, advance, plan_from_scan,
+};
+pub use session_callback::{
+    CallbackItem, CallbackOptions, CallbackReport, CallbackStatus, DELEGATIONS_FILE,
+    DelegationResult, SESSION_CALLBACK_SCHEMA, callback_sessions,
+};
+pub use session_dispatch::{
+    AutoDispatchOptions, DispatchAction, DispatchItem, DispatchOptions, DispatchReport,
+    SESSION_DISPATCH_SCHEMA, auto_dispatch, dispatch_sessions,
+};
+pub use session_fleet::{
+    FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, apply_budget, plan_fleet,
+};
+pub use session_fleet_remote::{
+    RemoteFleetOptions, RemoteFleetOutcome, SESSION_FLEET_REMOTE_SCHEMA, run_remote_fleet,
+};
+pub use session_fleet_run::{
+    FleetRunOptions, FleetRunOutcome, SESSION_FLEET_RUN_SCHEMA, build_plan, execute_fleet,
 };
 pub use session_index::{INDEX_SCHEMA, IndexSummary, RebuildReport, SessionIndex, VerifyReport};
 pub use session_migration::{
@@ -1519,10 +1784,23 @@ pub use session_migration::{
     MigrationPolicy, MigrationReport, MigrationTarget, SESSION_MIGRATION_SCHEMA,
     SessionMigrationBundle, SessionRole, plan_migration,
 };
+pub use session_plan::{
+    SESSION_PLAN_SCHEMA, SessionAction, SessionPlanItem, SessionPlanReport, plan_sessions,
+};
+pub use session_run::{ResumeSpec, read_resume_spec, resume_command, resume_target};
+pub use session_scan::{
+    LinkKind, SESSION_SCAN_SCHEMA, SessionEntry, SessionFormat, SessionGate, SessionLink,
+    SessionMeta, SessionScanReport, SessionTask, scan_sessions, scan_sessions_cached,
+    scan_sessions_roots, scan_sessions_roots_cached,
+};
+pub use session_verify::{
+    CallbackVerifyReport, CheckVerdict, DelegationCheck, SESSION_VERIFY_SCHEMA, verify_callbacks,
+};
 pub use state_layer::{
     AgentState, CompactionState, InProgressState, StateIssue, StateIssueCode, StateIssueSeverity,
     StateLayer, StateValidation, state_layer,
 };
+pub use subagent_cli::{CLI_AGENTS, CliAgentRun, CliAgentSpec, parse_cli_output, run_cli_agent};
 pub use subagent_process::{
     SubagentProcessConfig, SubagentReply, run_subagent, run_subagent_reply,
     run_subagent_reply_cancellable,

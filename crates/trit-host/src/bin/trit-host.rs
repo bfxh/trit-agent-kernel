@@ -11,9 +11,9 @@ use trit_host::{
     ContextPolicy, ContextRequest, ExecutorSetup, GitCheckpointStore, GitCheckpointingTools,
     HeadlessConfig, InMemoryContext, LowHitPolicy, McpToolExecutor, Model, ModelProfile,
     MutationJournal, OpenAiConfig, OpenAiProvider, OpenAiSamplingHandler, OperationLease,
-    PlanExecuteConfig, Proposal, ProviderModel, ReasoningEffort, RecoveryContext, ResolvedContext,
-    RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure, Session,
-    SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, ToolSpec, WriteClaim,
+    PlanExecuteConfig, Proposal, Protocol, ProviderModel, ReasoningEffort, RecoveryContext,
+    ResolvedContext, RewindScope, SamplingHandler, ScriptedModel, SearchOrder, SelectionPressure,
+    Session, SupervisorConfig, SupervisorRuntime, ToolCatalog, ToolExecutor, ToolSpec, WriteClaim,
     WriteGuard, default_tools, planner_catalog_specs, recovery_context_for_session,
     rewind_session_git_with_policy, rewind_session_with_policy, run_headless,
     run_plan_then_execute_with,
@@ -32,6 +32,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    trit_host::concurrency_limit::configure_from_env();
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
     if command.is_empty() || command == "--help" || command == "-h" {
@@ -47,8 +48,47 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-index" {
         return run_session_index(args);
     }
+    if command == "session-scan" {
+        return run_session_scan(args);
+    }
+    if command == "session-plan" {
+        return run_session_plan(args);
+    }
+    if command == "session-dispatch" {
+        return run_session_dispatch(args);
+    }
+    if command == "session-auto" {
+        return run_session_auto(args);
+    }
+    if command == "session-advance" {
+        return run_session_advance(args);
+    }
+    if command == "session-callback" {
+        return run_session_callback(args);
+    }
+    if command == "session-run" {
+        return run_session_run(args);
+    }
+    if command == "session-callback-verify" {
+        return run_session_callback_verify(args);
+    }
+    if command == "session-fleet" {
+        return run_session_fleet(args);
+    }
+    if command == "session-fleet-run" {
+        return run_session_fleet_run(args);
+    }
+    if command == "session-fleet-remote" {
+        return run_session_fleet_remote(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
+    }
+    if command == "tools" {
+        return run_tools(args);
+    }
+    if command == "settings" {
+        return run_settings(args);
     }
     if command == "journal-status" {
         return run_journal_status(args);
@@ -67,6 +107,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if command == "subagent-run" {
         return run_subagent_run(args);
+    }
+    if command == "subagent-fanout" {
+        return run_subagent_fanout(args);
     }
     if command == "plan-exec" {
         return run_plan_exec(args);
@@ -113,6 +156,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut allow_shell = false;
     let mut session = None;
     let mut provider = "scripted".to_owned();
+    let mut protocol_arg: Option<String> = None;
     let mut sandbox: Option<PathBuf> = None;
     let mut sandbox_args: Vec<String> = Vec::new();
     let mut allow_unsandboxed_shell = false;
@@ -150,6 +194,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut mcp_sampling_model: Option<String> = None;
     // 人类面默认输出 Markdown；需要机器消费时显式 `--output-format json`。
     let mut output_format = String::from("md");
+    let mut design_score_enabled = true;
+    let mut design_block_below: Option<u8> = None;
+    let mut lint_score_enabled: bool = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -192,10 +239,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--allow-shell" => allow_shell = true,
             "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
             "--provider" => provider = next(&mut args, "--provider")?,
+            "--protocol" => protocol_arg = Some(next(&mut args, "--protocol")?),
             "--sandbox" => sandbox = Some(PathBuf::from(next(&mut args, "--sandbox")?)),
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
+            "--no-design-score" => design_score_enabled = false,
+            "--lint-score" => lint_score_enabled = true,
+            "--design-block-below" => {
+                design_block_below = Some(
+                    next(&mut args, "--design-block-below")?
+                        .parse()
+                        .map_err(|error| fail(format!("bad --design-block-below: {error}")))?,
+                );
+            }
             "--output-format" => {
                 output_format = match next(&mut args, "--output-format")?.as_str() {
                     "md" | "markdown" => "md".into(),
@@ -360,14 +417,26 @@ fn run() -> Result<(), Box<dyn Error>> {
     if checkpoint_backend == "git" && checkpoint_dir.is_none() {
         return Err(fail("--checkpoint-backend git requires --checkpoint-dir"));
     }
-    if context_catalog.is_some() && provider != "openai" {
-        return Err(fail("--context-catalog requires --provider openai"));
+    if protocol_arg.is_some() && provider == "scripted" {
+        return Err(fail("--protocol requires a non-scripted --provider"));
+    }
+    let protocol = match protocol_arg.as_deref() {
+        Some(name) => Protocol::parse(name).map_err(|error| fail(error.to_string()))?,
+        None => match provider.as_str() {
+            "anthropic" => Protocol::AnthropicMessages,
+            "gemini" => Protocol::GeminiGenerateContent,
+            "deepseek" => Protocol::DeepSeekChat,
+            _ => Protocol::OpenAiChat,
+        },
+    };
+    if context_catalog.is_some() && provider == "scripted" {
+        return Err(fail("--context-catalog requires a real provider"));
     }
     if mcp_sampling_model.is_some() && !mcp_sampling {
         return Err(fail("--mcp-sampling-model requires --mcp-sampling"));
     }
-    if mcp_sampling && provider != "openai" {
-        return Err(fail("--mcp-sampling requires --provider openai"));
+    if mcp_sampling && provider == "scripted" {
+        return Err(fail("--mcp-sampling requires a real provider"));
     }
     if handoff_packet.is_none() && !handoff_state_hash.trim().is_empty() {
         return Err(fail("--handoff-state-hash requires --handoff-packet"));
@@ -564,6 +633,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         session,
         context,
         write_guard: None,
+        resume,
     };
     let scripted = match provider.as_str() {
         "scripted" => {
@@ -578,23 +648,25 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .map_err(|error| fail(format!("parse script: {error}")))?,
             )
         }
-        "openai" => {
+        "openai" | "anthropic" | "gemini" | "deepseek" => {
             if script.is_some() {
-                return Err(fail("--script is not used with --provider openai"));
+                return Err(fail(format!(
+                    "--script is not used with --provider {provider}"
+                )));
             }
             None
         }
         other => return Err(fail(format!("unknown provider: {other}"))),
     };
-    let openai_config = if provider == "openai" {
-        Some(OpenAiConfig::from_env()?)
-    } else {
+    let openai_config = if provider == "scripted" {
         None
+    } else {
+        Some(OpenAiConfig::from_env_for(protocol)?)
     };
     let sampling_handler: Option<Arc<dyn SamplingHandler>> = if mcp_sampling {
         let config = openai_config
             .as_ref()
-            .ok_or_else(|| fail("--mcp-sampling requires --provider openai"))?;
+            .ok_or_else(|| fail("--mcp-sampling requires a real provider"))?;
         let mut sampling_config = config.clone();
         if sampling_config.max_output_tokens.is_none() {
             sampling_config.max_output_tokens = Some(model_max_output);
@@ -611,7 +683,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(path) => {
             let config = openai_config
                 .as_ref()
-                .ok_or_else(|| fail("--context-catalog requires --provider openai"))?;
+                .ok_or_else(|| fail("--context-catalog requires a real provider"))?;
             let catalog = load_context_catalog(path)?;
             let project = context_project
                 .clone()
@@ -854,13 +926,53 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         eprintln!("cache ledger: {text}");
     }
+    let host_settings =
+        trit_host::settings::load(&workspace_root).map_err(|error| fail(error.to_string()))?;
+    // 设置里打开"参与决策"时用设置里的阈值；命令行显式参数优先。
+    let design_block_below = design_block_below.or_else(|| {
+        host_settings
+            .scoring
+            .participate_in_decision
+            .then_some(host_settings.scoring.design_block_below)
+    });
+    let mut design = design_score_enabled
+        .then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
+    // 显式开启才跑外部 lint；工具不存在/失败/超时都只是跳过，不影响主流程。
+    let lint = if lint_score_enabled {
+        trit_host::lint_score::run(&workspace_root, std::time::Duration::from_secs(120)).ok()
+    } else {
+        None
+    };
+    if let (Some(design), Some(lint)) = (design.as_mut(), lint.as_ref()) {
+        trit_host::lint_score::apply(design, lint);
+    }
     let mut stdout = std::io::stdout().lock();
     let rendered = if output_format == "json" {
-        serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
+        let mut value = serde_json::to_value(&outcome).map_err(|error| fail(error.to_string()))?;
+        if let Some(design) = &design {
+            value["design"] =
+                serde_json::to_value(design).map_err(|error| fail(error.to_string()))?;
+        }
+        if let Some(lint) = &lint {
+            value["lint"] = serde_json::to_value(lint).map_err(|error| fail(error.to_string()))?;
+        }
+        serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
     } else {
-        outcome.render_markdown()
+        let mut text = outcome.render_markdown();
+        if let Some(design) = &design {
+            text.push_str(&trit_host::render_design_markdown(design));
+        }
+        text
     };
     writeln!(stdout, "{rendered}")?;
+    if let (Some(design), Some(threshold)) = (&design, design_block_below)
+        && design.overall < threshold
+    {
+        return Err(fail(format!(
+            "design score {} below --design-block-below {threshold}",
+            design.overall
+        )));
+    }
     if gate_chain_post || gate_chain_post_report.is_some() {
         let mut exclude: Vec<&Path> = Vec::new();
         if let Some(path) = gate_chain_report.as_deref() {
@@ -913,6 +1025,19 @@ struct CacheOptions {
     pressure: CachePressurePolicy,
 }
 
+/// 校验信号开关：`TRIT_VERIFICATION_SIGNALS=0|false|off|no` 关闭，其余开启。
+///
+/// 关闭后既不统计校验次数，也不向模型注入重复校验提示。
+fn verification_signals_enabled() -> bool {
+    match std::env::var("TRIT_VERIFICATION_SIGNALS") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 fn build_model(
     scripted: Option<Vec<Proposal>>,
     config: Option<&OpenAiConfig>,
@@ -924,8 +1049,9 @@ fn build_model(
     if let Some(proposals) = scripted {
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
-    let config = config.ok_or_else(|| fail("--provider openai requires OPENAI_* env"))?;
-    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), default_tools());
+    let config = config.ok_or_else(|| fail("--provider requires a configured provider"))?;
+    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), default_tools())
+        .with_verification_signals(verification_signals_enabled());
     if let Some(catalog) = tool_catalog {
         model = model.with_tool_catalog(catalog);
     }
@@ -1290,8 +1416,9 @@ fn usage() {
          [--alignment-changed <path>] [--alignment-changed-set] \\\n    \
          [--alignment-no-git-changed] [--gate-chain-post] \\\n    \
          [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
-         [--provider scripted|openai] [--script <proposals.json>] \\\n    \
+         [--provider scripted|openai|anthropic|gemini|deepseek] [--protocol <name>] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
+         [--no-design-score] [--design-block-below N] [--lint-score] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
          [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \
@@ -1312,10 +1439,18 @@ fn usage() {
          --planner-script <proposals.json> --script <proposals.json> \\\n    \
          [--allow-write [--write-journal]] \\\n    \
          [--max-plan-steps N] [--max-exec-steps N] [--capsule-budget N] \\\n    \
-         [--output-format md|json]\n\n\
+         [--protocol <name>] [--output-format md|json]\n\n\
          scripted: deterministic replay from a JSON array of Proposal objects.\n\
          openai:   OpenAI-compatible /chat/completions; set OPENAI_API_KEY,\n\
          OPENAI_MODEL and optionally OPENAI_BASE_URL.\n\
+         anthropic: Anthropic Messages API; set ANTHROPIC_API_KEY / ANTHROPIC_MODEL\n\
+         (optionally ANTHROPIC_BASE_URL).\n\
+         gemini:   Gemini generateContent; set GEMINI_API_KEY / GEMINI_MODEL\n\
+         (optionally GEMINI_BASE_URL).\n\
+         deepseek: DeepSeek OpenAI-compatible API; set DEEPSEEK_API_KEY / DEEPSEEK_MODEL\n\
+         (optionally DEEPSEEK_BASE_URL).\n\
+         --protocol overrides the protocol otherwise inferred from --provider;\n\
+         TRIT_PROTOCOL / TRIT_API_KEY / TRIT_MODEL / TRIT_BASE_URL work for any protocol.\n\
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
          --output-format: md (default) renders a Markdown turn report; json keeps TurnOutcome.\n\
          --repo-identity: fail closed unless .agent/repo.json is valid; --repo-expected\n\
@@ -1358,6 +1493,8 @@ fn usage() {
          recovery. --mcp-sampling serves sampling/createMessage with the OpenAI-compatible\n\
          provider (optionally --mcp-sampling-model); roots_watch directories contribute\n\
          roots automatically and changes emit roots/list_changed.\n\n\
+         session commands accept repeated --root <dir>; multiple roots merge into one\n\
+         report (root = first, roots[] = all).\n\n\
          session-status: trit-host session-status --session <jsonl>\n\
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
          session-index: trit-host session-index --session <jsonl> --db <path>\n\
@@ -1365,6 +1502,56 @@ fn usage() {
          maintains the SQLite projection of a session log; --rebuild deletes the old\n\
          projection and rebuilds it from JSONL, --verify rebuilds into a scratch db and\n\
          compares rows (exits 1 when the projection is missing or differs).\n\
+         session-scan: trit-host session-scan --root <dir> [--cache <path>] [--compact]\n\
+         scans session JSONL files under a directory and prints tasks, links and\n\
+         per-session health (open turns, corrupt lines, in-doubt tools, last gate).\n\
+         session-plan: trit-host session-plan --root <dir> [--cache <path>] [--compact]\n\
+         scans sessions and prints a deterministic resume/inspect/idle plan with\n\
+         links and unassigned parent ids.\n\
+         session-dispatch: trit-host session-dispatch --root <dir> [--apply] [--compact]\n\
+         dispatches resume items into new trit session files; dry-run by default,\n\
+         --apply writes one TurnStarted per item and never overwrites targets.\n\
+         session-auto: trit-host session-auto --root <dir> [--max-items N] [--cache <path>]\n\
+         [--apply] [--compact]\n\
+         scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
+         dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
+         session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
+         [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
+         [--workers N] [--max-concurrency N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
+         [--write-journal-rollback] [--resume] [--apply] [--compact]\n\
+         one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
+         by default; --apply uses the OpenAI-compatible provider from the environment.\n\
+         With --nodes, the fleet phase dispatches through the remote node table instead.\n\
+         session-callback: trit-host session-callback --root <dir> [--cache <path>]\n\
+         [--apply] [--compact]\n\
+         writes parent/child results into delegations.jsonl; dry-run by default,\n\
+         idempotent on child records+modified time, and never edits session logs.\n\
+         session-run: trit-host session-run --session <resume.jsonl> [--workspace <dir>]\n\
+         [--apply] [-- <run args>...]\n\
+         reads the dispatch ticket and prints the run command; --apply starts it and\n\
+         writes a new <resume>.run.jsonl instead of appending to the ticket.\n\
+         session-callback-verify: trit-host session-callback-verify --root <dir>\n\
+         [--cache <path>] [--compact]\n\
+         re-scans children and compares them with delegations.jsonl; reports ok, stale,\n\
+         mismatch, missing child or missing delegation without writing anything.\n\
+         session-fleet: trit-host session-fleet --root <dir> [--workers N] [--budget-tokens N]\n\
+         [--cache <path>] [--compact]\n\
+         turns resume items into a dependency-ordered task graph; prints workers and\n\
+         topological layers (cycles are reported separately, never scheduled).\n\
+         session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
+         [--max-concurrency N] [--workspace <dir>] [--max-steps N] [--retry N]\n\
+         [--budget-tokens N] [--budget-cny F] [--cache <path>] [--apply] [--compact]\n\
+         dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
+         OpenAI-compatible provider from the environment and stops starting after a failure.\n\
+         session-fleet-remote: trit-host session-fleet-remote --root <dir> --nodes <node-table.json>\n\
+         [--workers N] [--max-concurrency N] [--retry N] [--budget-tokens N] [--scope S] [--health-probe]\n\
+         [--cache <path>] [--apply] [--compact]\n\
+         dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
+         tools: trit-host tools [--mcp-config <json>] [--compact]\n\
+         lists built-in tools; with --mcp-config starts MCP servers and lists external tools\n\
+         (server/tool/description/read_only_hint) without entering the tool loop.\n\
+         settings: trit-host settings [--root <dir>] [--get KEY] [--set KEY=VALUE] [--compact]\n\
+         reads/writes <root>/.agent/settings.json; keys follow docs/FRONTEND-CONTRACT.md §10.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1394,7 +1581,8 @@ fn usage() {
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
          [--pending-ttl-ms N] [--max-entries N] [--max-state-bytes N] [--state <path>] \\\n\
-         [--max-connections N] [--request-read-timeout-ms N] [--once]\n\
+         [--max-connections N] [--request-read-timeout-ms N] [--token-budget N] \\\n\
+         [--cny-budget F] [--once]\n\
          shared idempotency ledger: POST /claim, /renew and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
@@ -1453,6 +1641,745 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     if blocked {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `session-fleet-run --root <dir> [--workers N] [--workspace <dir>] [--max-steps N] [--apply]`：
+/// dry-run 只打印计划；`--apply` 用环境里的 OpenAI 兼容 provider 执行。
+/// `session-fleet-remote --root <dir> --nodes <node-table.json> [...]`：
+/// 把 session-fleet 任务图按节点表跨机派发；默认 dry-run。
+fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut nodes_path: Option<PathBuf> = None;
+    let mut workers = 4usize;
+    let mut max_concurrency: Option<usize> = None;
+    let mut workers_given = false;
+    let mut retry_limit = 0u32;
+    let mut budget_tokens = 0u64;
+    let mut scope: Option<String> = None;
+    let mut health_probe = false;
+    let mut cache: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--nodes" => nodes_path = Some(PathBuf::from(next(&mut args, "--nodes")?)),
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+                workers_given = true;
+            }
+            "--max-concurrency" => {
+                max_concurrency = Some(
+                    next(&mut args, "--max-concurrency")?
+                        .parse()
+                        .map_err(|_| fail("--max-concurrency must be a positive integer"))?,
+                );
+            }
+            "--retry" => {
+                retry_limit = next(&mut args, "--retry")?
+                    .parse()
+                    .map_err(|_| fail("--retry must be a non-negative integer"))?;
+            }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+            }
+            "--scope" => scope = Some(next(&mut args, "--scope")?),
+            "--health-probe" => health_probe = true,
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!(
+                    "unknown session-fleet-remote argument: {other}"
+                )));
+            }
+        }
+    }
+    let nodes_path = nodes_path
+        .ok_or_else(|| fail("session-fleet-remote requires --nodes <node-table.json>"))?;
+    let text = std::fs::read_to_string(&nodes_path)?;
+    let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
+    let roots = expand_roots(roots);
+    let settings = trit_host::settings::load(&roots[0])?;
+    trit_host::cost::configure_rate(settings.cost.usd_cny);
+    if !workers_given && settings.concurrency.workers > 0 {
+        workers = settings.concurrency.workers as usize;
+    }
+    let cap = concurrency_cap(
+        max_concurrency
+            .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
+    );
+    if cap > 0 {
+        workers = workers.min(cap);
+    }
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    if budget_tokens > 0 {
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+    }
+    let outcome = trit_host::run_remote_fleet(
+        &fleet,
+        nodes,
+        &trit_host::RemoteFleetOptions {
+            workers,
+            retry_limit,
+            health_probe,
+            dry_run: !apply,
+            scope,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&outcome)
+    } else {
+        serde_json::to_string_pretty(&outcome)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut workers = 4usize;
+    let mut max_concurrency: Option<usize> = None;
+    let mut workers_given = false;
+    let mut budget_given = false;
+    let mut workspace: Option<PathBuf> = None;
+    let mut max_steps = 20usize;
+    let mut retries = 0usize;
+    let mut budget_tokens = 0u64;
+    let mut budget_usd = 0.0f64;
+    let mut cache: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+                workers_given = true;
+            }
+            "--max-concurrency" => {
+                max_concurrency = Some(
+                    next(&mut args, "--max-concurrency")?
+                        .parse()
+                        .map_err(|_| fail("--max-concurrency must be a positive integer"))?,
+                );
+            }
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--max-steps" => {
+                max_steps = next(&mut args, "--max-steps")?
+                    .parse()
+                    .map_err(|_| fail("--max-steps must be a positive integer"))?;
+            }
+            "--retry" => {
+                retries = next(&mut args, "--retry")?
+                    .parse()
+                    .map_err(|_| fail("--retry must be a non-negative integer"))?;
+            }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+                budget_given = true;
+            }
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--budget-usd" => {
+                budget_usd = next(&mut args, "--budget-usd")?
+                    .parse()
+                    .map_err(|_| fail("--budget-usd must be a non-negative number"))?;
+                if !budget_usd.is_finite() || budget_usd < 0.0 {
+                    return Err(fail("--budget-usd must be a non-negative number"));
+                }
+            }
+            "--budget-cny" => {
+                let cny: f64 = next(&mut args, "--budget-cny")?
+                    .parse()
+                    .map_err(|_| fail("--budget-cny must be a non-negative number"))?;
+                if !cny.is_finite() || cny < 0.0 {
+                    return Err(fail("--budget-cny must be a non-negative number"));
+                }
+                budget_usd = cny / trit_host::cost::usd_cny_rate();
+                budget_given = true;
+            }
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!("unknown session-fleet-run argument: {other}")));
+            }
+        }
+    }
+    let roots = expand_roots(roots);
+    let settings = trit_host::settings::load(&roots[0])?;
+    trit_host::cost::configure_rate(settings.cost.usd_cny);
+    if !workers_given && settings.concurrency.workers > 0 {
+        workers = settings.concurrency.workers as usize;
+    }
+    if !budget_given {
+        if settings.budget.tokens > 0 {
+            budget_tokens = settings.budget.tokens;
+        }
+        if settings.budget.cny > 0.0 {
+            budget_usd = settings.budget.cny / trit_host::cost::usd_cny_rate();
+        }
+    }
+    let cap = concurrency_cap(
+        max_concurrency
+            .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
+    );
+    if cap > 0 {
+        workers = workers.min(cap);
+    }
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    if budget_tokens > 0 {
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+    }
+    let workspace = workspace.unwrap_or_else(|| roots[0].clone());
+    if !apply {
+        let report = serde_json::json!({
+            "dry_run": true,
+            "workers": fleet.workers,
+            "workspace": workspace.display().to_string(),
+            "max_steps": max_steps,
+            "retry": retries,
+            "budget_tokens": budget_tokens,
+            "budget_usd": budget_usd,
+            "tasks": fleet.tasks,
+            "layers": fleet.layers,
+            "skipped": fleet.skipped,
+            "cyclic": fleet.cyclic,
+        });
+        let text = if compact {
+            serde_json::to_string(&report)
+        } else {
+            serde_json::to_string_pretty(&report)
+        }
+        .map_err(|error| fail(error.to_string()))?;
+        println!("{text}");
+        return Ok(());
+    }
+    let config = trit_host::OpenAiConfig::from_env()?;
+    let outcome = trit_host::execute_fleet(
+        &fleet,
+        &workspace,
+        &roots[0],
+        config,
+        trit_host::FleetRunOptions {
+            workers,
+            max_steps,
+            retries,
+            budget_usd,
+        },
+    )?;
+    // 执行会话已写 `<task>.jsonl.meta`（parent），扫描后自动回填结果侧车。
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let callbacks =
+        trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: false })?;
+    let verification = trit_host::verify_callbacks(&scanned)?;
+    let failed = outcome.failed.is_some();
+    let report = serde_json::json!({
+        "fleet": outcome,
+        "callbacks": callbacks,
+        "verification": verification,
+    });
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    if failed {
+        return Err(fail("fleet failed; see failed task above"));
+    }
+    Ok(())
+}
+
+/// `session-fleet --root <dir> [--workers N] [--compact]`：
+/// 生成 resume 项的分层任务图；只读，不启动模型。
+fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut workers = 4usize;
+    let mut budget_tokens = 0u64;
+    let mut cache: Option<PathBuf> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+            }
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-fleet argument: {other}"))),
+        }
+    }
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    if budget_tokens > 0 {
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+    }
+    let text = if compact {
+        serde_json::to_string(&fleet)
+    } else {
+        serde_json::to_string_pretty(&fleet)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-callback-verify --root <dir> [--compact]`：
+/// 只读对账 delegations.jsonl 与 child 当前状态。
+fn run_session_callback_verify(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut cache: Option<PathBuf> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!(
+                    "unknown session-callback-verify argument: {other}"
+                )));
+            }
+        }
+    }
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let report = trit_host::verify_callbacks(&scanned)?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-run --session <resume.jsonl> [--workspace <dir>] [--apply] [-- <run args>]`：
+/// 默认只打印将执行的 `run` 命令；`--apply` 才启动新进程。
+fn run_session_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut session: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut extra = Vec::new();
+    let mut after_separator = false;
+    while let Some(arg) = args.next() {
+        if after_separator {
+            extra.push(arg);
+            continue;
+        }
+        match arg.as_str() {
+            "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--apply" => apply = true,
+            "--" => after_separator = true,
+            other => return Err(fail(format!("unknown session-run argument: {other}"))),
+        }
+    }
+    let session = session.ok_or_else(|| fail("session-run requires --session"))?;
+    let spec = trit_host::read_resume_spec(&session)?;
+    let workspace =
+        workspace.unwrap_or_else(|| session.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let target = trit_host::resume_target(&session);
+    let command = trit_host::resume_command(&spec, &workspace, &target);
+    let report = serde_json::json!({
+        "source": session.display().to_string(),
+        "task": spec.task,
+        "objective": spec.objective,
+        "max_steps": spec.max_steps,
+        "workspace": workspace.display().to_string(),
+        "target_session": target.display().to_string(),
+        "command": command,
+        "applied": apply,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+    );
+    if !apply {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|error| fail(error.to_string()))?;
+    let status = std::process::Command::new(exe)
+        .args(&command)
+        .args(&extra)
+        .status()
+        .map_err(|error| fail(error.to_string()))?;
+    if !status.success() {
+        return Err(fail(format!("run exited with {status}")));
+    }
+    Ok(())
+}
+
+/// `session-auto --root <dir> [--max-items N] [--apply] [--compact]`：
+/// 扫描 + 分配 + 只自动派发 Resume 项；默认 dry-run。
+/// `session-advance --root <dir> [...]`：一条命令推进多会话；默认 dry-run。
+fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut workspace: Option<PathBuf> = None;
+    let mut cache: Option<PathBuf> = None;
+    let mut nodes_path: Option<PathBuf> = None;
+    let mut max_items = 4usize;
+    let mut workers = 4usize;
+    let mut max_concurrency: Option<usize> = None;
+    let mut workers_given = false;
+    let mut budget_given = false;
+    let mut max_steps = 20usize;
+    let mut retries = 0usize;
+    let mut budget_tokens = 0u64;
+    let mut budget_usd = 0.0f64;
+    let mut write_journal_rollback = false;
+    let mut resume = false;
+    let mut scope: Option<String> = None;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--nodes" => nodes_path = Some(PathBuf::from(next(&mut args, "--nodes")?)),
+            "--max-items" => {
+                max_items = next(&mut args, "--max-items")?
+                    .parse()
+                    .map_err(|_| fail("--max-items must be a non-negative integer"))?;
+            }
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+                workers_given = true;
+            }
+            "--max-concurrency" => {
+                max_concurrency = Some(
+                    next(&mut args, "--max-concurrency")?
+                        .parse()
+                        .map_err(|_| fail("--max-concurrency must be a positive integer"))?,
+                );
+            }
+            "--max-steps" => {
+                max_steps = next(&mut args, "--max-steps")?
+                    .parse()
+                    .map_err(|_| fail("--max-steps must be a positive integer"))?;
+            }
+            "--retry" => {
+                retries = next(&mut args, "--retry")?
+                    .parse()
+                    .map_err(|_| fail("--retry must be a non-negative integer"))?;
+            }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+                budget_given = true;
+            }
+            "--budget-usd" => {
+                budget_usd = next(&mut args, "--budget-usd")?
+                    .parse()
+                    .map_err(|_| fail("--budget-usd must be a non-negative number"))?;
+                if !budget_usd.is_finite() || budget_usd < 0.0 {
+                    return Err(fail("--budget-usd must be a non-negative number"));
+                }
+            }
+            "--budget-cny" => {
+                let cny: f64 = next(&mut args, "--budget-cny")?
+                    .parse()
+                    .map_err(|_| fail("--budget-cny must be a non-negative number"))?;
+                if !cny.is_finite() || cny < 0.0 {
+                    return Err(fail("--budget-cny must be a non-negative number"));
+                }
+                budget_usd = cny / trit_host::cost::usd_cny_rate();
+                budget_given = true;
+            }
+            "--scope" => scope = Some(next(&mut args, "--scope")?),
+            "--write-journal-rollback" => write_journal_rollback = true,
+            "--resume" => resume = true,
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!("unknown session-advance argument: {other}")));
+            }
+        }
+    }
+    let roots = expand_roots(roots);
+    let settings = trit_host::settings::load(&roots[0])?;
+    trit_host::cost::configure_rate(settings.cost.usd_cny);
+    if !workers_given && settings.concurrency.workers > 0 {
+        workers = settings.concurrency.workers as usize;
+    }
+    if !budget_given {
+        if settings.budget.tokens > 0 {
+            budget_tokens = settings.budget.tokens;
+        }
+        if settings.budget.cny > 0.0 {
+            budget_usd = settings.budget.cny / trit_host::cost::usd_cny_rate();
+        }
+    }
+    let cap = concurrency_cap(
+        max_concurrency
+            .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
+    );
+    if cap > 0 {
+        workers = workers.min(cap);
+    }
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let workspace = workspace.unwrap_or_else(|| roots[0].clone());
+    let config = if apply && nodes_path.is_none() {
+        Some(trit_host::OpenAiConfig::from_env()?)
+    } else {
+        None
+    };
+    let nodes = match nodes_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(&path)?;
+            Some(serde_json::from_str::<Vec<trit_host::RemoteNode>>(&text)?)
+        }
+        None => None,
+    };
+    let report = trit_host::advance(
+        &scanned,
+        &plan,
+        &workspace,
+        &roots[0],
+        cache.as_deref(),
+        config,
+        nodes,
+        &trit_host::AdvanceOptions {
+            max_items,
+            workers,
+            max_steps,
+            retries,
+            budget_tokens,
+            budget_usd,
+            write_journal_rollback,
+            resume,
+            dry_run: !apply,
+            scope,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut max_items = 4usize;
+    let mut cache: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--max-items" => {
+                max_items = next(&mut args, "--max-items")?
+                    .parse()
+                    .map_err(|_| fail("--max-items must be a non-negative integer"))?;
+            }
+            "--apply" => apply = true,
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-auto argument: {other}"))),
+        }
+    }
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let report = trit_host::auto_dispatch(
+        &scanned,
+        &plan,
+        &trit_host::AutoDispatchOptions {
+            max_items,
+            dry_run: !apply,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-callback --root <dir> [--apply] [--compact]`：
+/// 默认 dry-run；`--apply` 才把 parent/child 结果追加到 delegations.jsonl。
+fn run_session_callback(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut cache: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-callback argument: {other}"))),
+        }
+    }
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let report =
+        trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: !apply })?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-dispatch --root <dir> [--apply] [--compact]`：
+/// 默认 dry-run；`--apply` 才为新会话写 TurnStarted，且拒绝覆盖已有目标。
+fn run_session_dispatch(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-dispatch argument: {other}"))),
+        }
+    }
+    let roots = expand_roots(roots);
+    let scanned = trit_host::scan_sessions_roots(&roots)?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let report = trit_host::dispatch_sessions(
+        &scanned,
+        &plan,
+        &trit_host::DispatchOptions {
+            dry_run: !apply,
+            max_steps: 16,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-plan --root <dir> [--compact]`：扫描会话并生成确定性的任务分配。
+fn scan_for(
+    roots: &[PathBuf],
+    cache: Option<&Path>,
+) -> Result<trit_host::SessionScanReport, Box<dyn Error>> {
+    match cache {
+        Some(path) => Ok(trit_host::scan_sessions_roots_cached(roots, path)?),
+        None => Ok(trit_host::scan_sessions_roots(roots)?),
+    }
+}
+
+/// `--root` 可重复；未提供时回退到当前目录。
+fn expand_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+    roots
+}
+
+/// 全局并发上限：显式参数优先，其次 `TRIT_MAX_CONCURRENCY`；0 表示不限。
+fn concurrency_cap(explicit: Option<usize>) -> usize {
+    explicit
+        .or_else(|| {
+            std::env::var("TRIT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut cache: Option<PathBuf> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-plan argument: {other}"))),
+        }
+    }
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let text = if compact {
+        serde_json::to_string(&plan)
+    } else {
+        serde_json::to_string_pretty(&plan)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-scan --root <dir> [--compact]`：只读扫描会话目录，输出清单/任务/链接。
+fn run_session_scan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut cache: Option<PathBuf> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown session-scan argument: {other}"))),
+        }
+    }
+    let roots = expand_roots(roots);
+    let report = match cache {
+        Some(path) => trit_host::scan_sessions_roots_cached(&roots, &path)?,
+        None => trit_host::scan_sessions_roots(&roots)?,
+    };
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 
@@ -1516,24 +2443,147 @@ fn run_session_index(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     Ok(())
 }
 
+/// `tools [--mcp-config <json>] [--compact]`：
+/// 列出内置工具；给了 MCP 配置时启动服务器并列出外部工具。
+fn run_tools(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut mcp_config: Option<PathBuf> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--mcp-config" => mcp_config = Some(PathBuf::from(next(&mut args, "--mcp-config")?)),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown tools argument: {other}"))),
+        }
+    }
+    let builtin = default_tools();
+    let mut report = serde_json::json!({
+        "builtin": builtin
+            .iter()
+            .map(|tool| serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "read_only": tool.read_only,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(path) = mcp_config {
+        let text = std::fs::read_to_string(&path)?;
+        let config: trit_host::SupervisorConfig = serde_json::from_str(&text)?;
+        let runtime =
+            trit_host::SupervisorRuntime::start(&config, trit_host::RecoveryContext::default())
+                .map_err(|error| fail(format!("start MCP runtime: {error}")))?;
+        let routes: Vec<_> = runtime
+            .tool_client()
+            .routes()
+            .into_iter()
+            .map(|route| {
+                serde_json::json!({
+                    "exposed_name": route.exposed_name,
+                    "server": route.server,
+                    "tool": route.tool,
+                    "description": route.description,
+                    "declared_read_only": route.declared_read_only,
+                })
+            })
+            .collect();
+        report["mcp"] = serde_json::Value::Array(routes);
+    }
+    let text = if compact {
+        serde_json::to_string(&report)?
+    } else {
+        serde_json::to_string_pretty(&report)?
+    };
+    println!("{text}");
+    Ok(())
+}
+
+/// `settings [--root <dir>] [--get KEY] [--set KEY=VALUE] [--compact]`：
+/// 读写 `<root>/.agent/settings.json`；键与 `docs/FRONTEND-CONTRACT.md` 第 10 节一致。
+fn run_settings(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut get: Option<String> = None;
+    let mut set: Option<String> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--get" => get = Some(next(&mut args, "--get")?),
+            "--set" => set = Some(next(&mut args, "--set")?),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown settings argument: {other}"))),
+        }
+    }
+    let mut settings = trit_host::settings::load(&root)?;
+    if let Some(pair) = set {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| fail("--set requires KEY=VALUE"))?;
+        trit_host::settings::set(&mut settings, key, value).map_err(|error| fail(error))?;
+        trit_host::settings::save(&root, &settings)?;
+    }
+    let output = match get {
+        Some(key) => trit_host::settings::get(&settings, &key).map_err(|error| fail(error))?,
+        None => serde_json::to_value(&settings)?,
+    };
+    let text = if compact {
+        serde_json::to_string(&output)?
+    } else {
+        serde_json::to_string_pretty(&output)?
+    };
+    println!("{text}");
+    Ok(())
+}
+
 /// `diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]`：
-/// 只读静态诊断。不启动 MCP / gateway / 子进程，也不创建目录或账本。
+/// 只读静态诊断。默认不启动 MCP / gateway / 子进程，也不创建目录或账本；
+/// 显式传 `--live-mcp <program>` 才拉起一个 stdio MCP server 做启动探测。
 fn run_diagnostics(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut workspace = PathBuf::from(".");
     let mut session = None;
     let mut db = None;
+    let mut live_program: Option<String> = None;
+    let mut live_args: Vec<String> = Vec::new();
+    let mut live_wait_ms = 1_500u64;
+    let mut live_max_stderr = 40usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
             "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
             "--db" => db = Some(PathBuf::from(next(&mut args, "--db")?)),
+            "--live-mcp" => live_program = Some(next(&mut args, "--live-mcp")?),
+            "--live-mcp-arg" => live_args.push(next(&mut args, "--live-mcp-arg")?),
+            "--live-wait-ms" => {
+                live_wait_ms = next(&mut args, "--live-wait-ms")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --live-wait-ms: {error}")))?;
+            }
+            "--live-max-stderr" => {
+                live_max_stderr = next(&mut args, "--live-max-stderr")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --live-max-stderr: {error}")))?;
+            }
             other => return Err(fail(format!("unknown diagnostics argument: {other}"))),
         }
     }
+    if live_program.is_none() && (!live_args.is_empty() || live_wait_ms != 1_500) {
+        return Err(fail(
+            "--live-mcp-arg/--live-wait-ms require --live-mcp <program>".to_owned(),
+        ));
+    }
+    let live = live_program.map(|program| {
+        let mut probe = trit_host::LiveMcpProbe::new(program)
+            .with_wait_millis(live_wait_ms)
+            .with_max_stderr_lines(live_max_stderr);
+        for arg in live_args.drain(..) {
+            probe = probe.with_arg(arg);
+        }
+        probe
+    });
     let report = trit_host::diagnose(&trit_host::DiagnosticsOptions {
         workspace: &workspace,
         session: session.as_deref(),
         projection: db.as_deref(),
+        live: live.as_ref(),
     })?;
     println!(
         "{}",
@@ -1616,67 +2666,8 @@ fn rollback_in_doubt(
     records: &[trit_host::JournalRecord],
     owned: Option<&OperationLease>,
 ) -> Result<(Vec<trit_host::RollbackOutcome>, Vec<serde_json::Value>), Box<dyn Error>> {
-    let owned_keys: Vec<String> = owned
-        .map(|lease| {
-            lease
-                .lock_paths()
-                .into_iter()
-                .map(|path| lock_key(workspace, path))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut outcomes = Vec::new();
-    let mut blocked = Vec::new();
-    for record in records {
-        let mut guard: Option<OperationLease> = None;
-        if record.lease_locks.is_empty() {
-            if record.lease_epoch.is_some() {
-                blocked.push(serde_json::json!({
-                    "op_id": record.op_id,
-                    "reason": "lease epoch recorded without lock paths; refuse automatic rollback",
-                }));
-                continue;
-            }
-        } else {
-            let missing: Vec<PathBuf> = record
-                .lease_locks
-                .iter()
-                .filter(|lock| !owned_keys.contains(&lock_key(workspace, Path::new(lock))))
-                .map(PathBuf::from)
-                .collect();
-            if !missing.is_empty() {
-                match OperationLease::acquire_lock_files(workspace, "journal-rollback", &missing) {
-                    Ok(lease) => guard = Some(lease),
-                    Err(trit_host::LeaseError::Busy { owner, epoch }) => {
-                        blocked.push(serde_json::json!({
-                            "op_id": record.op_id,
-                            "reason": format!("lease still held: owner={owner} epoch={epoch}"),
-                        }));
-                        continue;
-                    }
-                    Err(error) => {
-                        return Err(fail(format!("journal rollback lease: {error}")));
-                    }
-                }
-            }
-        }
-        let outcome = journal.rollback(record);
-        journal
-            .record_rollback(record.op_id, &outcome)
-            .map_err(|error| fail(error.to_string()))?;
-        drop(guard);
-        outcomes.push(outcome);
-    }
-    Ok((outcomes, blocked))
-}
-
-fn lock_key(workspace: &Path, lock: &Path) -> String {
-    let full = if lock.is_absolute() {
-        lock.to_path_buf()
-    } else {
-        workspace.join(lock)
-    };
-    full.to_string_lossy().replace('\\', "/").to_lowercase()
+    trit_host::journal::rollback_in_doubt(journal, workspace, records, owned)
+        .map_err(|error| fail(error.to_string()))
 }
 
 /// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。
@@ -1972,6 +2963,9 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         status,
         content: request.task.as_bytes().to_vec(),
         tokens: 1,
+        model: None,
+        usage: None,
+        dissent: None,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;
@@ -2433,6 +3427,23 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                 request_read_timeout_ms =
                     Some(next(&mut args, "--request-read-timeout-ms")?.parse()?)
             }
+            "--token-budget" => {
+                config = config.with_token_budget(next(&mut args, "--token-budget")?.parse()?)
+            }
+            "--usd-budget" => {
+                let budget: f64 = next(&mut args, "--usd-budget")?.parse()?;
+                if !budget.is_finite() || budget < 0.0 {
+                    return Err(fail("--usd-budget must be a non-negative number"));
+                }
+                config = config.with_usd_budget(budget);
+            }
+            "--cny-budget" => {
+                let cny: f64 = next(&mut args, "--cny-budget")?.parse()?;
+                if !cny.is_finite() || cny < 0.0 {
+                    return Err(fail("--cny-budget must be a non-negative number"));
+                }
+                config = config.with_usd_budget(cny / trit_host::cost::usd_cny_rate());
+            }
             "--once" => once = true,
             other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),
         }
@@ -2440,6 +3451,8 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     if let Some(ms) = request_read_timeout_ms {
         config = config.with_request_read_timeout(std::time::Duration::from_millis(ms));
     }
+    config =
+        config.with_prices(trit_host::cost::PriceTable::from_env().map_err(|error| fail(error))?);
     let server = trit_host::LedgerServer::bind(config)?;
     let addr = server.addr()?;
     println!("{}", serde_json::json!({ "bind": addr.to_string() }));
@@ -2582,7 +3595,7 @@ fn run_remote_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
     Ok(())
 }
 
-/// `plan-exec --task <t> --workspace <dir> (--planner-script P --script E | --provider openai)`：
+/// `plan-exec --task <t> --workspace <dir> (--planner-script P --script E | --provider openai|anthropic|gemini [--protocol <name>])`：
 ///
 /// 一键跑 planner → executor 两阶段。planner 只读产出 `PlanHandoff`；executor 的工具与
 /// `WriteClaim` 在计划校验通过后才按 `plan.profile.write_roots` 构造，计划和缓存都不跨阶段共享。
@@ -2592,6 +3605,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
     let mut planner_script: Option<PathBuf> = None;
     let mut executor_script: Option<PathBuf> = None;
     let mut provider = "scripted".to_owned();
+    let mut protocol_arg: Option<String> = None;
     let mut planner_model_name: Option<String> = None;
     let mut executor_model_name: Option<String> = None;
     let mut allow_write = false;
@@ -2612,6 +3626,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
                 executor_script = Some(PathBuf::from(next(&mut args, "--script")?));
             }
             "--provider" => provider = next(&mut args, "--provider")?,
+            "--protocol" => protocol_arg = Some(next(&mut args, "--protocol")?),
             "--planner-model" => planner_model_name = Some(next(&mut args, "--planner-model")?),
             "--executor-model" => executor_model_name = Some(next(&mut args, "--executor-model")?),
             "--allow-write" => allow_write = true,
@@ -2642,9 +3657,28 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
         }
     }
     let task = task.ok_or_else(|| fail("plan-exec requires --task"))?;
-    if provider != "scripted" && provider != "openai" {
+    if provider != "scripted"
+        && provider != "openai"
+        && provider != "anthropic"
+        && provider != "gemini"
+        && provider != "deepseek"
+    {
         return Err(fail(format!("plan-exec: bad --provider {provider}")));
     }
+    if protocol_arg.is_some() && provider == "scripted" {
+        return Err(fail(
+            "plan-exec: --protocol requires a non-scripted --provider",
+        ));
+    }
+    let protocol = match protocol_arg.as_deref() {
+        Some(name) => Protocol::parse(name).map_err(|error| fail(error.to_string()))?,
+        None => match provider.as_str() {
+            "anthropic" => Protocol::AnthropicMessages,
+            "gemini" => Protocol::GeminiGenerateContent,
+            "deepseek" => Protocol::DeepSeekChat,
+            _ => Protocol::OpenAiChat,
+        },
+    };
 
     // planner 侧只读：即便脚本里塞了写调用，也会被 ReadOnlyTools 拒绝。
     let mut planner_config = WorkspaceConfig::new(&workspace);
@@ -2653,6 +3687,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
 
     let planner_model = plan_exec_model(
         &provider,
+        protocol,
         planner_script.as_deref(),
         "--planner-script",
         planner_model_name.as_deref(),
@@ -2660,6 +3695,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
     )?;
     let executor_model = plan_exec_model(
         &provider,
+        protocol,
         executor_script.as_deref(),
         "--script",
         executor_model_name.as_deref(),
@@ -2759,6 +3795,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
 
 fn plan_exec_model(
     provider: &str,
+    protocol: Protocol,
     script: Option<&Path>,
     flag: &str,
     model_name: Option<&str>,
@@ -2770,7 +3807,8 @@ fn plan_exec_model(
         let proposals: Vec<Proposal> = serde_json::from_str(&text)?;
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
-    let mut config = OpenAiConfig::from_env().map_err(|error| fail(error.to_string()))?;
+    let mut config =
+        OpenAiConfig::from_env_for(protocol).map_err(|error| fail(error.to_string()))?;
     if let Some(model) = model_name {
         config.model = model.to_owned();
     }
@@ -2786,6 +3824,217 @@ fn plan_exec_model(
 /// 权限映射：`ReadOnly` → `ReadOnlyTools` 包 `LocalTools` 且 `allow_write = false`；
 /// `ReadWrite` → 直接用 `LocalTools` 且 `allow_write = true`。响应状态只有
 /// `judgment.is_complete()` 为 true 时才是 `Completed`。
+/// 子智能体最大嵌套深度：超过即拒绝，避免递归无限派发。
+const MAX_SUBAGENT_DEPTH: u32 = 3;
+
+/// `subagent-fanout --workspace <dir> --agents codex,claude-code [--tasks <json|->]
+///   [--workers N] [--depth N] [--timeout-ms N] [--dry-run]`
+///
+/// 并行驱动外部编码智能体 CLI；每个任务可指定 `agent`，否则按 `--agents` 轮转。
+/// 汇总结果与异议（dissent）；异议必须由调用方显式处理，不能静默丢弃。
+fn run_subagent_fanout(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut workspace = PathBuf::from(".");
+    let mut agents = String::from("codex");
+    let mut tasks_path: Option<PathBuf> = None;
+    let mut workers = 2usize;
+    let mut depth: u32 = std::env::var("TRIT_SUBAGENT_DEPTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1);
+    let mut timeout_ms: u64 = 900_000;
+    let mut dry_run = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
+            "--agents" => agents = next(&mut args, "--agents")?,
+            "--tasks" => tasks_path = Some(PathBuf::from(next(&mut args, "--tasks")?)),
+            "--workers" => workers = next(&mut args, "--workers")?.parse()?,
+            "--depth" => depth = next(&mut args, "--depth")?.parse()?,
+            "--timeout-ms" => timeout_ms = next(&mut args, "--timeout-ms")?.parse()?,
+            "--dry-run" => dry_run = true,
+            other => return Err(fail(format!("unknown subagent-fanout argument: {other}"))),
+        }
+    }
+    if !(1..=MAX_SUBAGENT_DEPTH).contains(&depth) {
+        return Err(fail(format!(
+            "subagent depth {depth} must be 1..={MAX_SUBAGENT_DEPTH}"
+        )));
+    }
+    // 并发上限：避免一个 --workers 参数就开上千线程。
+    let workers = workers.clamp(1, 32);
+    let specs: Vec<_> = agents
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            trit_host::CliAgentSpec::resolve(id).ok_or_else(|| {
+                fail(format!(
+                    "unknown subagent backend {id}; supported: {:?}",
+                    trit_host::CliAgentSpec::ids()
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    if specs.is_empty() {
+        return Err(fail("subagent-fanout requires --agents"));
+    }
+
+    let text = match tasks_path.as_ref() {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => {
+            let mut buffer = String::new();
+            std::io::stdin().read_to_string(&mut buffer)?;
+            buffer
+        }
+    };
+    let raw: serde_json::Value = serde_json::from_str(&text)?;
+    let mut tasks: Vec<(String, String, Option<String>)> = Vec::new();
+    for item in raw
+        .as_array()
+        .ok_or_else(|| fail("subagent-fanout tasks must be a JSON array"))?
+    {
+        let id = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| fail("task id required"))?
+            .to_owned();
+        let prompt = item
+            .get("prompt")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| fail("task prompt required"))?
+            .to_owned();
+        let agent = item
+            .get("agent")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        tasks.push((id, prompt, agent));
+    }
+    if tasks.is_empty() {
+        return Err(fail("subagent-fanout requires at least one task"));
+    }
+
+    if dry_run {
+        let mut plan = Vec::new();
+        for (index, (id, prompt, agent)) in tasks.iter().enumerate() {
+            let spec = match agent.as_deref() {
+                Some(id) => trit_host::CliAgentSpec::resolve(id)
+                    .ok_or_else(|| fail(format!("unknown subagent backend {id}")))?,
+                None => specs[index % specs.len()],
+            };
+            let (program, argv, stdin) = spec.command(prompt);
+            plan.push(serde_json::json!({
+                "id": id,
+                "agent": spec.id,
+                "program": program,
+                "args": argv,
+                "stdin": stdin.is_some(),
+                "depth": depth,
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": plan,
+                "workers": workers,
+                "depth": depth,
+            }))?
+        );
+        return Ok(());
+    }
+
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<serde_json::Value>>> =
+        tasks.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let python_before = trit_host::subagent_cli::snapshot_python_files(&workspace);
+    let lane = workers.max(1).min(tasks.len());
+    std::thread::scope(|scope| {
+        for _ in 0..lane {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((id, prompt, agent)) = tasks.get(index) else {
+                        break;
+                    };
+                    let spec = match agent.as_deref() {
+                        Some(agent_id) => match trit_host::CliAgentSpec::resolve(agent_id) {
+                            Some(spec) => spec,
+                            None => {
+                                if let Ok(mut slot) = slots[index].lock() {
+                                    *slot = Some(serde_json::json!({
+                                        "id": id,
+                                        "agent": agent_id,
+                                        "error": format!("unknown backend {agent_id}"),
+                                    }));
+                                }
+                                continue;
+                            }
+                        },
+                        None => specs[index % specs.len()],
+                    };
+                    let value = match trit_host::run_cli_agent(spec, prompt, &workspace, timeout) {
+                        Ok(run) => serde_json::json!({
+                            "id": id,
+                            "agent": spec.id,
+                            "exit": run.exit,
+                            "timed_out": run.timed_out,
+                            "content_chars": run.content.chars().count(),
+                            "dissent": run.dissent,
+                            "stderr_tail": run.stderr_tail,
+                        }),
+                        Err(error) => serde_json::json!({
+                            "id": id,
+                            "agent": spec.id,
+                            "error": error.to_string(),
+                        }),
+                    };
+                    if let Ok(mut slot) = slots[index].lock() {
+                        *slot = Some(value);
+                    }
+                }
+            });
+        }
+    });
+    let results: Vec<serde_json::Value> = slots
+        .into_iter()
+        .filter_map(|slot| slot.into_inner().unwrap_or(None))
+        .collect();
+    // 外部 CLI 直接改盘无法在写入时拦截：跑完对比快照，非测试 .py 视为违规。
+    let changed = trit_host::subagent_cli::changed_python_files(
+        &python_before,
+        &trit_host::subagent_cli::snapshot_python_files(&workspace),
+    );
+    let violations = trit_host::tech_stack::violations(&changed);
+    let dissents: Vec<serde_json::Value> = results
+        .iter()
+        .filter(|result| result.get("dissent").is_some_and(|value| !value.is_null()))
+        .map(|result| {
+            serde_json::json!({
+                "task": result.get("id"),
+                "dissent": result.get("dissent"),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "results": results,
+            "dissents": dissents,
+            "workers": workers,
+            "depth": depth,
+            "violations": violations.clone(),
+        }))?
+    );
+    if !violations.is_empty() {
+        return Err(fail(format!(
+            "external subagents wrote {} non-test Python path(s): {}",
+            violations.len(),
+            violations.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut workspace = PathBuf::from(".");
     let mut script: Option<PathBuf> = None;
@@ -2877,6 +4126,14 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
         status,
         content: outcome.render_markdown().into_bytes(),
         tokens: outcome.usage.total()?,
+        model: None,
+        usage: Some(trit_orch::SubagentUsage {
+            fresh: outcome.usage.fresh,
+            cached: outcome.usage.cached,
+            output: outcome.usage.output,
+            estimated: outcome.usage.estimated,
+        }),
+        dissent: None,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;

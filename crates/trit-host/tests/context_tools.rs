@@ -227,6 +227,7 @@ fn turn_context() -> TurnContext {
         receipts: Vec::new(),
         digest: None,
         projection: None,
+        history: Vec::new(),
     }
 }
 

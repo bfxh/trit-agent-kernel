@@ -38,6 +38,7 @@
 | [SANDBOX.md](SANDBOX.md) | Linux bwrap / macOS sandbox-exec / Windows AppContainer | `SandboxCommand::builtin`、`--sandbox builtin`、`appcontainer-run` |
 | [GATE-CHAIN.md](GATE-CHAIN.md) | 已实现 | `trit-orch::gate_chain`、`trit-orch gate-chain` CLI |
 | [AGENT-MODEL-MANIFEST.md](AGENT-MODEL-MANIFEST.md) | 契约草案，清单为模板 | [`agent-model-manifest.json`](agent-model-manifest.json)；运行时门禁仍归 `FeatureGate` |
+| [SESSION-ORCHESTRATION.md](SESSION-ORCHESTRATION.md) | 已实现 | `session_scan` / `session_plan` / `session_dispatch` / `session_fleet` / `session_run` / `session_callback` / `session_verify`、`remote_ledger` 预算 |
 
 ## 维护规则
 

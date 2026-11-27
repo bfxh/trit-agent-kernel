@@ -3,13 +3,13 @@
 //! 这里只有同步、纯数据的接口；真实 OpenAI-compatible 传输层由宿主实现。
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentError, ContextPlan, ContextReceipt, Model, PrefixSignal, Proposal, ToolOutcome,
-    ToolRequest, TurnContext,
+    ToolRequest, TurnContext, VerificationSignal,
 };
 use trit_orch::{TaskBrief, TokenUsage};
 use trit_reasonix::{ClaimRequest, HostUsage};
@@ -50,6 +50,8 @@ pub struct ProviderRequest {
     pub context_digest: Option<String>,
     pub context: Option<ContextPlan>,
     pub projection: Option<crate::context_projection::ProjectionView>,
+    /// 校验摘要（训练信号）；`None` 表示不注入。
+    pub verification: Option<VerificationSignal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,8 @@ pub struct ProviderModel<P> {
     tools: Vec<ToolSpec>,
     tool_catalog: Option<Arc<dyn ToolCatalog>>,
     context_planner: Option<Box<dyn ContextPlanner>>,
+    /// 是否把校验摘要注入模型请求；关闭时既不统计也不提示。
+    verification_signals: bool,
 }
 
 impl<P: Provider> ProviderModel<P> {
@@ -81,6 +85,7 @@ impl<P: Provider> ProviderModel<P> {
             tools: default_tools(),
             tool_catalog: None,
             context_planner: None,
+            verification_signals: true,
         }
     }
 
@@ -90,7 +95,14 @@ impl<P: Provider> ProviderModel<P> {
             tools,
             tool_catalog: None,
             context_planner: None,
+            verification_signals: true,
         }
+    }
+
+    /// 关闭/开启校验信号（训练信号与重复校验提示）。
+    pub fn with_verification_signals(mut self, enabled: bool) -> Self {
+        self.verification_signals = enabled;
+        self
     }
 
     pub fn with_tool_catalog(mut self, catalog: Arc<dyn ToolCatalog>) -> Self {
@@ -140,6 +152,10 @@ impl<P: Provider> Model for ProviderModel<P> {
             context_digest: context.digest.clone(),
             context: plan,
             projection: context.projection.clone(),
+            verification: self
+                .verification_signals
+                .then(|| VerificationSignal::from_receipts(&context.receipts))
+                .flatten(),
         })?;
         Ok(Proposal {
             tool_calls: response.tool_calls,
@@ -152,6 +168,11 @@ impl<P: Provider> Model for ProviderModel<P> {
 }
 
 pub fn default_tools() -> Vec<ToolSpec> {
+    static TOOLS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+    TOOLS.get_or_init(build_default_tools).clone()
+}
+
+fn build_default_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file".into(),
@@ -217,6 +238,50 @@ pub fn default_tools() -> Vec<ToolSpec> {
                     "max_results": {"type": "integer"}
                 },
                 "required": ["pattern"]
+            })),
+        },
+        ToolSpec {
+            name: "browser".into(),
+            description:
+                "Drive a headless Chrome/Chromium page via CDP: open, eval, screenshot, close."
+                    .into(),
+            read_only: false,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["open", "eval", "screenshot", "tabs", "select", "close_tab", "close"]},
+                    "url": {"type": "string"},
+                    "expression": {"type": "string"},
+                    "path": {"type": "string"},
+                    "tab": {"type": "integer"}
+                },
+                "required": ["action"]
+            })),
+        },
+        ToolSpec {
+            name: "download".into(),
+            description:
+                "Create a download task through the external downloader (FluxDown by default)."
+                    .into(),
+            read_only: false,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            })),
+        },
+        ToolSpec {
+            name: "tools_batch".into(),
+            description:
+                "Run up to 64 read-only tools (read_file/search_code/glob/download) in one call; returns compact per-call results."
+                    .into(),
+            read_only: true,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "calls": {"type": "array", "items": {"type": "object"}}
+                },
+                "required": ["calls"]
             })),
         },
         ToolSpec {
@@ -369,6 +434,7 @@ mod tests {
             receipts: Vec::new(),
             digest: None,
             projection: None,
+            history: Vec::new(),
         };
         model.proposal(&brief, &context).unwrap();
         *catalog_tools.lock().unwrap() = vec![spec("mcp__stub__echo"), spec("mcp__stub__echo2")];

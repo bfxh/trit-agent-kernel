@@ -272,6 +272,9 @@ fn ledger_claim_complete_and_pending_takeover() {
         status: DelegationStatus::Completed,
         content: b"done".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
     assert!(
@@ -375,6 +378,9 @@ fn completed_records_survive_restart() {
         status: DelegationStatus::Completed,
         content: b"persisted".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
 
@@ -455,6 +461,9 @@ fn pending_renewal_records_do_not_evict_done_on_restart() {
         status: DelegationStatus::Completed,
         content: b"retained".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
     let server = Arc::clone(&ledger);
@@ -560,6 +569,9 @@ fn capacity_evictions_replay_in_the_same_key_order() {
             status: DelegationStatus::Completed,
             content: task.as_bytes().to_vec(),
             tokens: 0,
+            model: None,
+            usage: None,
+            dissent: None,
         })
         .unwrap();
         remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
@@ -602,6 +614,9 @@ fn legacy_done_only_state_still_loads() {
         status: DelegationStatus::Completed,
         content: b"legacy".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
     let hex: String = frame.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -696,6 +711,9 @@ fn pending_lease_survives_restart_and_expires() {
         status: DelegationStatus::Completed,
         content: b"after-restart".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
     let server = Arc::clone(&renewed);
@@ -723,6 +741,9 @@ fn pending_lease_survives_restart_and_expires() {
         status: DelegationStatus::Completed,
         content: b"stale".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
 
@@ -771,6 +792,9 @@ fn scoped_ledger_keys_isolate_plans() {
         status: DelegationStatus::Completed,
         content: b"scoped".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     })
     .unwrap();
 
@@ -822,6 +846,9 @@ fn state_file_respects_byte_budget_and_compacts() {
             status: DelegationStatus::Completed,
             content: vec![b'x'; 80],
             tokens: 0,
+            model: None,
+            usage: None,
+            dissent: None,
         })
         .unwrap();
         remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
@@ -1057,6 +1084,9 @@ fn stale_completion_is_aborted_instead_of_returned() {
         status: DelegationStatus::Completed,
         content: b"winner".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
+        dissent: None,
     };
     let frame = encode_frame(&winner).unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1222,6 +1252,9 @@ fn superseded_node_stays_healthy_and_retry_reads_completion() {
         status: DelegationStatus::Completed,
         content: b"external-completion".to_vec(),
         tokens: 7,
+        model: None,
+        usage: None,
+        dissent: None,
     };
     let frame = encode_frame(&external).unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1289,5 +1322,398 @@ fn unreachable_ledger_fails_closed_without_executing() {
         result.status
     );
     assert!(!result.reusable());
+    server.join().unwrap();
+}
+
+#[test]
+fn token_budget_blocks_new_claims_after_spend() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_token("t")
+                .with_token_budget(10),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), Some("t"), 5);
+
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected first claim to win");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"done".to_vec(),
+        tokens: 10,
+        model: None,
+        usage: None,
+        dissent: None,
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+
+    // 预算已用尽：新键 claim 直接 503，客户端报错。
+    let error = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap_err();
+    assert!(error.contains("503"), "{error}");
+}
+
+#[test]
+fn token_budget_survives_restart() {
+    let path = state_file("budget-restart");
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_state_path(&path)
+                .with_token_budget(10),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let running = Arc::clone(&ledger);
+    let handle = thread::spawn(move || {
+        running.serve_once().unwrap();
+        running.serve_once().unwrap();
+    });
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected first claim");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"done".to_vec(),
+        tokens: 10,
+        model: None,
+        usage: None,
+        dissent: None,
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+    handle.join().unwrap();
+    drop(ledger);
+
+    // 重启后从状态文件回放 tokens，预算仍然耗尽。
+    let restarted = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_state_path(&path)
+                .with_token_budget(10),
+        )
+        .unwrap(),
+    );
+    let address = restarted.addr().unwrap();
+    let restarted_endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let server = Arc::clone(&restarted);
+    let handle = thread::spawn(move || server.serve_once().unwrap());
+    let error = remote_ledger::claim(&restarted_endpoint, "t2@0").unwrap_err();
+    assert!(error.contains("503"), "{error}");
+    handle.join().unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn losing_lease_holder_aborts_without_duplicate_execution() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0").with_pending_ttl(Duration::from_millis(120)),
+        )
+        .unwrap(),
+    );
+    let ledger_url = format!("http://{}", ledger.addr().unwrap());
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let outer = endpoint(&ledger_url, None, 5);
+
+    // 先占住同一键，等占位过期，让节点在派发时接管。
+    let Claim::New { .. } = remote_ledger::claim(&outer, "t1@0").unwrap() else {
+        panic!("expected the outer holder to claim first");
+    };
+    thread::sleep(Duration::from_millis(160));
+
+    let node_server = Arc::new(
+        RemoteServer::bind(
+            RemoteServerConfig::new("127.0.0.1:0")
+                .with_sleep_ms(800)
+                .with_ledger(endpoint(&ledger_url, None, 5))
+                // 续约间隔故意大于 pending_ttl：外部持有者才有机会接管。
+                .with_ledger_renew_interval(Duration::from_millis(400)),
+        )
+        .unwrap(),
+    );
+    let node_url = format!("http://{}/run", node_server.addr().unwrap());
+    let serving = Arc::clone(&node_server);
+    thread::spawn(move || serving.serve_forever().unwrap());
+
+    let table = Arc::new(
+        NodeTable::new(vec![RemoteNode::new(
+            "node-a",
+            endpoint(&node_url, None, 5),
+        )])
+        .unwrap(),
+    );
+    let plan = Plan::new(1, vec![task("t1")]).unwrap();
+    let dispatch = thread::spawn(move || {
+        run_remote_plan_with_table(
+            &plan,
+            table,
+            RemotePlanConfig::new(1),
+            CancelToken::new(),
+            |task: &TaskSpec| request_for(task),
+        )
+        .unwrap()
+    });
+
+    // 等节点拿到租约，再由外部持有者抢走：节点随后的 renew 必然失败。
+    thread::sleep(Duration::from_millis(50));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the node never claimed the lease"
+        );
+        match remote_ledger::claim(&outer, "t1@0").unwrap() {
+            Claim::Pending => thread::sleep(Duration::from_millis(10)),
+            Claim::New { lease } => {
+                assert!(!lease.is_empty());
+                break;
+            }
+            Claim::Done(_) => panic!("the task completed before the lease was stolen"),
+        }
+    }
+
+    let report = dispatch.join().unwrap();
+    assert!(report.report.failed.is_some());
+    assert!(matches!(
+        report.results.get("t1").map(|result| &result.status),
+        Some(DelegationStatus::Aborted)
+    ));
+    // 旧持有者只执行过一次，且没有登记完成。
+    assert_eq!(node_server.executed_requests(), 1);
+    assert_eq!(ledger.completions(), 0);
+    // Superseded 不隔离节点，也不算节点故障。
+    let snapshot = report
+        .nodes
+        .iter()
+        .find(|node| node.id == "node-a")
+        .unwrap();
+    assert!(snapshot.healthy, "a stolen lease must not isolate the node");
+    assert_eq!(snapshot.failures, 0);
+}
+
+#[test]
+fn deadline_exceeded_is_over_budget_not_node_failure() {
+    let node_server = Arc::new(
+        RemoteServer::bind(
+            RemoteServerConfig::new("127.0.0.1:0")
+                .with_sleep_ms(600)
+                .with_exec_timeout(Duration::from_millis(100)),
+        )
+        .unwrap(),
+    );
+    let node_url = format!("http://{}/run", node_server.addr().unwrap());
+    let serving = Arc::clone(&node_server);
+    thread::spawn(move || serving.serve_forever().unwrap());
+
+    let table = Arc::new(
+        NodeTable::new(vec![RemoteNode::new(
+            "node-a",
+            endpoint(&node_url, None, 5),
+        )])
+        .unwrap(),
+    );
+    let plan = Plan::new(1, vec![task("t1")]).unwrap();
+    let report = run_remote_plan_with_table(
+        &plan,
+        table,
+        RemotePlanConfig::new(1),
+        CancelToken::new(),
+        |task: &TaskSpec| request_for(task),
+    )
+    .unwrap();
+
+    assert!(report.report.failed.is_some());
+    assert!(matches!(
+        report.results.get("t1").map(|result| &result.status),
+        Some(DelegationStatus::Aborted)
+    ));
+    let snapshot = report
+        .nodes
+        .iter()
+        .find(|node| node.id == "node-a")
+        .unwrap();
+    assert!(snapshot.healthy, "a deadline is not a node failure");
+    assert_eq!(snapshot.failures, 1, "OverBudget still counts as a failure");
+    assert_eq!(node_server.executed_requests(), 1);
+}
+
+#[test]
+fn ledger_budget_exhaustion_fails_closed_without_execution() {
+    let ledger = Arc::new(
+        LedgerServer::bind(LedgerServerConfig::new("127.0.0.1:0").with_token_budget(1)).unwrap(),
+    );
+    let ledger_url = format!("http://{}", ledger.addr().unwrap());
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&ledger_url, None, 5);
+
+    // 先登记一个 1 token 的完成帧，把跨机预算耗尽。
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "warm@0").unwrap() else {
+        panic!("expected the warm claim to win");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "warm".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"warm".to_vec(),
+        tokens: 1,
+        model: None,
+        usage: None,
+        dissent: None,
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "warm@0", &lease, &frame).unwrap();
+
+    let node_server = Arc::new(
+        RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_ledger(endpoint(
+            &ledger_url,
+            None,
+            5,
+        )))
+        .unwrap(),
+    );
+    let node_url = format!("http://{}/run", node_server.addr().unwrap());
+    let serving = Arc::clone(&node_server);
+    thread::spawn(move || serving.serve_forever().unwrap());
+
+    let table = Arc::new(
+        NodeTable::new(vec![RemoteNode::new(
+            "node-a",
+            endpoint(&node_url, None, 5),
+        )])
+        .unwrap(),
+    );
+    let plan = Plan::new(1, vec![task("t1")]).unwrap();
+    let report = run_remote_plan_with_table(
+        &plan,
+        table,
+        RemotePlanConfig::new(1),
+        CancelToken::new(),
+        |task: &TaskSpec| request_for(task),
+    )
+    .unwrap();
+
+    assert!(report.report.failed.is_some());
+    assert!(matches!(
+        report.results.get("t1").map(|result| &result.status),
+        Some(DelegationStatus::Failed { .. })
+    ));
+    // 账本拒绝 claim 后节点根本不应进入执行阶段。
+    assert_eq!(
+        node_server.executed_requests(),
+        0,
+        "budget exhaustion must not execute"
+    );
+    let snapshot = report
+        .nodes
+        .iter()
+        .find(|node| node.id == "node-a")
+        .unwrap();
+    assert!(snapshot.healthy, "a ledger 503 is not a node failure");
+}
+
+#[test]
+fn usd_budget_blocks_new_claims_after_spend() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_usd_budget(1.0)
+                .with_prices(trit_host::cost::PriceTable::builtin()),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected first claim to win");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"done".to_vec(),
+        tokens: 0,
+        model: Some("gpt-4o".into()),
+        usage: Some(trit_orch::SubagentUsage {
+            fresh: 1_000_000,
+            cached: 0,
+            output: 0,
+            estimated: false,
+        }),
+        dissent: None,
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+
+    // 这帧折算 $2.50，已超过 $1 预算：新键 claim 直接 503。
+    let error = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap_err();
+    assert!(error.contains("503"), "{error}");
+}
+
+#[test]
+fn renew_errors_classify_transient_and_lease_loss() {
+    use trit_host::remote_ledger::RenewError;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = [500u16, 403, 404, 204];
+    let server = thread::spawn(move || {
+        for (index, code) in responses.iter().copied().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let done = code == 204 && index == responses.len() - 1;
+            let extra = if done { "X-Trit-Lease-Done: 1\r\n" } else { "" };
+            write!(
+                stream,
+                "HTTP/1.1 {code} X\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let lease = "0123456789abcdef";
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::Http(500))
+    ));
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::LeaseLost)
+    ));
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::UnknownKey)
+    ));
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::Completed)
+    ));
     server.join().unwrap();
 }

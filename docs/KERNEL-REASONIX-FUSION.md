@@ -350,8 +350,14 @@ Reasonix 的 `Usage` 明确区分 provider-reported 与 `estimated`，且“未�
 - 新增 `crates/trit-reasonix` 适配层：`HostUsage::into_token_usage()` 把
   `cache_hit_tokens / cache_miss_tokens / completion_tokens / estimated` 映射到内核口径。
 
-后续仍要做：预算结算与完成闸门在 `estimated` 时的显式策略（拒绝结算 / 降级为 Unknown），
-不能只“记一个标记”却继续当精确值使用。
+已落地（2026-11-28）——`estimated` 不再是"只记一个标记"：
+
+- 预算结算：`cost::budget_alert_with_exactness` 显式接收 exactness。用量是估算时仍然告警，但
+  `exceeded` 恒为 `false`（不拿估算数字硬判超支去中止任务或拒付），`warning()` 注明"用量估算，
+  未按精确值结算"，`BudgetAlert.exact` 随报告下发；旧报告缺该字段按精确值读入，历史数据不被降级。
+- 完成指标：`TurnMetrics.tokens_estimated` 与 `OrchestrationMetrics.usage_estimated`（含 Prometheus
+  gauge）随每次 turn / observation 传播，下游按估算处理，不回退成精确值。
+- `session-fleet-run` 的预算告警改用 exactness 版本：估算超预算只告警，不当作确定超支。
 
 ### 5.6 检查点 / 回退 → PlanPatch + epoch
 

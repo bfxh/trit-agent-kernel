@@ -4,10 +4,11 @@
 //! 执行仍走 `ToolExecutor`，因此会话、检查点与会话回放无需特殊分支。
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::mcp_http::HttpMcpClient;
 use crate::provider::{ToolCatalog, ToolSpec};
 use crate::supervisor::{McpSupervisor, RecoveryContext};
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
@@ -20,31 +21,62 @@ pub struct McpToolRoute {
     pub description: String,
     pub input_schema: Value,
     pub declared_read_only: bool,
+    /// stdio supervisor 下标；HTTP 客户端为 0 且 `http` 为 Some。
     supervisor: usize,
+    /// HTTP MCP 客户端下标；stdio 路由为 None。
+    http: Option<usize>,
 }
 
 #[derive(Clone)]
 pub struct McpToolClient {
     supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
+    http: Vec<Arc<HttpMcpClient>>,
     recovery: Arc<Mutex<RecoveryContext>>,
     timeout: Duration,
+    /// 路由缓存；高频 `route()`/`tools()` 调用不重复重建。
+    routes_cache: Arc<Mutex<Option<(Instant, Vec<McpToolRoute>)>>>,
 }
 
 impl McpToolClient {
     pub(crate) fn new(
         supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
+        http: Vec<Arc<HttpMcpClient>>,
         recovery: Arc<Mutex<RecoveryContext>>,
         timeout: Duration,
     ) -> Self {
         Self {
             supervisors,
+            http,
             recovery,
             timeout,
+            routes_cache: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 每次都从 supervisor 当前 tools 重建，list_changed 后无需重启。
+    /// 路由缓存：5 秒内复用；`invalidate` 可强制重建。
     pub fn routes(&self) -> Vec<McpToolRoute> {
+        let now = Instant::now();
+        if let Ok(cache) = self.routes_cache.lock()
+            && let Some((cached_at, routes)) = cache.as_ref()
+            && now.duration_since(*cached_at) < Duration::from_secs(5)
+        {
+            return routes.clone();
+        }
+        let routes = self.build_routes();
+        if let Ok(mut cache) = self.routes_cache.lock() {
+            *cache = Some((now, routes.clone()));
+        }
+        routes
+    }
+
+    /// 强制下次 `routes()` 重建；MCP `list_changed` 或 HTTP `refresh` 后调用。
+    pub fn invalidate(&self) {
+        if let Ok(mut cache) = self.routes_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    fn build_routes(&self) -> Vec<McpToolRoute> {
         let mut used = std::collections::BTreeSet::new();
         let mut routes = Vec::new();
         for (index, supervisor) in self.supervisors.iter().enumerate() {
@@ -72,12 +104,45 @@ impl McpToolClient {
                     description,
                     input_schema,
                     // `readOnlyHint` 是 MCP 服务端自报，不可作为授权依据。
-                    // 仅保留在 route 上供展示/诊断，绝不进入 ToolSpec.read_only。
+                    // 仅保留在 route 上供展示/诊断（`trit-host tools`），绝不进入 ToolSpec.read_only。
                     declared_read_only: tool
                         .annotations
                         .as_ref()
                         .is_some_and(|annotations| annotations.read_only_hint),
                     supervisor: index,
+                    http: None,
+                });
+            }
+        }
+        for (index, client) in self.http.iter().enumerate() {
+            let server = client.name().to_owned();
+            let Ok(mut tools) = client.tools() else {
+                continue;
+            };
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            for tool in tools {
+                let exposed_name = unique_exposed_name(&server, &tool.name, &mut used);
+                let description = tool
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("MCP tool {}.{}", server, tool.name));
+                let input_schema = if tool.input_schema.is_null() {
+                    serde_json::json!({"type": "object"})
+                } else {
+                    tool.input_schema.clone()
+                };
+                routes.push(McpToolRoute {
+                    exposed_name,
+                    server: server.clone(),
+                    tool: tool.name.clone(),
+                    description,
+                    input_schema,
+                    declared_read_only: tool
+                        .annotations
+                        .as_ref()
+                        .is_some_and(|annotations| annotations.read_only_hint),
+                    supervisor: 0,
+                    http: Some(index),
                 });
             }
         }
@@ -98,6 +163,15 @@ impl McpToolClient {
         let route = self
             .route(exposed_name)
             .ok_or_else(|| AgentError::Tool(format!("unknown MCP tool: {exposed_name}")))?;
+        if let Some(index) = route.http {
+            let client = self
+                .http
+                .get(index)
+                .ok_or_else(|| AgentError::Tool("HTTP MCP client is missing".into()))?;
+            return client.call(&route.tool, arguments).map_err(|error| {
+                AgentError::Tool(format!("MCP {}/{}: {error}", route.server, route.tool))
+            });
+        }
         let recovery = self
             .recovery
             .lock()
@@ -128,6 +202,7 @@ impl ToolCatalog for McpToolClient {
                     "{} (MCP {} / {})",
                     route.description, route.server, route.tool
                 ),
+                // MCP 的 readOnlyHint 不进入 ToolSpec.read_only（授权元数据）。
                 read_only: false,
                 input_schema: Some(route.input_schema),
             })

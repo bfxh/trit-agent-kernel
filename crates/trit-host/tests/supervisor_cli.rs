@@ -218,7 +218,7 @@ stderr: {stderr}"
 }
 
 #[test]
-fn cli_rejects_sampling_without_openai_provider() {
+fn cli_rejects_sampling_without_a_real_provider() {
     let root = temp_dir("sampling");
     let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
         .args([
@@ -234,7 +234,7 @@ fn cli_rejects_sampling_without_openai_provider() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("--mcp-sampling requires --provider openai"),
+        stderr.contains("--mcp-sampling requires a real provider"),
         "stderr: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -284,6 +284,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
         interval_ms: 10,
         mcp_timeout_ms: 1_000,
         resource_read_concurrency: 8,
+        mcp_http: Vec::new(),
     };
     std::fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
 
