@@ -4,6 +4,7 @@
 //! 打开后在校验过的句柄上计数硬链接；文件创建/覆盖不再依赖“先检查路径再写路径”。
 //! shell 默认关闭；开启后优先走宿主提供的 OS 沙箱，否则必须显式允许无沙箱。
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -862,12 +863,12 @@ impl ToolExecutor for LocalTools {
         }
     }
 
-    /// 同一批全是只读工具时并行执行；含写工具时退回逐条串行。
+    /// 同一批全是可并行工具时并行执行：只读直接并行，写工具按首路径分组。
     fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
         if requests.len() < 2
             || !requests
                 .iter()
-                .all(|request| is_readonly_tool(&request.tool))
+                .all(|request| is_parallel_tool(&request.tool))
         {
             return requests
                 .iter()
@@ -875,20 +876,62 @@ impl ToolExecutor for LocalTools {
                 .collect();
         }
         let tools: &LocalTools = self;
+        if requests
+            .iter()
+            .all(|request| is_readonly_tool(&request.tool))
+        {
+            return std::thread::scope(|scope| {
+                let handles: Vec<_> = requests
+                    .iter()
+                    .map(|request| scope.spawn(move || tools.execute_readonly(request)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(AgentError::Tool("readonly tool worker panicked".into()))
+                        })
+                    })
+                    .collect()
+            });
+        }
+        // 写工具：同一首路径串行，不同路径并行；没有路径的请求单独成组串行。
+        let mut groups: BTreeMap<Option<&str>, Vec<usize>> = BTreeMap::new();
+        for (index, request) in requests.iter().enumerate() {
+            groups
+                .entry(request.paths.first().map(String::as_str))
+                .or_default()
+                .push(index);
+        }
+        let mut results: Vec<Option<Result<ToolOutcome, AgentError>>> =
+            (0..requests.len()).map(|_| None).collect();
         std::thread::scope(|scope| {
-            let handles: Vec<_> = requests
-                .iter()
-                .map(|request| scope.spawn(move || tools.execute_readonly(request)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| {
-                        Err(AgentError::Tool("readonly tool worker panicked".into()))
+            let handles: Vec<_> = groups
+                .into_values()
+                .map(|indices| {
+                    scope.spawn(move || {
+                        indices
+                            .into_iter()
+                            .map(|index| (index, tools.execute_write(&requests[index])))
+                            .collect::<Vec<_>>()
                     })
                 })
-                .collect()
-        })
+                .collect();
+            for handle in handles {
+                if let Ok(batch) = handle.join() {
+                    for (index, outcome) in batch {
+                        results[index] = Some(outcome);
+                    }
+                }
+            }
+        });
+        results
+            .into_iter()
+            .map(|outcome| {
+                outcome
+                    .unwrap_or_else(|| Err(AgentError::Tool("parallel batch lost a result".into())))
+            })
+            .collect()
     }
 }
 
@@ -900,6 +943,15 @@ impl LocalTools {
             "search_code" => self.search_code(request),
             "glob" => self.glob(request),
             other => Err(AgentError::Tool(format!("tool {other} is not read-only"))),
+        }
+    }
+
+    /// 写工具的分段执行入口；同一首路径由 batch 串行化。
+    fn execute_write(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        match request.tool.as_str() {
+            "write_file" => self.write_file(request),
+            "move_path" => self.move_path(request),
+            other => Err(AgentError::Tool(format!("tool {other} is not writable"))),
         }
     }
 
@@ -984,6 +1036,14 @@ impl LocalTools {
 /// 只读工具可以在同一批内并行执行（无写副作用）。
 pub fn is_readonly_tool(tool: &str) -> bool {
     matches!(tool, "read_file" | "search_code" | "glob")
+}
+
+/// 可在同一批内分段并行的工具：只读，或按路径隔离的写。
+pub fn is_parallel_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file" | "search_code" | "glob" | "write_file" | "move_path"
+    )
 }
 
 fn is_cross_device(error: &std::io::Error) -> bool {
@@ -1172,6 +1232,44 @@ mod tests {
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes[0].as_ref().unwrap().output.contains("alpha"));
         assert!(outcomes[1].as_ref().unwrap().output.contains("beta"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_batch_serializes_same_path_and_parallelizes_distinct_paths() {
+        let root = temp("write-batch");
+        let mut config = WorkspaceConfig::new(&root);
+        config.allow_write = true;
+        let mut tools = LocalTools::new(config).unwrap();
+        let write = |call_id: &str, path: &str, content: &str| ToolRequest {
+            call_id: call_id.into(),
+            tool: "write_file".into(),
+            read_only: false,
+            command: None,
+            paths: vec![path.into()],
+            operation: None,
+            content: Some(content.into()),
+            span: None,
+            arguments: None,
+        };
+        let outcomes = tools.execute_batch(&[
+            write("call-1", "a.txt", "one"),
+            write("call-2", "b.txt", "two"),
+        ]);
+        assert!(outcomes.iter().all(|outcome| outcome.is_ok()));
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "two");
+
+        // 同一路径在同一批内串行：后一个请求覆盖前一个。
+        let outcomes = tools.execute_batch(&[
+            write("call-3", "same.txt", "first"),
+            write("call-4", "same.txt", "second"),
+        ]);
+        assert!(outcomes.iter().all(|outcome| outcome.is_ok()));
+        assert_eq!(
+            std::fs::read_to_string(root.join("same.txt")).unwrap(),
+            "second"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1415,7 +1415,7 @@ fn usage() {
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
          [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
-         [--workers N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
+         [--workers N] [--max-concurrency N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
          [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
@@ -1437,12 +1437,12 @@ fn usage() {
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
          session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
-         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
-         [--cache <path>] [--apply] [--compact]\n\
+         [--max-concurrency N] [--workspace <dir>] [--max-steps N] [--retry N]\n\
+         [--budget-tokens N] [--budget-cny F] [--cache <path>] [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          session-fleet-remote: trit-host session-fleet-remote --root <dir> --nodes <node-table.json>\n\
-         [--workers N] [--retry N] [--budget-tokens N] [--scope S] [--health-probe]\n\
+         [--workers N] [--max-concurrency N] [--retry N] [--budget-tokens N] [--scope S] [--health-probe]\n\
          [--cache <path>] [--apply] [--compact]\n\
          dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
@@ -1545,6 +1545,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut nodes_path: Option<PathBuf> = None;
     let mut workers = 4usize;
+    let mut max_concurrency: Option<usize> = None;
     let mut retry_limit = 0u32;
     let mut budget_tokens = 0u64;
     let mut scope: Option<String> = None;
@@ -1560,6 +1561,13 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
                 workers = next(&mut args, "--workers")?
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--max-concurrency" => {
+                max_concurrency = Some(
+                    next(&mut args, "--max-concurrency")?
+                        .parse()
+                        .map_err(|_| fail("--max-concurrency must be a positive integer"))?,
+                );
             }
             "--retry" => {
                 retry_limit = next(&mut args, "--retry")?
@@ -1587,6 +1595,10 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
         .ok_or_else(|| fail("session-fleet-remote requires --nodes <node-table.json>"))?;
     let text = std::fs::read_to_string(&nodes_path)?;
     let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
+    let cap = concurrency_cap(max_concurrency);
+    if cap > 0 {
+        workers = workers.min(cap);
+    }
     let roots = expand_roots(roots);
     let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
@@ -1618,6 +1630,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
 fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut workers = 4usize;
+    let mut max_concurrency: Option<usize> = None;
     let mut workspace: Option<PathBuf> = None;
     let mut max_steps = 20usize;
     let mut retries = 0usize;
@@ -1633,6 +1646,13 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                 workers = next(&mut args, "--workers")?
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--max-concurrency" => {
+                max_concurrency = Some(
+                    next(&mut args, "--max-concurrency")?
+                        .parse()
+                        .map_err(|_| fail("--max-concurrency must be a positive integer"))?,
+                );
             }
             "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
             "--max-steps" => {
@@ -1674,6 +1694,10 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                 return Err(fail(format!("unknown session-fleet-run argument: {other}")));
             }
         }
+    }
+    let cap = concurrency_cap(max_concurrency);
+    if cap > 0 {
+        workers = workers.min(cap);
     }
     let roots = expand_roots(roots);
     let scanned = scan_for(&roots, cache.as_deref())?;
@@ -1885,6 +1909,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut nodes_path: Option<PathBuf> = None;
     let mut max_items = 4usize;
     let mut workers = 4usize;
+    let mut max_concurrency: Option<usize> = None;
     let mut max_steps = 20usize;
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
@@ -1907,6 +1932,13 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                 workers = next(&mut args, "--workers")?
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--max-concurrency" => {
+                max_concurrency = Some(
+                    next(&mut args, "--max-concurrency")?
+                        .parse()
+                        .map_err(|_| fail("--max-concurrency must be a positive integer"))?,
+                );
             }
             "--max-steps" => {
                 max_steps = next(&mut args, "--max-steps")?
@@ -1947,6 +1979,10 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                 return Err(fail(format!("unknown session-advance argument: {other}")));
             }
         }
+    }
+    let cap = concurrency_cap(max_concurrency);
+    if cap > 0 {
+        workers = workers.min(cap);
     }
     let roots = expand_roots(roots);
     let scanned = scan_for(&roots, cache.as_deref())?;
@@ -2116,6 +2152,17 @@ fn expand_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
         roots.push(PathBuf::from("."));
     }
     roots
+}
+
+/// 全局并发上限：显式参数优先，其次 `TRIT_MAX_CONCURRENCY`；0 表示不限。
+fn concurrency_cap(explicit: Option<usize>) -> usize {
+    explicit
+        .or_else(|| {
+            std::env::var("TRIT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {

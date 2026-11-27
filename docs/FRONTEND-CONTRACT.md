@@ -156,3 +156,61 @@ FeatureGroupSpec { id, members[] }
 - 不用能力门禁替代工具权限、沙箱、工作区 ACL。
 - 不用它做 A/B 实验或模型能力开关；那些需要独立开关和审计。
 - 不让前端自行“猜一个默认值”绕过锁住状态。
+
+## 10. 设置项契约
+
+设置项不是能力门禁的替代：能力决定“入口能不能显示”，设置决定“显示后默认开不开、参数是多少”。设置由前端持久化，内核只接受显式参数或环境变量；内核不读写注册表、不替用户改系统设置。
+
+### 10.1 两项自启动
+
+| id | 类型 | 默认 | 作用 | 生效时机 | 内核行为 |
+| --- | --- | --- | --- | --- | --- |
+| `startup.app_autostart` | bool | `false` | 桌面应用随系统登录启动 | 下次登录 | 内核不实现；前端 / 安装器负责开机项，内核不写注册表 |
+| `startup.agent_autostart` | bool | `false` | 应用启动后自动恢复上次 agent 会话或服务 | 应用启动时 | 前端调用 `session-advance --root ... --apply`，或启动 `remote-ledger` / `remote-serve`；内核不自动拉起 |
+
+- 两项互不依赖：关闭应用自启动不影响手动打开；关闭 agent 自启动时应用启动后停在空会话。
+- `startup.agent_autostart` 必须配合 `concurrency.max`，避免启动即打满。
+- 失败回退：自动恢复失败（会话损坏、预算不足、provider 不可用）时展示一次可关闭的通知，不重试、不静默清空。
+
+### 10.2 并发与预算
+
+| id | 类型 | 默认 | 对应内核入口 |
+| --- | --- | --- | --- |
+| `concurrency.max` | u32，`0` = 不限 | `0` | `--max-concurrency` / `TRIT_MAX_CONCURRENCY` |
+| `session.workers` | u32 | `4` | `--workers` |
+| `budget.tokens` | u64，`0` = 不限 | `0` | `--budget-tokens` |
+| `budget.cny` | f64，`0` = 不限 | `0` | `--budget-cny` |
+| `cost.usd_cny` | f64 | `7.2` | `TRIT_USD_CNY` |
+| `cost.model_prices` | path | 内置价目表 | `TRIT_MODEL_PRICES` |
+
+- `concurrency.max` 是**总并发上限**：`--workers` 与它取小；多会话、多 root、跨机任务叠加时不会超过它。
+- 预算耗尽 fail-closed：token 预算小于任务数直接拒绝；人民币预算达到 80% 写 warning、超过标记 `exceeded`；跨机 ledger 达到预算后 `/claim` 返回 503。
+- 汇率与价目表只影响展示和预算折算，不改变真实计费；未知模型不按 0 计价。
+
+### 10.3 浏览器
+
+| id | 类型 | 默认 | 对应内核入口 |
+| --- | --- | --- | --- |
+| `browser.enabled` | bool | `false` | 前端是否展示 `browser` 工具 |
+| `browser.chrome_path` | path | 自动探测 | `TRIT_CHROME` |
+| `browser.headless` | bool | `true` | 启动参数 |
+| `browser.screenshot_allow_write` | bool | `false` | 截图需要 workspace `allow-write` |
+
+- 浏览器通过 CDP 驱动本机 Chrome / Chromium / Edge，不嵌入渲染引擎；没有可用浏览器时返回明确错误，不降级成“假装成功”。
+- 截图路径限制在 workspace 内；未开启 `allow-write` 时拒绝截图。
+
+### 10.4 观测
+
+| id | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `diagnostics.show_background_tasks` | bool | `true` | `diagnostics` 输出 `background_tasks[]` 与 `background_started` |
+| `diagnostics.token_rate` | bool | `true` | 会话报告展示 `tokens_per_second` |
+
+- 观测字段只读，不参与完成裁决；旧日志缺少指标时 `tokens_per_second` 为 `null`。
+
+### 10.5 前端要求
+
+- 设置项必须显式持久化并在启动时上报；不要用本地常量猜默认值。
+- 设置变化只影响下一次调用，不允许热改正在运行的任务。
+- 每个开关都要有一句“为什么默认关闭”的说明；两个自启动必须默认关闭。
+- 设置项 id 与本文一致；新增项走第 7 节的版本规则。

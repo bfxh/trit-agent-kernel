@@ -945,12 +945,12 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 return Err(AgentError::EmptyProposal);
             }
 
-            let readonly_batch = proposal.tool_calls.len() > 1
+            let parallel_batch = proposal.tool_calls.len() > 1
                 && proposal
                     .tool_calls
                     .iter()
-                    .all(|request| crate::tools::is_readonly_tool(&request.tool));
-            let mut batched = if readonly_batch {
+                    .all(|request| crate::tools::is_parallel_tool(&request.tool));
+            let mut batched = if parallel_batch {
                 self.tools
                     .execute_batch(&proposal.tool_calls)
                     .into_iter()
@@ -997,7 +997,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     }
                     None => None,
                 };
-                let outcome = if readonly_batch {
+                let outcome = if parallel_batch {
                     match batched.get_mut(index).and_then(Option::take) {
                         Some(outcome) => outcome,
                         None => self.tools.execute(request),

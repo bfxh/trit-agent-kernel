@@ -762,6 +762,7 @@ mod tests {
                 "bash",
                 "search_code",
                 "glob",
+                "browser",
                 "context_search",
                 "context_add",
                 "context_read",
