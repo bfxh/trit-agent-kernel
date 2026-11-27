@@ -290,6 +290,14 @@ impl<T: Model + ?Sized> Model for Box<T> {
 pub trait ToolExecutor {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError>;
 
+    /// 批量执行；默认逐条串行。实现可对无副作用的只读工具并行。
+    fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
+        requests
+            .iter()
+            .map(|request| self.execute(request))
+            .collect()
+    }
+
     /// 新一轮开始；检查点/审计工具可在这里准备状态。
     fn begin_turn(&mut self, _turn: usize, _objective: &str) -> Result<(), AgentError> {
         Ok(())
@@ -304,6 +312,10 @@ pub trait ToolExecutor {
 impl<T: ToolExecutor + ?Sized> ToolExecutor for Box<T> {
     fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
         (**self).execute(request)
+    }
+
+    fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
+        (**self).execute_batch(requests)
     }
 
     fn begin_turn(&mut self, turn: usize, objective: &str) -> Result<(), AgentError> {
@@ -926,7 +938,21 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 return Err(AgentError::EmptyProposal);
             }
 
-            for request in &proposal.tool_calls {
+            let readonly_batch = proposal.tool_calls.len() > 1
+                && proposal
+                    .tool_calls
+                    .iter()
+                    .all(|request| crate::tools::is_readonly_tool(&request.tool));
+            let mut batched = if readonly_batch {
+                self.tools
+                    .execute_batch(&proposal.tool_calls)
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            for (index, request) in proposal.tool_calls.iter().enumerate() {
                 log_session(
                     &mut session,
                     SessionEvent::ToolRequested {
@@ -964,7 +990,14 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                     }
                     None => None,
                 };
-                let outcome = self.tools.execute(request)?;
+                let outcome = if readonly_batch {
+                    match batched.get_mut(index).and_then(Option::take) {
+                        Some(outcome) => outcome,
+                        None => self.tools.execute(request),
+                    }
+                } else {
+                    self.tools.execute(request)
+                }?;
                 if outcome.call_id != request.call_id {
                     return Err(AgentError::ToolMismatch {
                         expected: request.call_id.clone(),

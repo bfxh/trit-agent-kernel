@@ -7,6 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -167,7 +168,7 @@ pub struct LocalTools {
     max_output_bytes: usize,
     persistent_shell: bool,
     max_search_file_bytes: usize,
-    shell_session: Option<ShellSession>,
+    shell_session: Mutex<Option<ShellSession>>,
 }
 
 fn persistent_shell_candidates() -> Vec<(PathBuf, Vec<&'static str>)> {
@@ -365,7 +366,7 @@ impl LocalTools {
             max_output_bytes: config.max_output_bytes,
             persistent_shell: config.persistent_shell,
             max_search_file_bytes: config.max_search_file_bytes,
-            shell_session: None,
+            shell_session: Mutex::new(None),
         })
     }
 
@@ -782,14 +783,21 @@ impl LocalTools {
             .as_deref()
             .ok_or_else(|| AgentError::Tool("command is required".into()))?;
         if self.persistent_shell && self.sandbox.is_none() && self.allow_unsandboxed_shell {
-            if self.shell_session.is_none() {
-                self.shell_session = ShellSession::spawn(&self.root).ok();
+            let mut guard = self
+                .shell_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.is_none() {
+                *guard = ShellSession::spawn(&self.root).ok();
             }
-            if let Some(session) = self.shell_session.as_mut() {
-                let (status, output) = session.run(command, self.max_output_bytes)?;
+            let run = guard
+                .as_mut()
+                .map(|session| session.run(command, self.max_output_bytes))
+                .transpose()?;
+            if let Some((status, output)) = run {
                 let in_doubt = status.is_none();
                 if in_doubt {
-                    self.shell_session = None;
+                    *guard = None;
                 }
                 return Ok(ToolOutcome {
                     call_id: request.call_id.clone(),
@@ -850,6 +858,52 @@ impl ToolExecutor for LocalTools {
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
     }
+
+    /// 同一批全是只读工具时并行执行；含写工具时退回逐条串行。
+    fn execute_batch(&mut self, requests: &[ToolRequest]) -> Vec<Result<ToolOutcome, AgentError>> {
+        if requests.len() < 2
+            || !requests
+                .iter()
+                .all(|request| is_readonly_tool(&request.tool))
+        {
+            return requests
+                .iter()
+                .map(|request| self.execute(request))
+                .collect();
+        }
+        let tools: &LocalTools = self;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = requests
+                .iter()
+                .map(|request| scope.spawn(move || tools.execute_readonly(request)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(AgentError::Tool("readonly tool worker panicked".into()))
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
+impl LocalTools {
+    /// 只读工具的无副作用执行入口；并行 batch 只允许走这里。
+    fn execute_readonly(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        match request.tool.as_str() {
+            "read_file" => self.read_file(request),
+            "search_code" => self.search_code(request),
+            "glob" => self.glob(request),
+            other => Err(AgentError::Tool(format!("tool {other} is not read-only"))),
+        }
+    }
+}
+
+/// 只读工具可以在同一批内并行执行（无写副作用）。
+pub fn is_readonly_tool(tool: &str) -> bool {
+    matches!(tool, "read_file" | "search_code" | "glob")
 }
 
 fn is_cross_device(error: &std::io::Error) -> bool {
@@ -1013,5 +1067,31 @@ mod tests {
             )));
             assert!(!is_cross_device(&std::io::Error::from_raw_os_error(17)));
         }
+    }
+
+    #[test]
+    fn readonly_batch_preserves_request_order() {
+        let root = temp("readonly-batch");
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.join("b.txt"), "beta").unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut tools = LocalTools::new(config).unwrap();
+        let request = |call_id: &str, path: &str| ToolRequest {
+            call_id: call_id.into(),
+            tool: "read_file".into(),
+            read_only: true,
+            command: None,
+            paths: vec![path.into()],
+            operation: None,
+            content: None,
+            span: None,
+            arguments: None,
+        };
+        let outcomes =
+            tools.execute_batch(&[request("call-1", "a.txt"), request("call-2", "b.txt")]);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].as_ref().unwrap().output.contains("alpha"));
+        assert!(outcomes[1].as_ref().unwrap().output.contains("beta"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -70,6 +70,8 @@ DelegationResult（parent 目录 delegations.jsonl）
 - `--retry N` 只重跑 `deferred + failed` 子集，移除集合外依赖后重新分层。
 - Ctrl-C 接 `CancelToken`（Unix SIGINT / Windows SetConsoleCtrlHandler），协作式取消。
 - 每个任务独立 provider/model，但共享 `ureq::Agent` 连接池。
+- 内核并发：同一 proposal 内全是只读工具（`read_file`/`search_code`/`glob`）时走 `ToolExecutor::execute_batch` 并行执行，写工具与 `bash` 保持串行；多任务并发由 `trit_orch::fleet` 的 `workers` 控制。
+- GPU：内核与 CLI 不承载模型推理，GPU 加速属于 provider 侧；本层只做线程级并行，不对本地推理做承诺。
 
 ## 5. 预算与成本
 
