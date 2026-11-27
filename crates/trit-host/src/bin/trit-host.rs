@@ -194,9 +194,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut mcp_sampling_model: Option<String> = None;
     // 人类面默认输出 Markdown；需要机器消费时显式 `--output-format json`。
     let mut output_format = String::from("md");
-    let mut design_score_enabled = true;
-    let mut design_block_below: Option<u8> = None;
-    let mut lint_score_enabled: bool = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -244,15 +241,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--sandbox-arg" => sandbox_args.push(next(&mut args, "--sandbox-arg")?),
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
-            "--no-design-score" => design_score_enabled = false,
-            "--lint-score" => lint_score_enabled = true,
-            "--design-block-below" => {
-                design_block_below = Some(
-                    next(&mut args, "--design-block-below")?
-                        .parse()
-                        .map_err(|error| fail(format!("bad --design-block-below: {error}")))?,
-                );
-            }
             "--output-format" => {
                 output_format = match next(&mut args, "--output-format")?.as_str() {
                     "md" | "markdown" => "md".into(),
@@ -926,53 +914,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         eprintln!("cache ledger: {text}");
     }
-    let host_settings =
-        trit_host::settings::load(&workspace_root).map_err(|error| fail(error.to_string()))?;
-    // 设置里打开"参与决策"时用设置里的阈值；命令行显式参数优先。
-    let design_block_below = design_block_below.or_else(|| {
-        host_settings
-            .scoring
-            .participate_in_decision
-            .then_some(host_settings.scoring.design_block_below)
-    });
-    let mut design = design_score_enabled
-        .then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
-    // 显式开启才跑外部 lint；工具不存在/失败/超时都只是跳过，不影响主流程。
-    let lint = if lint_score_enabled {
-        trit_host::lint_score::run(&workspace_root, std::time::Duration::from_secs(120)).ok()
-    } else {
-        None
-    };
-    if let (Some(design), Some(lint)) = (design.as_mut(), lint.as_ref()) {
-        trit_host::lint_score::apply(design, lint);
-    }
     let mut stdout = std::io::stdout().lock();
     let rendered = if output_format == "json" {
-        let mut value = serde_json::to_value(&outcome).map_err(|error| fail(error.to_string()))?;
-        if let Some(design) = &design {
-            value["design"] =
-                serde_json::to_value(design).map_err(|error| fail(error.to_string()))?;
-        }
-        if let Some(lint) = &lint {
-            value["lint"] = serde_json::to_value(lint).map_err(|error| fail(error.to_string()))?;
-        }
-        serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
+        serde_json::to_string_pretty(&outcome).map_err(|error| fail(error.to_string()))?
     } else {
-        let mut text = outcome.render_markdown();
-        if let Some(design) = &design {
-            text.push_str(&trit_host::render_design_markdown(design));
-        }
-        text
+        outcome.render_markdown()
     };
     writeln!(stdout, "{rendered}")?;
-    if let (Some(design), Some(threshold)) = (&design, design_block_below)
-        && design.overall < threshold
-    {
-        return Err(fail(format!(
-            "design score {} below --design-block-below {threshold}",
-            design.overall
-        )));
-    }
     if gate_chain_post || gate_chain_post_report.is_some() {
         let mut exclude: Vec<&Path> = Vec::new();
         if let Some(path) = gate_chain_report.as_deref() {
@@ -1418,7 +1366,6 @@ fn usage() {
          [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
          [--provider scripted|openai|anthropic|gemini|deepseek] [--protocol <name>] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
-         [--no-design-score] [--design-block-below N] [--lint-score] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
          [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \

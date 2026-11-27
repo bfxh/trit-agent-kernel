@@ -28,8 +28,6 @@ pub struct Settings {
     pub diagnostics: DiagnosticsSettings,
     /// 记录与信号开关；`verification_signals` 控制是否统计并注入校验摘要。
     pub recording: RecordingSettings,
-    /// 前后端评分是否参与决策；默认关闭。
-    pub scoring: ScoringSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +101,6 @@ impl Default for Settings {
             browser: BrowserSettings::default(),
             diagnostics: DiagnosticsSettings::default(),
             recording: RecordingSettings::default(),
-            scoring: ScoringSettings::default(),
         }
     }
 }
@@ -157,25 +154,6 @@ impl Default for DiagnosticsSettings {
         Self {
             background_tasks: true,
             token_rate: true,
-        }
-    }
-}
-
-/// 评分设置：是否让分数参与决策。默认关闭，只在显式开启时按分数阻断。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ScoringSettings {
-    /// 设计分是否参与交付判定；默认关闭。
-    pub participate_in_decision: bool,
-    /// 参与判定时的阈值：`overall < design_block_below` 视为不合格。
-    pub design_block_below: u8,
-}
-
-impl Default for ScoringSettings {
-    fn default() -> Self {
-        Self {
-            participate_in_decision: false,
-            design_block_below: 60,
         }
     }
 }

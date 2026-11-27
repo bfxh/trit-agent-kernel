@@ -355,13 +355,6 @@ pub(crate) fn build_request_body(config: &OpenAiConfig, request: &ProviderReques
          package manager. Do not introduce a new language, framework or package manager unless \
          the task brief explicitly authorizes it as an explicit_override.",
     );
-    system.push_str(
-        "\n\nDesign quality is scored. Keep module boundaries and naming clear, handle errors \
-         explicitly instead of unwrap/panic, give network calls timeouts and bounded responses, \
-         and design the frontend with accessibility (aria/label/alt), loading/empty/error states, \
-         responsive breakpoints and a restrained design-token palette (few colors, few font sizes, \
-         consistent spacing).",
-    );
     let mut context_tail = String::new();
     let mut context_fingerprint = String::new();
     if let Some(plan) = &request.context {
