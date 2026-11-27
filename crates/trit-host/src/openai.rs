@@ -5,10 +5,12 @@
 
 use std::fmt;
 use std::io::{BufReader, Read};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::provider_health::{ConnectionFailureKind, ConnectionHealth, ConnectionHealthPolicy};
 use crate::provider_stream::{
     OpenAiStreamAssembler, ProviderStreamEvent, StreamingProvider, read_sse_events,
 };
@@ -92,10 +94,30 @@ impl OpenAiConfig {
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     agent: ureq::Agent,
+    health: Arc<Mutex<ConnectionHealth>>,
+    health_policy: ConnectionHealthPolicy,
 }
 
 /// 单次 HTTP 响应的读取上限；超过时 fail closed，避免恶意/异常网关拖垮进程。
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 把 HTTP 状态码映射到连接失败类型；配额文案优先按 Quota 处理。
+fn classify_status(code: u16, body: &str) -> ConnectionFailureKind {
+    match code {
+        429 => ConnectionFailureKind::RateLimit,
+        401 | 403 => ConnectionFailureKind::Auth,
+        402 => ConnectionFailureKind::Quota,
+        500..=599 => ConnectionFailureKind::Server,
+        400..=499 => {
+            if body.to_ascii_lowercase().contains("quota") {
+                ConnectionFailureKind::Quota
+            } else {
+                ConnectionFailureKind::Protocol
+            }
+        }
+        _ => ConnectionFailureKind::Unknown,
+    }
+}
 
 fn read_response_text(response: ureq::Response) -> Result<String, AgentError> {
     let mut bytes = Vec::new();
@@ -118,7 +140,32 @@ impl OpenAiProvider {
             .timeout(config.timeout)
             .timeout_connect(config.connect_timeout)
             .build();
-        Self { config, agent }
+        Self {
+            config,
+            agent,
+            health: Arc::new(Mutex::new(ConnectionHealth::new())),
+            health_policy: ConnectionHealthPolicy::default(),
+        }
+    }
+
+    /// 当前连接健康快照。
+    pub fn health(&self) -> ConnectionHealth {
+        self.health
+            .lock()
+            .map(|health| health.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_success(&self) {
+        if let Ok(mut health) = self.health.lock() {
+            health.record_success();
+        }
+    }
+
+    fn record_failure(&self, kind: ConnectionFailureKind) {
+        if let Ok(mut health) = self.health.lock() {
+            health.record_failure(kind, self.health_policy);
+        }
     }
 
     fn post_chat(&self, body: &Value) -> Result<String, AgentError> {
@@ -127,19 +174,26 @@ impl OpenAiProvider {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let response = self
+        match self
             .agent
             .post(&url)
             .set("Authorization", &format!("Bearer {}", self.config.api_key))
             .set("Content-Type", "application/json")
-            .send_string(&body.to_string());
-        match response {
-            Ok(response) => read_response_text(response),
+            .send_string(&body.to_string())
+        {
+            Ok(response) => {
+                self.record_success();
+                read_response_text(response)
+            }
             Err(ureq::Error::Status(code, response)) => {
                 let text = read_response_text(response).unwrap_or_default();
+                self.record_failure(classify_status(code, &text));
                 Err(AgentError::Provider(format!("HTTP {code}: {text}")))
             }
-            Err(error) => Err(AgentError::Provider(format!("transport: {error}"))),
+            Err(error) => {
+                self.record_failure(ConnectionFailureKind::Transport);
+                Err(AgentError::Provider(format!("transport: {error}")))
+            }
         }
     }
 
@@ -185,12 +239,17 @@ impl StreamingProvider for OpenAiProvider {
             .set("Accept", "text/event-stream")
             .send_string(&body.to_string());
         let response = match response {
-            Ok(response) => response,
+            Ok(response) => {
+                self.record_success();
+                response
+            }
             Err(ureq::Error::Status(code, response)) => {
                 let text = read_response_text(response).unwrap_or_default();
+                self.record_failure(classify_status(code, &text));
                 return Err(AgentError::Provider(format!("HTTP {code}: {text}")));
             }
             Err(error) => {
+                self.record_failure(ConnectionFailureKind::Transport);
                 return Err(AgentError::Provider(format!("transport: {error}")));
             }
         };
@@ -1023,5 +1082,74 @@ mod tests {
         let config = OpenAiConfig::new("http://127.0.0.1:9/v1", "k", "m");
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert_eq!(config.timeout, Duration::from_secs(120));
+    }
+
+    fn mock_status_server(
+        status: u16,
+        body: &'static str,
+        count: usize,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut request_body = vec![0u8; content_length];
+                reader.read_exact(&mut request_body).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn server_errors_degrade_health() {
+        use crate::provider_health::ConnectionState;
+        let (port, handle) = mock_status_server(500, "{}", 3);
+        let provider = OpenAiProvider::new(OpenAiConfig::new(
+            format!("http://127.0.0.1:{port}/v1"),
+            "k",
+            "m",
+        ));
+        for _ in 0..3 {
+            assert!(provider.complete_chat(&json!({})).is_err());
+        }
+        assert_eq!(provider.health().state, ConnectionState::Unavailable);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn auth_error_is_immediately_unavailable() {
+        use crate::provider_health::ConnectionState;
+        let (port, handle) = mock_status_server(401, "{}", 1);
+        let provider = OpenAiProvider::new(OpenAiConfig::new(
+            format!("http://127.0.0.1:{port}/v1"),
+            "k",
+            "m",
+        ));
+        assert!(provider.complete_chat(&json!({})).is_err());
+        assert_eq!(provider.health().state, ConnectionState::Unavailable);
+        handle.join().unwrap();
     }
 }
