@@ -16,6 +16,7 @@
 | `session-scan --root <dir> [--cache <path>]` | 扫描会话、任务、链接、健康信息 | 只读 |
 | `session-plan --root <dir> [--cache <path>]` | 生成 resume/inspect/idle/skip 分配 | 只读 |
 | `session-auto --root <dir> [--max-items N] [--cache <path>]` | 只自动派发 `resume` 项 | dry-run |
+| `session-advance --root <dir> [--workspace <dir>] [--cache <path>]` | 一条命令：scan → plan → auto dispatch → fleet run → callback → verify | dry-run |
 | `session-dispatch --root <dir> [--cache <path>]` | 手动派发全部 `resume` 项 | dry-run |
 | `session-run --session <resume.jsonl> [--apply]` | 读取派发单并执行单任务 | dry-run |
 | `session-callback --root <dir> [--apply]` | 写 parent 的 `delegations.jsonl` | dry-run |
@@ -109,7 +110,8 @@ cargo bench -p trit-host --bench session_scan
 
 ## 9. 当前边界
 
-- `session-auto` 只生成派发单，不自动接 `session-fleet-run`；执行仍需显式 `session-fleet-run --apply` 或 `session-run --apply`。
+- `session-advance` 是唯一的自动闭环命令；`session-auto` 只生成派发单，不自动接 `session-fleet-run`。
+- `session-advance` 的任务 id 使用 `<source>.run`，执行会话写到独立 `<source>.run.jsonl`，不覆盖原会话或派发单。
 - 扫描缓存是 JSON 侧车，不是 SQLite 投影；`session_index` 仍只服务单个会话。
 - 跨机预算只在 ledger 端累计，不把 usage 写回 remote-exec 的本地账本。
 - UI/设置栏只消费这些 JSON，不参与内核判定。

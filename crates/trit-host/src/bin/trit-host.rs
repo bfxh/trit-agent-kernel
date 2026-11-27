@@ -59,6 +59,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-auto" {
         return run_session_auto(args);
     }
+    if command == "session-advance" {
+        return run_session_advance(args);
+    }
     if command == "session-callback" {
         return run_session_callback(args);
     }
@@ -1405,6 +1408,11 @@ fn usage() {
          [--apply] [--compact]\n\
          scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
+         session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
+         [--cache <path>] [--max-items N] [--workers N] [--max-steps N] [--retry N]\n\
+         [--budget-tokens N] [--apply] [--compact]\n\
+         one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
+         by default; --apply uses the OpenAI-compatible provider from the environment.\n\
          session-callback: trit-host session-callback --root <dir> [--cache <path>]\n\
          [--apply] [--compact]\n\
          writes parent/child results into delegations.jsonl; dry-run by default,\n\
@@ -1758,6 +1766,89 @@ fn run_session_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 
 /// `session-auto --root <dir> [--max-items N] [--apply] [--compact]`：
 /// 扫描 + 分配 + 只自动派发 Resume 项；默认 dry-run。
+/// `session-advance --root <dir> [...]`：一条命令推进多会话；默认 dry-run。
+fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut workspace: Option<PathBuf> = None;
+    let mut cache: Option<PathBuf> = None;
+    let mut max_items = 4usize;
+    let mut workers = 4usize;
+    let mut max_steps = 20usize;
+    let mut retries = 0usize;
+    let mut budget_tokens = 0u64;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--max-items" => {
+                max_items = next(&mut args, "--max-items")?
+                    .parse()
+                    .map_err(|_| fail("--max-items must be a non-negative integer"))?;
+            }
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--max-steps" => {
+                max_steps = next(&mut args, "--max-steps")?
+                    .parse()
+                    .map_err(|_| fail("--max-steps must be a positive integer"))?;
+            }
+            "--retry" => {
+                retries = next(&mut args, "--retry")?
+                    .parse()
+                    .map_err(|_| fail("--retry must be a non-negative integer"))?;
+            }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+            }
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!("unknown session-advance argument: {other}")));
+            }
+        }
+    }
+    let scanned = scan_for(&root, cache.as_deref())?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let workspace = workspace.unwrap_or_else(|| root.clone());
+    let config = if apply {
+        Some(trit_host::OpenAiConfig::from_env()?)
+    } else {
+        None
+    };
+    let report = trit_host::advance(
+        &scanned,
+        &plan,
+        &workspace,
+        &root,
+        cache.as_deref(),
+        config,
+        &trit_host::AdvanceOptions {
+            max_items,
+            workers,
+            max_steps,
+            retries,
+            budget_tokens,
+            dry_run: !apply,
+        },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
 fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
     let mut max_items = 4usize;
