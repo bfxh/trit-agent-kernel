@@ -104,7 +104,7 @@ impl McpToolClient {
                     description,
                     input_schema,
                     // `readOnlyHint` 是 MCP 服务端自报，不可作为授权依据。
-                    // 仅保留在 route 上供展示/诊断，绝不进入 ToolSpec.read_only。
+                    // 仅保留在 route 上供展示/诊断（`trit-host tools`），绝不进入 ToolSpec.read_only。
                     declared_read_only: tool
                         .annotations
                         .as_ref()
@@ -202,6 +202,7 @@ impl ToolCatalog for McpToolClient {
                     "{} (MCP {} / {})",
                     route.description, route.server, route.tool
                 ),
+                // MCP 的 readOnlyHint 不进入 ToolSpec.read_only（授权元数据）。
                 read_only: false,
                 input_schema: Some(route.input_schema),
             })
