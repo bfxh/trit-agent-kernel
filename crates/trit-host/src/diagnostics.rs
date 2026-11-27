@@ -93,6 +93,12 @@ pub struct SessionDiagnostics {
     pub gate_chains: usize,
     pub latest_gate_blocked: Option<bool>,
     pub last_seq: u64,
+    /// 最后一条 `TurnFinished` 的 token 总量；没有完成轮次时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_total: Option<u64>,
+    /// 最后一条 `TurnFinished` 的吞吐（token/s）；旧日志没有指标时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second: Option<f64>,
 }
 
 /// SQLite 投影摘要；只在传入 `--db` 时出现。
@@ -113,6 +119,10 @@ pub struct DiagnosticsReport {
     pub session: Option<SessionDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionDiagnostics>,
+    /// 当前进程仍在运行的后台任务（CLI 短进程通常为空；长期服务可见）。
+    pub background_tasks: Vec<crate::background::BackgroundTask>,
+    /// 本进程累计启动过的后台任务数。
+    pub background_started: u64,
     pub warnings: Vec<String>,
 }
 
@@ -139,12 +149,23 @@ pub fn diagnose(options: &DiagnosticsOptions<'_>) -> Result<DiagnosticsReport, A
             let records = crate::session::SessionLog::open(path)?.load()?;
             let state = recover(&records)?;
             let latest_gate_blocked = state.gate_chains.last().map(|record| !record.passed());
+            let metrics = records.iter().rev().find_map(|record| match &record.event {
+                crate::session::SessionEvent::TurnFinished {
+                    metrics: Some(metrics),
+                    ..
+                } => Some(metrics.clone()),
+                _ => None,
+            });
             Some(SessionDiagnostics {
                 path: path.display().to_string(),
                 turns: state.turns.len(),
                 gate_chains: state.gate_chains.len(),
                 latest_gate_blocked,
                 last_seq: records.last().map_or(0, |record| record.seq),
+                tokens_total: metrics.as_ref().map(|metrics| metrics.tokens_total),
+                tokens_per_second: metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.tokens_per_second),
             })
         }
         None => None,
@@ -191,6 +212,8 @@ pub fn diagnose(options: &DiagnosticsOptions<'_>) -> Result<DiagnosticsReport, A
         journal,
         session,
         projection,
+        background_tasks: crate::background::snapshot(),
+        background_started: crate::background::started_total(),
         warnings,
     })
 }

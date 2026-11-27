@@ -779,6 +779,7 @@ impl WaitedChild {
         let pid = child.id();
         let (sender, exit) = mpsc::channel();
         let monitor = std::thread::spawn(move || {
+            let _task = crate::background::register("supervisor-child-wait");
             let status = child.wait();
             let _ = sender.send(status);
         });

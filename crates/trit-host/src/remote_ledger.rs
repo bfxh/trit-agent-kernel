@@ -403,6 +403,7 @@ impl LedgerServer {
             let completions = Arc::clone(&self.completions);
             std::thread::spawn(move || {
                 let _slot = slot;
+                let _task = crate::background::register("remote-ledger-conn");
                 let _ = handle(stream, &config, auth.as_ref(), &state, &completions);
             });
         }

@@ -18,14 +18,14 @@ pub const SESSION_SCHEMA: u32 = 1;
 /// 单个会话日志读取上限；超过时 fail closed，避免巨型文件拖垮进程。
 const MAX_SESSION_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub schema: u32,
     pub seq: u64,
     pub event: SessionEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     TurnStarted {
@@ -351,7 +351,7 @@ fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
 }
 
 /// 从已有事件恢复出的多轮会话状态。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionState {
     pub turns: Vec<TurnRecord>,
     pub usage: TokenUsage,
@@ -387,7 +387,7 @@ impl SessionState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnRecord {
     pub task: String,
     pub objective: String,

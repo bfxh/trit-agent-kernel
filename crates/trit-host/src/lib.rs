@@ -375,7 +375,7 @@ impl ToolExecutor for ScriptedTools {
 ///
 /// 比率统一用 basis point（万分之一，`10000` = 100%），避免浮点比较；
 /// 分母为 0 时对应字段为 `None`，不伪造 0% 或 100%。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnMetrics {
     /// 实际用掉的模型回合数（每个 step 一次 proposal）。
     pub steps: usize,
@@ -401,6 +401,9 @@ pub struct TurnMetrics {
     pub tokens_total: u64,
     /// 总 token / steps；成功结束的轮次至少 1 step。
     pub tokens_per_step: u64,
+    /// 总 token / 墙钟秒；耗时不足 1µs 时为 None。
+    #[serde(default)]
+    pub tokens_per_second: Option<f64>,
     /// provider 未给精确用量时为 true；此时 token 指标只作估算。
     pub tokens_estimated: bool,
     /// 从进入 turn 到完成裁决的墙钟耗时。
@@ -433,6 +436,9 @@ impl TurnMetrics {
             .saturating_add(usage.cached)
             .saturating_add(usage.output);
         let input_tokens = usage.fresh.saturating_add(usage.cached);
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let tokens_per_second = (elapsed.as_micros() > 0)
+            .then(|| tokens_total as f64 / elapsed.as_secs_f64().max(1e-6));
         Self {
             steps,
             max_steps,
@@ -446,8 +452,9 @@ impl TurnMetrics {
             cache_hit_bp: ratio_bp(usage.cached, input_tokens),
             tokens_total,
             tokens_per_step: tokens_total / steps.max(1) as u64,
+            tokens_per_second,
             tokens_estimated: usage.estimated,
-            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms,
             completed,
         }
     }
@@ -460,7 +467,7 @@ fn ratio_bp(numerator: u64, denominator: u64) -> Option<u32> {
     Some(((numerator as u128 * 10_000) / denominator as u128).min(10_000) as u32)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TurnOutcome {
     pub task: String,
     pub steps: usize,
@@ -1400,6 +1407,7 @@ pub fn run_headless<M: Model>(
 #[cfg(windows)]
 pub mod appcontainer;
 mod auth;
+pub mod background;
 mod cancel_guard;
 pub mod checkpoint;
 pub mod child_env;

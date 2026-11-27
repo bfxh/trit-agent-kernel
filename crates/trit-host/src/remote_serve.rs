@@ -725,6 +725,7 @@ impl RemoteServer {
             let executions = Arc::clone(&self.executions);
             workers.push(std::thread::spawn(move || {
                 let _slot = slot;
+                let _task = crate::background::register("remote-serve-conn");
                 let _ = handle(
                     stream,
                     &config,
@@ -764,6 +765,7 @@ impl RemoteServer {
             let executions = Arc::clone(&self.executions);
             std::thread::spawn(move || {
                 let _slot = slot;
+                let _task = crate::background::register("remote-serve-conn");
                 let _ = handle(
                     stream,
                     &config,
