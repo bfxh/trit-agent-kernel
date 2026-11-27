@@ -1423,7 +1423,7 @@ fn usage() {
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
          [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
          [--workers N] [--max-concurrency N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
-         [--apply] [--compact]\n\
+         [--write-journal-rollback] [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
          With --nodes, the fleet phase dispatches through the remote node table instead.\n\
@@ -1959,6 +1959,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
     let mut budget_usd = 0.0f64;
+    let mut write_journal_rollback = false;
     let mut scope: Option<String> = None;
     let mut apply = false;
     let mut compact = false;
@@ -2021,6 +2022,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                 budget_given = true;
             }
             "--scope" => scope = Some(next(&mut args, "--scope")?),
+            "--write-journal-rollback" => write_journal_rollback = true,
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => {
@@ -2079,6 +2081,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             retries,
             budget_tokens,
             budget_usd,
+            write_journal_rollback,
             dry_run: !apply,
             scope,
         },
@@ -2533,67 +2536,8 @@ fn rollback_in_doubt(
     records: &[trit_host::JournalRecord],
     owned: Option<&OperationLease>,
 ) -> Result<(Vec<trit_host::RollbackOutcome>, Vec<serde_json::Value>), Box<dyn Error>> {
-    let owned_keys: Vec<String> = owned
-        .map(|lease| {
-            lease
-                .lock_paths()
-                .into_iter()
-                .map(|path| lock_key(workspace, path))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut outcomes = Vec::new();
-    let mut blocked = Vec::new();
-    for record in records {
-        let mut guard: Option<OperationLease> = None;
-        if record.lease_locks.is_empty() {
-            if record.lease_epoch.is_some() {
-                blocked.push(serde_json::json!({
-                    "op_id": record.op_id,
-                    "reason": "lease epoch recorded without lock paths; refuse automatic rollback",
-                }));
-                continue;
-            }
-        } else {
-            let missing: Vec<PathBuf> = record
-                .lease_locks
-                .iter()
-                .filter(|lock| !owned_keys.contains(&lock_key(workspace, Path::new(lock))))
-                .map(PathBuf::from)
-                .collect();
-            if !missing.is_empty() {
-                match OperationLease::acquire_lock_files(workspace, "journal-rollback", &missing) {
-                    Ok(lease) => guard = Some(lease),
-                    Err(trit_host::LeaseError::Busy { owner, epoch }) => {
-                        blocked.push(serde_json::json!({
-                            "op_id": record.op_id,
-                            "reason": format!("lease still held: owner={owner} epoch={epoch}"),
-                        }));
-                        continue;
-                    }
-                    Err(error) => {
-                        return Err(fail(format!("journal rollback lease: {error}")));
-                    }
-                }
-            }
-        }
-        let outcome = journal.rollback(record);
-        journal
-            .record_rollback(record.op_id, &outcome)
-            .map_err(|error| fail(error.to_string()))?;
-        drop(guard);
-        outcomes.push(outcome);
-    }
-    Ok((outcomes, blocked))
-}
-
-fn lock_key(workspace: &Path, lock: &Path) -> String {
-    let full = if lock.is_absolute() {
-        lock.to_path_buf()
-    } else {
-        workspace.join(lock)
-    };
-    full.to_string_lossy().replace('\\', "/").to_lowercase()
+    trit_host::journal::rollback_in_doubt(journal, workspace, records, owned)
+        .map_err(|error| fail(error.to_string()))
 }
 
 /// `journal-status --workspace <dir>`：只读输出 mutation journal 对账结果。

@@ -15,8 +15,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::lease::{LeaseError, OperationLease};
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::check_ancestors;
@@ -552,6 +554,74 @@ impl MutationJournal {
 pub fn inspect(root: impl AsRef<Path>) -> Result<JournalReport, JournalError> {
     let path = root.as_ref().join(JOURNAL_PATH);
     report_records(read_records(&path)?)
+}
+
+/// 安全回滚 `in_doubt` 记录：需要租约锁时先取锁；仍被他人持有的记录进 `blocked`。
+pub fn rollback_in_doubt(
+    journal: &mut MutationJournal,
+    workspace: &Path,
+    records: &[JournalRecord],
+    owned: Option<&OperationLease>,
+) -> Result<(Vec<RollbackOutcome>, Vec<serde_json::Value>), JournalError> {
+    let owned_keys: Vec<String> = owned
+        .map(|lease| {
+            lease
+                .lock_paths()
+                .into_iter()
+                .map(|path| lock_key(workspace, path))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut outcomes = Vec::new();
+    let mut blocked = Vec::new();
+    for record in records {
+        let mut guard: Option<OperationLease> = None;
+        if record.lease_locks.is_empty() {
+            if record.lease_epoch.is_some() {
+                blocked.push(serde_json::json!({
+                    "op_id": record.op_id,
+                    "reason": "lease epoch recorded without lock paths; refuse automatic rollback",
+                }));
+                continue;
+            }
+        } else {
+            let missing: Vec<PathBuf> = record
+                .lease_locks
+                .iter()
+                .filter(|lock| !owned_keys.contains(&lock_key(workspace, Path::new(lock))))
+                .map(PathBuf::from)
+                .collect();
+            if !missing.is_empty() {
+                match OperationLease::acquire_lock_files(workspace, "journal-rollback", &missing) {
+                    Ok(lease) => guard = Some(lease),
+                    Err(LeaseError::Busy { owner, epoch }) => {
+                        blocked.push(serde_json::json!({
+                            "op_id": record.op_id,
+                            "reason": format!("lease still held: owner={owner} epoch={epoch}"),
+                        }));
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(JournalError::Io(format!("journal rollback lease: {error}")));
+                    }
+                }
+            }
+        }
+        let outcome = journal.rollback(record);
+        journal.record_rollback(record.op_id, &outcome)?;
+        drop(guard);
+        outcomes.push(outcome);
+    }
+    Ok((outcomes, blocked))
+}
+
+fn lock_key(workspace: &Path, lock: &Path) -> String {
+    let full = if lock.is_absolute() {
+        lock.to_path_buf()
+    } else {
+        workspace.join(lock)
+    };
+    full.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 fn report_records(records: Vec<JournalRecord>) -> Result<JournalReport, JournalError> {

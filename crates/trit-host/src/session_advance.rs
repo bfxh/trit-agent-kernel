@@ -35,6 +35,9 @@ pub struct AdvanceOptions {
     /// 美元预算；0 表示不限。跨过 80% 时报告告警。
     #[serde(default)]
     pub budget_usd: f64,
+    /// 发现 in_doubt 写日志时自动安全回滚；默认 false（fail closed）。
+    #[serde(default)]
+    pub write_journal_rollback: bool,
     pub dry_run: bool,
     /// 跨机执行时的计划作用域。
     #[serde(default)]
@@ -50,6 +53,7 @@ impl Default for AdvanceOptions {
             retries: 0,
             budget_tokens: 0,
             budget_usd: 0.0,
+            write_journal_rollback: false,
             dry_run: true,
             scope: None,
         }
@@ -126,16 +130,35 @@ pub fn advance(
     }
 
     // 上一次进程若在写操作中途崩溃，journal 会留下未闭合的 begin。
-    // 本地执行前 fail closed，避免在状态不明的工作区上继续写。
+    // 默认 fail closed；显式开启 --write-journal-rollback 时先安全回滚。
     if nodes.is_none() {
-        let journal = crate::journal::inspect(workspace)
+        let mut journal = crate::journal::MutationJournal::open(workspace)
             .map_err(|error| AgentError::SessionState(format!("write journal: {error}")))?;
-        if journal.has_in_doubt() {
-            return Err(AgentError::SessionState(format!(
-                "write journal has {} in-doubt operation(s); run `trit-host journal-status --workspace {} --rollback` before advancing",
-                journal.in_doubt.len(),
-                workspace.display()
-            )));
+        let report = journal
+            .report()
+            .map_err(|error| AgentError::SessionState(format!("write journal: {error}")))?;
+        if report.has_in_doubt() {
+            if options.write_journal_rollback {
+                let (_, blocked) = crate::journal::rollback_in_doubt(
+                    &mut journal,
+                    workspace,
+                    &report.in_doubt,
+                    None,
+                )
+                .map_err(|error| AgentError::SessionState(format!("write journal: {error}")))?;
+                if !blocked.is_empty() {
+                    return Err(AgentError::SessionState(format!(
+                        "write journal: {} in-doubt operation(s) still protected by a live lease; refusing rollback",
+                        blocked.len()
+                    )));
+                }
+            } else {
+                return Err(AgentError::SessionState(format!(
+                    "write journal has {} in-doubt operation(s); run `trit-host journal-status --workspace {} --rollback` before advancing",
+                    report.in_doubt.len(),
+                    workspace.display()
+                )));
+            }
         }
     }
 
