@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +119,8 @@ pub fn run_remote_fleet(
         health_probe_interval: None,
         health_probe_concurrency: 1,
         health_max_age: None,
+        retry_backoff: Duration::ZERO,
+        retry_backoff_max: Duration::from_secs(30),
     };
     let report = run_remote_plan_with_table(&plan, table, config, CancelToken::new(), |task| {
         build_request(task)

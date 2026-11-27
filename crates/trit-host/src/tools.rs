@@ -1327,7 +1327,10 @@ mod tests {
         );
         assert!(!root.join("a.txt").exists());
         assert!(!root.join("b.txt").exists());
-        assert_eq!(std::fs::read_to_string(root.join("c.txt")).unwrap(), "alpha");
+        assert_eq!(
+            std::fs::read_to_string(root.join("c.txt")).unwrap(),
+            "alpha"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

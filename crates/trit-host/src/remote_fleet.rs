@@ -109,6 +109,10 @@ pub struct RemotePlanConfig {
     /// `None` 完全信任传入快照（保持旧行为）。配置后仍需 preflight / 周期探测
     /// 才能把超龄节点重新放行；未配探测时超龄节点不会参与派发。
     pub health_max_age: Option<Duration>,
+    /// 换节点重试前的指数退避基数；`Duration::ZERO` 表示不等待。
+    pub retry_backoff: Duration,
+    /// 退避上限。
+    pub retry_backoff_max: Duration,
 }
 
 impl RemotePlanConfig {
@@ -122,6 +126,8 @@ impl RemotePlanConfig {
             health_probe_interval: None,
             health_probe_concurrency: 1,
             health_max_age: None,
+            retry_backoff: Duration::ZERO,
+            retry_backoff_max: Duration::from_secs(30),
         }
     }
 
@@ -132,6 +138,13 @@ impl RemotePlanConfig {
 
     pub fn with_retry_limit(mut self, retry_limit: u32) -> Self {
         self.retry_limit = retry_limit;
+        self
+    }
+
+    /// 设置换节点重试的指数退避；`base` 为 0 表示不等待。
+    pub fn with_retry_backoff(mut self, base: Duration, max: Duration) -> Self {
+        self.retry_backoff = base;
+        self.retry_backoff_max = if max.is_zero() { base } else { max };
         self
     }
 
@@ -303,6 +316,8 @@ where
     }
     let scope = config.scope.clone();
     let retry_limit = config.retry_limit;
+    let retry_backoff_base = config.retry_backoff;
+    let retry_backoff_max = config.retry_backoff_max;
     let replies: Arc<Mutex<BTreeMap<String, DelegationResult>>> = Arc::default();
     let assignments: Arc<Mutex<BTreeMap<String, String>>> = Arc::default();
     let attempts: Arc<Mutex<BTreeMap<String, Vec<RemoteAttempt>>>> = Arc::default();
@@ -425,6 +440,10 @@ where
                     return Err(last_error.unwrap_or_else(|| "remote node failed".into()));
                 }
                 retries_used += 1;
+                let backoff = retry_backoff(retries_used, retry_backoff_base, retry_backoff_max);
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
             }
         }
     };
@@ -1019,6 +1038,16 @@ fn spawn_health_monitor(
 }
 
 /// 追加一条尝试记录。
+/// 第 `attempt` 次重试前的等待：base * 2^(attempt-1)，封顶 max。
+fn retry_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let shift = attempt.saturating_sub(1).min(10);
+    let factor = 1u32 << shift;
+    base.saturating_mul(factor).min(max)
+}
+
 fn record_attempt(
     attempts: &Mutex<BTreeMap<String, Vec<RemoteAttempt>>>,
     task: &str,
@@ -1036,5 +1065,21 @@ fn record_attempt(
                 model,
                 usage,
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_backoff_grows_and_caps() {
+        let base = Duration::from_millis(10);
+        let max = Duration::from_millis(50);
+        assert_eq!(retry_backoff(1, base, max), Duration::from_millis(10));
+        assert_eq!(retry_backoff(2, base, max), Duration::from_millis(20));
+        assert_eq!(retry_backoff(3, base, max), Duration::from_millis(40));
+        assert_eq!(retry_backoff(4, base, max), Duration::from_millis(50));
+        assert_eq!(retry_backoff(10, Duration::ZERO, max), Duration::ZERO);
     }
 }
