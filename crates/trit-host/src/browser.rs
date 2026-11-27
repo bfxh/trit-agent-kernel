@@ -123,8 +123,37 @@ impl Browser {
         self.session_id = Some(session_id);
         self.command("Page.enable", json!({}))?;
         self.command("Runtime.enable", json!({}))?;
-        self.command("Page.navigate", json!({"url": url}))?;
+        self.navigate_and_wait(url)?;
         Ok(())
+    }
+
+    /// 导航并等待 `Page.loadEventFired`；超时 fail closed，避免在未加载页面上 eval。
+    fn navigate_and_wait(&mut self, url: &str) -> Result<(), AgentError> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut message = json!({"id": id, "method": "Page.navigate", "params": {"url": url}});
+        if let Some(session) = &self.session_id {
+            message["sessionId"] = json!(session);
+        }
+        self.socket.send_text(&message.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if Instant::now() > deadline {
+                return Err(AgentError::Tool(format!("browser load timeout: {url}")));
+            }
+            let text = self.socket.read_text()?;
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|error| AgentError::Tool(format!("CDP frame: {error}")))?;
+            if value.get("id").and_then(Value::as_u64) == Some(id) {
+                if let Some(error) = value.get("error") {
+                    return Err(AgentError::Tool(format!("CDP Page.navigate: {error}")));
+                }
+                continue;
+            }
+            if value.get("method").and_then(Value::as_str) == Some("Page.loadEventFired") {
+                return Ok(());
+            }
+        }
     }
 
     /// 在页面执行表达式，返回 `returnByValue` 的结果。
