@@ -413,4 +413,34 @@ mod tests {
     fn empty_stream_fails_closed() {
         assert!(OpenAiStreamAssembler::new().finish(&[]).is_err());
     }
+
+    #[test]
+    fn real_sse_tool_call_fixture_assembles() {
+        // 真实录制形态：多事件、tool args 分片、usage 与 [DONE]。
+        let fixture = r#": keep-alive
+data: {"id":"chatcmpl-1","choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read_file","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}
+
+data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"src/main.rs\"}"}}]}}]}
+
+data: {"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":8,"total_tokens":20}}
+
+data: [DONE]
+
+"#;
+        let mut assembler = OpenAiStreamAssembler::new();
+        read_sse_events(Cursor::new(fixture), |event| {
+            assembler.push_sse(&event)?;
+            Ok(())
+        })
+        .unwrap();
+        let response = assembler.finish(&crate::default_tools()).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].call_id, "call_abc");
+        assert_eq!(response.tool_calls[0].tool, "read_file");
+        assert_eq!(response.tool_calls[0].paths, ["src/main.rs"]);
+        assert_eq!(response.usage.prompt_tokens, 12);
+        assert_eq!(response.usage.completion_tokens, 8);
+    }
 }
