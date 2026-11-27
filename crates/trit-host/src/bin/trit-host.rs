@@ -1405,14 +1405,16 @@ fn usage() {
          [--apply] [--compact]\n\
          scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
-         session-callback: trit-host session-callback --root <dir> [--apply] [--compact]\n\
+         session-callback: trit-host session-callback --root <dir> [--cache <path>]\n\
+         [--apply] [--compact]\n\
          writes parent/child results into delegations.jsonl; dry-run by default,\n\
          idempotent on child records+modified time, and never edits session logs.\n\
          session-run: trit-host session-run --session <resume.jsonl> [--workspace <dir>]\n\
          [--apply] [-- <run args>...]\n\
          reads the dispatch ticket and prints the run command; --apply starts it and\n\
          writes a new <resume>.run.jsonl instead of appending to the ticket.\n\
-         session-callback-verify: trit-host session-callback-verify --root <dir> [--compact]\n\
+         session-callback-verify: trit-host session-callback-verify --root <dir>\n\
+         [--cache <path>] [--compact]\n\
          re-scans children and compares them with delegations.jsonl; reports ok, stale,\n\
          mismatch, missing child or missing delegation without writing anything.\n\
          session-fleet: trit-host session-fleet --root <dir> [--workers N] [--budget-tokens N]\n\
@@ -1672,10 +1674,12 @@ fn run_session_callback_verify(
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
+    let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => {
                 return Err(fail(format!(
@@ -1684,7 +1688,7 @@ fn run_session_callback_verify(
             }
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let report = trit_host::verify_callbacks(&scanned)?;
     let text = if compact {
         serde_json::to_string(&report)
@@ -1798,17 +1802,19 @@ fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
 /// 默认 dry-run；`--apply` 才把 parent/child 结果追加到 delegations.jsonl。
 fn run_session_callback(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
+    let mut cache: Option<PathBuf> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-callback argument: {other}"))),
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let report =
         trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: !apply })?;
     let text = if compact {
