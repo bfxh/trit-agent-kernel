@@ -3946,6 +3946,7 @@ fn run_subagent_fanout(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<serde_json::Value>>> =
         tasks.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let python_before = trit_host::subagent_cli::snapshot_python_files(&workspace);
     let lane = workers.max(1).min(tasks.len());
     std::thread::scope(|scope| {
         for _ in 0..lane {
@@ -3998,6 +3999,12 @@ fn run_subagent_fanout(mut args: impl Iterator<Item = String>) -> Result<(), Box
         .into_iter()
         .filter_map(|slot| slot.into_inner().unwrap_or(None))
         .collect();
+    // 外部 CLI 直接改盘无法在写入时拦截：跑完对比快照，非测试 .py 视为违规。
+    let changed = trit_host::subagent_cli::changed_python_files(
+        &python_before,
+        &trit_host::subagent_cli::snapshot_python_files(&workspace),
+    );
+    let violations = trit_host::tech_stack::violations(&changed);
     let dissents: Vec<serde_json::Value> = results
         .iter()
         .filter(|result| result.get("dissent").is_some_and(|value| !value.is_null()))
@@ -4015,8 +4022,16 @@ fn run_subagent_fanout(mut args: impl Iterator<Item = String>) -> Result<(), Box
             "dissents": dissents,
             "workers": workers,
             "depth": depth,
+            "violations": violations.clone(),
         }))?
     );
+    if !violations.is_empty() {
+        return Err(fail(format!(
+            "external subagents wrote {} non-test Python path(s): {}",
+            violations.len(),
+            violations.join(", ")
+        )));
+    }
     Ok(())
 }
 

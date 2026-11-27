@@ -65,6 +65,17 @@ trit-host subagent-fanout --workspace <dir> --agents codex,claude-code \
   质量负责，不是服从。
 - 异议不影响响应有效性（`validate_for` 只校验 `task + epoch`），但会出现在 `dissent` 汇总里。
 
+## 3.5 外部 CLI 事后审计
+
+外部 CLI 子进程在宿主工具之外直接改盘，`write_file` / `bash` 的校验管不到它们。
+`subagent-fanout` 因此在跑前跑后各拍一次工作区 `.py` 快照（相对路径 + 大小 + mtime），
+对比出新增/修改的文件，再用 `tech_stack::violations` 过滤：
+
+- 报告 JSON 增 `violations` 数组；
+- 只要出现**非测试路径的 `.py`**，命令以非零退出并在 stderr 列出路径（fail closed）；
+- 跳过 `.git` / `target` / `node_modules` / `.venv`，最多 20k 个 `.py`；
+- 只审计 `--workspace` 指定的目录；任务自定义 workspace 时不覆盖。
+
 ## 4. 嵌套与安全边界
 
 - 子智能体可以再派生子智能体；最大深度 3（`--depth` 或 `TRIT_SUBAGENT_DEPTH`），超过直接拒绝。

@@ -6,6 +6,7 @@
 //! 默认调用约定是 `<program> <args...> <prompt>`（或 stdin），实际参数差异用
 //! `TRIT_SUBAGENT_<ID>_PROGRAM` / `_ARGS` / `_AUTO_ARGS` 覆盖，不靠猜。
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -177,6 +178,68 @@ pub fn parse_stack_block(stdout: &str) -> Option<trit_orch::StackReport> {
     let after = start + "<<<STACK>>>".len();
     let end_rel = stdout[after..].find(DISSENT_CLOSE)?;
     serde_json::from_str::<trit_orch::StackReport>(stdout[after..after + end_rel].trim()).ok()
+}
+
+/// 递归收集 `.py` 文件快照：`相对路径 -> (字节数, 修改时间毫秒)`。
+///
+/// 跳过 `.git` / `target` / `node_modules` / `.venv`，并限制文件数。
+pub fn snapshot_python_files(root: &Path) -> BTreeMap<String, (u64, u128)> {
+    const MAX_FILES: usize = 20_000;
+    let mut files = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if files.len() >= MAX_FILES {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".venv") {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("py") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let relative = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or(0);
+            files.insert(relative, (metadata.len(), modified));
+        }
+    }
+    files
+}
+
+/// 对比前后快照，返回新增或修改过的路径。
+pub fn changed_python_files(
+    before: &BTreeMap<String, (u64, u128)>,
+    after: &BTreeMap<String, (u64, u128)>,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(path, stamp)| before.get(*path) != Some(*stamp))
+        .map(|(path, _)| path.clone())
+        .collect()
 }
 
 /// 一次外部 CLI 子智能体的运行结果。
@@ -389,5 +452,38 @@ mod tests {
         let (content, dissent) = parse_cli_output("  ok  \n");
         assert_eq!(content, "  ok");
         assert!(dissent.is_none());
+    }
+
+    #[test]
+    fn snapshot_detects_new_python_files_and_flags_violations() {
+        let root = std::env::temp_dir().join(format!(
+            "trit-snap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("tests/test_a.py"), "print(1)").unwrap();
+        let before = snapshot_python_files(&root);
+
+        // 新增一个生产路径的 .py：快照应发现，且被判违规。
+        std::fs::write(root.join("src_evil.py"), "print(1)").unwrap();
+        let after = snapshot_python_files(&root);
+        let changed = changed_python_files(&before, &after);
+        assert!(changed.contains(&"src_evil.py".to_owned()), "{changed:?}");
+        assert_eq!(
+            crate::tech_stack::violations(&changed),
+            vec!["src_evil.py".to_owned()]
+        );
+
+        // 测试路径的新增不算违规。
+        std::fs::write(root.join("tests/test_b.py"), "print(2)").unwrap();
+        let changed = changed_python_files(&after, &snapshot_python_files(&root));
+        assert_eq!(
+            crate::tech_stack::violations(&changed),
+            Vec::<String>::new()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

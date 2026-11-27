@@ -90,7 +90,7 @@ pub fn run(root: &Path, timeout: Duration) -> Result<LintSummary, String> {
 
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
-    let reader_out = stdout.take().map(|mut pipe| {
+    let reader_out = stdout.take().map(|pipe| {
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
             let _ = pipe
@@ -99,7 +99,7 @@ pub fn run(root: &Path, timeout: Duration) -> Result<LintSummary, String> {
             buffer
         })
     });
-    let reader_err = stderr.take().map(|mut pipe| {
+    let reader_err = stderr.take().map(|pipe| {
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
             let _ = pipe

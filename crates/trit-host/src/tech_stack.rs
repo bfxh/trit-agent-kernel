@@ -33,6 +33,17 @@ pub fn validate_write_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 从一组路径里挑出违反"test-only 语言"规则的（保持输入顺序）。
+///
+/// 用于外部 CLI 子智能体的事后审计：它们绕过了 `write_file`，只能在跑完后对比快照。
+pub fn violations(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| validate_write_path(path).is_err())
+        .cloned()
+        .collect()
+}
+
 /// 从 shell 命令里粗略提取写入目标（重定向、`tee`、`cp`/`mv` 目标）。
 ///
 /// 启发式：能挡住"顺手 `> src/x.py`"这类常见写法，但无法覆盖所有 shell 语法
