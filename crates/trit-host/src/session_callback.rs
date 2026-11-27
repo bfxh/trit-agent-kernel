@@ -252,16 +252,14 @@ fn record_hash(record: &DelegationResult) -> String {
         record.child_modified_ms,
         record.prev_hash.as_deref().unwrap_or_default()
     );
-    fnv1a64(payload.as_bytes())
-}
-
-fn fnv1a64(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    use std::fmt::Write as _;
+    let digest = ring::digest::digest(&ring::digest::SHA256, payload.as_bytes());
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for byte in digest.as_ref() {
+        let _ = write!(out, "{byte:02x}");
     }
-    format!("fnv1a64:{hash:016x}")
+    out
 }
 
 fn last_record_hash(target: &Path) -> Result<Option<String>, AgentError> {
