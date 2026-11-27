@@ -28,6 +28,13 @@
 "用户要求支持某语言"不等于"允许模型偏好某语言"：授权是具体的、一次性的、
 写在 brief 里的，不是模型的口味。
 
+## 3.5 测试代码例外（硬约束）
+
+项目主栈之外的语言默认**只允许写测试代码**：`.py` 只能落在 `tests/`、`test/`、`spec/`、
+`test_*.py`、`*_test.py`、`conftest.py`。`write_file` 在落盘前调用
+`crate::tech_stack::validate_write_path`，非测试路径直接拒绝——不是扣分，是**写不进去**。
+生产代码里出现 Python 会被挡下；其它语言不受此限。
+
 ## 4. 子智能体同样受限
 
 `SubagentRequest.stack_policy`：

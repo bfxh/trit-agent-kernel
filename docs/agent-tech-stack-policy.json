@@ -31,6 +31,15 @@
     "subagent",
     "external-cli-subagent"
   ],
+  "test_only_languages": {
+    "python": [
+      "tests/**",
+      "**/test_*.py",
+      "**/*_test.py",
+      "**/conftest.py"
+    ],
+    "note": "测试代码可以用；生产代码里出现即被 write_file 硬拒绝（不是扣分，是拒绝写入）"
+  },
   "subagent_contract": {
     "request": "StackPolicy{existing,allowed_additions}",
     "response": "StackReport{used,added}",

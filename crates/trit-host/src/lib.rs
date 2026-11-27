@@ -1642,6 +1642,7 @@ pub mod state_layer;
 pub mod subagent_cli;
 pub mod subagent_process;
 pub mod supervisor;
+pub mod tech_stack;
 pub mod tools;
 pub use trit_orch::{RemoteNode, SelectionPressure};
 

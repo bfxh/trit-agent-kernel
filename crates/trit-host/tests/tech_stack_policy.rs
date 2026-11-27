@@ -153,3 +153,43 @@ fn subagent_stack_validation_rejects_unauthorized_usage() {
     };
     trit_orch::validate_stack(&added_python, &authorized).unwrap();
 }
+
+#[test]
+fn python_writes_are_rejected_outside_test_paths() {
+    let root = std::env::temp_dir().join(format!(
+        "trit-tech-stack-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut config = trit_host::tools::WorkspaceConfig::new(&root);
+    config.allow_write = true;
+    let mut tools = trit_host::tools::LocalTools::new(config).unwrap();
+
+    // 生产路径：写不进去（硬拒绝，不是扣分）。
+    let error = trit_host::ToolExecutor::execute(
+        &mut tools,
+        &trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "print(1)"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("test paths"), "{error}");
+    assert!(!root.join("src/a.py").exists(), "被拒绝的写入不应落盘");
+
+    // 测试路径：允许。
+    trit_host::ToolExecutor::execute(
+        &mut tools,
+        &trit_host::ToolRequest::write("w2", "write_file", "tests/test_a.py", "print(1)"),
+    )
+    .unwrap();
+    assert!(root.join("tests/test_a.py").is_file());
+
+    // 其它语言不受影响。
+    trit_host::ToolExecutor::execute(
+        &mut tools,
+        &trit_host::ToolRequest::write("w3", "write_file", "src/lib.rs", "pub fn f() {}\n"),
+    )
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&root);
+}

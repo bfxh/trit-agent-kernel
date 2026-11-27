@@ -662,6 +662,8 @@ impl LocalTools {
         let raw = self.first_path(request)?;
         let relative = self.resolve_relative(raw)?;
         self.reject_symlink(&relative, raw)?;
+        // 语言用途硬约束：test-only 语言（默认 Python）只能写测试路径。
+        crate::tech_stack::validate_write_path(raw).map_err(AgentError::Tool)?;
         if let Some(parent) = relative.parent()
             && !parent.as_os_str().is_empty()
         {
