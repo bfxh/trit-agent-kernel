@@ -40,6 +40,21 @@
 
 如果任务只要后端产物，正确交付是 **后端产物 + 一行 handoff 说明**，不是顺手把前端也做了。
 
+### 2.2 语言与模型无关性（硬约束）
+
+产物语言由**项目文档**规定，不由模型决定。机器契约：
+[`agent-language-policy.json`](agent-language-policy.json)（`trit.agent-language-policy/v1`），
+人类面说明：[`LANGUAGE-POLICY.md`](LANGUAGE-POLICY.md)，校验：`cargo test -p trit-host --test agent_policy`。
+
+- 本仓库产物语言是中文（`zh-CN`）：文档、代码注释、commit message、CLI 帮助与错误、测试断言消息、UI 文案、日志、回执。
+- 模型的语言偏好、厂商标识、训练语料分布都不是依据；换模型、换 provider、换会话不改变产物语言。
+- 不翻译标识符、路径、命令、协议字段名。
+- 项目未声明语言时，跟随用户当前请求的语言，并在该仓库保持一致。
+
+**模型无关**：这条策略约束所有现在与将来的模型。接入新模型必须提供 provider 适配层、
+确认遵守本策略、通过 `agent_policy` 契约测试；模型不得自带语言偏好、项目偏好或厂商特定的输出形状。
+清单中每个 agent / model / plugin 条目都必须写 `language_behavior: "follow-project-language-policy"`。
+
 ## 3. 清单字段
 
 [`agent-model-manifest.json`](agent-model-manifest.json) 使用 `trit.agent-model-manifest/v1`。字段含义：
@@ -56,6 +71,7 @@
 | `must_not` | 是 | 默认不做什么；空数组也要显式写 |
 | `deferred` | 否 | 现在不做、但保留位置的事项 |
 | `handoff` | 否 | 交给谁、交接什么、证据在哪 |
+| `language_behavior` | 是 | 固定为 `follow-project-language-policy`；见 §2.2 |
 
 `owner` 是智能体告诉后端“这是你的东西”的唯一稳定依据。显示层可以换名字，`owner` 不能跟着改。
 

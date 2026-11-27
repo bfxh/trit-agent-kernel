@@ -36,6 +36,7 @@
   "agents": [
     {
       "id": "agent.trit",
+      "language_behavior": "follow-project-language-policy",
       "display_name": "Trit Agent",
       "role": "kernel",
       "owner": "agent.kernel",
@@ -60,6 +61,7 @@
   "models": [
     {
       "id": "model.backend.primary",
+      "language_behavior": "follow-project-language-policy",
       "display_name": "Backend Primary",
       "role": "backend",
       "owner": "model.backend.primary",
@@ -93,6 +95,7 @@
     },
     {
       "id": "model.frontend.collaborator",
+      "language_behavior": "follow-project-language-policy",
       "display_name": "Frontend Collaborator",
       "role": "frontend",
       "owner": "model.frontend.collaborator",
@@ -121,6 +124,7 @@
   "plugins": [
     {
       "id": "plugin.perf-benchmark-ab-dashboard",
+      "language_behavior": "follow-project-language-policy",
       "display_name": "Performance A/B Dashboard",
       "role": "plugin",
       "owner": "model.frontend.collaborator",
@@ -128,6 +132,12 @@
       "status": "reference",
       "eligible": true,
       "modalities": ["text", "image", "video"],
+      "capabilities": [
+        "benchmark-comparison",
+        "paper-style-summary",
+        "comparison-figures",
+        "raw-csv-links"
+      ],
       "inputs": [
         "benchmark-json",
         "baseline-metadata",
@@ -152,6 +162,27 @@
       ]
     }
   ],
+  "language_policy": {
+    "contract": "docs/agent-language-policy.json",
+    "schema": "trit.agent-language-policy/v1",
+    "principle": "artifact-locale-follows-project-documentation",
+    "model_preference_is_not_a_source": true,
+    "human_doc": "docs/LANGUAGE-POLICY.md",
+    "conformance_test": "crates/trit-host/tests/agent_policy.rs"
+  },
+  "model_neutrality": {
+    "applies_to": "every current and future model and provider",
+    "forbidden": [
+      "language-preference",
+      "project-preference",
+      "vendor-specific-output-shape"
+    ],
+    "adding_a_model_requires": [
+      "provider-adapter",
+      "language-policy-acknowledgement",
+      "conformance-test"
+    ]
+  },
   "task_brief": {
     "required_fields": [
       "TASK",
