@@ -3,6 +3,7 @@
 //! 只读、不写文件。用于防止“child 假完成”：记录写的是 completed，但 child 现在
 //! 已变成 open/incomplete，或日志在回填后继续增长。
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -59,6 +60,7 @@ pub struct CallbackVerifyReport {
 pub fn verify_callbacks(scan: &SessionScanReport) -> Result<CallbackVerifyReport, AgentError> {
     let mut checks = Vec::new();
     let mut warnings = Vec::new();
+    let mut checked = BTreeSet::new();
     for link in &scan.links {
         if link.kind != LinkKind::ParentChild {
             continue;
@@ -75,6 +77,11 @@ pub fn verify_callbacks(scan: &SessionScanReport) -> Result<CallbackVerifyReport
             .parent()
             .unwrap_or(Path::new("."))
             .join(DELEGATIONS_FILE);
+        if checked.insert(target.clone())
+            && let Some(warning) = verify_chain(&target)
+        {
+            warnings.push(warning);
+        }
         let recorded = last_record(&target, &link.from, &link.to)?;
         let child = scan
             .sessions
@@ -133,6 +140,30 @@ pub fn verify_callbacks(scan: &SessionScanReport) -> Result<CallbackVerifyReport
         checks,
         warnings,
     })
+}
+
+fn verify_chain(path: &Path) -> Option<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return None;
+    };
+    let mut prev: Option<String> = None;
+    for (index, line) in text.lines().enumerate() {
+        let Ok(record) = serde_json::from_str::<DelegationResult>(line) else {
+            continue;
+        };
+        if record.record_hash.is_empty() {
+            continue;
+        }
+        if record.prev_hash != prev {
+            return Some(format!(
+                "delegations chain broken at line {} ({})",
+                index + 1,
+                path.display()
+            ));
+        }
+        prev = Some(record.record_hash);
+    }
+    None
 }
 
 fn last_record(
@@ -233,6 +264,8 @@ mod tests {
             steps: 1,
             child_records: records,
             child_modified_ms: 7,
+            prev_hash: None,
+            record_hash: String::new(),
         };
         let mut line = serde_json::to_string(&record).unwrap();
         line.push('\n');
@@ -271,6 +304,36 @@ mod tests {
         let root = temp("missing");
         let report = verify_callbacks(&scan(&root, entry(&root, "child", 3, true))).unwrap();
         assert_eq!(report.checks[0].verdict, CheckVerdict::MissingDelegation);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn broken_hash_chain_is_reported() {
+        let root = temp("chain");
+        let record = DelegationResult {
+            parent: "parent".into(),
+            child: "child".into(),
+            task: Some("work".into()),
+            status: CallbackStatus::Completed,
+            steps: 1,
+            child_records: 3,
+            child_modified_ms: 7,
+            prev_hash: Some("fnv1a64:deadbeef".into()),
+            record_hash: "fnv1a64:cafebabe".into(),
+        };
+        let mut line = serde_json::to_string(&record).unwrap();
+        line.push('\n');
+        fs::write(root.join(DELEGATIONS_FILE), line).unwrap();
+
+        let report = verify_callbacks(&scan(&root, entry(&root, "child", 3, true))).unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("chain broken")),
+            "{:?}",
+            report.warnings
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

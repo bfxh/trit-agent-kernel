@@ -52,6 +52,12 @@ pub struct DelegationResult {
     /// 幂等键的一部分：child 的日志记录数与修改时间。
     pub child_records: usize,
     pub child_modified_ms: u64,
+    /// 前一条记录的 `record_hash`；第一条为 None。
+    #[serde(default)]
+    pub prev_hash: Option<String>,
+    /// 本条逻辑内容 + `prev_hash` 的 FNV-1a 指纹。
+    #[serde(default)]
+    pub record_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +135,8 @@ pub fn callback_sessions(
             steps: child.tasks.last().map_or(0, |task| task.steps),
             child_records: child.records,
             child_modified_ms: child.modified_ms,
+            prev_hash: None,
+            record_hash: String::new(),
         };
         let written = if already_written(&target, &result)? {
             skipped.push(format!("{} -> {}: already recorded", link.from, link.to));
@@ -217,16 +225,58 @@ fn append_result(target: &Path, result: &DelegationResult) -> Result<(), AgentEr
             target.display()
         )));
     }
+    let mut record = result.clone();
+    record.prev_hash = last_record_hash(target)?;
+    record.record_hash = record_hash(&record);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(target)
         .map_err(|error| AgentError::Io(format!("append {}: {error}", target.display())))?;
-    serde_json::to_writer(&mut file, result)
+    serde_json::to_writer(&mut file, &record)
         .map_err(|error| AgentError::SessionState(format!("encode delegation: {error}")))?;
     file.write_all(b"\n")
         .map_err(|error| AgentError::Io(format!("append {}: {error}", target.display())))?;
     Ok(())
+}
+
+fn record_hash(record: &DelegationResult) -> String {
+    let payload = format!(
+        "{}|{}|{}|{:?}|{}|{}|{}|{}",
+        record.parent,
+        record.child,
+        record.task.as_deref().unwrap_or_default(),
+        record.status,
+        record.steps,
+        record.child_records,
+        record.child_modified_ms,
+        record.prev_hash.as_deref().unwrap_or_default()
+    );
+    fnv1a64(payload.as_bytes())
+}
+
+fn fnv1a64(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{hash:016x}")
+}
+
+fn last_record_hash(target: &Path) -> Result<Option<String>, AgentError> {
+    let Ok(text) = fs::read_to_string(target) else {
+        return Ok(None);
+    };
+    let mut last = None;
+    for line in text.lines() {
+        if let Ok(record) = serde_json::from_str::<DelegationResult>(line)
+            && !record.record_hash.is_empty()
+        {
+            last = Some(record.record_hash);
+        }
+    }
+    Ok(last)
 }
 
 #[cfg(test)]
@@ -349,6 +399,40 @@ mod tests {
         let scan = report(&root, entry(&root, "child", false));
         let report = callback_sessions(&scan, &CallbackOptions::default()).unwrap();
         assert_eq!(report.items[0].status, CallbackStatus::Incomplete);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delegation_records_form_a_hash_chain() {
+        let root = temp("chain");
+        let target = root.join(DELEGATIONS_FILE);
+        let mut first = DelegationResult {
+            parent: "parent".into(),
+            child: "a".into(),
+            task: Some("a".into()),
+            status: CallbackStatus::Completed,
+            steps: 1,
+            child_records: 1,
+            child_modified_ms: 1,
+            prev_hash: None,
+            record_hash: String::new(),
+        };
+        append_result(&target, &first).unwrap();
+        first.child = "b".into();
+        append_result(&target, &first).unwrap();
+
+        let text = fs::read_to_string(&target).unwrap();
+        let records: Vec<DelegationResult> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(!records[0].record_hash.is_empty());
+        assert_eq!(
+            records[1].prev_hash.as_deref(),
+            Some(records[0].record_hash.as_str())
+        );
+        assert!(!records[1].record_hash.is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 }
