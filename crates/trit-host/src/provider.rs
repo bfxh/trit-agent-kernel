@@ -226,6 +226,18 @@ fn build_default_tools() -> Vec<ToolSpec> {
             })),
         },
         ToolSpec {
+            name: "download".into(),
+            description:
+                "Create a download task through the external downloader (FluxDown by default)."
+                    .into(),
+            read_only: false,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            })),
+        },
+        ToolSpec {
             name: "context_search".into(),
             description: "Search the context catalog and return candidate ids/labels.".into(),
             read_only: true,

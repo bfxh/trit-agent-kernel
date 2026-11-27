@@ -859,6 +859,7 @@ impl ToolExecutor for LocalTools {
             "glob" => self.glob(request),
             "bash" => self.bash(request),
             "browser" => self.browser(request),
+            "download" => self.download(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
     }
@@ -1040,6 +1041,44 @@ impl LocalTools {
             in_doubt: false,
             output: truncate(output, self.max_output_bytes),
         }
+    }
+
+    /// 调用外部下载器（默认 FluxDown）创建下载任务；未安装时 fail closed。
+    fn download(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let args = request
+            .arguments
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let url = args["url"]
+            .as_str()
+            .ok_or_else(|| AgentError::Tool("download requires url".into()))?;
+        let command = std::env::var("TRIT_FLUXDOWN").unwrap_or_else(|_| "fluxdown".into());
+        let output = std::process::Command::new(&command)
+            .args(["add", "--local", url])
+            .output()
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "spawn {command}: {error}; install FluxDown or set TRIT_FLUXDOWN"
+                ))
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(AgentError::Tool(format!(
+                "{command} add failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: Some(format!("{command} add --local {url}")),
+            passed: true,
+            assertions: 0,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: truncate(format!("{stdout}{stderr}"), self.max_output_bytes),
+        })
     }
 }
 
@@ -1331,6 +1370,26 @@ mod tests {
             std::fs::read_to_string(root.join("c.txt")).unwrap(),
             "alpha"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn download_requires_url() {
+        let root = temp("download");
+        let config = WorkspaceConfig::new(&root);
+        let tools = LocalTools::new(config).unwrap();
+        let request = ToolRequest {
+            call_id: "d1".into(),
+            tool: "download".into(),
+            read_only: false,
+            command: None,
+            paths: Vec::new(),
+            operation: None,
+            content: None,
+            span: None,
+            arguments: None,
+        };
+        assert!(tools.download(&request).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

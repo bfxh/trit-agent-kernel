@@ -782,6 +782,7 @@ mod tests {
                 "search_code",
                 "glob",
                 "browser",
+                "download",
                 "context_search",
                 "context_add",
                 "context_read",

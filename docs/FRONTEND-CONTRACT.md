@@ -185,8 +185,10 @@ FeatureGroupSpec { id, members[] }
 | `cost.usd_cny` | f64 | `7.2` | `TRIT_USD_CNY` |
 | `cost.model_prices` | path | 内置价目表 | `TRIT_MODEL_PRICES` |
 | `provider.connect_timeout` | duration | `10s` | `TRIT_OPENAI_CONNECT_TIMEOUT_SECS` |
+| `download.command` | path | `fluxdown` | `TRIT_FLUXDOWN` |
 
 - `concurrency.max` 是**总并发上限**：`--workers` 与它取小；多会话、多 root、跨机任务叠加时不会超过它。
+- `download` 工具默认调用 `fluxdown add --local <url>`（FluxDown 是默认下载器）；未安装时 fail closed，可用 `TRIT_FLUXDOWN` 指向其他路径。
 - 预算耗尽 fail-closed：token 预算小于任务数直接拒绝；人民币预算达到 80% 写 warning、超过标记 `exceeded`；跨机 ledger 达到预算后 `/claim` 返回 503。
 - 汇率与价目表只影响展示和预算折算，不改变真实计费；未知模型不按 0 计价。
 
