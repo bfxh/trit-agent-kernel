@@ -1474,7 +1474,8 @@ fn usage() {
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
          [--pending-ttl-ms N] [--max-entries N] [--max-state-bytes N] [--state <path>] \\\n\
-         [--max-connections N] [--request-read-timeout-ms N] [--token-budget N] [--once]\n\
+         [--max-connections N] [--request-read-timeout-ms N] [--token-budget N] \\\n\
+         [--usd-budget F] [--once]\n\
          shared idempotency ledger: POST /claim, /renew and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
@@ -2668,6 +2669,8 @@ fn run_subagent_echo(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         status,
         content: request.task.as_bytes().to_vec(),
         tokens: 1,
+        model: None,
+        usage: None,
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;
@@ -3132,6 +3135,13 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
             "--token-budget" => {
                 config = config.with_token_budget(next(&mut args, "--token-budget")?.parse()?)
             }
+            "--usd-budget" => {
+                let budget: f64 = next(&mut args, "--usd-budget")?.parse()?;
+                if !budget.is_finite() || budget < 0.0 {
+                    return Err(fail("--usd-budget must be a non-negative number"));
+                }
+                config = config.with_usd_budget(budget);
+            }
             "--once" => once = true,
             other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),
         }
@@ -3139,6 +3149,8 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     if let Some(ms) = request_read_timeout_ms {
         config = config.with_request_read_timeout(std::time::Duration::from_millis(ms));
     }
+    config =
+        config.with_prices(trit_host::cost::PriceTable::from_env().map_err(|error| fail(error))?);
     let server = trit_host::LedgerServer::bind(config)?;
     let addr = server.addr()?;
     println!("{}", serde_json::json!({ "bind": addr.to_string() }));
@@ -3576,6 +3588,13 @@ fn run_subagent_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
         status,
         content: outcome.render_markdown().into_bytes(),
         tokens: outcome.usage.total()?,
+        model: None,
+        usage: Some(trit_orch::SubagentUsage {
+            fresh: outcome.usage.fresh,
+            cached: outcome.usage.cached,
+            output: outcome.usage.output,
+            estimated: outcome.usage.estimated,
+        }),
     };
     let frame = trit_orch::encode_frame(&response)?;
     std::io::stdout().write_all(&frame)?;

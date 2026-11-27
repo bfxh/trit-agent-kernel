@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use trit_orch::{
     AccessMode, CancelToken, CapsuleEntry, ContextCapsule, NodeTable, RemoteNode, SubagentProfile,
-    SubagentRequest, TaskSpec,
+    SubagentRequest, TaskSpec, TokenUsage,
 };
 
 use crate::AgentError;
+use crate::cost::PriceTable;
 use crate::remote_fleet::{RemotePlanConfig, RemotePlanReport, run_remote_plan_with_table};
 use crate::session_fleet::SessionFleetReport;
 use crate::session_fleet_run::build_plan;
@@ -46,7 +47,7 @@ impl Default for RemoteFleetOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteFleetOutcome {
     pub schema: u32,
     pub dry_run: bool,
@@ -62,6 +63,15 @@ pub struct RemoteFleetOutcome {
     pub deferred: Vec<String>,
     #[serde(default)]
     pub assignments: BTreeMap<String, String>,
+    /// 远端自报的 token 用量（按每次尝试累加；旧节点不返回时为 0）。
+    #[serde(default)]
+    pub usage: TokenUsage,
+    /// 按远端模型单价折算的预估费用（美元）；没有任何可定价的尝试时为 None。
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// 成本模型告警（未知模型、定价文件非法等）。
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// 执行跨机派发；`dry_run` 时只回任务/节点清单。
@@ -84,6 +94,9 @@ pub fn run_remote_fleet(
             failed: None,
             deferred: Vec::new(),
             assignments: BTreeMap::new(),
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -132,6 +145,46 @@ fn build_request(task: &TaskSpec) -> SubagentRequest {
 }
 
 fn outcome_from_report(report: RemotePlanReport) -> RemoteFleetOutcome {
+    let mut usage = TokenUsage::default();
+    let mut warnings = Vec::new();
+    let mut cost_usd = 0.0f64;
+    let mut priced = false;
+    let table = match PriceTable::from_env() {
+        Ok(table) => Some(table),
+        Err(error) => {
+            warnings.push(format!("cost model: {error}"));
+            None
+        }
+    };
+    for attempts in report.attempts.values() {
+        for attempt in attempts {
+            let Some(remote) = attempt.usage else {
+                continue;
+            };
+            usage.fresh += remote.fresh;
+            usage.cached += remote.cached;
+            usage.output += remote.output;
+            usage.estimated |= remote.estimated;
+            let (Some(table), Some(model)) = (table.as_ref(), attempt.model.as_deref()) else {
+                continue;
+            };
+            let local = TokenUsage {
+                fresh: remote.fresh,
+                cached: remote.cached,
+                output: remote.output,
+                estimated: remote.estimated,
+            };
+            match table.estimate(model, &local) {
+                Some(estimate) => {
+                    cost_usd += estimate.usd;
+                    priced = true;
+                }
+                None => warnings.push(format!("cost model: no price for model {model}")),
+            }
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
     RemoteFleetOutcome {
         schema: SESSION_FLEET_REMOTE_SCHEMA,
         dry_run: false,
@@ -142,6 +195,9 @@ fn outcome_from_report(report: RemotePlanReport) -> RemoteFleetOutcome {
         failed: report.report.failed.map(|failure| failure.task),
         deferred: report.report.deferred,
         assignments: report.assignments,
+        usage,
+        cost_usd: priced.then_some(cost_usd),
+        warnings,
     }
 }
 

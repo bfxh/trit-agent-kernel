@@ -73,6 +73,12 @@ pub struct RemoteAttempt {
     pub node: String,
     /// 本次尝试的结局；协议级错误记为 `Failed`（带错误文本）。
     pub status: DelegationStatus,
+    /// 远端自报的模型名；用于成本折算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 远端自报的 token 明细；旧节点不返回时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<trit_orch::SubagentUsage>,
 }
 
 /// 跨机派发配置。
@@ -344,7 +350,14 @@ where
                             map.insert(task_id.clone(), reply.result.clone());
                         }
                         let status = reply.result.status.clone();
-                        record_attempt(&attempts, &task_id, &node_id, &status);
+                        record_attempt(
+                            &attempts,
+                            &task_id,
+                            &node_id,
+                            &status,
+                            reply.model.clone(),
+                            reply.usage,
+                        );
                         if reply.lease_lost {
                             // 同一任务已被其他持有者接管：节点健康，任务等待新持有者。
                             lease.finish(NodeOutcome::Superseded);
@@ -395,7 +408,7 @@ where
                         let status = DelegationStatus::Failed {
                             message: error.to_string(),
                         };
-                        record_attempt(&attempts, &task_id, &node_id, &status);
+                        record_attempt(&attempts, &task_id, &node_id, &status, None, None);
                         if cancel.is_cancelled() {
                             lease.finish(NodeOutcome::Abandoned);
                             return Err("remote plan cancelled".into());
@@ -1011,6 +1024,8 @@ fn record_attempt(
     task: &str,
     node: &str,
     status: &DelegationStatus,
+    model: Option<String>,
+    usage: Option<trit_orch::SubagentUsage>,
 ) {
     if let Ok(mut map) = attempts.lock() {
         map.entry(task.to_string())
@@ -1018,6 +1033,8 @@ fn record_attempt(
             .push(RemoteAttempt {
                 node: node.to_string(),
                 status: status.clone(),
+                model,
+                usage,
             });
     }
 }

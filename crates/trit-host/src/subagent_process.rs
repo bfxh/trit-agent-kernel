@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use trit_orch::{
     CancelToken, DelegationResult, DelegationStatus, MAX_FRAME_BYTES, SubagentRequest,
-    SubagentResponse, decode_frame, digest_hex, encode_frame, exit_status,
+    SubagentResponse, SubagentUsage, decode_frame, digest_hex, encode_frame, exit_status,
 };
 
 use crate::AgentError;
@@ -82,6 +82,10 @@ impl SubagentProcessConfig {
 pub struct SubagentReply {
     pub result: DelegationResult,
     pub content: Vec<u8>,
+    /// 子 agent 自报的用量明细；旧子 agent 不返回时为 None。
+    pub usage: Option<SubagentUsage>,
+    /// 子 agent 自报的模型名；用于成本折算。
+    pub model: Option<String>,
 }
 
 /// spawn 子 agent 并完成一次请求/响应交换，只返回结果元数据。
@@ -187,8 +191,15 @@ fn run_subagent_reply_with_cancel(
         Ok(Some(response)) => {
             response.validate_for(request)?;
             let content = response.content.clone();
+            let usage = response.usage;
+            let model = response.model.clone();
             let result = response.into_delegation_result();
-            Ok(SubagentReply { result, content })
+            Ok(SubagentReply {
+                result,
+                content,
+                usage,
+                model,
+            })
         }
         Ok(None) => Ok(SubagentReply {
             result: DelegationResult {
@@ -199,6 +210,8 @@ fn run_subagent_reply_with_cancel(
                 tokens: 0,
             },
             content: Vec::new(),
+            usage: None,
+            model: None,
         }),
         Err(error) => Err(AgentError::Kernel(error)),
     }
@@ -215,5 +228,7 @@ fn aborted_reply(request: &SubagentRequest) -> SubagentReply {
             tokens: 0,
         },
         content: Vec::new(),
+        usage: None,
+        model: None,
     }
 }

@@ -54,8 +54,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
+use trit_orch::{
+    MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, TokenUsage, decode_frame, encode_frame,
+};
 
+use crate::cost::PriceTable;
 use crate::lease::SingleInstanceLock;
 
 use crate::auth::{AUTH_DIGEST_LEN, authorization_matches, bearer_digest};
@@ -114,6 +117,11 @@ pub struct LedgerServerConfig {
     pub request_read_timeout: Option<Duration>,
     /// 可选跨机 token 预算；达到后 `/claim` 返回 503。仅内存累计，重启清零。
     pub token_budget: Option<u64>,
+    /// 可选跨机美元预算；按完成帧的 `model + usage` 折算累计，达到后 `/claim` 返回 503。
+    /// 仅内存累计，重启清零。
+    pub usd_budget: Option<f64>,
+    /// 成本折算价目表；默认内置表，CLI 可用 `TRIT_MODEL_PRICES` 覆盖。
+    pub prices: PriceTable,
 }
 
 impl LedgerServerConfig {
@@ -128,6 +136,8 @@ impl LedgerServerConfig {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             request_read_timeout: Some(DEFAULT_REQUEST_READ_TIMEOUT),
             token_budget: None,
+            usd_budget: None,
+            prices: PriceTable::builtin(),
         }
     }
 
@@ -170,6 +180,18 @@ impl LedgerServerConfig {
     /// 设置跨机 token 预算；达到后 `/claim` 返回 503。
     pub fn with_token_budget(mut self, budget: u64) -> Self {
         self.token_budget = Some(budget);
+        self
+    }
+
+    /// 设置跨机美元预算；达到后 `/claim` 返回 503。
+    pub fn with_usd_budget(mut self, budget: f64) -> Self {
+        self.usd_budget = Some(budget);
+        self
+    }
+
+    /// 替换成本折算价目表。
+    pub fn with_prices(mut self, prices: PriceTable) -> Self {
+        self.prices = prices;
         self
     }
 }
@@ -239,6 +261,8 @@ struct LedgerState {
     bytes: usize,
     /// 已完成帧自报的 token 总量；仅内存累计，重启清零。
     tokens_used: u64,
+    /// 已完成帧折算的美元总量；仅内存累计，重启清零。
+    usd_used: f64,
 }
 
 /// 已绑定的账本服务端。
@@ -319,6 +343,7 @@ impl LedgerServer {
                     config.pending_ttl,
                     config.max_entries,
                     config.max_state_bytes,
+                    &config.prices,
                 )?;
                 if std::fs::metadata(path)
                     .is_ok_and(|meta| meta.len() > config.max_state_bytes as u64)
@@ -557,6 +582,12 @@ fn handle(
                     {
                         state.tokens_used = state.tokens_used.saturating_add(response.tokens);
                     }
+                    let usd = frame_usd(&config.prices, &response);
+                    if usd > 0.0
+                        && let Ok(mut state) = state.lock()
+                    {
+                        state.usd_used += usd;
+                    }
                     respond(&mut stream, 204, "No Content", b"")
                 }
                 Ok(CompleteOutcome::Duplicate) => respond(&mut stream, 204, "No Content", b""),
@@ -628,6 +659,11 @@ impl LedgerServerView<'_> {
         let mut state = self.state.lock().map_err(|_| ())?;
         if let Some(budget) = self.config.token_budget
             && state.tokens_used >= budget
+        {
+            return Err(());
+        }
+        if let Some(budget) = self.config.usd_budget
+            && state.usd_used >= budget
         {
             return Err(());
         }
@@ -751,6 +787,23 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> std:
     write_response(stream, code, reason, &[], body)
 }
 
+/// 按帧自报的 `model + usage` 折算美元；缺任一字段返回 0（不计价）。
+fn frame_usd(prices: &PriceTable, response: &SubagentResponse) -> f64 {
+    let (Some(model), Some(usage)) = (response.model.as_deref(), response.usage) else {
+        return 0.0;
+    };
+    let usage = TokenUsage {
+        fresh: usage.fresh,
+        cached: usage.cached,
+        output: usage.output,
+        estimated: usage.estimated,
+    };
+    prices
+        .estimate(model, &usage)
+        .map(|estimate| estimate.usd)
+        .unwrap_or(0.0)
+}
+
 fn respond_with_lease(
     stream: &mut TcpStream,
     code: u16,
@@ -814,6 +867,7 @@ fn load_entries(
     pending_ttl: Duration,
     max_entries: usize,
     max_state_bytes: usize,
+    prices: &PriceTable,
 ) -> std::io::Result<LedgerState> {
     if !path.exists() {
         return Ok(LedgerState::default());
@@ -881,9 +935,11 @@ fn load_entries(
                     let mut buffer = old_frame.clone();
                     if let Ok(Some(old)) = decode_frame::<SubagentResponse>(&mut buffer) {
                         state.tokens_used = state.tokens_used.saturating_sub(old.tokens);
+                        state.usd_used = (state.usd_used - frame_usd(prices, &old)).max(0.0);
                     }
                 }
                 state.tokens_used = state.tokens_used.saturating_add(response.tokens);
+                state.usd_used += frame_usd(prices, &response);
                 if let Some(Entry::Done { frame, lease }) = state.entries.get(&key) {
                     state.bytes =
                         state

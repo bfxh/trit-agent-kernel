@@ -126,8 +126,8 @@ pub use shadow_learn::{
 };
 pub use status::Counts;
 pub use subagent::{
-    MAX_FRAME_BYTES, RemoteEndpoint, SubagentRequest, SubagentResponse, decode_frame, encode_frame,
-    exit_status,
+    MAX_FRAME_BYTES, RemoteEndpoint, SubagentRequest, SubagentResponse, SubagentUsage,
+    decode_frame, encode_frame, exit_status,
 };
 pub use tick::{Tick, TickInput, tick};
 pub use trace::{

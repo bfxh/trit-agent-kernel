@@ -272,6 +272,8 @@ fn ledger_claim_complete_and_pending_takeover() {
         status: DelegationStatus::Completed,
         content: b"done".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
     assert!(
@@ -375,6 +377,8 @@ fn completed_records_survive_restart() {
         status: DelegationStatus::Completed,
         content: b"persisted".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
 
@@ -455,6 +459,8 @@ fn pending_renewal_records_do_not_evict_done_on_restart() {
         status: DelegationStatus::Completed,
         content: b"retained".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
     let server = Arc::clone(&ledger);
@@ -560,6 +566,8 @@ fn capacity_evictions_replay_in_the_same_key_order() {
             status: DelegationStatus::Completed,
             content: task.as_bytes().to_vec(),
             tokens: 0,
+            model: None,
+            usage: None,
         })
         .unwrap();
         remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
@@ -602,6 +610,8 @@ fn legacy_done_only_state_still_loads() {
         status: DelegationStatus::Completed,
         content: b"legacy".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
     let hex: String = frame.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -696,6 +706,8 @@ fn pending_lease_survives_restart_and_expires() {
         status: DelegationStatus::Completed,
         content: b"after-restart".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
     let server = Arc::clone(&renewed);
@@ -723,6 +735,8 @@ fn pending_lease_survives_restart_and_expires() {
         status: DelegationStatus::Completed,
         content: b"stale".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
 
@@ -771,6 +785,8 @@ fn scoped_ledger_keys_isolate_plans() {
         status: DelegationStatus::Completed,
         content: b"scoped".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     })
     .unwrap();
 
@@ -822,6 +838,8 @@ fn state_file_respects_byte_budget_and_compacts() {
             status: DelegationStatus::Completed,
             content: vec![b'x'; 80],
             tokens: 0,
+            model: None,
+            usage: None,
         })
         .unwrap();
         remote_ledger::complete(&ledger_endpoint, &key, &lease, &frame).unwrap();
@@ -1057,6 +1075,8 @@ fn stale_completion_is_aborted_instead_of_returned() {
         status: DelegationStatus::Completed,
         content: b"winner".to_vec(),
         tokens: 0,
+        model: None,
+        usage: None,
     };
     let frame = encode_frame(&winner).unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1222,6 +1242,8 @@ fn superseded_node_stays_healthy_and_retry_reads_completion() {
         status: DelegationStatus::Completed,
         content: b"external-completion".to_vec(),
         tokens: 7,
+        model: None,
+        usage: None,
     };
     let frame = encode_frame(&external).unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1316,6 +1338,8 @@ fn token_budget_blocks_new_claims_after_spend() {
         status: DelegationStatus::Completed,
         content: b"done".to_vec(),
         tokens: 10,
+        model: None,
+        usage: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1352,6 +1376,8 @@ fn token_budget_survives_restart() {
         status: DelegationStatus::Completed,
         content: b"done".to_vec(),
         tokens: 10,
+        model: None,
+        usage: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
@@ -1532,6 +1558,8 @@ fn ledger_budget_exhaustion_fails_closed_without_execution() {
         status: DelegationStatus::Completed,
         content: b"warm".to_vec(),
         tokens: 1,
+        model: None,
+        usage: None,
     })
     .unwrap();
     remote_ledger::complete(&ledger_endpoint, "warm@0", &lease, &frame).unwrap();
@@ -1582,4 +1610,44 @@ fn ledger_budget_exhaustion_fails_closed_without_execution() {
         .find(|node| node.id == "node-a")
         .unwrap();
     assert!(snapshot.healthy, "a ledger 503 is not a node failure");
+}
+
+#[test]
+fn usd_budget_blocks_new_claims_after_spend() {
+    let ledger = Arc::new(
+        LedgerServer::bind(
+            LedgerServerConfig::new("127.0.0.1:0")
+                .with_usd_budget(1.0)
+                .with_prices(trit_host::cost::PriceTable::builtin()),
+        )
+        .unwrap(),
+    );
+    let address = ledger.addr().unwrap();
+    let running = Arc::clone(&ledger);
+    thread::spawn(move || running.serve_forever().unwrap());
+    let ledger_endpoint = endpoint(&format!("http://{address}"), None, 5);
+
+    let Claim::New { lease } = remote_ledger::claim(&ledger_endpoint, "t1@0").unwrap() else {
+        panic!("expected first claim to win");
+    };
+    let frame = encode_frame(&SubagentResponse {
+        task: "t1".into(),
+        epoch: 0,
+        status: DelegationStatus::Completed,
+        content: b"done".to_vec(),
+        tokens: 0,
+        model: Some("gpt-4o".into()),
+        usage: Some(trit_orch::SubagentUsage {
+            fresh: 1_000_000,
+            cached: 0,
+            output: 0,
+            estimated: false,
+        }),
+    })
+    .unwrap();
+    remote_ledger::complete(&ledger_endpoint, "t1@0", &lease, &frame).unwrap();
+
+    // 这帧折算 $2.50，已超过 $1 预算：新键 claim 直接 503。
+    let error = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap_err();
+    assert!(error.contains("503"), "{error}");
 }

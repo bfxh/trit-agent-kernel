@@ -145,6 +145,10 @@ pub const MAX_RESPONSE_BYTES: usize = MAX_FRAME_BYTES + 4;
 pub struct RemoteReply {
     pub result: DelegationResult,
     pub content: Vec<u8>,
+    /// 远端自报的模型名；用于成本折算。旧节点不返回时为 None。
+    pub model: Option<String>,
+    /// 远端自报的 token 明细；旧节点不返回时为 None。
+    pub usage: Option<trit_orch::SubagentUsage>,
     /// 服务端因账本租约被其他持有者接管而中止：节点仍健康，任务应由当前持有者完成。
     pub lease_lost: bool,
     /// 服务端执行时限到点而中止：节点仍健康，可按重试预算换节点。
@@ -267,6 +271,8 @@ pub fn run_remote_subagent_reply_scoped(
             Ok(RemoteReply {
                 result,
                 content: response.content,
+                model: response.model,
+                usage: response.usage,
                 lease_lost,
                 deadline_exceeded,
             })
@@ -440,6 +446,8 @@ fn unresolved_reply(request: &SubagentRequest, status: DelegationStatus) -> Remo
     RemoteReply {
         result: unresolved(request, status),
         content: Vec::new(),
+        model: None,
+        usage: None,
         lease_lost: false,
         deadline_exceeded: false,
     }

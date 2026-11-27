@@ -208,6 +208,13 @@ fn spawn_header_capture_node() -> CaptureNode {
             status: DelegationStatus::Completed,
             content: b"captured".to_vec(),
             tokens: 0,
+            model: Some("gpt-4o".into()),
+            usage: Some(trit_orch::SubagentUsage {
+                fresh: 1_000_000,
+                cached: 0,
+                output: 1_000_000,
+                estimated: false,
+            }),
         })
         .unwrap();
         write!(
@@ -282,4 +289,44 @@ fn advance_sends_the_scoped_idempotency_key() {
         "the remote must receive the scoped idempotency key"
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn remote_usage_is_priced_into_the_outcome() {
+    let capture = spawn_header_capture_node();
+    let fleet = trit_host::SessionFleetReport {
+        schema: trit_host::SESSION_FLEET_SCHEMA,
+        workers: 1,
+        tasks: vec![trit_host::FleetTask {
+            id: "task-1".into(),
+            task: "do work".into(),
+            deps: Vec::new(),
+            workspace: None,
+            parent: None,
+            max_tokens: 0,
+        }],
+        layers: vec![vec!["task-1".into()]],
+        skipped: Vec::new(),
+        cyclic: Vec::new(),
+    };
+
+    let outcome = trit_host::run_remote_fleet(
+        &fleet,
+        vec![capture.node.clone()],
+        &trit_host::RemoteFleetOptions {
+            workers: 1,
+            retry_limit: 0,
+            health_probe: false,
+            dry_run: false,
+            scope: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome.completed, vec!["task-1".to_owned()]);
+    assert_eq!(outcome.usage.fresh, 1_000_000);
+    assert_eq!(outcome.usage.output, 1_000_000);
+    let cost = outcome.cost_usd.expect("remote usage must be priced");
+    // gpt-4o: $2.50 / Mtok 输入 + $10.00 / Mtok 输出。
+    assert!((cost - 12.5).abs() < 1e-9, "{cost}");
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
 }

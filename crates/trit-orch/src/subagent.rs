@@ -47,6 +47,23 @@ impl SubagentRequest {
     }
 }
 
+/// 子 agent 自报的 token 用量明细；旧节点不返回时整体为 `None`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentUsage {
+    /// 新输入 token（cache miss）。
+    #[serde(default)]
+    pub fresh: u64,
+    /// 缓存命中输入 token。
+    #[serde(default)]
+    pub cached: u64,
+    /// 输出 token。
+    #[serde(default)]
+    pub output: u64,
+    /// 供应商未返回精确用量。
+    #[serde(default)]
+    pub estimated: bool,
+}
+
 /// 子 agent 返回的响应帧。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentResponse {
@@ -62,6 +79,12 @@ pub struct SubagentResponse {
     /// 实际消耗的 token。
     #[serde(default)]
     pub tokens: u64,
+    /// 远端自报的模型名；用于成本折算。旧节点不返回时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 远端自报的 token 明细；旧节点不返回时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SubagentUsage>,
 }
 
 impl SubagentResponse {

@@ -24,7 +24,7 @@
 | `session-fleet --root <dir>... [--workers N] [--budget-tokens N] [--cache <path>]` | 生成依赖分层 + 预算 | 只读 |
 | `session-fleet-run --root <dir>... [--workers N] [--retry N] [--budget-tokens N] [--budget-usd F] [--cache <path>]` | 并发执行 + 自动回填 + 对账 | dry-run |
 | `session-fleet-remote --root <dir>... --nodes <node-table.json> [--retry N] [--scope S] [--apply]` | 把 fleet 任务按节点表跨机派发 | dry-run |
-| `remote-ledger --token-budget N` | 跨机 claim/complete 的 token 预算 | 预算不设则不限 |
+| `remote-ledger --token-budget N [--usd-budget F]` | 跨机 claim/complete 的 token/美元预算 | 预算不设则不限 |
 
 ## 2. 数据流
 
@@ -74,13 +74,14 @@ DelegationResult（parent 目录 delegations.jsonl）
 ## 5. 预算与成本
 
 - 本地：`--budget-tokens` 均分到 fleet 任务，预算小于任务数直接 fail closed。
-- 跨机：`remote-ledger` 累计 `/complete` 帧里 `SubagentResponse.tokens`；达到预算后新 `/claim` 返回 503。
+- 跨机：`remote-ledger` 累计 `/complete` 帧的 token 与美元（帧携带 `model + usage` 时按价目表折算）；达到 `--token-budget` 或 `--usd-budget` 后新 `/claim` 返回 503。
 - 预算随状态文件回放，ledger 重启不清零。
 - 成本模型（`crates/trit-host/src/cost.rs`）：
   - `FleetRunOutcome` 汇总本次执行（含重试）的真实 `usage`，按模型单价折算 `cost.usd`；
   - 内置常见模型价目表（美元 / 百万 token，cache 命中单独计价）；`TRIT_MODEL_PRICES=<json>` 可覆盖或补充，文件读不到/非法时 fail closed；
   - 未知模型返回 `null` 并写 warning，绝不按 0 计价；
   - `--budget-usd F` 在已花达到 80% 时写 `warnings` 与结构化 `budget_alert`，不改变执行行为；超过预算时 `exceeded = true`。
+  - 跨机：子 agent 帧可选携带 `model` + `usage`（`SubagentUsage`）；宿主 `RemoteFleetOutcome` 输出 `usage` / `cost_usd` / `warnings`，ledger 用同一价目表累计美元。
 
 ## 6. 结果回填与对账
 
@@ -124,6 +125,6 @@ cargo bench -p trit-host --bench session_scan
 - `--scope S` 把幂等键变成 `[scope|]task@epoch`：不同计划必须用不同 scope，否则同名任务会在共享 ledger 中互相去重；`session-advance` 会把 scope 透传到远程 fleet 阶段。
 - 扫描缓存是 JSON 侧车，不是 SQLite 投影；`session_index` 仍只服务单个会话。
 - `--root` 可重复：多个根合并成一份报告（`root` = 第一个，`roots[]` = 全部），跨根链接照常建立；缓存仍按文件绝对路径复用，重复根不会重复计数。
-- 成本模型只折算本地 fleet 的真实 usage；跨机预算仍只在 ledger 端累计，货币折算不跨机回传。
-- 跨机预算只在 ledger 端累计，不把 usage 写回 remote-exec 的本地账本。
+- 成本模型同时覆盖本地 fleet 与跨机帧：远端自报 `model + usage`，ledger 用同一价目表累计美元并可用 `--usd-budget` fail closed；未上报 usage 的旧节点不计价。
+- 跨机预算（token 与美元）只在 ledger 端累计，不把 usage 写回 remote-exec 的本地账本。
 - UI/设置栏只消费这些 JSON，不参与内核判定。
