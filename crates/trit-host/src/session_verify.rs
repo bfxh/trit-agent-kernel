@@ -143,6 +143,9 @@ pub fn verify_callbacks(scan: &SessionScanReport) -> Result<CallbackVerifyReport
 }
 
 fn verify_chain(path: &Path) -> Option<String> {
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_DELEGATIONS_BYTES) {
+        return Some(format!("delegations file too large: {}", path.display()));
+    }
     let Ok(text) = fs::read_to_string(path) else {
         return None;
     };

@@ -265,6 +265,12 @@ fn fnv1a64(bytes: &[u8]) -> String {
 }
 
 fn last_record_hash(target: &Path) -> Result<Option<String>, AgentError> {
+    if fs::metadata(target).is_ok_and(|metadata| metadata.len() > MAX_DELEGATIONS_BYTES) {
+        return Err(AgentError::Io(format!(
+            "delegations file too large: {}",
+            target.display()
+        )));
+    }
     let Ok(text) = fs::read_to_string(target) else {
         return Ok(None);
     };
