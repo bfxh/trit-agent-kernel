@@ -69,6 +69,9 @@ pub struct RemoteFleetOutcome {
     /// 按远端模型单价折算的预估费用（美元）；没有任何可定价的尝试时为 None。
     #[serde(default)]
     pub cost_usd: Option<f64>,
+    /// 按当前汇率折算的预估费用（人民币）；默认展示口径。
+    #[serde(default)]
+    pub cost_cny: Option<f64>,
     /// 成本模型告警（未知模型、定价文件非法等）。
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -96,6 +99,7 @@ pub fn run_remote_fleet(
             assignments: BTreeMap::new(),
             usage: TokenUsage::default(),
             cost_usd: None,
+            cost_cny: None,
             warnings: Vec::new(),
         });
     }
@@ -197,6 +201,7 @@ fn outcome_from_report(report: RemotePlanReport) -> RemoteFleetOutcome {
         assignments: report.assignments,
         usage,
         cost_usd: priced.then_some(cost_usd),
+        cost_cny: priced.then_some(cost_usd * crate::cost::usd_cny_rate()),
         warnings,
     }
 }

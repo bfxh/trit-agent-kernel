@@ -17,6 +17,19 @@ pub const COST_SCHEMA: u32 = 1;
 pub const DEFAULT_ALERT_THRESHOLD: f64 = 0.8;
 /// 覆盖内置价目表的环境变量，值是 JSON 文件路径。
 pub const PRICES_ENV: &str = "TRIT_MODEL_PRICES";
+/// 默认美元兑人民币汇率；成本默认以人民币展示。
+pub const DEFAULT_USD_CNY: f64 = 7.2;
+/// 覆盖美元兑人民币汇率的处理变量名。
+pub const USD_CNY_ENV: &str = "TRIT_USD_CNY";
+
+/// 当前汇率；处理变量缺失、非法或非正时回退默认值。
+pub fn usd_cny_rate() -> f64 {
+    std::env::var(USD_CNY_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(DEFAULT_USD_CNY)
+}
 
 /// 单一模型的单价，单位：美元 / 百万 token。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -38,6 +51,8 @@ pub struct CostEstimate {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub usd: f64,
+    /// 人民币金额；按 `TRIT_USD_CNY` 或默认汇率折算。
+    pub cny: f64,
     /// 用量本身来自供应商估算（`TokenUsage::estimated`）时为 false。
     pub exact: bool,
 }
@@ -47,25 +62,29 @@ pub struct CostEstimate {
 pub struct BudgetAlert {
     pub budget_usd: f64,
     pub spent_usd: f64,
+    /// 预算的人民币金额（按当前汇率折算）。
+    pub budget_cny: f64,
+    /// 已花的人民币金额（按当前汇率折算）。
+    pub spent_cny: f64,
     pub threshold: f64,
     /// 已花达到或超过预算本身。
     pub exceeded: bool,
 }
 
 impl BudgetAlert {
-    /// 便于写进报告 warnings 的一行文本。
+    /// 便于写进报告 warnings 的一行文本；默认以人民币展示。
     pub fn warning(&self) -> String {
-        let percent = (self.spent_usd / self.budget_usd * 100.0).round();
+        let percent = (self.spent_cny / self.budget_cny * 100.0).round();
         if self.exceeded {
             format!(
-                "budget exceeded: spent ${:.6} of ${:.2} ({}%)",
-                self.spent_usd, self.budget_usd, percent
+                "预算超支：已花 ¥{:.2} / ¥{:.2}（{}%）",
+                self.spent_cny, self.budget_cny, percent
             )
         } else {
             format!(
-                "budget alert: spent ${:.6} of ${:.2} ({}%, threshold {}%)",
-                self.spent_usd,
-                self.budget_usd,
+                "预算告警：已花 ¥{:.2} / ¥{:.2}（{}%，阈值 {}%）",
+                self.spent_cny,
+                self.budget_cny,
                 percent,
                 (self.threshold * 100.0).round()
             )
@@ -181,6 +200,7 @@ impl PriceTable {
             cached_input_tokens: usage.cached,
             output_tokens: usage.output,
             usd,
+            cny: usd * usd_cny_rate(),
             exact: usage.is_exact(),
         })
     }
@@ -206,6 +226,8 @@ pub fn budget_alert(spent_usd: f64, budget_usd: f64, threshold: f64) -> Option<B
     Some(BudgetAlert {
         budget_usd,
         spent_usd,
+        budget_cny: budget_usd * usd_cny_rate(),
+        spent_cny: spent_usd * usd_cny_rate(),
         threshold,
         exceeded: spent_usd >= budget_usd,
     })
@@ -244,6 +266,7 @@ mod tests {
             .estimate("gpt-4o", &usage(1_000_000, 1_000_000, 1_000_000))
             .unwrap();
         assert!((cost.usd - (2.50 + 1.25 + 10.00)).abs() < 1e-9);
+        assert!((cost.cny - cost.usd * usd_cny_rate()).abs() < 1e-9);
         assert!(cost.exact);
         let mut estimated = usage(0, 0, 1_000_000);
         estimated.estimated = true;
@@ -292,7 +315,8 @@ mod tests {
         assert!(alert.warning().contains("80%"));
         let exceeded = budget_alert(1.20, 1.0, DEFAULT_ALERT_THRESHOLD).unwrap();
         assert!(exceeded.exceeded);
-        assert!(exceeded.warning().contains("budget exceeded"));
+        assert!(exceeded.warning().contains("预算超支"));
+        assert!((exceeded.budget_cny - exceeded.budget_usd * usd_cny_rate()).abs() < 1e-9);
         // 不限预算与非法阈值。
         assert!(budget_alert(100.0, 0.0, DEFAULT_ALERT_THRESHOLD).is_none());
         assert!(budget_alert(100.0, 1.0, f64::NAN).is_some());

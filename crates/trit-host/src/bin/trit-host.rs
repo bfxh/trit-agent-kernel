@@ -1415,7 +1415,7 @@ fn usage() {
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
          [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
-         [--workers N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-usd F]\n\
+         [--workers N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
          [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
@@ -1437,7 +1437,7 @@ fn usage() {
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
          session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
-         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-usd F]\n\
+         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
          [--cache <path>] [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
@@ -1475,7 +1475,7 @@ fn usage() {
          remote-ledger: trit-host remote-ledger [--bind <addr>] [--token <t>] \\\n\
          [--pending-ttl-ms N] [--max-entries N] [--max-state-bytes N] [--state <path>] \\\n\
          [--max-connections N] [--request-read-timeout-ms N] [--token-budget N] \\\n\
-         [--usd-budget F] [--once]\n\
+         [--cny-budget F] [--once]\n\
          shared idempotency ledger: POST /claim, /renew and /complete coordinate retries across nodes;\n\
          prints {{\"bind\":\"127.0.0.1:PORT\"}} before accepting.\n\n\
          remote-exec: trit-host remote-exec [--bind <addr>] [--token <t>] \\\n\
@@ -1658,6 +1658,15 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                 if !budget_usd.is_finite() || budget_usd < 0.0 {
                     return Err(fail("--budget-usd must be a non-negative number"));
                 }
+            }
+            "--budget-cny" => {
+                let cny: f64 = next(&mut args, "--budget-cny")?
+                    .parse()
+                    .map_err(|_| fail("--budget-cny must be a non-negative number"))?;
+                if !cny.is_finite() || cny < 0.0 {
+                    return Err(fail("--budget-cny must be a non-negative number"));
+                }
+                budget_usd = cny / trit_host::cost::usd_cny_rate();
             }
             "--apply" => apply = true,
             "--compact" => compact = true,
@@ -1921,6 +1930,15 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                 if !budget_usd.is_finite() || budget_usd < 0.0 {
                     return Err(fail("--budget-usd must be a non-negative number"));
                 }
+            }
+            "--budget-cny" => {
+                let cny: f64 = next(&mut args, "--budget-cny")?
+                    .parse()
+                    .map_err(|_| fail("--budget-cny must be a non-negative number"))?;
+                if !cny.is_finite() || cny < 0.0 {
+                    return Err(fail("--budget-cny must be a non-negative number"));
+                }
+                budget_usd = cny / trit_host::cost::usd_cny_rate();
             }
             "--scope" => scope = Some(next(&mut args, "--scope")?),
             "--apply" => apply = true,
@@ -3141,6 +3159,13 @@ fn run_remote_ledger(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                     return Err(fail("--usd-budget must be a non-negative number"));
                 }
                 config = config.with_usd_budget(budget);
+            }
+            "--cny-budget" => {
+                let cny: f64 = next(&mut args, "--cny-budget")?.parse()?;
+                if !cny.is_finite() || cny < 0.0 {
+                    return Err(fail("--cny-budget must be a non-negative number"));
+                }
+                config = config.with_usd_budget(cny / trit_host::cost::usd_cny_rate());
             }
             "--once" => once = true,
             other => return Err(fail(format!("unknown remote-ledger argument: {other}"))),
