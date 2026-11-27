@@ -257,6 +257,15 @@ pub struct PrefixSignal {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnStepRecord {
+    pub step: usize,
+    /// 该步提出过的工具调用，按提出顺序。
+    pub requests: Vec<ToolRequest>,
+    /// 该步是否已声明完成（`CompletionClaimed`）。
+    pub claimed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnContext {
     pub task: String,
@@ -267,6 +276,8 @@ pub struct TurnContext {
     pub digest: Option<String>,
     /// 当前 append-only 投影的模型可见视图。
     pub projection: Option<crate::context_projection::ProjectionView>,
+    /// 崩溃续跑时回放的本 turn 早期步骤；新 turn 为空。
+    pub history: Vec<TurnStepRecord>,
 }
 
 pub trait Model {
@@ -750,6 +761,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         let mut receipts: Vec<ToolOutcome> = Vec::new();
         let mut usage = TokenUsage::default();
         let mut start_step = 0usize;
+        let mut history: Vec<TurnStepRecord> = Vec::new();
         let resumed = resume.is_some();
         match resume {
             Some(resume) => {
@@ -772,6 +784,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 receipts = resume.receipts();
                 usage = resume.usage;
                 start_step = resume.next_step;
+                history = resume.history.clone();
                 for request in resume.unsettled() {
                     let outcome = ToolOutcome {
                         call_id: request.call_id.clone(),
@@ -871,6 +884,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
             receipts: Vec::new(),
             digest: None,
             projection: None,
+            history,
         };
 
         for step in start_step..self.max_steps {

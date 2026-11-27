@@ -81,7 +81,8 @@ DelegationResult（parent 目录 delegations.jsonl）
 - `run --resume` / `session-advance --resume` 会先看 session 里最后一个 turn：没有 `TurnFinished` 且 task 对得上，就从它的断点继续，而不是新起一个 turn 重跑。
 - 恢复只采纳确定事实：`ToolCompleted` 的回执照旧计入证据；`ToolRequested` 之后没有回执的请求补记为 `in_doubt`，既不当作成功、也不重放，由模型在重跑的这一步决定是否重试。
 - 断点若停在某一步的工具执行中，该 step 的 proposal 会重跑（`next_step` 退回该 step）；否则从 `step + 1` 继续。
-- 附带恢复：已消耗 token、上下文投影（`context_projection::replay`）、effect 台账（`Confirmed`/`Unknown`）。
+- 附带恢复：已消耗 token、上下文投影（`context_projection::replay`）、effect 台账（`Confirmed`/`Unknown`）、以及该 turn 早期步骤的提议历史（`TurnContext.history`：每步提过哪些工具调用、是否声明过完成），模型能从断点接上自己走过的一半。
+- 不恢复的部分只有模型侧的推理文本本身：provider 不保存这些内容，恢复后的第一步由模型基于回执与历史重新决策。
 - 恢复不了（日志损坏、断点属于别的 task、turn 已收尾）时退回旧语义：先把未完成的 `<task>.jsonl` 归档为 `<task>.prev-<ms>.jsonl` 再重跑。
 
 ## 5. 预算与成本

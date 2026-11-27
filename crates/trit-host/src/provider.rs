@@ -402,6 +402,7 @@ mod tests {
             receipts: Vec::new(),
             digest: None,
             projection: None,
+            history: Vec::new(),
         };
         model.proposal(&brief, &context).unwrap();
         *catalog_tools.lock().unwrap() = vec![spec("mcp__stub__echo"), spec("mcp__stub__echo2")];

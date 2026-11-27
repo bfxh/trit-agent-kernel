@@ -228,6 +228,19 @@ fn archive_incomplete_session(dir: &Path, id: &str) -> Result<(), String> {
         .map_err(|error| format!("archive {}: {error}", path.display()))
 }
 
+/// 该任务的 session 能否从中间状态续跑。
+///
+/// 只有「未收尾 turn 的 task 与本次要跑的 task 一致」才算可恢复；日志损坏、
+/// 断点属于别的 task（例如任务改过名）都返回 false，调用方退回归档重跑。
+fn session_resumable(dir: &Path, id: &str) -> bool {
+    let path = safe_task_path(dir, id);
+    SessionLog::open(&path)
+        .ok()
+        .and_then(|log| log.load().ok())
+        .and_then(|records| crate::session::resume_turn(&records).ok().flatten())
+        .is_some_and(|resume| resume.task == id)
+}
+
 /// 任务 id 只允许 `[A-Za-z0-9._-]`，避免 meta 里的 `../` 把 session 写出目录。
 fn safe_task_path(dir: &Path, id: &str) -> PathBuf {
     let safe: String = id
@@ -305,11 +318,7 @@ fn execute_once(
         reject_symlink(&session)?;
         // 能从中断 turn 的中间状态恢复就不归档：归档会丢掉已经拿到的证据。
         // 日志损坏或断点属于别的任务时退回「归档后重跑」，保持旧语义。
-        let resumable = SessionLog::open(&session)
-            .ok()
-            .and_then(|log| log.load().ok())
-            .and_then(|records| crate::session::resume_turn(&records).ok().flatten())
-            .is_some_and(|resume| resume.task == task.task.id);
+        let resumable = session_resumable(&session_dir, &task.task.id);
         if !resumable && let Err(error) = archive_incomplete_session(&session_dir, &task.task.id) {
             return Err(error);
         }
@@ -656,6 +665,76 @@ mod tests {
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().contains(".prev-"));
         assert!(archived);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_resumable_requires_matching_task_and_open_turn() {
+        let dir = std::env::temp_dir().join(format!(
+            "trit-resumable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut log = SessionLog::open(dir.join("old.run.jsonl")).unwrap();
+        log.append(SessionEvent::TurnStarted {
+            task: "old.run".into(),
+            objective: "o".into(),
+            max_steps: 2,
+        })
+        .unwrap();
+        log.append(SessionEvent::Proposal {
+            step: 0,
+            tool_calls: 1,
+            completion: false,
+            usage: trit_reasonix::HostUsage::default(),
+            context: None,
+        })
+        .unwrap();
+        log.append(SessionEvent::ToolRequested {
+            step: 0,
+            request: crate::ToolRequest::write("w1", "write_file", "a.txt", "x"),
+        })
+        .unwrap();
+        drop(log);
+
+        assert!(
+            session_resumable(&dir, "old.run"),
+            "同任务的中断 turn 应可恢复"
+        );
+        assert!(
+            !session_resumable(&dir, "new.run"),
+            "任务改名后断点属于别人，必须退回归档重跑"
+        );
+        assert!(
+            !session_resumable(&dir, "missing.run"),
+            "没有日志时不可恢复"
+        );
+
+        std::fs::write(dir.join("broken.run.jsonl"), "not-json\n").unwrap();
+        assert!(
+            !session_resumable(&dir, "broken.run"),
+            "损坏日志必须退回归档重跑"
+        );
+
+        let mut log = SessionLog::open(dir.join("done.run.jsonl")).unwrap();
+        log.append(SessionEvent::TurnStarted {
+            task: "done.run".into(),
+            objective: "o".into(),
+            max_steps: 1,
+        })
+        .unwrap();
+        log.append(SessionEvent::TurnFinished {
+            steps: 1,
+            complete: true,
+            metrics: None,
+        })
+        .unwrap();
+        drop(log);
+        assert!(!session_resumable(&dir, "done.run"), "已收尾 turn 不可恢复");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

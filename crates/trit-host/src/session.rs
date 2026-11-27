@@ -422,6 +422,8 @@ pub struct TurnResume {
     pub next_step: usize,
     /// 断点所在的 step（`next_step` 是它重跑还是推进，取决于是否有未确定的请求）。
     pub step: usize,
+    /// 本 turn 早期步骤的提议历史，回放给模型。
+    pub history: Vec<crate::TurnStepRecord>,
     /// 从事件重放出来的上下文投影。
     pub projection: crate::context_projection::ContextProjection,
 }
@@ -479,6 +481,7 @@ pub fn resume_turn(records: &[SessionRecord]) -> Result<Option<TurnResume>, Agen
         ..TurnResume::default()
     };
     let mut last_step = 0usize;
+    let mut history: Vec<crate::TurnStepRecord> = Vec::new();
     for record in tail {
         match &record.event {
             SessionEvent::Proposal { step, usage, .. } => {
@@ -488,6 +491,25 @@ pub fn resume_turn(records: &[SessionRecord]) -> Result<Option<TurnResume>, Agen
             SessionEvent::ToolRequested { step, request } => {
                 last_step = *step;
                 resume.requests.push(request.clone());
+                match history.iter_mut().find(|record| record.step == *step) {
+                    Some(record) => record.requests.push(request.clone()),
+                    None => history.push(crate::TurnStepRecord {
+                        step: *step,
+                        requests: vec![request.clone()],
+                        claimed: false,
+                    }),
+                }
+            }
+            SessionEvent::CompletionClaimed { step, .. } => {
+                last_step = *step;
+                match history.iter_mut().find(|record| record.step == *step) {
+                    Some(record) => record.claimed = true,
+                    None => history.push(crate::TurnStepRecord {
+                        step: *step,
+                        requests: Vec::new(),
+                        claimed: true,
+                    }),
+                }
             }
             SessionEvent::ToolCompleted { step, outcome } => {
                 last_step = *step;
@@ -499,6 +521,8 @@ pub fn resume_turn(records: &[SessionRecord]) -> Result<Option<TurnResume>, Agen
             _ => {}
         }
     }
+    history.sort_by_key(|record| record.step);
+    resume.history = history;
     // 断点落在某个 step 的工具执行中间：该 step 还没跑完，重跑它的 proposal，
     // 模型会看到结果未知的那条请求，再由它决定是否重试。
     resume.step = last_step;

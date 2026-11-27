@@ -584,3 +584,211 @@ fn headless_resume_continues_without_a_new_turn_start() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// 记录实际被执行过的工具调用，用来证明恢复不会重放已完成的请求。
+struct CountingTools {
+    seen: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    outcomes: std::collections::VecDeque<ToolOutcome>,
+}
+
+impl trit_host::ToolExecutor for CountingTools {
+    fn execute(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        self.seen.borrow_mut().push(request.call_id.clone());
+        self.outcomes.pop_front().ok_or(AgentError::ToolExhausted)
+    }
+}
+
+fn written(call_id: &str, path: &str) -> ToolOutcome {
+    ToolOutcome {
+        call_id: call_id.into(),
+        tool: "write_file".into(),
+        command: None,
+        passed: true,
+        assertions: 0,
+        written_paths: vec![path.into()],
+        in_doubt: false,
+        output: String::new(),
+    }
+}
+
+fn completion(paths: &[&str]) -> Proposal {
+    Proposal {
+        tool_calls: Vec::new(),
+        completion: Some(ClaimRequest {
+            criteria: vec![CriterionRequest {
+                id: "c1".into(),
+                kind: CriterionKind::Diff {
+                    paths: paths.iter().map(|path| (*path).to_owned()).collect(),
+                },
+            }],
+        }),
+        usage: HostUsage::default(),
+        ..Proposal::default()
+    }
+}
+
+/// 穷举截断点：日志停在每个位置时，恢复都不得重放已经拿到回执的工具。
+#[test]
+fn resume_from_every_truncation_never_replays_settled_tools() {
+    let events = vec![
+        SessionEvent::TurnStarted {
+            task: "headless".into(),
+            objective: "write".into(),
+            max_steps: 4,
+        },
+        SessionEvent::Proposal {
+            step: 0,
+            tool_calls: 1,
+            completion: false,
+            usage: HostUsage::default(),
+            context: None,
+        },
+        SessionEvent::ToolRequested {
+            step: 0,
+            request: ToolRequest::write("w1", "write_file", "a.txt", "a"),
+        },
+        SessionEvent::ToolCompleted {
+            step: 0,
+            outcome: written("w1", "a.txt"),
+        },
+        SessionEvent::Proposal {
+            step: 1,
+            tool_calls: 1,
+            completion: false,
+            usage: HostUsage::default(),
+            context: None,
+        },
+        SessionEvent::ToolRequested {
+            step: 1,
+            request: ToolRequest::write("w2", "write_file", "b.txt", "b"),
+        },
+        SessionEvent::ToolCompleted {
+            step: 1,
+            outcome: written("w2", "b.txt"),
+        },
+    ];
+    for cut in 1..events.len() {
+        let path = temp_file(&format!("trunc-{cut}"));
+        let mut log = SessionLog::open(&path).unwrap();
+        for event in events[..cut].iter().cloned() {
+            log.append(event).unwrap();
+        }
+        drop(log);
+
+        let records = SessionLog::open(&path).unwrap().load().unwrap();
+        let Some(resume) = trit_host::session::resume_turn(&records).unwrap() else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let settled: Vec<String> = resume
+            .receipts()
+            .iter()
+            .map(|outcome| outcome.call_id.clone())
+            .collect();
+        let mut unique = settled.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), settled.len(), "cut={cut}: 回执不得重复");
+        assert_eq!(
+            resume.requests.len(),
+            settled.len() + resume.unsettled().len(),
+            "cut={cut}: 每个已发请求要么有回执、要么未确定"
+        );
+        assert!(
+            resume.next_step == resume.step || resume.next_step == resume.step + 1,
+            "cut={cut}: next_step 必须落在断点或其后一步"
+        );
+        let steps: Vec<usize> = resume.history.iter().map(|record| record.step).collect();
+        let mut sorted = steps.clone();
+        sorted.sort_unstable();
+        assert_eq!(steps, sorted, "cut={cut}: history 必须按 step 递增");
+        assert!(
+            steps.iter().all(|step| *step <= resume.step),
+            "cut={cut}: history 不得包含断点之后的步骤"
+        );
+
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = trit_host::AgentHost::new(
+            ScriptedModel::new(vec![completion(&["a.txt", "b.txt"])]),
+            CountingTools {
+                seen: std::rc::Rc::clone(&seen),
+                outcomes: vec![written("w1", "a.txt"), written("w2", "b.txt")].into(),
+            },
+        );
+        let mut log = SessionLog::open(&path).unwrap();
+        let _ = host.run_turn_resume_with_session(&turn(), &mut log, resume);
+        for call_id in seen.borrow().iter() {
+            assert!(
+                !settled.contains(call_id),
+                "cut={cut}: 已完成的工具 {call_id} 被重放执行"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// 跨层对账：恢复补记的 `in_doubt` 写与 journal 里未闭合的 begin 指向同一路径时，
+/// 完成声明必须是 `Conflicted`，不能被其余证据抬成 Complete。
+#[test]
+fn resumed_in_doubt_write_conflicts_with_open_journal_entry() {
+    let root = temp_workspace("resume-journal");
+    let path = temp_file("resume-journal");
+    let mut log = SessionLog::open(&path).unwrap();
+    log.append(SessionEvent::TurnStarted {
+        task: "headless".into(),
+        objective: "write".into(),
+        max_steps: 4,
+    })
+    .unwrap();
+    log.append(SessionEvent::Proposal {
+        step: 0,
+        tool_calls: 1,
+        completion: false,
+        usage: HostUsage::default(),
+        context: None,
+    })
+    .unwrap();
+    log.append(SessionEvent::ToolRequested {
+        step: 0,
+        request: ToolRequest::write("w1", "write_file", "a.txt", "hello"),
+    })
+    .unwrap();
+    drop(log);
+
+    // 崩溃时写操作已经开始但没落回执：journal 只有 begin，report 会把它列为 in_doubt。
+    let mut journal = trit_host::journal::MutationJournal::open(&root).unwrap();
+    let _open = journal
+        .record_begin(
+            &ToolRequest::write("w1", "write_file", "a.txt", "hello"),
+            None,
+        )
+        .unwrap();
+    assert!(journal.report().unwrap().has_in_doubt());
+
+    let mut resuming = config(&root, Some(path.clone()));
+    resuming.resume = true;
+    resuming.write_guard = Some(trit_host::permissions::WriteGuard {
+        claim: trit_host::permissions::WriteClaim::new(&root, vec![PathBuf::from("a.txt")])
+            .unwrap(),
+        lease: None,
+        journal: Some(journal),
+    });
+    let outcome = run_headless(
+        turn(),
+        ScriptedModel::new(vec![completion(&["a.txt"])]),
+        resuming,
+    )
+    .unwrap();
+    assert!(
+        outcome.judgment.is_conflicted(),
+        "ORCH_SESSION_RESUME_JOURNAL: 未闭合写必须让完成声明冲突，实际 {:?}",
+        outcome.judgment.verdict
+    );
+    assert!(!outcome.judgment.is_complete());
+    assert!(
+        outcome.receipts.iter().any(|outcome| outcome.in_doubt),
+        "恢复必须把发出但没回执的写补记为 in_doubt"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&root);
+}
