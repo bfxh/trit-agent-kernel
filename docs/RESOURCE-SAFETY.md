@@ -45,7 +45,7 @@
 
 ## 6. 已知边界与后续
 
-- `McpToolClient::routes()` 每次重建路由（临时分配，不是泄漏）；高频调用可加版本缓存。
+- `McpToolClient::routes()` 有 5s 缓存与 `invalidate()`；临时分配只发生在缓存过期或失效时。
 - HTTP MCP 工具缓存有 TTL（默认 60s）与 `refresh()`；服务端 `list_changed` 仍不会自动推送，需要重建客户端或调用 refresh。
 - 浏览器单页面；多标签/页面池是后续能力。
 - `background` 注册表没有条目上限，但条目随线程结束移除；长期服务应监控 `running()`。
