@@ -1620,6 +1620,7 @@ pub mod remote_ledger;
 pub mod remote_serve;
 pub mod remote_subagent;
 pub mod sampling;
+pub mod scoring;
 pub mod separation;
 pub mod serve;
 pub mod session;
@@ -1739,6 +1740,7 @@ pub use remote_subagent::{
     validate_idempotency_scope,
 };
 pub use sampling::OpenAiSamplingHandler;
+pub use scoring::{BLOCK_THRESHOLD, Surface, SurfaceScore, score_turn};
 pub use separation::{
     PLAN_TOOL, READ_ONLY_TOOLS, ReadOnlyCatalog, ReadOnlyTools, SessionPaths, is_read_only_tool,
     plan_handoff_from_proposal, planner_tool_specs,

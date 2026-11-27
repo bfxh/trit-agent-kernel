@@ -53,6 +53,7 @@ fn response(task: &str, epoch: u64, status: DelegationStatus) -> SubagentRespons
         tokens: 5,
         model: None,
         usage: None,
+        dissent: None,
     }
 }
 

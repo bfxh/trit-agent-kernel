@@ -64,6 +64,40 @@ pub struct SubagentUsage {
     pub estimated: bool,
 }
 
+/// 项目技术栈约束：现有栈 + 本次显式授权的例外。
+///
+/// 默认 `allowed_additions` 为空：子智能体不得自行引入新语言/框架/包管理器。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPolicy {
+    #[serde(default)]
+    pub existing: Vec<String>,
+    #[serde(default)]
+    pub allowed_additions: Vec<String>,
+}
+
+/// 子智能体自报的技术栈使用情况。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackReport {
+    #[serde(default)]
+    pub used: Vec<String>,
+    #[serde(default)]
+    pub added: Vec<String>,
+}
+
+/// 校验子智能体自报的技术栈：`added` 必须是授权集合的子集。
+///
+/// 用于帧协议子智能体与外部 CLI 子智能体；越权新增直接判协议违约。
+pub fn validate_stack(added: &[String], allowed_additions: &[String]) -> Result<(), Error> {
+    for item in added {
+        if !allowed_additions.iter().any(|allowed| allowed == item) {
+            return Err(Error::SubagentProtocol {
+                message: format!("subagent added tech {item} without authorization"),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 子智能体对主智能体决定的异议。
 ///
 /// 只在"按现在的做法对项目不利"时提出；主智能体必须显式处理（采纳或说明驳回理由），

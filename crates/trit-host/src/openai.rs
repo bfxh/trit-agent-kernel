@@ -350,6 +350,11 @@ pub(crate) fn build_request_body(config: &OpenAiConfig, request: &ProviderReques
          Manual notes are never evidence.",
         request.brief.render()
     );
+    system.push_str(
+        "\n\nFollow the project's existing programming language, framework, build tooling and \
+         package manager. Do not introduce a new language, framework or package manager unless \
+         the task brief explicitly authorizes it as an explicit_override.",
+    );
     let mut context_tail = String::new();
     let mut context_fingerprint = String::new();
     if let Some(plan) = &request.context {

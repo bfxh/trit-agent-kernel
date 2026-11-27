@@ -171,6 +171,14 @@ pub fn parse_cli_output(stdout: &str) -> (String, Option<Dissent>) {
     (content, Some(dissent))
 }
 
+/// 解析 `<<<STACK>>>{json}<<<END>>>` 块；不存在或非法时返回 None。
+pub fn parse_stack_block(stdout: &str) -> Option<trit_orch::StackReport> {
+    let start = stdout.find("<<<STACK>>>")?;
+    let after = start + "<<<STACK>>>".len();
+    let end_rel = stdout[after..].find(DISSENT_CLOSE)?;
+    serde_json::from_str::<trit_orch::StackReport>(stdout[after..after + end_rel].trim()).ok()
+}
+
 /// 一次外部 CLI 子智能体的运行结果。
 #[derive(Debug, Clone, Default)]
 pub struct CliAgentRun {
@@ -281,6 +289,11 @@ pub fn run_cli_agent(
     }
     let text = String::from_utf8_lossy(&stdout);
     let (content, dissent) = parse_cli_output(&text);
+    // 子智能体不得自行引入新技术栈：默认允许集合为空，越权即失败。
+    if let Some(stack) = parse_stack_block(&text) {
+        trit_orch::validate_stack(&stack.added, &[])
+            .map_err(|error| AgentError::Provider(error.to_string()))?;
+    }
     let stderr_text = String::from_utf8_lossy(&stderr);
     let stderr_tail: String = {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
