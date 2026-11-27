@@ -744,6 +744,7 @@ mod tests {
                 "write_file",
                 "bash",
                 "search_code",
+                "trit_search",
                 "glob",
                 "context_search",
                 "context_add",

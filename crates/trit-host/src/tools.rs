@@ -7,6 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Instant;
 
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
@@ -562,6 +563,125 @@ impl LocalTools {
         })
     }
 
+    /// 三进制文本搜索：`?` 为单字节通配（Kleene 未知位）。
+    ///
+    /// 与 `search_code` 共用路径解析、glob 过滤、禁区与文件读取限制；
+    /// 输出每行 `path:line:[T|U] text`，`T` 为确定匹配，`U` 为含未知位的匹配。
+    fn trit_search(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let arguments = request.arguments.as_ref();
+        let query = arguments
+            .and_then(|arguments| arguments.get("query"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .ok_or_else(|| AgentError::Tool("trit_search requires a non-empty query".into()))?;
+        let case_sensitive = arguments
+            .and_then(|arguments| arguments.get("case_sensitive"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let max_results = arguments
+            .and_then(|arguments| arguments.get("max_results"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 1000) as usize;
+        let path = arguments
+            .and_then(|arguments| arguments.get("path"))
+            .and_then(serde_json::Value::as_str);
+        let include_glob = arguments
+            .and_then(|arguments| arguments.get("glob"))
+            .and_then(serde_json::Value::as_str)
+            .map(Glob::new)
+            .transpose()
+            .map_err(|error| AgentError::Tool(format!("bad glob filter: {error}")))?
+            .map(|glob| glob.compile_matcher());
+        let started = Instant::now();
+        let searcher = trit_core::TritSearcher::new(query, !case_sensitive)
+            .map_err(|error| AgentError::Tool(error.to_string()))?;
+        let base = self.resolve_search_base(path)?;
+        let mut walker = WalkBuilder::new(self.root.join(&base));
+        walker
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .follow_links(false);
+        let mut results = Vec::new();
+        let mut unknown = 0usize;
+        let mut files_scanned = 0usize;
+        let mut bytes_scanned = 0usize;
+        for entry in walker.build().flatten() {
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if self.is_forbidden_absolute(path) {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(&self.root) else {
+                continue;
+            };
+            if let Some(include_glob) = &include_glob
+                && !glob_matches(include_glob, relative)
+            {
+                continue;
+            }
+            let Some(text) = self.read_search_text(relative) else {
+                continue;
+            };
+            files_scanned += 1;
+            bytes_scanned += text.len();
+            let display = relative.to_string_lossy().replace('\\', "/");
+            for (index, line) in text.lines().enumerate() {
+                let verdict = match searcher.line_verdict(line.as_bytes()) {
+                    trit_core::Ternary::True => "T",
+                    trit_core::Ternary::Unknown => {
+                        unknown += 1;
+                        "U"
+                    }
+                    trit_core::Ternary::False => continue,
+                };
+                results.push(format!(
+                    "{display}:{}:{verdict} {}",
+                    index + 1,
+                    line.trim_end().chars().take(500).collect::<String>()
+                ));
+                if results.len() >= max_results {
+                    break;
+                }
+            }
+            if results.len() >= max_results {
+                break;
+            }
+        }
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        let metrics = format!(
+            "scanned {files_scanned} file(s), {bytes_scanned} byte(s) in {elapsed_us} us"
+        );
+        let output = if results.is_empty() {
+            format!("no matches for {query}\n{metrics}")
+        } else {
+            format!(
+                "{}\n{} match(es), {} unknown, {metrics}",
+                results.join("\n"),
+                results.len(),
+                unknown
+            )
+        };
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed: true,
+            assertions: 0,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: truncate(output, self.max_output_bytes),
+        })
+    }
+
     fn glob(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
         let arguments = request.arguments.as_ref();
         let pattern = arguments
@@ -822,6 +942,7 @@ impl ToolExecutor for LocalTools {
             "write_file" => self.write_file(request),
             "move_path" => self.move_path(request),
             "search_code" => self.search_code(request),
+            "trit_search" => self.trit_search(request),
             "glob" => self.glob(request),
             "bash" => self.bash(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),

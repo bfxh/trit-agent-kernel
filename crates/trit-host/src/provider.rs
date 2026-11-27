@@ -190,6 +190,22 @@ pub fn default_tools() -> Vec<ToolSpec> {
             })),
         },
         ToolSpec {
+            name: "trit_search".into(),
+            description: "Ternary text search: '?' is a single-byte wildcard reported as Unknown (Kleene); respects .gitignore.".into(),
+            read_only: true,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
+                    "case_sensitive": {"type": "boolean"},
+                    "max_results": {"type": "integer"}
+                },
+                "required": ["query"]
+            })),
+        },
+        ToolSpec {
             name: "glob".into(),
             description: "List workspace files matching a glob pattern.".into(),
             read_only: true,

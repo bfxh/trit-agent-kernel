@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Rust 宿主骨架：模型/工具循环、效果台账与完成裁决"
 
 [dependencies]
+trit-core.workspace = true
 trit-orch.workspace = true
 trit-reasonix.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
@@ -29,3 +30,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[bench]]
+name = "search_compare"
+harness = false

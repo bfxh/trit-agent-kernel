@@ -11,6 +11,7 @@ pub mod limits;
 pub mod parallel;
 pub mod parser;
 pub mod quant;
+pub mod search;
 pub mod topology;
 pub mod tristate;
 pub mod value;
@@ -21,6 +22,7 @@ pub use bits::{BitPlane, TriBit, TruthTable};
 pub use bulk::{TriVec, TriVecError};
 pub use limits::{LimitError, Limits, check_expr, check_vars, checked_pow3};
 pub use parser::Parser;
+pub use search::{MatchVerdict, SearchError, TritSearcher};
 pub use topology::{TernaryEdge, TernaryTopology, TopologyError};
 pub use tristate::{
     BusError, LaneConflict, TriState, TriStateBus, TriStateConflict, TriStateDriver,

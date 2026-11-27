@@ -67,6 +67,12 @@ pub const TOOL_CAPABILITIES: &[ToolCapability] = &[
         requires_sandbox: false,
     },
     ToolCapability {
+        name: "trit_search",
+        read_only: true,
+        writes: false,
+        requires_sandbox: false,
+    },
+    ToolCapability {
         name: "write_file",
         read_only: false,
         writes: true,
@@ -103,10 +109,26 @@ pub struct ProjectionDiagnostics {
     pub summary: Option<IndexSummary>,
 }
 
+/// `trit_search` 的确定性自检：正确性对齐朴素 oracle、并发与串行一致，并给出微基准。
+///
+/// 全部是固定语料上的纯计算，不读工作区、不创建文件、不启动线程池以外的资源。
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchDiagnostics {
+    pub corpus_bytes: usize,
+    pub lines: usize,
+    pub patterns: usize,
+    pub verdicts_checked: usize,
+    pub mismatches: usize,
+    pub serial_parallel_equal: bool,
+    pub elapsed_us: u64,
+    pub mib_per_s: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticsReport {
     pub kernel: KernelVersions,
     pub tools: &'static [ToolCapability],
+    pub search: SearchDiagnostics,
     pub workspace: String,
     pub journal: JournalDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +148,16 @@ pub struct DiagnosticsOptions<'a> {
 
 pub fn diagnose(options: &DiagnosticsOptions<'_>) -> Result<DiagnosticsReport, AgentError> {
     let mut warnings = Vec::new();
+    let search = search_diagnostics();
+    if search.mismatches > 0 {
+        warnings.push(format!(
+            "trit_search oracle mismatch on {} of {} verdict(s)",
+            search.mismatches, search.verdicts_checked
+        ));
+    }
+    if !search.serial_parallel_equal {
+        warnings.push("trit_search parallel judgement diverged from serial".to_string());
+    }
     let journal = journal_diagnostics(options.workspace)?;
     if journal.in_doubt > 0 {
         warnings.push(format!(
@@ -187,12 +219,78 @@ pub fn diagnose(options: &DiagnosticsOptions<'_>) -> Result<DiagnosticsReport, A
             session_index: INDEX_SCHEMA,
         },
         tools: TOOL_CAPABILITIES,
+        search,
         workspace: options.workspace.display().to_string(),
         journal,
         session,
         projection,
         warnings,
     })
+}
+
+/// 固定语料 + 固定模式的自检；与单元/集成测试同源，供 CI 与排障脚本读取。
+///
+/// 正确性以 [`trit_core::search::naive_find`] 为独立 oracle；并发一致性直接比较
+/// `judge_lines` 的串行与多线程结果。耗时为整段自检的墙钟时间，用于观察回归。
+fn search_diagnostics() -> SearchDiagnostics {
+    use std::time::Instant;
+
+    use trit_core::search::naive_find;
+    use trit_core::{MatchVerdict, Ternary, TritSearcher};
+
+    let lines: Vec<String> = (0..1_500)
+        .map(|i| match i % 5 {
+            0 => format!("pub fn open(path: &Path) -> io::Result<File> {{ // {i}"),
+            1 => format!("    let handle = File::open(path)?; // needle {i}"),
+            2 => format!("    let abc_{i} = compute({i});"),
+            _ => format!("    let value_{i} = {i} * 2;"),
+        })
+        .collect();
+    let corpus_bytes: usize = lines.iter().map(String::len).sum();
+    let slices: Vec<&[u8]> = lines.iter().map(|line| line.as_bytes()).collect();
+    let patterns = ["fn open", "fn ?pen", "???", "a?c", "ERROR", "k?"];
+    let jobs = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+
+    let started = Instant::now();
+    let mut verdicts_checked = 0usize;
+    let mut mismatches = 0usize;
+    let mut serial_parallel_equal = true;
+    for pattern in patterns {
+        let Ok(searcher) = TritSearcher::new(pattern, false) else {
+            mismatches += 1;
+            continue;
+        };
+        for line in &lines {
+            let fast = searcher.line_verdict(line.as_bytes());
+            let expected = match naive_find(pattern, false, line.as_bytes()) {
+                Some((_, MatchVerdict::Match)) => Ternary::True,
+                Some((_, MatchVerdict::Unknown)) => Ternary::Unknown,
+                _ => Ternary::False,
+            };
+            verdicts_checked += 1;
+            if fast != expected {
+                mismatches += 1;
+            }
+        }
+        if searcher.judge_lines(&slices, 1) != searcher.judge_lines(&slices, jobs) {
+            serial_parallel_equal = false;
+        }
+    }
+    let elapsed_us = started.elapsed().as_micros().max(1) as u64;
+    let mib_per_s =
+        corpus_bytes as f64 / (1024.0 * 1024.0) / (elapsed_us as f64 / 1_000_000.0);
+    SearchDiagnostics {
+        corpus_bytes,
+        lines: lines.len(),
+        patterns: patterns.len(),
+        verdicts_checked,
+        mismatches,
+        serial_parallel_equal,
+        elapsed_us,
+        mib_per_s,
+    }
 }
 
 fn journal_diagnostics(workspace: &Path) -> Result<JournalDiagnostics, AgentError> {
