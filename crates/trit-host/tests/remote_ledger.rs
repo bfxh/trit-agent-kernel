@@ -1651,3 +1651,54 @@ fn usd_budget_blocks_new_claims_after_spend() {
     let error = remote_ledger::claim(&ledger_endpoint, "t2@0").unwrap_err();
     assert!(error.contains("503"), "{error}");
 }
+
+#[test]
+fn renew_errors_classify_transient_and_lease_loss() {
+    use trit_host::remote_ledger::RenewError;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = [500u16, 403, 404, 204];
+    let server = thread::spawn(move || {
+        for (index, code) in responses.iter().copied().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let done = code == 204 && index == responses.len() - 1;
+            let extra = if done { "X-Trit-Lease-Done: 1\r\n" } else { "" };
+            write!(
+                stream,
+                "HTTP/1.1 {code} X\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let endpoint = endpoint(&format!("http://{address}"), None, 5);
+    let lease = "0123456789abcdef";
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::Http(500))
+    ));
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::LeaseLost)
+    ));
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::UnknownKey)
+    ));
+    assert!(matches!(
+        remote_ledger::renew_checked(&endpoint, "t1@0", lease),
+        Err(RenewError::Completed)
+    ));
+    server.join().unwrap();
+}
