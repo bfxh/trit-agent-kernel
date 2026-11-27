@@ -1389,7 +1389,7 @@ fn usage() {
          maintains the SQLite projection of a session log; --rebuild deletes the old\n\
          projection and rebuilds it from JSONL, --verify rebuilds into a scratch db and\n\
          compares rows (exits 1 when the projection is missing or differs).\n\
-         session-scan: trit-host session-scan --root <dir> [--compact]\n\
+         session-scan: trit-host session-scan --root <dir> [--cache <path>] [--compact]\n\
          scans session JSONL files under a directory and prints tasks, links and\n\
          per-session health (open turns, corrupt lines, in-doubt tools, last gate).\n\
          session-plan: trit-host session-plan --root <dir> [--compact]\n\
@@ -1826,15 +1826,20 @@ fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
 /// `session-scan --root <dir> [--compact]`：只读扫描会话目录，输出清单/任务/链接。
 fn run_session_scan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
+    let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-scan argument: {other}"))),
         }
     }
-    let report = trit_host::scan_sessions(&root)?;
+    let report = match cache {
+        Some(path) => trit_host::scan_sessions_cached(&root, &path)?,
+        None => trit_host::scan_sessions(&root)?,
+    };
     let text = if compact {
         serde_json::to_string(&report)
     } else {

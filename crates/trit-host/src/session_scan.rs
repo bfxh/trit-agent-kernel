@@ -116,19 +116,87 @@ pub struct SessionLink {
     pub to: String,
 }
 
+/// 扫描缓存：按 size + mtime 复用未变化会话的 `SessionEntry`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ScanCache {
+    schema: u32,
+    files: BTreeMap<String, CachedEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedEntry {
+    size: u64,
+    modified_ms: u64,
+    entry: SessionEntry,
+}
+
 /// 扫描 `root` 下的会话文件；错误只降级为 warnings，不中断整次扫描。
 pub fn scan_sessions(root: &Path) -> Result<SessionScanReport, AgentError> {
+    scan_sessions_inner(root, None)
+}
+
+/// 带缓存扫描：未变化（size + mtime）的会话直接复用上次结果，只重扫变化文件。
+pub fn scan_sessions_cached(
+    root: &Path,
+    cache_path: &Path,
+) -> Result<SessionScanReport, AgentError> {
+    scan_sessions_inner(root, Some(cache_path))
+}
+
+fn scan_sessions_inner(
+    root: &Path,
+    cache_path: Option<&Path>,
+) -> Result<SessionScanReport, AgentError> {
     let mut files = Vec::new();
     collect_session_files(root, 0, &mut files)?;
     files.sort();
 
+    let cache = cache_path
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<ScanCache>(&text).ok())
+        .unwrap_or_default();
+    let mut next = ScanCache {
+        schema: SESSION_SCAN_SCHEMA,
+        files: BTreeMap::new(),
+    };
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
     for path in &files {
+        let key = path.display().to_string();
+        let metadata = fs::metadata(path).ok();
+        let size = metadata.as_ref().map_or(0, |metadata| metadata.len());
+        let modified_ms = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_millis() as u64);
+        if let Some(cached) = cache.files.get(&key)
+            && cached.size == size
+            && cached.modified_ms == modified_ms
+        {
+            next.files.insert(key, cached.clone());
+            sessions.push(cached.entry.clone());
+            continue;
+        }
         match scan_session(path) {
-            Ok(entry) => sessions.push(entry),
+            Ok(entry) => {
+                next.files.insert(
+                    key,
+                    CachedEntry {
+                        size,
+                        modified_ms,
+                        entry: entry.clone(),
+                    },
+                );
+                sessions.push(entry);
+            }
             Err(error) => warnings.push(format!("{}: {error}", path.display())),
         }
+    }
+    if let Some(path) = cache_path
+        && let Ok(text) = serde_json::to_string(&next)
+    {
+        let _ = fs::write(path, text);
     }
     let links = build_links(&sessions);
     Ok(SessionScanReport {
@@ -602,6 +670,41 @@ mod tests {
         let report = scan_sessions(&root).unwrap();
         assert_eq!(report.scanned, 1);
         assert_eq!(report.sessions[0].session_id, "real");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cached_scan_reuses_and_updates_changed_files() {
+        let root = temp("cache");
+        let session = root.join("a.jsonl");
+        let mut log = crate::session::SessionLog::open(&session).unwrap();
+        log.append(SessionEvent::TurnStarted {
+            task: "t".into(),
+            objective: "o".into(),
+            max_steps: 1,
+        })
+        .unwrap();
+        drop(log);
+        let cache = root.join("scan-cache.json");
+
+        let first = scan_sessions_cached(&root, &cache).unwrap();
+        assert_eq!(first.sessions.len(), 1);
+        assert_eq!(first.sessions[0].records, 1);
+        assert!(cache.exists());
+
+        let second = scan_sessions_cached(&root, &cache).unwrap();
+        assert_eq!(second.sessions, first.sessions);
+
+        let mut log = crate::session::SessionLog::open(&session).unwrap();
+        log.append(SessionEvent::TurnFinished {
+            steps: 1,
+            complete: true,
+            metrics: None,
+        })
+        .unwrap();
+        drop(log);
+        let third = scan_sessions_cached(&root, &cache).unwrap();
+        assert_eq!(third.sessions[0].records, 2);
         let _ = fs::remove_dir_all(&root);
     }
 }

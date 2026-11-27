@@ -1548,7 +1548,7 @@ pub use session_plan::{
 pub use session_run::{ResumeSpec, read_resume_spec, resume_command, resume_target};
 pub use session_scan::{
     LinkKind, SESSION_SCAN_SCHEMA, SessionEntry, SessionFormat, SessionGate, SessionLink,
-    SessionMeta, SessionScanReport, SessionTask, scan_sessions,
+    SessionMeta, SessionScanReport, SessionTask, scan_sessions, scan_sessions_cached,
 };
 pub use session_verify::{
     CallbackVerifyReport, CheckVerdict, DelegationCheck, SESSION_VERIFY_SCHEMA, verify_callbacks,
