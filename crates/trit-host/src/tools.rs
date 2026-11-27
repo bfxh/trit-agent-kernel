@@ -605,10 +605,7 @@ impl LocalTools {
             .git_global(true)
             .git_exclude(true)
             .follow_links(false);
-        let mut results = Vec::new();
-        let mut unknown = 0usize;
-        let mut files_scanned = 0usize;
-        let mut bytes_scanned = 0usize;
+        let mut files = Vec::new();
         for entry in walker.build().flatten() {
             let Some(file_type) = entry.file_type() else {
                 continue;
@@ -628,26 +625,63 @@ impl LocalTools {
             {
                 continue;
             }
+            files.push(relative.to_path_buf());
+        }
+        // 排序保证并行结果与目录遍历顺序无关，输出稳定可复现。
+        files.sort();
+
+        struct FileMatches {
+            display: String,
+            bytes: usize,
+            matches: Vec<(usize, &'static str, String)>,
+        }
+        // 全局命中计数：达到 max_results 后停止读取后续文件，避免并行把整个仓库扫完。
+        let found_count = std::sync::atomic::AtomicUsize::new(0);
+        let found = trit_core::parallel::map(&files, 0, |relative| {
+            if found_count.load(std::sync::atomic::Ordering::Relaxed) >= max_results {
+                return Ok::<_, ()>(None);
+            }
             let Some(text) = self.read_search_text(relative) else {
-                continue;
+                return Ok::<_, ()>(None);
             };
-            files_scanned += 1;
-            bytes_scanned += text.len();
             let display = relative.to_string_lossy().replace('\\', "/");
+            let mut matches = Vec::new();
             for (index, line) in text.lines().enumerate() {
                 let verdict = match searcher.line_verdict(line.as_bytes()) {
                     trit_core::Ternary::True => "T",
-                    trit_core::Ternary::Unknown => {
-                        unknown += 1;
-                        "U"
-                    }
+                    trit_core::Ternary::Unknown => "U",
                     trit_core::Ternary::False => continue,
                 };
-                results.push(format!(
-                    "{display}:{}:{verdict} {}",
+                matches.push((
                     index + 1,
-                    line.trim_end().chars().take(500).collect::<String>()
+                    verdict,
+                    line.trim_end().chars().take(500).collect::<String>(),
                 ));
+                let total = found_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if matches.len() >= max_results || total >= max_results {
+                    break;
+                }
+            }
+            Ok::<_, ()>(Some(FileMatches {
+                display,
+                bytes: text.len(),
+                matches,
+            }))
+        })
+        .expect("infallible");
+
+        let mut results = Vec::new();
+        let mut unknown = 0usize;
+        let mut files_scanned = 0usize;
+        let mut bytes_scanned = 0usize;
+        for file in found.into_iter().flatten() {
+            files_scanned += 1;
+            bytes_scanned += file.bytes;
+            for (line_no, verdict, text) in file.matches {
+                if verdict == "U" {
+                    unknown += 1;
+                }
+                results.push(format!("{}:{line_no}:{verdict} {text}", file.display));
                 if results.len() >= max_results {
                     break;
                 }
@@ -657,9 +691,8 @@ impl LocalTools {
             }
         }
         let elapsed_us = started.elapsed().as_micros() as u64;
-        let metrics = format!(
-            "scanned {files_scanned} file(s), {bytes_scanned} byte(s) in {elapsed_us} us"
-        );
+        let metrics =
+            format!("scanned {files_scanned} file(s), {bytes_scanned} byte(s) in {elapsed_us} us");
         let output = if results.is_empty() {
             format!("no matches for {query}\n{metrics}")
         } else {

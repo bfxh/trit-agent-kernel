@@ -246,3 +246,34 @@ fn trit_search_reports_no_matches_with_metrics() {
     assert!(outcome.output.contains("scanned 1 file(s)"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn trit_search_parallel_files_are_ordered_and_complete() {
+    let root = temp_workspace("parallel");
+    for index in 0..64 {
+        write(
+            &root,
+            &format!("src/f{index:03}.rs"),
+            &format!("fn open {index}\n"),
+        );
+    }
+    let mut tools = make_tools(&root);
+
+    let outcome = tools
+        .execute(&request(
+            "trit_search",
+            json!({"query": "fn open", "max_results": 100}),
+        ))
+        .unwrap();
+    let lines = result_lines(&outcome.output);
+    assert_eq!(lines.len(), 64);
+    let paths: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split(':').next().unwrap())
+        .collect();
+    let mut sorted = paths.clone();
+    sorted.sort();
+    assert_eq!(paths, sorted, "parallel results must stay path-ordered");
+    assert!(outcome.output.contains("scanned 64 file(s)"));
+    let _ = std::fs::remove_dir_all(&root);
+}

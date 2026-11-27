@@ -45,7 +45,11 @@ fn corpus(target: usize) -> String {
 
 fn temp_workspace() -> PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("trit-search-compare-{}-{:?}", std::process::id(), std::thread::current().id()));
+    path.push(format!(
+        "trit-search-compare-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
@@ -115,7 +119,10 @@ fn main() {
 
     let (elapsed, hits) = timed(|| {
         let outcome = tools
-            .execute(&request("search_code", json!({"query": "fn open", "max_results": 1000})))
+            .execute(&request(
+                "search_code",
+                json!({"query": "fn open", "max_results": 1000}),
+            ))
             .unwrap();
         assert!(outcome.passed);
         outcome.output.lines().count()
@@ -124,16 +131,26 @@ fn main() {
 
     let (elapsed, hits) = timed(|| {
         let outcome = tools
-            .execute(&request("trit_search", json!({"query": "fn open", "max_results": 1000})))
+            .execute(&request(
+                "trit_search",
+                json!({"query": "fn open", "max_results": 1000}),
+            ))
             .unwrap();
         assert!(outcome.passed);
-        outcome.output.lines().filter(|line| line.contains(":T ")).count()
+        outcome
+            .output
+            .lines()
+            .filter(|line| line.contains(":T "))
+            .count()
     });
     report("trit_search", "literal", bytes, elapsed, hits);
 
     let (elapsed, hits) = timed(|| {
         let outcome = tools
-            .execute(&request("search_code", json!({"query": "fn .pen", "regex": true, "max_results": 1000})))
+            .execute(&request(
+                "search_code",
+                json!({"query": "fn .pen", "regex": true, "max_results": 1000}),
+            ))
             .unwrap();
         assert!(outcome.passed);
         outcome.output.lines().count()
@@ -142,10 +159,17 @@ fn main() {
 
     let (elapsed, hits) = timed(|| {
         let outcome = tools
-            .execute(&request("trit_search", json!({"query": "fn ?pen", "max_results": 1000})))
+            .execute(&request(
+                "trit_search",
+                json!({"query": "fn ?pen", "max_results": 1000}),
+            ))
             .unwrap();
         assert!(outcome.passed);
-        outcome.output.lines().filter(|line| line.contains(":U ")).count()
+        outcome
+            .output
+            .lines()
+            .filter(|line| line.contains(":U "))
+            .count()
     });
     report("trit_search", "wildcard_kleene", bytes, elapsed, hits);
 
@@ -171,7 +195,75 @@ fn main() {
             });
             report("ripgrep", "literal", bytes, elapsed, hits);
         }
-        None => println!("{}", json!({"tool": "ripgrep", "case": "literal", "rg": null})),
+        None => println!(
+            "{}",
+            json!({"tool": "ripgrep", "case": "literal", "rg": null})
+        ),
+    }
+
+    // 多文件场景：文件级并行与目录遍历开销的对比。
+    let multi = root.join("multi");
+    std::fs::create_dir_all(&multi).unwrap();
+    let per_file = TARGET_BYTES / 256;
+    let mut multi_bytes = 0usize;
+    for index in 0..256 {
+        let text = corpus(per_file);
+        multi_bytes += text.len();
+        std::fs::write(multi.join(format!("f{index:03}.rs")), text).unwrap();
+    }
+    println!(
+        "{}",
+        json!({"multi_files": 256, "multi_bytes": multi_bytes})
+    );
+
+    let (elapsed, hits) = timed(|| {
+        let outcome = tools
+            .execute(&request(
+                "search_code",
+                json!({"query": "fn open", "path": "multi", "max_results": 1000}),
+            ))
+            .unwrap();
+        assert!(outcome.passed);
+        outcome.output.lines().count()
+    });
+    report("search_code", "multi_literal", multi_bytes, elapsed, hits);
+
+    let (elapsed, hits) = timed(|| {
+        let outcome = tools
+            .execute(&request(
+                "trit_search",
+                json!({"query": "fn open", "path": "multi", "max_results": 1000}),
+            ))
+            .unwrap();
+        assert!(outcome.passed);
+        outcome
+            .output
+            .lines()
+            .filter(|line| line.contains(":T "))
+            .count()
+    });
+    report("trit_search", "multi_literal", multi_bytes, elapsed, hits);
+
+    if let Some(rg) = find_rg() {
+        let (elapsed, hits) = timed(|| {
+            let output = Command::new(&rg)
+                .args([
+                    "-F",
+                    "-n",
+                    "--no-heading",
+                    "--color",
+                    "never",
+                    "--max-count",
+                    "1000",
+                    "fn open",
+                    "multi",
+                ])
+                .current_dir(&root)
+                .output()
+                .expect("run ripgrep");
+            String::from_utf8_lossy(&output.stdout).lines().count()
+        });
+        report("ripgrep", "multi_literal", multi_bytes, elapsed, hits);
     }
 
     println!("compare: ok");

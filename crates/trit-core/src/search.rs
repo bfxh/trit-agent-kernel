@@ -190,8 +190,10 @@ impl TritSearcher {
     ///
     /// 行数 ≥ 2 且 `jobs > 1` 时用 [`parallel::map`] 分块并行；结果顺序与串行一致。
     pub fn judge_lines(&self, lines: &[&[u8]], jobs: usize) -> Vec<Ternary> {
-        parallel::map(lines, jobs, |line| Ok::<Ternary, ()>(self.line_verdict(line)))
-            .expect("infallible")
+        parallel::map(lines, jobs, |line| {
+            Ok::<Ternary, ()>(self.line_verdict(line))
+        })
+        .expect("infallible")
     }
 
     /// 返回所有匹配（起始偏移 + 判定），按偏移升序；最多 `limit` 条，`limit == 0` 表示不限。
@@ -226,7 +228,11 @@ fn rarity(b: u8) -> u8 {
 }
 
 /// 朴素参考实现（穷举逐位置比较），作为预过滤实现的独立 oracle。
-pub fn naive_find(pattern: &str, case_insensitive: bool, hay: &[u8]) -> Option<(usize, MatchVerdict)> {
+pub fn naive_find(
+    pattern: &str,
+    case_insensitive: bool,
+    hay: &[u8],
+) -> Option<(usize, MatchVerdict)> {
     let fold = |b: u8| {
         if case_insensitive {
             b.to_ascii_lowercase()
@@ -297,7 +303,10 @@ mod tests {
 
     #[test]
     fn errors() {
-        assert!(matches!(TritSearcher::new("", false), Err(SearchError::Empty)));
+        assert!(matches!(
+            TritSearcher::new("", false),
+            Err(SearchError::Empty)
+        ));
         assert!(matches!(
             TritSearcher::new(&"a".repeat(4097), false),
             Err(SearchError::TooLong(4097))
@@ -341,12 +350,27 @@ mod tests {
     #[test]
     fn agrees_with_naive_oracle() {
         let patterns = [
-            "fn open", "a?c", "???", "x?y?z", "?ab", "ab?", "kk", "_i?d", "??a?", "zzzz", "?", "k?", "f?",
-            "?f", "f?f",
+            "fn open", "a?c", "???", "x?y?z", "?ab", "ab?", "kk", "_i?d", "??a?", "zzzz", "?",
+            "k?", "f?", "?f", "f?f",
         ];
         let hays: Vec<Vec<u8>> = [
-            "", "a", "abc", "xxabcxxabc", "aXc a?c", "fn open fn opEn fn  open", "aXc", "a_c",
-            "the quick brown fox", "zzzzzzzz", "needle in haystack", "k", "kk", "fA", "Af", "fAf", "fff",
+            "",
+            "a",
+            "abc",
+            "xxabcxxabc",
+            "aXc a?c",
+            "fn open fn opEn fn  open",
+            "aXc",
+            "a_c",
+            "the quick brown fox",
+            "zzzzzzzz",
+            "needle in haystack",
+            "k",
+            "kk",
+            "fA",
+            "Af",
+            "fAf",
+            "fff",
         ]
         .iter()
         .map(|s| s.as_bytes().to_vec())

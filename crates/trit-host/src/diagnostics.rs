@@ -32,6 +32,10 @@ pub struct ToolCapability {
     pub writes: bool,
     /// 需要宿主提供 OS 沙箱（否则必须显式允许无沙箱）。
     pub requires_sandbox: bool,
+    /// 覆盖该工具的集成测试目标（相对 crate 根）；设置栏据此显示“已有测试”。
+    pub tests: &'static [&'static str],
+    /// 对应基准入口；没有基准时为 None。
+    pub bench: Option<&'static str>,
 }
 
 /// 无头模式的工具目录。新增工具时同步这里与 `tools.rs` 的分发。
@@ -41,42 +45,60 @@ pub const TOOL_CAPABILITIES: &[ToolCapability] = &[
         read_only: false,
         writes: true,
         requires_sandbox: true,
+        tests: &[
+            "tests/native_tools.rs",
+            "tests/tools.rs",
+            "tests/appcontainer.rs",
+        ],
+        bench: None,
     },
     ToolCapability {
         name: "glob",
         read_only: true,
         writes: false,
         requires_sandbox: false,
+        tests: &["tests/native_tools.rs"],
+        bench: None,
     },
     ToolCapability {
         name: "move_path",
         read_only: false,
         writes: true,
         requires_sandbox: false,
+        tests: &["tests/tools.rs"],
+        bench: None,
     },
     ToolCapability {
         name: "read_file",
         read_only: true,
         writes: false,
         requires_sandbox: false,
+        tests: &["tests/tools.rs"],
+        bench: None,
     },
     ToolCapability {
         name: "search_code",
         read_only: true,
         writes: false,
         requires_sandbox: false,
+        tests: &["tests/native_tools.rs"],
+        bench: Some("search_compare"),
     },
     ToolCapability {
         name: "trit_search",
         read_only: true,
         writes: false,
         requires_sandbox: false,
+        tests: &["tests/trit_search.rs", "tests/native_tools.rs"],
+        bench: Some("search_compare"),
     },
     ToolCapability {
         name: "write_file",
         read_only: false,
         writes: true,
         requires_sandbox: false,
+        tests: &["tests/tools.rs"],
+        bench: None,
     },
 ];
 
@@ -279,8 +301,7 @@ fn search_diagnostics() -> SearchDiagnostics {
         }
     }
     let elapsed_us = started.elapsed().as_micros().max(1) as u64;
-    let mib_per_s =
-        corpus_bytes as f64 / (1024.0 * 1024.0) / (elapsed_us as f64 / 1_000_000.0);
+    let mib_per_s = corpus_bytes as f64 / (1024.0 * 1024.0) / (elapsed_us as f64 / 1_000_000.0);
     SearchDiagnostics {
         corpus_bytes,
         lines: lines.len(),

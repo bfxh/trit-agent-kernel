@@ -69,6 +69,19 @@ fn fresh_workspace_reports_without_creating_any_directory() {
     assert_eq!(report["journal"]["present"], false);
     assert_eq!(report["journal"]["in_doubt"], 0);
     assert_eq!(report["tools"].as_array().unwrap().len(), 7);
+    let tools = report["tools"].as_array().unwrap();
+    let trit = tools
+        .iter()
+        .find(|tool| tool["name"] == "trit_search")
+        .expect("trit_search capability");
+    assert!(
+        trit["tests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|test| test == "tests/trit_search.rs")
+    );
+    assert_eq!(trit["bench"], "search_compare");
     assert_eq!(report["search"]["mismatches"], 0);
     assert_eq!(report["search"]["serial_parallel_equal"], true);
     assert!(report["search"]["verdicts_checked"].as_u64().unwrap() > 0);

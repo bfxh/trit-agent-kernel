@@ -137,7 +137,12 @@ fn main() {
     let (elapsed, hits) = measure(|| {
         lines
             .iter()
-            .filter(|line| matches!(naive_find("fn open", false, line), Some((_, MatchVerdict::Match))))
+            .filter(|line| {
+                matches!(
+                    naive_find("fn open", false, line),
+                    Some((_, MatchVerdict::Match))
+                )
+            })
             .count()
     });
     report("naive_oracle", hay.len(), elapsed, hits);
