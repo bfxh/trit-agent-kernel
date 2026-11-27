@@ -76,3 +76,81 @@ fn missing_nodes_fails_closed() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("requires --nodes"), "{stderr}");
 }
+
+struct EchoNode {
+    child: std::process::Child,
+}
+
+impl Drop for EchoNode {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_echo_node() -> (EchoNode, trit_host::RemoteNode) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .arg("remote-echo")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    let base = format!("http://{}", value["bind"].as_str().unwrap());
+    let node = trit_host::RemoteNode::new(
+        "node-echo",
+        trit_orch::RemoteEndpoint {
+            url: format!("{base}/run"),
+            auth_token: None,
+            timeout_secs: 5,
+        },
+    );
+    (EchoNode { child }, node)
+}
+
+#[test]
+fn apply_reaches_a_real_echo_node() {
+    let (_child, node) = spawn_echo_node();
+    let fleet = trit_host::SessionFleetReport {
+        schema: trit_host::SESSION_FLEET_SCHEMA,
+        workers: 1,
+        tasks: vec![trit_host::FleetTask {
+            id: "task-1".into(),
+            task: "do work".into(),
+            deps: Vec::new(),
+            workspace: None,
+            parent: None,
+            max_tokens: 0,
+        }],
+        layers: vec![vec!["task-1".into()]],
+        skipped: Vec::new(),
+        cyclic: Vec::new(),
+    };
+
+    let outcome = trit_host::run_remote_fleet(
+        &fleet,
+        vec![node],
+        &trit_host::RemoteFleetOptions {
+            workers: 1,
+            retry_limit: 0,
+            health_probe: false,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(outcome.completed, vec!["task-1".to_owned()]);
+    assert_eq!(
+        outcome.assignments.get("task-1").map(String::as_str),
+        Some("node-echo")
+    );
+    assert!(outcome.failed.is_none());
+}
