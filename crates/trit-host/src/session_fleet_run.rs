@@ -149,10 +149,11 @@ pub fn execute_fleet(
         match PriceTable::from_env() {
             Ok(table) => {
                 if let Some(estimate) = table.estimate(&config.model, &outcome.usage) {
-                    if let Some(alert) = cost::budget_alert(
+                    if let Some(alert) = cost::budget_alert_with_exactness(
                         estimate.usd,
                         options.budget_usd,
                         cost::DEFAULT_ALERT_THRESHOLD,
+                        estimate.exact,
                     ) {
                         outcome.warnings.push(alert.warning());
                         outcome.budget_alert = Some(alert);

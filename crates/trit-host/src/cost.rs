@@ -81,22 +81,34 @@ pub struct BudgetAlert {
     /// 已花的人民币金额（按当前汇率折算）。
     pub spent_cny: f64,
     pub threshold: f64,
-    /// 已花达到或超过预算本身。
+    /// 已花达到或超过预算本身；用量是估算时恒为 false（不硬判超支）。
     pub exceeded: bool,
+    /// 用量来自供应商估算时为 false：金额只能当估计，不能按精确值结算。
+    #[serde(default = "default_true")]
+    pub exact: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl BudgetAlert {
     /// 便于写进报告 warnings 的一行文本；默认以人民币展示。
     pub fn warning(&self) -> String {
         let percent = (self.spent_cny / self.budget_cny * 100.0).round();
+        let suffix = if self.exact {
+            ""
+        } else {
+            "（用量估算，未按精确值结算）"
+        };
         if self.exceeded {
             format!(
-                "预算超支：已花 ¥{:.2} / ¥{:.2}（{}%）",
+                "预算超支：已花 ¥{:.2} / ¥{:.2}（{}%）{suffix}",
                 self.spent_cny, self.budget_cny, percent
             )
         } else {
             format!(
-                "预算告警：已花 ¥{:.2} / ¥{:.2}（{}%，阈值 {}%）",
+                "预算告警：已花 ¥{:.2} / ¥{:.2}（{}%，阈值 {}%）{suffix}",
                 self.spent_cny,
                 self.budget_cny,
                 percent,
@@ -225,7 +237,23 @@ fn valid_price(price: f64) -> bool {
 }
 
 /// 已花费用达到预算的 `threshold` 时返回告警；`budget_usd <= 0` 视为不限预算。
+///
+/// 视用量为精确值；估算用量请用 [`budget_alert_with_exactness`]。
 pub fn budget_alert(spent_usd: f64, budget_usd: f64, threshold: f64) -> Option<BudgetAlert> {
+    budget_alert_with_exactness(spent_usd, budget_usd, threshold, true)
+}
+
+/// 同 [`budget_alert`]，但显式声明用量是否精确。
+///
+/// 用量来自供应商估算（`TokenUsage::estimated`）时，金额只能当估计：仍然会告警，
+/// 但不硬判「超支」（`exceeded = false`），并在 `warning()` 里注明未按精确值结算。
+/// 这样调用方不会拿估算数字去中止任务或拒付，也不会把它当精确值静默通过。
+pub fn budget_alert_with_exactness(
+    spent_usd: f64,
+    budget_usd: f64,
+    threshold: f64,
+    exact: bool,
+) -> Option<BudgetAlert> {
     if !(budget_usd.is_finite() && budget_usd > 0.0) {
         return None;
     }
@@ -243,7 +271,8 @@ pub fn budget_alert(spent_usd: f64, budget_usd: f64, threshold: f64) -> Option<B
         budget_cny: budget_usd * usd_cny_rate(),
         spent_cny: spent_usd * usd_cny_rate(),
         threshold,
-        exceeded: spent_usd >= budget_usd,
+        exceeded: exact && spent_usd >= budget_usd,
+        exact,
     })
 }
 
@@ -319,6 +348,31 @@ mod tests {
                 .is_err()
         );
         assert!(table.apply_json("{not json").is_err());
+    }
+
+    #[test]
+    fn estimated_usage_does_not_hard_judge_exceeded() {
+        // 估算用量同样会告警，但不能被当成"确定超支"去中止或拒付。
+        let alert = budget_alert_with_exactness(1.20, 1.0, DEFAULT_ALERT_THRESHOLD, false).unwrap();
+        assert!(!alert.exceeded, "估算用量不得硬判超支");
+        assert!(!alert.exact);
+        assert!(
+            alert.warning().contains("估算"),
+            "warning 必须注明未按精确值结算: {}",
+            alert.warning()
+        );
+        // 精确用量维持原语义。
+        let exact = budget_alert_with_exactness(1.20, 1.0, DEFAULT_ALERT_THRESHOLD, true).unwrap();
+        assert!(exact.exceeded);
+        assert!(exact.exact);
+        assert!(!exact.warning().contains("估算"));
+        // 旧报告没有 exact 字段时按精确值读入，避免历史数据被降级。
+        let legacy: BudgetAlert = serde_json::from_str(
+            r#"{"budget_usd":1.0,"spent_usd":1.2,"budget_cny":7.2,"spent_cny":8.64,"threshold":0.8,"exceeded":true}"#,
+        )
+        .unwrap();
+        assert!(legacy.exact);
+        assert!(legacy.exceeded);
     }
 
     #[test]
