@@ -1412,6 +1412,7 @@ pub mod browser;
 mod cancel_guard;
 pub mod checkpoint;
 pub mod child_env;
+pub mod concurrency_limit;
 mod connection_limit;
 pub mod context;
 pub mod context_layers;

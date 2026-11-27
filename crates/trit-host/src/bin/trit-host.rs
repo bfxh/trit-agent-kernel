@@ -32,6 +32,7 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    trit_host::concurrency_limit::configure_from_env();
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
     if command.is_empty() || command == "--help" || command == "-h" {

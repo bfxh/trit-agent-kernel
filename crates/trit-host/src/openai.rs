@@ -105,6 +105,7 @@ impl OpenAiProvider {
     }
 
     fn post_chat(&self, body: &Value) -> Result<String, AgentError> {
+        let _permit = crate::concurrency_limit::acquire();
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -149,6 +150,7 @@ impl StreamingProvider for OpenAiProvider {
         request: &ProviderRequest,
         on_event: &mut dyn FnMut(ProviderStreamEvent) -> Result<(), AgentError>,
     ) -> Result<ProviderResponse, AgentError> {
+        let _permit = crate::concurrency_limit::acquire();
         let mut body = build_request_body(&self.config, request);
         body["stream"] = json!(true);
         if self.config.stream_include_usage {

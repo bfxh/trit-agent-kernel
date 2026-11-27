@@ -190,6 +190,7 @@ pub fn run_remote_subagent_reply_scoped(
         validate_idempotency_scope(scope)?;
     }
     endpoint.validate()?;
+    let _permit = crate::concurrency_limit::acquire();
     let frame = encode_frame(request)?;
 
     let agent = agent_for(endpoint.timeout_secs);
