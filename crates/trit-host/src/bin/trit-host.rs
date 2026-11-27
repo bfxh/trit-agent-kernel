@@ -59,6 +59,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-callback" {
         return run_session_callback(args);
     }
+    if command == "session-run" {
+        return run_session_run(args);
+    }
+    if command == "session-callback-verify" {
+        return run_session_callback_verify(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1389,6 +1395,13 @@ fn usage() {
          session-callback: trit-host session-callback --root <dir> [--apply] [--compact]\n\
          writes parent/child results into delegations.jsonl; dry-run by default,\n\
          idempotent on child records+modified time, and never edits session logs.\n\
+         session-run: trit-host session-run --session <resume.jsonl> [--workspace <dir>]\n\
+         [--apply] [-- <run args>...]\n\
+         reads the dispatch ticket and prints the run command; --apply starts it and\n\
+         writes a new <resume>.run.jsonl instead of appending to the ticket.\n\
+         session-callback-verify: trit-host session-callback-verify --root <dir> [--compact]\n\
+         re-scans children and compares them with delegations.jsonl; reports ok, stale,\n\
+         mismatch, missing child or missing delegation without writing anything.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1476,6 +1489,92 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     );
     if blocked {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `session-callback-verify --root <dir> [--compact]`：
+/// 只读对账 delegations.jsonl 与 child 当前状态。
+fn run_session_callback_verify(
+    mut args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!(
+                    "unknown session-callback-verify argument: {other}"
+                )));
+            }
+        }
+    }
+    let scanned = trit_host::scan_sessions(&root)?;
+    let report = trit_host::verify_callbacks(&scanned)?;
+    let text = if compact {
+        serde_json::to_string(&report)
+    } else {
+        serde_json::to_string_pretty(&report)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+/// `session-run --session <resume.jsonl> [--workspace <dir>] [--apply] [-- <run args>]`：
+/// 默认只打印将执行的 `run` 命令；`--apply` 才启动新进程。
+fn run_session_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut session: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut extra = Vec::new();
+    let mut after_separator = false;
+    while let Some(arg) = args.next() {
+        if after_separator {
+            extra.push(arg);
+            continue;
+        }
+        match arg.as_str() {
+            "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--apply" => apply = true,
+            "--" => after_separator = true,
+            other => return Err(fail(format!("unknown session-run argument: {other}"))),
+        }
+    }
+    let session = session.ok_or_else(|| fail("session-run requires --session"))?;
+    let spec = trit_host::read_resume_spec(&session)?;
+    let workspace =
+        workspace.unwrap_or_else(|| session.parent().unwrap_or(Path::new(".")).to_path_buf());
+    let target = trit_host::resume_target(&session);
+    let command = trit_host::resume_command(&spec, &workspace, &target);
+    let report = serde_json::json!({
+        "source": session.display().to_string(),
+        "task": spec.task,
+        "objective": spec.objective,
+        "max_steps": spec.max_steps,
+        "workspace": workspace.display().to_string(),
+        "target_session": target.display().to_string(),
+        "command": command,
+        "applied": apply,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| fail(error.to_string()))?
+    );
+    if !apply {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|error| fail(error.to_string()))?;
+    let status = std::process::Command::new(exe)
+        .args(&command)
+        .args(&extra)
+        .status()
+        .map_err(|error| fail(error.to_string()))?;
+    if !status.success() {
+        return Err(fail(format!("run exited with {status}")));
     }
     Ok(())
 }

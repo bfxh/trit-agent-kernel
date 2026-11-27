@@ -154,7 +154,7 @@ pub fn callback_sessions(
     })
 }
 
-fn classify(child: &SessionEntry) -> CallbackStatus {
+pub(crate) fn classify(child: &SessionEntry) -> CallbackStatus {
     if child.in_doubt > 0 || child.open_turn {
         return CallbackStatus::Incomplete;
     }

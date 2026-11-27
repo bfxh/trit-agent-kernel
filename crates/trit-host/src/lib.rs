@@ -1407,7 +1407,9 @@ pub mod session_dispatch;
 pub mod session_index;
 pub mod session_migration;
 pub mod session_plan;
+pub mod session_run;
 pub mod session_scan;
+pub mod session_verify;
 pub mod state_layer;
 pub mod subagent_process;
 pub mod supervisor;
@@ -1534,9 +1536,13 @@ pub use session_migration::{
 pub use session_plan::{
     SESSION_PLAN_SCHEMA, SessionAction, SessionPlanItem, SessionPlanReport, plan_sessions,
 };
+pub use session_run::{ResumeSpec, read_resume_spec, resume_command, resume_target};
 pub use session_scan::{
     LinkKind, SESSION_SCAN_SCHEMA, SessionEntry, SessionFormat, SessionGate, SessionLink,
     SessionMeta, SessionScanReport, SessionTask, scan_sessions,
+};
+pub use session_verify::{
+    CallbackVerifyReport, CheckVerdict, DelegationCheck, SESSION_VERIFY_SCHEMA, verify_callbacks,
 };
 pub use state_layer::{
     AgentState, CompactionState, InProgressState, StateIssue, StateIssueCode, StateIssueSeverity,
