@@ -8,6 +8,7 @@
 //! 同名条目覆盖内置表，新名字追加；`cached_input` 可省略（按 `input` 计）。
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use trit_orch::TokenUsage;
@@ -22,13 +23,26 @@ pub const DEFAULT_USD_CNY: f64 = 7.2;
 /// 覆盖美元兑人民币汇率的处理变量名。
 pub const USD_CNY_ENV: &str = "TRIT_USD_CNY";
 
-/// 当前汇率；处理变量缺失、非法或非正时回退默认值。
+/// 进程内配置的汇率（通常来自 `settings.cost.usd_cny`）；环境变量优先。
+static CONFIGURED_RATE: OnceLock<f64> = OnceLock::new();
+
+/// 设置进程内汇率；非法值忽略。
+pub fn configure_rate(rate: f64) {
+    if rate.is_finite() && rate > 0.0 {
+        let _ = CONFIGURED_RATE.set(rate);
+    }
+}
+
+/// 当前汇率；`TRIT_USD_CNY` > settings > 默认值。
 pub fn usd_cny_rate() -> f64 {
-    std::env::var(USD_CNY_ENV)
+    if let Some(rate) = std::env::var(USD_CNY_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|rate| rate.is_finite() && *rate > 0.0)
-        .unwrap_or(DEFAULT_USD_CNY)
+    {
+        return rate;
+    }
+    CONFIGURED_RATE.get().copied().unwrap_or(DEFAULT_USD_CNY)
 }
 
 /// 单一模型的单价，单位：美元 / 百万 token。

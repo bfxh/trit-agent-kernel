@@ -1605,6 +1605,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
     let roots = expand_roots(roots);
     let settings = trit_host::settings::load(&roots[0])?;
+    trit_host::cost::configure_rate(settings.cost.usd_cny);
     if !workers_given && settings.concurrency.workers > 0 {
         workers = settings.concurrency.workers as usize;
     }
@@ -1717,6 +1718,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     }
     let roots = expand_roots(roots);
     let settings = trit_host::settings::load(&roots[0])?;
+    trit_host::cost::configure_rate(settings.cost.usd_cny);
     if !workers_given && settings.concurrency.workers > 0 {
         workers = settings.concurrency.workers as usize;
     }
@@ -2022,6 +2024,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     }
     let roots = expand_roots(roots);
     let settings = trit_host::settings::load(&roots[0])?;
+    trit_host::cost::configure_rate(settings.cost.usd_cny);
     if !workers_given && settings.concurrency.workers > 0 {
         workers = settings.concurrency.workers as usize;
     }
