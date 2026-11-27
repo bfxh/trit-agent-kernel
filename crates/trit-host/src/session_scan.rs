@@ -18,6 +18,8 @@ pub const SESSION_SCAN_SCHEMA: u32 = 1;
 
 /// 单文件读取上限；超过时只报 warning，不把整个文件读进内存。
 const MAX_SESSION_BYTES: u64 = 32 * 1024 * 1024;
+/// 扫描缓存上限；超过时忽略缓存并回退全量扫描。
+const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 /// 会话目录递归深度；`projects/<name>/sessions` 通常两层。
 const MAX_DEPTH: usize = 4;
 
@@ -152,7 +154,13 @@ fn scan_sessions_inner(
     files.sort();
 
     let cache = cache_path
-        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|path| {
+            let metadata = fs::metadata(path).ok()?;
+            if metadata.len() > MAX_CACHE_BYTES {
+                return None;
+            }
+            fs::read_to_string(path).ok()
+        })
         .and_then(|text| serde_json::from_str::<ScanCache>(&text).ok())
         .unwrap_or_default();
     let mut next = ScanCache {

@@ -4,7 +4,7 @@
 //! API key 只在 Authorization 头里出现，Debug 输出会脱敏。
 
 use std::fmt;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -80,6 +80,24 @@ pub struct OpenAiProvider {
     agent: ureq::Agent,
 }
 
+/// 单次 HTTP 响应的读取上限；超过时 fail closed，避免恶意/异常网关拖垮进程。
+const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_response_text(response: ureq::Response) -> Result<String, AgentError> {
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_RESPONSE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| AgentError::Provider(format!("read response: {error}")))?;
+    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
+        return Err(AgentError::Provider(format!(
+            "response exceeds {MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 impl OpenAiProvider {
     pub fn new(config: OpenAiConfig) -> Self {
         let agent = ureq::AgentBuilder::new().timeout(config.timeout).build();
@@ -98,11 +116,9 @@ impl OpenAiProvider {
             .set("Content-Type", "application/json")
             .send_string(&body.to_string());
         match response {
-            Ok(response) => response
-                .into_string()
-                .map_err(|error| AgentError::Provider(format!("read response: {error}"))),
+            Ok(response) => read_response_text(response),
             Err(ureq::Error::Status(code, response)) => {
-                let text = response.into_string().unwrap_or_default();
+                let text = read_response_text(response).unwrap_or_default();
                 Err(AgentError::Provider(format!("HTTP {code}: {text}")))
             }
             Err(error) => Err(AgentError::Provider(format!("transport: {error}"))),
@@ -152,7 +168,7 @@ impl StreamingProvider for OpenAiProvider {
         let response = match response {
             Ok(response) => response,
             Err(ureq::Error::Status(code, response)) => {
-                let text = response.into_string().unwrap_or_default();
+                let text = read_response_text(response).unwrap_or_default();
                 return Err(AgentError::Provider(format!("HTTP {code}: {text}")));
             }
             Err(error) => {
