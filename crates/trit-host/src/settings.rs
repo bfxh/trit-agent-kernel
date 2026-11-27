@@ -165,13 +165,17 @@ impl Default for DiagnosticsSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScoringSettings {
+    /// 设计分是否参与交付判定；默认关闭。
     pub participate_in_decision: bool,
+    /// 参与判定时的阈值：`overall < design_block_below` 视为不合格。
+    pub design_block_below: u8,
 }
 
 impl Default for ScoringSettings {
     fn default() -> Self {
         Self {
             participate_in_decision: false,
+            design_block_below: 60,
         }
     }
 }

@@ -119,3 +119,33 @@ fn design_block_below_fails_the_run() {
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_file(script);
 }
+
+#[test]
+fn settings_can_enable_decision_participation() {
+    let root = workspace("settings-on");
+    let script = script("settings-on");
+    std::fs::create_dir_all(root.join(".agent")).unwrap();
+    std::fs::write(
+        root.join(".agent/settings.json"),
+        r#"{"schema":1,"scoring":{"participate_in_decision":true,"design_block_below":101}}"#,
+    )
+    .unwrap();
+    // 不传 CLI 阈值：完全由设置决定是否参与决策。
+    let (code, _stdout, stderr) = run(&root, &script, &["--output-format", "json"]);
+    assert_ne!(code, Some(0), "设置打开后应失败: {stderr}");
+    assert!(stderr.contains("design score"), "{stderr}");
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_file(script);
+}
+
+#[test]
+fn settings_default_does_not_block() {
+    let root = workspace("settings-off");
+    let script = script("settings-off");
+    let (code, stdout, stderr) = run(&root, &script, &["--output-format", "json"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("json output");
+    assert_eq!(value["design"]["overall"], 100, "{value}");
+    let _ = std::fs::remove_dir_all(root);
+    let _ = std::fs::remove_file(script);
+}

@@ -47,11 +47,18 @@
 
 ## 2. 分数怎么用
 
-- **默认只打分、只记录**：`Settings.scoring.participate_in_decision = false`。
-  分数不会改变完成裁决（那仍由 `judge_completion` 与回执决定）。
+| 开关 | 默认 | 含义 |
+| --- | --- | --- |
+| `Settings.scoring.participate_in_decision` | `false` | 关闭：只打分并记录；开启：`run` 按阈值阻断 |
+| `Settings.scoring.design_block_below` | `60` | 参与判定时的阈值：`overall < 该值` 视为不合格 |
+| `--design-block-below N`（CLI） | 未设置 | 显式开启阻断并指定阈值；优先于设置 |
+| `--no-design-score`（CLI） | 未设置 | 完全关闭设计评分（不报告、不阻断） |
+
+- **默认只打分、只记录**：分数不会改变完成裁决（那仍由 `judge_completion` 与回执决定）。
 - **喂回模型**：请求 system 里已经写明设计质量会被评分、以及要遵守的要点
   （模块边界、显式错误处理、网络超时与有界响应、无障碍 / 状态 / 响应式 / 克制的设计令牌）。
-- 需要让分数参与调度或交付时，再打开 `participate_in_decision`，由上层按分数处理。
+- 设置文件损坏或 schema 不符时 `run` 直接失败（fail closed），不会静默用默认值。
+- 设置文件位置：`<workspace>/.agent/settings.json`。
 
 ## 3. 与结果分的关系
 

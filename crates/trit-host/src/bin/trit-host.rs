@@ -924,6 +924,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         eprintln!("cache ledger: {text}");
     }
+    let host_settings =
+        trit_host::settings::load(&workspace_root).map_err(|error| fail(error.to_string()))?;
+    // 设置里打开"参与决策"时用设置里的阈值；命令行显式参数优先。
+    let design_block_below = design_block_below.or_else(|| {
+        host_settings
+            .scoring
+            .participate_in_decision
+            .then_some(host_settings.scoring.design_block_below)
+    });
     let design = design_score_enabled
         .then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
     let mut stdout = std::io::stdout().lock();
