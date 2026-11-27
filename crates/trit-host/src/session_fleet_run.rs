@@ -352,8 +352,12 @@ fn execute_once(
             usage.output += outcome.usage.output;
             usage.estimated |= outcome.usage.estimated;
         }
+        let mut content = outcome.render_markdown();
+        // 设计分随任务输出一起回报；不影响完成裁决。
+        let design = crate::score_written_paths(&workspace, &outcome.receipts);
+        content.push_str(&crate::render_design_markdown(&design));
         Ok(FleetOutput {
-            content: outcome.render_markdown().into_bytes(),
+            content: content.into_bytes(),
             tokens,
         })
     };

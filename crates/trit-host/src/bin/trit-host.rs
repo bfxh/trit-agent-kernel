@@ -924,12 +924,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         eprintln!("cache ledger: {text}");
     }
-    let design =
-        design_score_enabled.then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
+    let design = design_score_enabled
+        .then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
     let mut stdout = std::io::stdout().lock();
     let rendered = if output_format == "json" {
-        let mut value =
-            serde_json::to_value(&outcome).map_err(|error| fail(error.to_string()))?;
+        let mut value = serde_json::to_value(&outcome).map_err(|error| fail(error.to_string()))?;
         if let Some(design) = &design {
             value["design"] =
                 serde_json::to_value(design).map_err(|error| fail(error.to_string()))?;
