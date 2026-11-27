@@ -27,7 +27,9 @@
 //! 9. **健康探测只读且同鉴权**：`GET <origin>/health` 沿用 Bearer、不跳转、
 //!    不派发任务；只有 2xx 才算可达，供显式恢复隔离节点使用。
 
+use std::collections::BTreeMap;
 use std::io::Read;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use trit_orch::{
@@ -39,6 +41,24 @@ use crate::AgentError;
 
 /// 远程端点交换的帧媒体类型；请求与响应都用它。
 pub const FRAME_CONTENT_TYPE: &str = "application/x-trit-frame";
+
+/// 按 timeout 复用 ureq 连接池；send/cancel/health 共享同一个 agent。
+fn agent_for(timeout_secs: u64) -> ureq::Agent {
+    static AGENTS: OnceLock<Mutex<BTreeMap<u64, ureq::Agent>>> = OnceLock::new();
+    let agents = AGENTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut agents = agents
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    agents
+        .entry(timeout_secs)
+        .or_insert_with(|| {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(timeout_secs))
+                .redirects(0)
+                .build()
+        })
+        .clone()
+}
 
 /// 幂等键头：值是 `"<task>@<epoch>"`，配了计划作用域时是
 /// `"<scope>|<task>@<epoch>"`。
@@ -168,10 +188,7 @@ pub fn run_remote_subagent_reply_scoped(
     endpoint.validate()?;
     let frame = encode_frame(request)?;
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(endpoint.timeout_secs))
-        .redirects(0)
-        .build();
+    let agent = agent_for(endpoint.timeout_secs);
     let mut call = agent
         .post(endpoint.url.trim())
         .set("Content-Type", FRAME_CONTENT_TYPE)
@@ -356,12 +373,7 @@ fn cancel_endpoint_url(endpoint_url: &str) -> String {
 /// 返回 `Ok(())` 只代表通知被端点接受，不代表远端已经停止执行。
 pub fn cancel_remote_subagent(endpoint: &RemoteEndpoint, key: &str) -> Result<(), String> {
     endpoint.validate().map_err(|error| error.to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(
-            endpoint.timeout_secs.clamp(1, CANCEL_REQUEST_TIMEOUT_SECS),
-        ))
-        .redirects(0)
-        .build();
+    let agent = agent_for(endpoint.timeout_secs.clamp(1, CANCEL_REQUEST_TIMEOUT_SECS));
     let url = cancel_endpoint_url(&endpoint.url);
     let mut call = agent.post(&url).set(IDEMPOTENCY_HEADER, key);
     if let Some(token) = endpoint.auth_token.as_deref() {
@@ -381,12 +393,7 @@ pub fn cancel_remote_subagent(endpoint: &RemoteEndpoint, key: &str) -> Result<()
 /// 非 2xx、3xx、传输失败都返回错误。超时限制在 1–5s，避免恢复流程被慢节点拖住。
 pub fn probe_remote_health(endpoint: &RemoteEndpoint) -> Result<(), String> {
     endpoint.validate().map_err(|error| error.to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(
-            endpoint.timeout_secs.clamp(1, HEALTH_REQUEST_TIMEOUT_SECS),
-        ))
-        .redirects(0)
-        .build();
+    let agent = agent_for(endpoint.timeout_secs.clamp(1, HEALTH_REQUEST_TIMEOUT_SECS));
     let url = endpoint_origin_url(&endpoint.url, HEALTH_PATH);
     let mut call = agent.get(&url);
     if let Some(token) = endpoint.auth_token.as_deref() {

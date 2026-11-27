@@ -3,7 +3,7 @@
 //! 这里只有同步、纯数据的接口；真实 OpenAI-compatible 传输层由宿主实现。
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -152,6 +152,11 @@ impl<P: Provider> Model for ProviderModel<P> {
 }
 
 pub fn default_tools() -> Vec<ToolSpec> {
+    static TOOLS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
+    TOOLS.get_or_init(build_default_tools).clone()
+}
+
+fn build_default_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file".into(),
