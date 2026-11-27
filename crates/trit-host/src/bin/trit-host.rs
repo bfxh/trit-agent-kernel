@@ -68,6 +68,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "session-fleet" {
         return run_session_fleet(args);
     }
+    if command == "session-fleet-run" {
+        return run_session_fleet_run(args);
+    }
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
@@ -1408,6 +1411,10 @@ fn usage() {
          session-fleet: trit-host session-fleet --root <dir> [--workers N] [--compact]\n\
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
+         session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
+         [--workspace <dir>] [--max-steps N] [--apply] [--compact]\n\
+         dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
+         OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1495,6 +1502,81 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
     );
     if blocked {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `session-fleet-run --root <dir> [--workers N] [--workspace <dir>] [--max-steps N] [--apply]`：
+/// dry-run 只打印计划；`--apply` 用环境里的 OpenAI 兼容 provider 执行。
+fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut workers = 4usize;
+    let mut workspace: Option<PathBuf> = None;
+    let mut max_steps = 20usize;
+    let mut apply = false;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--workers" => {
+                workers = next(&mut args, "--workers")?
+                    .parse()
+                    .map_err(|_| fail("--workers must be a positive integer"))?;
+            }
+            "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
+            "--max-steps" => {
+                max_steps = next(&mut args, "--max-steps")?
+                    .parse()
+                    .map_err(|_| fail("--max-steps must be a positive integer"))?;
+            }
+            "--apply" => apply = true,
+            "--compact" => compact = true,
+            other => {
+                return Err(fail(format!("unknown session-fleet-run argument: {other}")));
+            }
+        }
+    }
+    let scanned = trit_host::scan_sessions(&root)?;
+    let plan = trit_host::plan_sessions(&scanned);
+    let fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    let workspace = workspace.unwrap_or_else(|| root.clone());
+    if !apply {
+        let report = serde_json::json!({
+            "dry_run": true,
+            "workers": fleet.workers,
+            "workspace": workspace.display().to_string(),
+            "max_steps": max_steps,
+            "tasks": fleet.tasks,
+            "layers": fleet.layers,
+            "skipped": fleet.skipped,
+            "cyclic": fleet.cyclic,
+        });
+        let text = if compact {
+            serde_json::to_string(&report)
+        } else {
+            serde_json::to_string_pretty(&report)
+        }
+        .map_err(|error| fail(error.to_string()))?;
+        println!("{text}");
+        return Ok(());
+    }
+    let config = trit_host::OpenAiConfig::from_env()?;
+    let outcome = trit_host::execute_fleet(
+        &fleet,
+        &workspace,
+        &root,
+        config,
+        trit_host::FleetRunOptions { workers, max_steps },
+    )?;
+    let text = if compact {
+        serde_json::to_string(&outcome)
+    } else {
+        serde_json::to_string_pretty(&outcome)
+    }
+    .map_err(|error| fail(error.to_string()))?;
+    println!("{text}");
+    if outcome.failed.is_some() {
+        return Err(fail("fleet failed; see failed task above"));
     }
     Ok(())
 }
