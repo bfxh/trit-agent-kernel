@@ -93,7 +93,7 @@ fn run_with_journal(root: &Path, script_path: &Path) -> (Option<i32>, String) {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/a.py",
+            "src/a.rs",
             "--write-journal",
         ],
     )
@@ -102,8 +102,8 @@ fn run_with_journal(root: &Path, script_path: &Path) -> (Option<i32>, String) {
 #[test]
 fn run_writes_journal_and_status_reports_completed() {
     let root = root("pair");
-    write(&root, "src/a.py", "x");
-    let script_path = script("pair", "src/a.py");
+    write(&root, "src/a.rs", "x");
+    let script_path = script("pair", "src/a.rs");
     let (code, text) = run_with_journal(&root, &script_path);
     assert_eq!(code, Some(0), "{text}");
 
@@ -126,7 +126,7 @@ fn journal_status_exits_one_on_unclosed_begin() {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         &path,
-        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/b.py\"],\"at\":1}\n",
+        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/b.rs\"],\"at\":1}\n",
     )
     .unwrap();
 
@@ -140,16 +140,16 @@ fn journal_status_exits_one_on_unclosed_begin() {
 #[test]
 fn run_warns_when_journal_has_in_doubt() {
     let root = root("warn");
-    write(&root, "src/a.py", "x");
+    write(&root, "src/a.rs", "x");
     let path = root.join(".agent/write-journal.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         &path,
-        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/b.py\"],\"at\":1}\n",
+        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/b.rs\"],\"at\":1}\n",
     )
     .unwrap();
 
-    let script_path = script("warn", "src/a.py");
+    let script_path = script("warn", "src/a.rs");
     let (code, text) = run_with_journal(&root, &script_path);
     assert_eq!(code, Some(0), "{text}");
     assert!(text.contains("left in doubt"), "{text}");
@@ -160,17 +160,17 @@ fn run_warns_when_journal_has_in_doubt() {
 #[test]
 fn run_does_not_complete_when_declared_path_is_in_doubt() {
     let root = root("reconcile");
-    write(&root, "src/a.py", "x");
+    write(&root, "src/a.rs", "x");
     let path = root.join(".agent/write-journal.jsonl");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
         &path,
-        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/a.py\"],\"at\":1}\n",
+        "{\"schema\":1,\"seq\":1,\"op_id\":1,\"phase\":\"begin\",\"tool\":\"write_file\",\"call_id\":\"crash\",\"paths\":[\"src/a.rs\"],\"at\":1}\n",
     )
     .unwrap();
 
-    // 本轮确实写了并声明了 src/a.py，但账本里同一路径还压着上次崩溃的未闭合写操作。
-    let script_path = script("reconcile", "src/a.py");
+    // 本轮确实写了并声明了 src/a.rs，但账本里同一路径还压着上次崩溃的未闭合写操作。
+    let script_path = script("reconcile", "src/a.rs");
     let (code, text) = run_with_journal(&root, &script_path);
     assert_eq!(
         code,
@@ -214,33 +214,33 @@ fn journal_status_rollback(root: &Path) -> (Option<i32>, Value) {
 #[test]
 fn journal_status_rolls_back_in_doubt_write() {
     let root = root("rollback");
-    write(&root, "src/a.py", "old");
+    write(&root, "src/a.rs", "old");
     let mut journal = trit_host::MutationJournal::open(&root).unwrap();
-    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "new");
+    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.rs", "new");
     journal.record_begin(&request, None).unwrap();
     // 模拟写了一半：文件已变成新内容，但没有 finish。
-    fs::write(root.join("src/a.py"), "new").unwrap();
+    fs::write(root.join("src/a.rs"), "new").unwrap();
     drop(journal);
 
     let (code, value) = journal_status_rollback(&root);
     assert_eq!(code, Some(0), "{value}");
-    assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
+    assert_eq!(fs::read_to_string(root.join("src/a.rs")).unwrap(), "old");
     assert_eq!(value["report"]["in_doubt"].as_array().unwrap().len(), 0);
     assert_eq!(value["report"]["rolled_back"], 1);
-    assert_eq!(value["rollbacks"][0]["restored"][0], "src/a.py");
+    assert_eq!(value["rollbacks"][0]["restored"][0], "src/a.rs");
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn journal_status_rollback_refuses_while_lease_is_live() {
     let root = root("lease-guard");
-    write(&root, "src/a.py", "old");
+    write(&root, "src/a.rs", "old");
     let mut journal = trit_host::MutationJournal::open(&root).unwrap();
-    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "new");
+    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.rs", "new");
     let lease = trit_host::OperationLease::acquire_paths(
         &root,
         "live-writer",
-        &[PathBuf::from("src/a.py")],
+        &[PathBuf::from("src/a.rs")],
     )
     .unwrap();
     let locks: Vec<String> = lease
@@ -256,7 +256,7 @@ fn journal_status_rollback_refuses_while_lease_is_live() {
     journal
         .record_begin_with_lease(&request, Some(lease.epoch()), &locks)
         .unwrap();
-    fs::write(root.join("src/a.py"), "new").unwrap();
+    fs::write(root.join("src/a.rs"), "new").unwrap();
     drop(journal);
 
     let (code, value) = journal_status_rollback(&root);
@@ -264,7 +264,7 @@ fn journal_status_rollback_refuses_while_lease_is_live() {
     assert_eq!(value["blocked"].as_array().unwrap().len(), 1, "{value}");
     assert_eq!(value["rollbacks"].as_array().unwrap().len(), 0, "{value}");
     assert_eq!(
-        fs::read_to_string(root.join("src/a.py")).unwrap(),
+        fs::read_to_string(root.join("src/a.rs")).unwrap(),
         "new",
         "live lease must protect the in-doubt write"
     );
@@ -273,22 +273,22 @@ fn journal_status_rollback_refuses_while_lease_is_live() {
     let (code, value) = journal_status_rollback(&root);
     assert_eq!(code, Some(0), "{value}");
     assert_eq!(value["blocked"].as_array().unwrap().len(), 0, "{value}");
-    assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
+    assert_eq!(fs::read_to_string(root.join("src/a.rs")).unwrap(), "old");
     let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn run_can_roll_back_in_doubt_writes_on_start() {
     let root = root("auto-rollback");
-    write(&root, "src/a.py", "old");
+    write(&root, "src/a.rs", "old");
     let mut journal = trit_host::MutationJournal::open(&root).unwrap();
-    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.py", "new");
+    let request = trit_host::ToolRequest::write("w1", "write_file", "src/a.rs", "new");
     journal.record_begin(&request, None).unwrap();
-    fs::write(root.join("src/a.py"), "new").unwrap();
+    fs::write(root.join("src/a.rs"), "new").unwrap();
     drop(journal);
 
     // run 写的是另一个文件，避免回滚结果被本次运行覆盖。
-    let script_path = script("auto-rollback", "src/b.py");
+    let script_path = script("auto-rollback", "src/b.rs");
     let (code, text) = host(
         &root,
         &[
@@ -303,7 +303,7 @@ fn run_can_roll_back_in_doubt_writes_on_start() {
     );
     assert_eq!(code, Some(0), "{text}");
     assert!(text.contains("rolled back op"), "{text}");
-    assert_eq!(fs::read_to_string(root.join("src/a.py")).unwrap(), "old");
+    assert_eq!(fs::read_to_string(root.join("src/a.rs")).unwrap(), "old");
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
