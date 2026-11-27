@@ -23,12 +23,15 @@ use crate::session_fleet_run::build_plan;
 
 pub const SESSION_FLEET_REMOTE_SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteFleetOptions {
     pub workers: usize,
     pub retry_limit: u32,
     pub health_probe: bool,
     pub dry_run: bool,
+    /// 计划作用域；不同计划用不同值，避免同名任务在共享账本中碰撞。
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl Default for RemoteFleetOptions {
@@ -38,6 +41,7 @@ impl Default for RemoteFleetOptions {
             retry_limit: 0,
             health_probe: false,
             dry_run: true,
+            scope: None,
         }
     }
 }
@@ -92,7 +96,7 @@ pub fn run_remote_fleet(
         workers: options.workers.max(1),
         failure_threshold: 1,
         retry_limit: options.retry_limit,
-        scope: None,
+        scope: options.scope.clone(),
         health_probe_on_start: options.health_probe,
         health_probe_interval: None,
         health_probe_concurrency: 1,

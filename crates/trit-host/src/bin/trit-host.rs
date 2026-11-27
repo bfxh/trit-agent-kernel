@@ -1412,8 +1412,8 @@ fn usage() {
          scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
-         [--cache <path>] [--nodes <node-table.json>] [--max-items N] [--workers N]\n\
-         [--max-steps N] [--retry N] [--budget-tokens N] [--apply] [--compact]\n\
+         [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
+         [--workers N] [--max-steps N] [--retry N] [--budget-tokens N] [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
          With --nodes, the fleet phase dispatches through the remote node table instead.\n\
@@ -1439,8 +1439,8 @@ fn usage() {
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          session-fleet-remote: trit-host session-fleet-remote --root <dir> --nodes <node-table.json>\n\
-         [--workers N] [--retry N] [--budget-tokens N] [--health-probe] [--cache <path>]\n\
-         [--apply] [--compact]\n\
+         [--workers N] [--retry N] [--budget-tokens N] [--scope S] [--health-probe]\n\
+         [--cache <path>] [--apply] [--compact]\n\
          dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
@@ -1543,6 +1543,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let mut workers = 4usize;
     let mut retry_limit = 0u32;
     let mut budget_tokens = 0u64;
+    let mut scope: Option<String> = None;
     let mut health_probe = false;
     let mut cache: Option<PathBuf> = None;
     let mut apply = false;
@@ -1566,6 +1567,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
             }
+            "--scope" => scope = Some(next(&mut args, "--scope")?),
             "--health-probe" => health_probe = true,
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--apply" => apply = true,
@@ -1595,6 +1597,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
             retry_limit,
             health_probe,
             dry_run: !apply,
+            scope,
         },
     )?;
     let text = if compact {
@@ -1857,6 +1860,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut max_steps = 20usize;
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
+    let mut scope: Option<String> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
@@ -1890,6 +1894,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
             }
+            "--scope" => scope = Some(next(&mut args, "--scope")?),
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => {
@@ -1927,6 +1932,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             retries,
             budget_tokens,
             dry_run: !apply,
+            scope,
         },
     )?;
     let text = if compact {

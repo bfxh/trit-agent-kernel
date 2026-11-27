@@ -147,6 +147,7 @@ fn apply_reaches_a_real_echo_node() {
             retry_limit: 0,
             health_probe: false,
             dry_run: false,
+            scope: None,
         },
     )
     .unwrap();

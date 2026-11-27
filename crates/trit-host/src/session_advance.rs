@@ -25,7 +25,7 @@ use crate::session_verify::{CallbackVerifyReport, verify_callbacks};
 
 pub const SESSION_ADVANCE_SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvanceOptions {
     pub max_items: usize,
     pub workers: usize,
@@ -33,6 +33,9 @@ pub struct AdvanceOptions {
     pub retries: usize,
     pub budget_tokens: u64,
     pub dry_run: bool,
+    /// 跨机执行时的计划作用域。
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl Default for AdvanceOptions {
@@ -44,6 +47,7 @@ impl Default for AdvanceOptions {
             retries: 0,
             budget_tokens: 0,
             dry_run: true,
+            scope: None,
         }
     }
 }
@@ -113,6 +117,7 @@ pub fn advance(
                 retry_limit: options.retries as u32,
                 health_probe: false,
                 dry_run: false,
+                scope: options.scope.clone(),
             },
         )?;
         report.remote = Some(remote);
