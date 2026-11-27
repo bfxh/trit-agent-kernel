@@ -970,6 +970,19 @@ struct CacheOptions {
     pressure: CachePressurePolicy,
 }
 
+/// 校验信号开关：`TRIT_VERIFICATION_SIGNALS=0|false|off|no` 关闭，其余开启。
+///
+/// 关闭后既不统计校验次数，也不向模型注入重复校验提示。
+fn verification_signals_enabled() -> bool {
+    match std::env::var("TRIT_VERIFICATION_SIGNALS") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 fn build_model(
     scripted: Option<Vec<Proposal>>,
     config: Option<&OpenAiConfig>,
@@ -982,7 +995,8 @@ fn build_model(
         return Ok(Box::new(ScriptedModel::new(proposals)));
     }
     let config = config.ok_or_else(|| fail("--provider requires a configured provider"))?;
-    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), default_tools());
+    let mut model = ProviderModel::with_tools(OpenAiProvider::new(config.clone()), default_tools())
+        .with_verification_signals(verification_signals_enabled());
     if let Some(catalog) = tool_catalog {
         model = model.with_tool_catalog(catalog);
     }

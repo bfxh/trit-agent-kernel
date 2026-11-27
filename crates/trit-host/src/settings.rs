@@ -26,6 +26,8 @@ pub struct Settings {
     pub cost: CostSettings,
     pub browser: BrowserSettings,
     pub diagnostics: DiagnosticsSettings,
+    /// 记录与信号开关；`verification_signals` 控制是否统计并注入校验摘要。
+    pub recording: RecordingSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,15 @@ pub struct DiagnosticsSettings {
     pub token_rate: bool,
 }
 
+/// 记录层开关：控制是否把校验摘要注入模型请求（训练信号）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordingSettings {
+    /// 默认开启：注入校验摘要，并在出现重复校验时提示模型。
+    /// 关闭后只停止注入与提示；`TurnMetrics` 仍记录三个计数（排障与采样需要）。
+    pub verification_signals: bool,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -89,6 +100,7 @@ impl Default for Settings {
             cost: CostSettings::default(),
             browser: BrowserSettings::default(),
             diagnostics: DiagnosticsSettings::default(),
+            recording: RecordingSettings::default(),
         }
     }
 }
@@ -142,6 +154,14 @@ impl Default for DiagnosticsSettings {
         Self {
             background_tasks: true,
             token_rate: true,
+        }
+    }
+}
+
+impl Default for RecordingSettings {
+    fn default() -> Self {
+        Self {
+            verification_signals: true,
         }
     }
 }

@@ -382,6 +382,46 @@ impl ToolExecutor for ScriptedTools {
     }
 }
 
+/// 给模型的校验摘要：本 turn 已执行哪些命令、重复了多少次。
+///
+/// 这是"训练信号"：让模型看到自己在重复校验，从而减少无意义的重复执行。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationSignal {
+    pub calls: usize,
+    pub unique: usize,
+    pub repeated: usize,
+    /// 去重后的命令（最多 8 条），供模型判断哪些已经跑过。
+    pub commands: Vec<String>,
+}
+
+impl VerificationSignal {
+    /// 从回执里提炼；没有任何命令时返回 `None`（不注入空信号）。
+    pub fn from_receipts(receipts: &[ToolOutcome]) -> Option<Self> {
+        let mut unique: Vec<String> = Vec::new();
+        let mut calls = 0usize;
+        for outcome in receipts {
+            let Some(command) = outcome.command.as_deref() else {
+                continue;
+            };
+            calls += 1;
+            if !unique.iter().any(|seen| seen == command) {
+                unique.push(command.to_owned());
+            }
+        }
+        if calls == 0 {
+            return None;
+        }
+        let unique_count = unique.len();
+        unique.truncate(8);
+        Some(Self {
+            calls,
+            unique: unique_count,
+            repeated: calls.saturating_sub(unique_count),
+            commands: unique,
+        })
+    }
+}
+
 /// 单轮次工作效率指标：只描述这一轮实际发生了什么，不参与完成裁决。
 ///
 /// 比率统一用 basis point（万分之一，`10000` = 100%），避免浮点比较；
@@ -417,6 +457,15 @@ pub struct TurnMetrics {
     pub tokens_per_second: Option<f64>,
     /// provider 未给精确用量时为 true；此时 token 指标只作估算。
     pub tokens_estimated: bool,
+    /// 本 turn 执行过的命令数（带 `command` 的回执）。
+    #[serde(default)]
+    pub verification_calls: usize,
+    /// 去重后的命令数。
+    #[serde(default)]
+    pub unique_verifications: usize,
+    /// 重复执行的命令数（`verification_calls - unique_verifications`）。
+    #[serde(default)]
+    pub repeated_verifications: usize,
     /// 从进入 turn 到完成裁决的墙钟耗时。
     pub elapsed_ms: u64,
     /// 完成裁决是否通过。
@@ -442,6 +491,14 @@ impl TurnMetrics {
             .filter(|outcome| !outcome.passed && !outcome.in_doubt)
             .count();
         let in_doubt_tools = receipts.iter().filter(|outcome| outcome.in_doubt).count();
+        // 校验次数：带命令的回执按命令去重，差额就是重复校验。
+        let commands: Vec<&str> = receipts
+            .iter()
+            .filter_map(|outcome| outcome.command.as_deref())
+            .collect();
+        let verification_calls = commands.len();
+        let unique_verifications = commands.iter().copied().collect::<BTreeSet<&str>>().len();
+        let repeated_verifications = verification_calls.saturating_sub(unique_verifications);
         let tokens_total = usage
             .fresh
             .saturating_add(usage.cached)
@@ -465,6 +522,9 @@ impl TurnMetrics {
             tokens_per_step: tokens_total / steps.max(1) as u64,
             tokens_per_second,
             tokens_estimated: usage.estimated,
+            verification_calls,
+            unique_verifications,
+            repeated_verifications,
             elapsed_ms,
             completed,
         }

@@ -360,6 +360,16 @@ pub(crate) fn build_request_body(config: &OpenAiConfig, request: &ProviderReques
         context_tail = plan.render_tail();
         context_fingerprint = plan.cache.prefix_fingerprint.clone();
     }
+    if request
+        .verification
+        .as_ref()
+        .is_some_and(|signal| signal.repeated > 0)
+    {
+        system.push_str(
+            "\n\nSome commands were re-run with identical arguments. \
+             Do not repeat a verification command that already has a receipt; reuse its result.",
+        );
+    }
     let mut user = json!({
         "step": request.step,
         "usage": request.usage,
@@ -371,6 +381,10 @@ pub(crate) fn build_request_body(config: &OpenAiConfig, request: &ProviderReques
     });
     if let Some(projection) = &request.projection {
         user["projection"] = serde_json::to_value(projection).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(verification) = &request.verification {
+        user["verification"] =
+            serde_json::to_value(verification).unwrap_or(serde_json::Value::Null);
     }
     let mut body = json!({
         "model": config.model,
@@ -884,6 +898,7 @@ mod tests {
             context_digest: None,
             context: None,
             projection: None,
+            verification: None,
         }
     }
 

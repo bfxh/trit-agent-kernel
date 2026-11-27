@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentError, ContextPlan, ContextReceipt, Model, PrefixSignal, Proposal, ToolOutcome,
-    ToolRequest, TurnContext,
+    ToolRequest, TurnContext, VerificationSignal,
 };
 use trit_orch::{TaskBrief, TokenUsage};
 use trit_reasonix::{ClaimRequest, HostUsage};
@@ -50,6 +50,8 @@ pub struct ProviderRequest {
     pub context_digest: Option<String>,
     pub context: Option<ContextPlan>,
     pub projection: Option<crate::context_projection::ProjectionView>,
+    /// 校验摘要（训练信号）；`None` 表示不注入。
+    pub verification: Option<VerificationSignal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,8 @@ pub struct ProviderModel<P> {
     tools: Vec<ToolSpec>,
     tool_catalog: Option<Arc<dyn ToolCatalog>>,
     context_planner: Option<Box<dyn ContextPlanner>>,
+    /// 是否把校验摘要注入模型请求；关闭时既不统计也不提示。
+    verification_signals: bool,
 }
 
 impl<P: Provider> ProviderModel<P> {
@@ -81,6 +85,7 @@ impl<P: Provider> ProviderModel<P> {
             tools: default_tools(),
             tool_catalog: None,
             context_planner: None,
+            verification_signals: true,
         }
     }
 
@@ -90,7 +95,14 @@ impl<P: Provider> ProviderModel<P> {
             tools,
             tool_catalog: None,
             context_planner: None,
+            verification_signals: true,
         }
+    }
+
+    /// 关闭/开启校验信号（训练信号与重复校验提示）。
+    pub fn with_verification_signals(mut self, enabled: bool) -> Self {
+        self.verification_signals = enabled;
+        self
     }
 
     pub fn with_tool_catalog(mut self, catalog: Arc<dyn ToolCatalog>) -> Self {
@@ -140,6 +152,10 @@ impl<P: Provider> Model for ProviderModel<P> {
             context_digest: context.digest.clone(),
             context: plan,
             projection: context.projection.clone(),
+            verification: self
+                .verification_signals
+                .then(|| VerificationSignal::from_receipts(&context.receipts))
+                .flatten(),
         })?;
         Ok(Proposal {
             tool_calls: response.tool_calls,
