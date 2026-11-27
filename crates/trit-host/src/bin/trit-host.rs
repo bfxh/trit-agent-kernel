@@ -604,6 +604,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         session,
         context,
         write_guard: None,
+        resume,
     };
     let scripted = match provider.as_str() {
         "scripted" => {

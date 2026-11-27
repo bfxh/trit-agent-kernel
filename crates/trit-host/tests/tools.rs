@@ -310,6 +310,7 @@ fn headless_run_writes_and_proves_from_local_receipts() {
             session: None,
             context: trit_host::ContextPolicy::default(),
             write_guard: None,
+            resume: false,
         },
     )
     .unwrap();
@@ -346,6 +347,7 @@ fn headless_run_rejects_escape_before_writing() {
             session: None,
             context: trit_host::ContextPolicy::default(),
             write_guard: None,
+            resume: false,
         },
     )
     .unwrap_err();

@@ -91,6 +91,7 @@ where
             session: Some(path),
             context: ContextPolicy::default(),
             write_guard: None,
+            resume: false,
         };
         let outcome = run_headless(turn_spec_from_task(task), (self.model)(task), config)
             .map_err(|error| error.to_string())?;

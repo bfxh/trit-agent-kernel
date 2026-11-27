@@ -402,6 +402,114 @@ pub struct TurnRecord {
     pub metrics: Option<TurnMetrics>,
 }
 
+/// 崩溃恢复点：最后一个没有 `TurnFinished` 的 turn 的中间状态。
+///
+/// 只携带「确定发生过」的事实：已发出的请求、按 `call_id` 索引的确定回执、
+/// 已消耗 token、以及重放出来的上下文投影。请求发出但没落回执的那一条
+/// 不在 `outcomes` 里——调用方必须把它当成结果未知（`in_doubt`），
+/// 不能重放、也不能算成功。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnResume {
+    pub task: String,
+    pub objective: String,
+    /// 已发出的工具请求，按事件顺序。
+    pub requests: Vec<ToolRequest>,
+    /// 按 `call_id` 索引的确定回执；缺项表示该请求结果未知。
+    pub outcomes: std::collections::BTreeMap<String, ToolOutcome>,
+    /// 该 turn 已消耗的 token。
+    pub usage: TokenUsage,
+    /// 下一个要执行的 step 序号。
+    pub next_step: usize,
+    /// 断点所在的 step（`next_step` 是它重跑还是推进，取决于是否有未确定的请求）。
+    pub step: usize,
+    /// 从事件重放出来的上下文投影。
+    pub projection: crate::context_projection::ContextProjection,
+}
+
+impl TurnResume {
+    /// 结果确定的回执，按请求顺序。
+    pub fn receipts(&self) -> Vec<ToolOutcome> {
+        self.requests
+            .iter()
+            .filter_map(|request| self.outcomes.get(&request.call_id).cloned())
+            .collect()
+    }
+
+    /// 发出后崩溃、结果未知的请求，按请求顺序。
+    pub fn unsettled(&self) -> Vec<&ToolRequest> {
+        self.requests
+            .iter()
+            .filter(|request| !self.outcomes.contains_key(&request.call_id))
+            .collect()
+    }
+}
+
+/// 找出最后一个未完成 turn 的恢复点；没有未完成 turn 时返回 `None`。
+///
+/// 只有最后一个 `TurnStarted` 之后完全没有 `TurnFinished` 才可恢复：
+/// 中途夹着已收尾的 turn 会让「同一 turn 的中间状态」失去意义。
+pub fn resume_turn(records: &[SessionRecord]) -> Result<Option<TurnResume>, AgentError> {
+    let Some(start) = records
+        .iter()
+        .rposition(|record| matches!(record.event, SessionEvent::TurnStarted { .. }))
+    else {
+        return Ok(None);
+    };
+    let tail = &records[start..];
+    if tail
+        .iter()
+        .any(|record| matches!(record.event, SessionEvent::TurnFinished { .. }))
+    {
+        return Ok(None);
+    }
+    let Some(SessionEvent::TurnStarted {
+        task,
+        objective,
+        max_steps: _,
+    }) = tail.first().map(|record| &record.event)
+    else {
+        return Ok(None);
+    };
+
+    let mut resume = TurnResume {
+        task: task.clone(),
+        objective: objective.clone(),
+        projection: crate::context_projection::replay(records)
+            .map_err(|error| AgentError::SessionState(format!("context projection: {error}")))?,
+        ..TurnResume::default()
+    };
+    let mut last_step = 0usize;
+    for record in tail {
+        match &record.event {
+            SessionEvent::Proposal { step, usage, .. } => {
+                last_step = *step;
+                add_usage(&mut resume.usage, usage.into_token_usage());
+            }
+            SessionEvent::ToolRequested { step, request } => {
+                last_step = *step;
+                resume.requests.push(request.clone());
+            }
+            SessionEvent::ToolCompleted { step, outcome } => {
+                last_step = *step;
+                resume
+                    .outcomes
+                    .entry(outcome.call_id.clone())
+                    .or_insert_with(|| outcome.clone());
+            }
+            _ => {}
+        }
+    }
+    // 断点落在某个 step 的工具执行中间：该 step 还没跑完，重跑它的 proposal，
+    // 模型会看到结果未知的那条请求，再由它决定是否重试。
+    resume.step = last_step;
+    resume.next_step = if resume.unsettled().is_empty() {
+        last_step.saturating_add(1)
+    } else {
+        last_step
+    };
+    Ok(Some(resume))
+}
+
 /// 从 JSONL 事件重建会话；未收到 `TurnFinished` 的 turn 标记为未完成。
 pub fn recover(records: &[SessionRecord]) -> Result<SessionState, AgentError> {
     let mut state = SessionState::default();

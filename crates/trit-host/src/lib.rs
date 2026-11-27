@@ -714,7 +714,7 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
     }
 
     pub fn run_turn(&mut self, turn: &TurnSpec) -> Result<TurnOutcome, AgentError> {
-        self.run_turn_inner(turn, None)
+        self.run_turn_inner(turn, None, None)
     }
 
     pub fn run_turn_with_session(
@@ -722,15 +722,96 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
         turn: &TurnSpec,
         session: &mut SessionLog,
     ) -> Result<TurnOutcome, AgentError> {
-        self.run_turn_inner(turn, Some(session))
+        self.run_turn_inner(turn, Some(session), None)
+    }
+
+    /// 从崩溃点续跑：注入 `resume` 里的确定事实，从断点 step 继续。
+    ///
+    /// 恢复语义刻意保守：只有拿到确定回执的请求按原样计入证据；发出但没有
+    /// 回执的请求补记为 `in_doubt`，既不当作成功也不重跑，由模型在重跑的那
+    /// 一步决定是否重试。
+    pub fn run_turn_resume_with_session(
+        &mut self,
+        turn: &TurnSpec,
+        session: &mut SessionLog,
+        resume: crate::session::TurnResume,
+    ) -> Result<TurnOutcome, AgentError> {
+        self.run_turn_inner(turn, Some(session), Some(resume))
     }
 
     fn run_turn_inner(
         &mut self,
         turn: &TurnSpec,
         mut session: Option<&mut SessionLog>,
+        resume: Option<crate::session::TurnResume>,
     ) -> Result<TurnOutcome, AgentError> {
         let started = Instant::now();
+        let mut ledger = Ledger::new();
+        let mut receipts: Vec<ToolOutcome> = Vec::new();
+        let mut usage = TokenUsage::default();
+        let mut start_step = 0usize;
+        let resumed = resume.is_some();
+        match resume {
+            Some(resume) => {
+                if resume.task != turn.task {
+                    return Err(AgentError::SessionState(format!(
+                        "resume task {} does not match turn {}",
+                        resume.task, turn.task
+                    )));
+                }
+                // 投影整体替换为日志重放结果：它已包含前面所有 turn 的历史，
+                // 且 visible_start 正落在该 turn 的起点上，不能再 `begin_turn`。
+                self.context_projection = resume.projection.clone();
+                self.receipt_epochs = self
+                    .context_projection
+                    .canonical()
+                    .iter()
+                    .map(|entry| (entry.call_id.clone(), entry.epoch))
+                    .collect();
+                self.last_prefix_fingerprint = None;
+                receipts = resume.receipts();
+                usage = resume.usage;
+                start_step = resume.next_step;
+                for request in resume.unsettled() {
+                    let outcome = ToolOutcome {
+                        call_id: request.call_id.clone(),
+                        tool: request.tool.clone(),
+                        command: request.command.clone(),
+                        passed: false,
+                        assertions: 0,
+                        written_paths: Vec::new(),
+                        in_doubt: true,
+                        output: "resumed after crash: outcome unknown".into(),
+                    };
+                    log_session(
+                        &mut session,
+                        SessionEvent::ToolCompleted {
+                            step: resume.step,
+                            outcome: outcome.clone(),
+                        },
+                    )?;
+                    self.context_projection.append(resume.step, &outcome);
+                    receipts.push(outcome);
+                }
+                for request in &resume.requests {
+                    let Some(effect) = request.host_call(&turn.task).effect_spec() else {
+                        continue;
+                    };
+                    let attempt = ledger.prepare(&turn.task, 0, &effect.operation, 1)?;
+                    ledger.mark_sending(&attempt, 1)?;
+                    match resume.outcomes.get(&request.call_id) {
+                        Some(outcome) if !outcome.in_doubt => {
+                            ledger.record_result(&attempt, outcome.passed)?;
+                        }
+                        _ => ledger.mark_unknown(&attempt)?,
+                    }
+                }
+            }
+            None => {
+                self.context_projection.begin_turn();
+                self.receipt_epochs.clear();
+            }
+        }
         let mut spec = turn.task_spec();
         spec.epoch = self.context_projection.epoch();
         let task_epoch = spec.epoch;
@@ -772,30 +853,27 @@ impl<M: Model, T: ToolExecutor> AgentHost<M, T> {
                 task: turn.task.clone(),
             })?;
 
-        log_session(
-            &mut session,
-            SessionEvent::TurnStarted {
-                task: turn.task.clone(),
-                objective: turn.objective.clone(),
-                max_steps: self.max_steps,
-            },
-        )?;
-        self.context_projection.begin_turn();
-        self.receipt_epochs.clear();
-        let mut ledger = Ledger::new();
-        let mut receipts = Vec::new();
-        let mut usage = TokenUsage::default();
+        if !resumed {
+            log_session(
+                &mut session,
+                SessionEvent::TurnStarted {
+                    task: turn.task.clone(),
+                    objective: turn.objective.clone(),
+                    max_steps: self.max_steps,
+                },
+            )?;
+        }
         let mut rebasis: Vec<AdmissionObligation> = Vec::new();
         let mut context = TurnContext {
             task: turn.task.clone(),
-            step: 0,
+            step: start_step,
             usage,
             receipts: Vec::new(),
             digest: None,
             projection: None,
         };
 
-        for step in 0..self.max_steps {
+        for step in start_step..self.max_steps {
             context.step = step;
             context.usage = usage;
             let compacted = compact_receipts(&receipts, &self.context);
@@ -1381,6 +1459,22 @@ pub struct HeadlessConfig {
     pub context: ContextPolicy,
     /// 可选的写入守卫（路径 claim + 跨进程租约）。
     pub write_guard: Option<crate::permissions::WriteGuard>,
+    /// 续跑：session 里最后一个 turn 未收尾时，从它的中间状态继续，而不是新起 turn。
+    #[doc(hidden)]
+    pub resume: bool,
+}
+
+impl HeadlessConfig {
+    pub fn new(workspace: crate::tools::WorkspaceConfig) -> Self {
+        Self {
+            workspace,
+            max_steps: 8,
+            session: None,
+            context: ContextPolicy::default(),
+            write_guard: None,
+            resume: false,
+        }
+    }
 }
 
 /// 无头运行：本地工具 + 模型提议 + 内核裁决。
@@ -1398,6 +1492,12 @@ pub fn run_headless<M: Model>(
         .with_write_claim(claim);
     if let Some(path) = config.session {
         let mut log = SessionLog::open(path)?;
+        if config.resume
+            && let Some(resume) = crate::session::resume_turn(&log.load()?)?
+            && resume.task == turn.task
+        {
+            return host.run_turn_resume_with_session(&turn, &mut log, resume);
+        }
         host.run_turn_with_session(&turn, &mut log)
     } else {
         host.run_turn(&turn)
@@ -1568,7 +1668,8 @@ pub use separation::{
 pub use serve::{Route, ServeConfig, ServeError, ServeHeaders, authorize, route};
 pub use session::{
     GateChainPhase, GateChainRecord, SESSION_SCHEMA, Session, SessionEvent, SessionLog,
-    SessionRecord, SessionState, TurnRecord, recover, recovery_context_for_session,
+    SessionRecord, SessionState, TurnRecord, TurnResume, recover, recovery_context_for_session,
+    resume_turn,
 };
 pub use session_advance::{
     AdvanceOptions, AdvanceReport, SESSION_ADVANCE_SCHEMA, advance, plan_from_scan,

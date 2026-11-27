@@ -76,6 +76,14 @@ DelegationResult（parent 目录 delegations.jsonl）
 - MCP 的 `readOnlyHint` 仅保留在 route 与 `trit-host tools` 展示，不进入 `ToolSpec.read_only`、并行判断或权限授权。
 - GPU：内核与 CLI 不承载模型推理，GPU 加速属于 provider 侧；本层只做线程级并行，不对本地推理做承诺。
 
+### 崩溃续跑（中间状态恢复）
+
+- `run --resume` / `session-advance --resume` 会先看 session 里最后一个 turn：没有 `TurnFinished` 且 task 对得上，就从它的断点继续，而不是新起一个 turn 重跑。
+- 恢复只采纳确定事实：`ToolCompleted` 的回执照旧计入证据；`ToolRequested` 之后没有回执的请求补记为 `in_doubt`，既不当作成功、也不重放，由模型在重跑的这一步决定是否重试。
+- 断点若停在某一步的工具执行中，该 step 的 proposal 会重跑（`next_step` 退回该 step）；否则从 `step + 1` 继续。
+- 附带恢复：已消耗 token、上下文投影（`context_projection::replay`）、effect 台账（`Confirmed`/`Unknown`）。
+- 恢复不了（日志损坏、断点属于别的 task、turn 已收尾）时退回旧语义：先把未完成的 `<task>.jsonl` 归档为 `<task>.prev-<ms>.jsonl` 再重跑。
+
 ## 5. 预算与成本
 
 - 本地：`--budget-tokens` 均分到 fleet 任务，预算小于任务数直接 fail closed。

@@ -49,7 +49,7 @@
 - `checkpoint.save`：临时文件与目标在同一目录，`rename` 不跨设备；Windows 目标被占用时先删再重试。
 - `restore_rewind_backups` / `journal.backup_paths`：备份与恢复都是读写复制，不依赖 `rename` 的跨设备语义。
 - `git_checkpoint`：由 git 自己处理索引/对象写入。
-- 续跑归档：`--resume` 执行前把未完成的 `<task>.jsonl` 改名为 `<task>.prev-<ms>.jsonl`，避免新 turn 追加进旧文件；归档失败则 fail closed。
+- 续跑：`run --resume` / `session-advance --resume` 能从中断 turn 的中间状态继续（见 SESSION-ORCHESTRATION「崩溃续跑」）；无法恢复时退回归档：把未完成的 `<task>.jsonl` 改名为 `<task>.prev-<ms>.jsonl`，避免新 turn 追加进旧文件；归档失败则 fail closed。
 
 ## 7. 已知边界与后续
 

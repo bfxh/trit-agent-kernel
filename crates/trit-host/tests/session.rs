@@ -87,6 +87,7 @@ fn config(root: &std::path::Path, session: Option<PathBuf>) -> HeadlessConfig {
         session,
         context: trit_host::ContextPolicy::default(),
         write_guard: None,
+        resume: false,
     }
 }
 
@@ -383,6 +384,203 @@ fn session_exposes_state_layer_and_validation() {
         session.validate_state().unwrap().verdict,
         trit_orch::Ternary::True
     );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn resume_turn_extracts_crashed_turn_state() {
+    let path = temp_file("resume-state");
+    let mut log = SessionLog::open(&path).unwrap();
+    log.append(SessionEvent::TurnStarted {
+        task: "headless".into(),
+        objective: "write a file".into(),
+        max_steps: 4,
+    })
+    .unwrap();
+    log.append(SessionEvent::Proposal {
+        step: 0,
+        tool_calls: 1,
+        completion: false,
+        usage: HostUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            cache_hit_tokens: 8,
+            cache_miss_tokens: 2,
+            estimated: false,
+        },
+        context: None,
+    })
+    .unwrap();
+    log.append(SessionEvent::ToolRequested {
+        step: 0,
+        request: ToolRequest::write("w1", "write_file", "a.txt", "hello"),
+    })
+    .unwrap();
+    log.append(SessionEvent::ToolCompleted {
+        step: 0,
+        outcome: write_outcome(),
+    })
+    .unwrap();
+    drop(log);
+
+    let records = SessionLog::open(&path).unwrap().load().unwrap();
+    let resume = trit_host::session::resume_turn(&records)
+        .unwrap()
+        .expect("ORCH_SESSION_RESUME: crashed turn must be resumable");
+    assert_eq!(resume.task, "headless");
+    assert_eq!(resume.next_step, 1);
+    assert_eq!(resume.step, 0);
+    assert_eq!(resume.receipts().len(), 1);
+    assert_eq!(resume.receipts()[0].call_id, "w1");
+    assert!(resume.unsettled().is_empty());
+    assert_eq!(
+        resume.usage,
+        TokenUsage {
+            fresh: 2,
+            cached: 8,
+            output: 2,
+            estimated: false,
+        }
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn resume_turn_reruns_the_step_of_an_unsettled_request() {
+    let path = temp_file("resume-unsettled");
+    let mut log = SessionLog::open(&path).unwrap();
+    log.append(SessionEvent::TurnStarted {
+        task: "headless".into(),
+        objective: "write a file".into(),
+        max_steps: 4,
+    })
+    .unwrap();
+    log.append(SessionEvent::Proposal {
+        step: 1,
+        tool_calls: 1,
+        completion: false,
+        usage: HostUsage::default(),
+        context: None,
+    })
+    .unwrap();
+    log.append(SessionEvent::ToolRequested {
+        step: 1,
+        request: ToolRequest::write("w2", "write_file", "b.txt", "x"),
+    })
+    .unwrap();
+    drop(log);
+
+    let records = SessionLog::open(&path).unwrap().load().unwrap();
+    let resume = trit_host::session::resume_turn(&records).unwrap().unwrap();
+    assert_eq!(resume.step, 1);
+    assert_eq!(resume.next_step, 1, "unsettled request must rerun its step");
+    assert!(resume.receipts().is_empty());
+    assert_eq!(resume.unsettled().len(), 1);
+    assert_eq!(resume.unsettled()[0].call_id, "w2");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn finished_turn_is_not_resumable() {
+    let path = temp_file("resume-finished");
+    let mut log = SessionLog::open(&path).unwrap();
+    log.append(SessionEvent::TurnStarted {
+        task: "t".into(),
+        objective: "o".into(),
+        max_steps: 1,
+    })
+    .unwrap();
+    log.append(SessionEvent::TurnFinished {
+        steps: 1,
+        complete: true,
+        metrics: None,
+    })
+    .unwrap();
+    drop(log);
+    let records = SessionLog::open(&path).unwrap().load().unwrap();
+    assert!(trit_host::session::resume_turn(&records).unwrap().is_none());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn headless_resume_continues_without_a_new_turn_start() {
+    let root = temp_workspace("resume-run");
+    let path = temp_file("resume-run");
+    let mut log = SessionLog::open(&path).unwrap();
+    log.append(SessionEvent::TurnStarted {
+        task: "headless".into(),
+        objective: "write a file".into(),
+        max_steps: 4,
+    })
+    .unwrap();
+    log.append(SessionEvent::Proposal {
+        step: 0,
+        tool_calls: 1,
+        completion: false,
+        usage: HostUsage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            cache_hit_tokens: 8,
+            cache_miss_tokens: 2,
+            estimated: false,
+        },
+        context: None,
+    })
+    .unwrap();
+    log.append(SessionEvent::ToolRequested {
+        step: 0,
+        request: ToolRequest::write("w1", "write_file", "a.txt", "hello"),
+    })
+    .unwrap();
+    log.append(SessionEvent::ToolCompleted {
+        step: 0,
+        outcome: write_outcome(),
+    })
+    .unwrap();
+    drop(log);
+
+    let mut resumed_config = config(&root, Some(path.clone()));
+    resumed_config.resume = true;
+    let outcome = run_headless(
+        turn(),
+        ScriptedModel::new(vec![Proposal {
+            tool_calls: Vec::new(),
+            completion: Some(ClaimRequest {
+                criteria: vec![CriterionRequest {
+                    id: "c1".into(),
+                    kind: CriterionKind::Diff {
+                        paths: vec!["a.txt".into()],
+                    },
+                }],
+            }),
+            usage: HostUsage::default(),
+            ..Proposal::default()
+        }]),
+        resumed_config,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.judgment.verdict,
+        EvidenceVerdict::Proved,
+        "ORCH_SESSION_RESUME_EVIDENCE: crashed-run receipts must still back the claim"
+    );
+    assert_eq!(outcome.steps, 2, "resume continues at step 1");
+    assert_eq!(outcome.usage.fresh, 2, "resumed usage is carried over");
+
+    let records = SessionLog::open(&path).unwrap().load().unwrap();
+    let starts = records
+        .iter()
+        .filter(|record| matches!(record.event, SessionEvent::TurnStarted { .. }))
+        .count();
+    assert_eq!(
+        starts, 1,
+        "ORCH_SESSION_RESUME_TURN: no duplicate TurnStarted"
+    );
+    assert!(matches!(
+        records.last().unwrap().event,
+        SessionEvent::TurnFinished { complete: true, .. }
+    ));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&root);
 }

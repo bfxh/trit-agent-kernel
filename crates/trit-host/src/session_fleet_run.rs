@@ -21,7 +21,7 @@ use crate::cost::{self, BudgetAlert, CostEstimate, PriceTable};
 
 use crate::openai::{OpenAiConfig, OpenAiProvider};
 use crate::provider::{ProviderModel, default_tools};
-use crate::session::{SessionEvent, SessionRecord};
+use crate::session::{SessionEvent, SessionLog, SessionRecord};
 use crate::session_fleet::SessionFleetReport;
 use crate::tools::WorkspaceConfig;
 use crate::{AgentError, ContextPolicy, HeadlessConfig, run_headless, turn_spec_from_task};
@@ -303,7 +303,14 @@ fn execute_once(
             .unwrap_or_else(|| fallback_workspace.clone());
         let session = safe_task_path(&session_dir, &task.task.id);
         reject_symlink(&session)?;
-        if let Err(error) = archive_incomplete_session(&session_dir, &task.task.id) {
+        // 能从中断 turn 的中间状态恢复就不归档：归档会丢掉已经拿到的证据。
+        // 日志损坏或断点属于别的任务时退回「归档后重跑」，保持旧语义。
+        let resumable = SessionLog::open(&session)
+            .ok()
+            .and_then(|log| log.load().ok())
+            .and_then(|records| crate::session::resume_turn(&records).ok().flatten())
+            .is_some_and(|resume| resume.task == task.task.id);
+        if !resumable && let Err(error) = archive_incomplete_session(&session_dir, &task.task.id) {
             return Err(error);
         }
         if let Some(parent) = parents.get(&task.task.id) {
@@ -321,6 +328,7 @@ fn execute_once(
             session: Some(session),
             context: ContextPolicy::default(),
             write_guard: None,
+            resume: resumable,
         };
         let outcome = run_headless(turn_spec_from_task(task), model, headless)
             .map_err(|error| error.to_string())?;
