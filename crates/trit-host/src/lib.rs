@@ -1404,6 +1404,7 @@ pub mod serve;
 pub mod session;
 pub mod session_callback;
 pub mod session_dispatch;
+pub mod session_fleet;
 pub mod session_index;
 pub mod session_migration;
 pub mod session_plan;
@@ -1527,6 +1528,7 @@ pub use session_dispatch::{
     DispatchAction, DispatchItem, DispatchOptions, DispatchReport, SESSION_DISPATCH_SCHEMA,
     dispatch_sessions,
 };
+pub use session_fleet::{FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, plan_fleet};
 pub use session_index::{INDEX_SCHEMA, IndexSummary, RebuildReport, SessionIndex, VerifyReport};
 pub use session_migration::{
     CacheDropReason, ContextConflictPolicy, ContextVersion, HookDescriptor, MigrationPlan,
