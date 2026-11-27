@@ -43,12 +43,12 @@ fn fixture(root: &Path) {
         "alignment.json",
         r#"{"schema":"alignment/1","goal":{"id":"G1","text":"ship it"},
 "requirements":[{"id":"R1","text":"a","priority":"must","parent":"G1",
-"artifacts":["A1"],"evidence":["E1"],"changes":["src/a.py"]}],
-"artifacts":[{"id":"A1","path":"src/a.py"}],
-"evidence":[{"id":"E1","path":"tests/a.py","locator":"text:test_a"}]}"#,
+"artifacts":["A1"],"evidence":["E1"],"changes":["src/a.rs"]}],
+"artifacts":[{"id":"A1","path":"src/a.rs"}],
+"evidence":[{"id":"E1","path":"tests/a.rs","locator":"text:test_a"}]}"#,
     );
-    write(root, "src/a.py", "print(1)\n");
-    write(root, "tests/a.py", "def test_a(): pass\n");
+    write(root, "src/a.rs", "print(1)\n");
+    write(root, "tests/a.rs", "def test_a(): pass\n");
     write(
         root,
         "packet.json",
@@ -209,7 +209,7 @@ fn host_uses_git_changes_and_rejects_unlinked_path() {
     let root = root("git-changed");
     fixture(&root);
     git_repo(&root);
-    write(&root, "src/b.py", "print(2)\n");
+    write(&root, "src/b.rs", "print(2)\n");
 
     let (code, text) = host(
         &root,
@@ -234,7 +234,7 @@ fn host_explicit_changed_overrides_git_lookup() {
     let root = root("explicit-changed");
     fixture(&root);
     git_repo(&root);
-    write(&root, "src/b.py", "print(2)\n");
+    write(&root, "src/b.rs", "print(2)\n");
 
     let (code, text) = host(
         &root,
@@ -247,7 +247,7 @@ fn host_explicit_changed_overrides_git_lookup() {
             "--alignment-manifest",
             "alignment.json",
             "--alignment-changed",
-            "src/a.py",
+            "src/a.rs",
         ],
     );
     assert_eq!(code, Some(2), "{text}");
@@ -261,7 +261,7 @@ fn host_can_disable_git_changed_lookup() {
     let root = root("no-git-changed");
     fixture(&root);
     git_repo(&root);
-    write(&root, "src/b.py", "print(2)\n");
+    write(&root, "src/b.rs", "print(2)\n");
 
     let (code, text) = host(
         &root,
@@ -287,7 +287,7 @@ fn host_changed_set_enforces_declared_changes() {
     let root = root("changed-set");
     fixture(&root);
     git_repo(&root);
-    write(&root, "src/b.py", "print(2)\n");
+    write(&root, "src/b.rs", "print(2)\n");
 
     let (code, text) = host(
         &root,
@@ -300,7 +300,7 @@ fn host_changed_set_enforces_declared_changes() {
             "--alignment-manifest",
             "alignment.json",
             "--alignment-changed",
-            "src/b.py",
+            "src/b.rs",
             "--alignment-changed-set",
         ],
     );
@@ -376,10 +376,10 @@ fn host_normalizes_alignment_changed_paths() {
             "--alignment-manifest",
             "alignment.json",
             "--alignment-changed",
-            ".\\src\\a.py",
+            ".\\src\\a.rs",
         ],
     );
-    // `.\src\a.py` 折成 `src/a.py`，命中清单的 changes，门链放行到 script 校验。
+    // `.\src\a.rs` 折成 `src/a.rs`，命中清单的 changes，门链放行到 script 校验。
     assert_eq!(code, Some(2), "{text}");
     assert!(!text.contains("gate chain rejected"), "{text}");
     assert!(text.contains("--script is required"), "{text}");
@@ -401,7 +401,7 @@ fn host_rejects_alignment_changed_escape() {
             "--alignment-manifest",
             "alignment.json",
             "--alignment-changed",
-            "../outside.py",
+            "../outside.rs",
         ],
     );
     assert_eq!(code, Some(2), "{text}");
@@ -417,7 +417,7 @@ fn host_post_passes_when_changes_align() {
     let root = root("post-pass");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("post-pass", "src/a.py");
+    let script_path = script("post-pass", "src/a.rs");
     let (code, text) = host(
         &root,
         &[
@@ -445,7 +445,7 @@ fn host_post_rejects_unlinked_change() {
     let root = root("post-fail");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("post-fail", "src/b.py");
+    let script_path = script("post-fail", "src/b.rs");
     let (code, text) = host(
         &root,
         &[
@@ -474,7 +474,7 @@ fn host_post_rejects_unlinked_change() {
 fn host_post_requires_git_workspace() {
     let root = root("post-no-git");
     fixture(&root);
-    let script_path = script("post-no-git", "src/a.py");
+    let script_path = script("post-no-git", "src/a.rs");
     let (code, text) = host(
         &root,
         &[
@@ -502,7 +502,7 @@ fn host_writes_gate_chain_reports() {
     let root = root("reports");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("reports", "src/a.py");
+    let script_path = script("reports", "src/a.rs");
     let (code, text) = host(
         &root,
         &[
@@ -542,7 +542,7 @@ fn host_post_report_is_written_on_failure() {
     let root = root("post-report-fail");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("post-report-fail", "src/b.py");
+    let script_path = script("post-report-fail", "src/b.rs");
     let (code, text) = host(
         &root,
         &[
@@ -576,7 +576,7 @@ fn host_logs_gate_chain_to_session() {
     let root = root("session-log");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("session-log", "src/a.py");
+    let script_path = script("session-log", "src/a.rs");
     let session = root.join("session.jsonl");
     let (code, text) = host(
         &root,
@@ -641,7 +641,7 @@ fn host_logs_post_failure_to_session() {
     let root = root("session-post-fail");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("session-post-fail", "src/b.py");
+    let script_path = script("session-post-fail", "src/b.rs");
     let session = root.join("session.jsonl");
     let (code, text) = host(
         &root,
@@ -722,7 +722,7 @@ fn host_post_report_flag_alone_enables_post_check() {
     let root = root("post-report-flag");
     fixture(&root);
     git_repo(&root);
-    let script_path = script("post-report-flag", "src/a.py");
+    let script_path = script("post-report-flag", "src/a.rs");
     let (code, text) = host(
         &root,
         &[

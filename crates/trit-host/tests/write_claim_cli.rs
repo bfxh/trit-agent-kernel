@@ -98,8 +98,8 @@ fn write_lease_requires_claim() {
 #[test]
 fn write_claim_blocks_undeclared_write() {
     let root = root("blocked");
-    write(&root, "src/a.py", "x");
-    let script_path = script("blocked", "src/b.py");
+    write(&root, "src/a.rs", "x");
+    let script_path = script("blocked", "src/b.rs");
     let (code, text) = host(
         &root,
         &[
@@ -107,12 +107,12 @@ fn write_claim_blocks_undeclared_write() {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/a.py",
+            "src/a.rs",
         ],
     );
     assert_eq!(code, Some(1), "{text}");
     assert!(text.contains("write claim does not allow"), "{text}");
-    assert!(!root.join("src/b.py").exists());
+    assert!(!root.join("src/b.rs").exists());
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
@@ -120,8 +120,8 @@ fn write_claim_blocks_undeclared_write() {
 #[test]
 fn write_lease_binds_and_increments_epoch() {
     let root = root("epoch");
-    write(&root, "src/a.py", "x");
-    let script_path = script("epoch", "src/a.py");
+    write(&root, "src/a.rs", "x");
+    let script_path = script("epoch", "src/a.rs");
 
     let (code, text) = host(
         &root,
@@ -130,7 +130,7 @@ fn write_lease_binds_and_increments_epoch() {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/a.py",
+            "src/a.rs",
             "--write-lease",
             "host-a",
         ],
@@ -145,7 +145,7 @@ fn write_lease_binds_and_increments_epoch() {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/a.py",
+            "src/a.rs",
             "--write-lease",
             "host-b",
         ],
@@ -159,10 +159,10 @@ fn write_lease_binds_and_increments_epoch() {
 #[test]
 fn write_lease_is_busy_when_held() {
     let root = root("busy");
-    write(&root, "src/a.py", "x");
-    let script_path = script("busy", "src/a.py");
+    write(&root, "src/a.rs", "x");
+    let script_path = script("busy", "src/a.rs");
     let holder =
-        OperationLease::acquire_paths(&root, "test-holder", &[PathBuf::from("src/a.py")]).unwrap();
+        OperationLease::acquire_paths(&root, "test-holder", &[PathBuf::from("src/a.rs")]).unwrap();
     let (code, text) = host(
         &root,
         &[
@@ -170,7 +170,7 @@ fn write_lease_is_busy_when_held() {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/a.py",
+            "src/a.rs",
             "--write-lease",
             "host-b",
         ],
@@ -185,8 +185,8 @@ fn write_lease_is_busy_when_held() {
 #[test]
 fn write_claim_accepts_glob_pattern() {
     let root = root("glob");
-    write(&root, "src/a.py", "x");
-    let script_path = script("glob", "src/a.py");
+    write(&root, "src/a.rs", "x");
+    let script_path = script("glob", "src/a.rs");
     let (code, text) = host(
         &root,
         &[
@@ -194,7 +194,7 @@ fn write_claim_accepts_glob_pattern() {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/*.py",
+            "src/*.rs",
         ],
     );
     assert_eq!(code, Some(0), "{text}");
@@ -206,7 +206,7 @@ fn write_claim_accepts_glob_pattern() {
 #[test]
 fn builtin_sandbox_is_configured_on_windows() {
     let root = root("builtin");
-    write(&root, "src/a.py", "x");
+    write(&root, "src/a.rs", "x");
     let (code, text) = host(&root, &["--sandbox", "builtin"]);
     assert_eq!(code, Some(2), "{text}");
     assert!(!text.contains("only available on Linux"), "{text}");
@@ -217,8 +217,8 @@ fn builtin_sandbox_is_configured_on_windows() {
 #[test]
 fn write_claim_checks_both_move_endpoints() {
     let root = root("move");
-    write(&root, "src/a.py", "x");
-    let script_path = script_move("move", "src/a.py", "src/b.py");
+    write(&root, "src/a.rs", "x");
+    let script_path = script_move("move", "src/a.rs", "src/b.rs");
 
     // 目标未被 claim 覆盖：整个 move 被 blocked，源文件保持原位。
     let (code, text) = host(
@@ -228,13 +228,13 @@ fn write_claim_checks_both_move_endpoints() {
             "--script",
             script_path.to_str().unwrap(),
             "--write-claim",
-            "src/a.py",
+            "src/a.rs",
         ],
     );
     assert_eq!(code, Some(1), "{text}");
     assert!(text.contains("write claim does not allow"), "{text}");
-    assert!(root.join("src/a.py").exists());
-    assert!(!root.join("src/b.py").exists());
+    assert!(root.join("src/a.rs").exists());
+    assert!(!root.join("src/b.rs").exists());
 
     // 两端都在 claim 内：移动成功。
     let (code, text) = host(
@@ -248,8 +248,8 @@ fn write_claim_checks_both_move_endpoints() {
         ],
     );
     assert_eq!(code, Some(0), "{text}");
-    assert!(!root.join("src/a.py").exists());
-    assert!(root.join("src/b.py").exists());
+    assert!(!root.join("src/a.rs").exists());
+    assert!(root.join("src/b.rs").exists());
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_file(script_path);
 }
