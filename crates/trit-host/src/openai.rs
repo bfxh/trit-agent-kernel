@@ -3,6 +3,7 @@
 //! 只负责 HTTP 传输、工具 schema 与响应解析；不让内核接触网络。
 //! API key 只在 Authorization 头里出现，Debug 输出会脱敏。
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{BufReader, Read};
 use std::sync::{Arc, Mutex};
@@ -86,7 +87,19 @@ impl OpenAiConfig {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(10));
+        let model = Self::resolve_model(model);
         Ok(Self::new(base_url, api_key, model).with_connect_timeout(connect_timeout))
+    }
+
+    /// `TRIT_MODEL_ALIASES`（JSON 对象）命中时替换模型名；非法 JSON 保持原名。
+    fn resolve_model(model: String) -> String {
+        let Ok(raw) = std::env::var("TRIT_MODEL_ALIASES") else {
+            return model;
+        };
+        let Ok(aliases) = serde_json::from_str::<BTreeMap<String, String>>(&raw) else {
+            return model;
+        };
+        apply_model_alias(&aliases, &model)
     }
 }
 
@@ -100,6 +113,13 @@ pub struct OpenAiProvider {
 
 /// 单次 HTTP 响应的读取上限；超过时 fail closed，避免恶意/异常网关拖垮进程。
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn apply_model_alias(aliases: &BTreeMap<String, String>, model: &str) -> String {
+    aliases
+        .get(model)
+        .cloned()
+        .unwrap_or_else(|| model.to_owned())
+}
 
 /// 把 HTTP 状态码映射到连接失败类型；配额文案优先按 Quota 处理。
 fn classify_status(code: u16, body: &str) -> ConnectionFailureKind {
@@ -1151,5 +1171,15 @@ mod tests {
         assert!(provider.complete_chat(&json!({})).is_err());
         assert_eq!(provider.health().state, ConnectionState::Unavailable);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn model_alias_maps_and_falls_back() {
+        let aliases = BTreeMap::from([
+            ("fast".to_owned(), "gpt-4o-mini".to_owned()),
+            ("smart".to_owned(), "gpt-4o".to_owned()),
+        ]);
+        assert_eq!(apply_model_alias(&aliases, "fast"), "gpt-4o-mini");
+        assert_eq!(apply_model_alias(&aliases, "gpt-4o"), "gpt-4o");
     }
 }

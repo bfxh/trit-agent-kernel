@@ -185,6 +185,7 @@ FeatureGroupSpec { id, members[] }
 | `cost.usd_cny` | f64 | `7.2` | `TRIT_USD_CNY` |
 | `cost.model_prices` | path | 内置价目表 | `TRIT_MODEL_PRICES` |
 | `provider.connect_timeout` | duration | `10s` | `TRIT_OPENAI_CONNECT_TIMEOUT_SECS` |
+| `provider.model_aliases` | JSON 对象 | 空 | `TRIT_MODEL_ALIASES` |
 | `download.command` | path | `fluxdown` | `TRIT_FLUXDOWN` |
 
 - `concurrency.max` 是**总并发上限**：`--workers` 与它取小；多会话、多 root、跨机任务叠加时不会超过它。
