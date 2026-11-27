@@ -83,6 +83,7 @@ pub fn score_artifacts(artifacts: &[Artifact<'_>]) -> DesignReport {
             network_files += 1;
         }
         code_rules(artifact, &mut findings);
+        language_rules(artifact, &mut findings);
         if network {
             network_rules(artifact, &mut findings);
         }
@@ -313,6 +314,92 @@ fn code_rules(artifact: &Artifact<'_>, findings: &mut Vec<DesignFinding>) {
     }
 }
 
+/// 语言特定规则：按扩展名补充 Python / Go / TypeScript 的惯用法检查。
+fn language_rules(artifact: &Artifact<'_>, findings: &mut Vec<DesignFinding>) {
+    let lower = artifact.path.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next().unwrap_or_default();
+    let content = artifact.content;
+
+    let markers = content.matches("TODO").count() + content.matches("FIXME").count();
+    if markers > 3 {
+        push(
+            findings,
+            DesignAxis::Code,
+            "unresolved-markers",
+            5,
+            format!("{}: {markers} 处 TODO/FIXME 未清理", artifact.path),
+        );
+    }
+
+    match ext {
+        "py" => {
+            if content.contains("open(") && !content.contains("with ") {
+                push(
+                    findings,
+                    DesignAxis::Code,
+                    "python-unmanaged-resource",
+                    5,
+                    format!("{}: 用 open() 但没用 with 管理资源", artifact.path),
+                );
+            }
+            if content.lines().any(|line| line.trim() == "except:") {
+                push(
+                    findings,
+                    DesignAxis::Code,
+                    "python-bare-except",
+                    10,
+                    format!("{}: 裸 except: 会吞掉所有异常", artifact.path),
+                );
+            }
+        }
+        "go" => {
+            let declares_err = content.contains("err :=") || content.contains("err =");
+            if declares_err && !content.contains("if err != nil") {
+                push(
+                    findings,
+                    DesignAxis::Code,
+                    "go-unchecked-error",
+                    10,
+                    format!("{}: 声明了 err 但没有 if err != nil 检查", artifact.path),
+                );
+            }
+            let opens = content.contains("os.Open(") || content.contains("sql.Open(");
+            if opens && !content.contains("defer ") {
+                push(
+                    findings,
+                    DesignAxis::Code,
+                    "go-missing-defer",
+                    5,
+                    format!("{}: 打开了资源但没有 defer Close", artifact.path),
+                );
+            }
+        }
+        "ts" | "tsx" => {
+            let any = content.matches(": any").count() + content.matches("as any").count();
+            if any > 5 {
+                push(
+                    findings,
+                    DesignAxis::Code,
+                    "ts-any-sprawl",
+                    5,
+                    format!("{}: {any} 处 any，类型收窄不足", artifact.path),
+                );
+            }
+            let logs = content.matches("console.log(").count();
+            if logs > 3 {
+                push(
+                    findings,
+                    DesignAxis::Code,
+                    "console-log-leftover",
+                    5,
+                    format!("{}: {logs} 处 console.log 残留", artifact.path),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn has_repeated_block(lines: &[&str], window: usize) -> bool {
     if lines.len() < window * 2 {
         return false;
@@ -342,7 +429,7 @@ fn has_repeated_block(lines: &[&str], window: usize) -> bool {
 
 fn network_rules(artifact: &Artifact<'_>, findings: &mut Vec<DesignFinding>) {
     let content = artifact.content;
-    if !content.contains("timeout") && !content.contains("timeout_ms") {
+    if !content.to_ascii_lowercase().contains("timeout") {
         push(
             findings,
             DesignAxis::Network,
@@ -638,5 +725,87 @@ mod tests {
             .map(|f| f.rule.as_str())
             .collect();
         assert!(rules.contains(&"too-many-colors"), "{rules:?}");
+    }
+
+    #[test]
+    fn python_rules_flag_bare_except_and_unmanaged_open() {
+        let content =
+            "def f():\n    fh = open('x')\n    try:\n        pass\n    except:\n        pass\n";
+        let report = score_artifacts(&[art("src/a.py", content)]);
+        let code = report
+            .axes
+            .iter()
+            .find(|axis| axis.axis == DesignAxis::Code)
+            .unwrap();
+        let rules: Vec<&str> = code
+            .findings
+            .iter()
+            .map(|finding| finding.rule.as_str())
+            .collect();
+        assert!(rules.contains(&"python-bare-except"), "{rules:?}");
+        assert!(rules.contains(&"python-unmanaged-resource"), "{rules:?}");
+    }
+
+    #[test]
+    fn go_rules_flag_unchecked_error_and_missing_defer() {
+        let content = "func f() {\n    err := do()\n    _ = err\n    fh, _ := os.Open(\"x\")\n    _ = fh\n}\n";
+        let report = score_artifacts(&[art("src/a.go", content)]);
+        let code = report
+            .axes
+            .iter()
+            .find(|axis| axis.axis == DesignAxis::Code)
+            .unwrap();
+        let rules: Vec<&str> = code
+            .findings
+            .iter()
+            .map(|finding| finding.rule.as_str())
+            .collect();
+        assert!(rules.contains(&"go-unchecked-error"), "{rules:?}");
+        assert!(rules.contains(&"go-missing-defer"), "{rules:?}");
+    }
+
+    #[test]
+    fn ts_rules_flag_any_and_console_log() {
+        let mut content = String::new();
+        for index in 0..6 {
+            content.push_str(&format!("const a{index}: any = 1;\n"));
+        }
+        for index in 0..4 {
+            content.push_str(&format!("console.log({index});\n"));
+        }
+        let report = score_artifacts(&[art("src/a.tsx", &content)]);
+        let code = report
+            .axes
+            .iter()
+            .find(|axis| axis.axis == DesignAxis::Code)
+            .unwrap();
+        let rules: Vec<&str> = code
+            .findings
+            .iter()
+            .map(|finding| finding.rule.as_str())
+            .collect();
+        assert!(rules.contains(&"ts-any-sprawl"), "{rules:?}");
+        assert!(rules.contains(&"console-log-leftover"), "{rules:?}");
+    }
+
+    #[test]
+    fn markers_rule_flags_todo_sprawl() {
+        let mut content = String::new();
+        for index in 0..4 {
+            content.push_str(&format!("// TODO: fix {index}\n"));
+        }
+        content.push_str("pub fn f() {}\n");
+        let report = score_artifacts(&[art("src/a.rs", &content)]);
+        let code = report
+            .axes
+            .iter()
+            .find(|axis| axis.axis == DesignAxis::Code)
+            .unwrap();
+        let rules: Vec<&str> = code
+            .findings
+            .iter()
+            .map(|finding| finding.rule.as_str())
+            .collect();
+        assert!(rules.contains(&"unresolved-markers"), "{rules:?}");
     }
 }

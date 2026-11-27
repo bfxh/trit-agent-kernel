@@ -15,6 +15,18 @@
 | `no-comments` | −5 | 文件超过 200 行、注释不足 2% |
 | `duplicated-block` | −10 | 连续 3 行以上完全重复的代码块 |
 
+### 语言特定规则（补充到代码设计）
+
+| 规则 | 扣分 | 触发 |
+| --- | --- | --- |
+| `python-bare-except` | −10 | 裸 `except:` 吞掉所有异常 |
+| `python-unmanaged-resource` | −5 | 用 `open(` 但没用 `with` |
+| `go-unchecked-error` | −10 | 声明了 `err` 但没有 `if err != nil` |
+| `go-missing-defer` | −5 | `os.Open` / `sql.Open` 没有 `defer` |
+| `ts-any-sprawl` | −5 | `: any` / `as any` 超过 5 处 |
+| `console-log-leftover` | −5 | `console.log(` 超过 3 处 |
+| `unresolved-markers` | −5 | `TODO` / `FIXME` 超过 3 处 |
+
 ### 网络设计（`network`）
 
 只对包含网络调用的文件生效（`reqwest`/`ureq`/`hyper`/`axios`/`fetch(`/`client.post(` 等）。
