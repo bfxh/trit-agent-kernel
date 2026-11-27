@@ -1551,6 +1551,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let mut nodes_path: Option<PathBuf> = None;
     let mut workers = 4usize;
     let mut max_concurrency: Option<usize> = None;
+    let mut workers_given = false;
     let mut retry_limit = 0u32;
     let mut budget_tokens = 0u64;
     let mut scope: Option<String> = None;
@@ -1566,6 +1567,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
                 workers = next(&mut args, "--workers")?
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
+                workers_given = true;
             }
             "--max-concurrency" => {
                 max_concurrency = Some(
@@ -1602,6 +1604,9 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
     let roots = expand_roots(roots);
     let settings = trit_host::settings::load(&roots[0])?;
+    if !workers_given && settings.concurrency.workers > 0 {
+        workers = settings.concurrency.workers as usize;
+    }
     let cap = concurrency_cap(
         max_concurrency
             .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
@@ -1640,6 +1645,8 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut workers = 4usize;
     let mut max_concurrency: Option<usize> = None;
+    let mut workers_given = false;
+    let mut budget_given = false;
     let mut workspace: Option<PathBuf> = None;
     let mut max_steps = 20usize;
     let mut retries = 0usize;
@@ -1655,6 +1662,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                 workers = next(&mut args, "--workers")?
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
+                workers_given = true;
             }
             "--max-concurrency" => {
                 max_concurrency = Some(
@@ -1678,6 +1686,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                 budget_tokens = next(&mut args, "--budget-tokens")?
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+                budget_given = true;
             }
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--budget-usd" => {
@@ -1696,6 +1705,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                     return Err(fail("--budget-cny must be a non-negative number"));
                 }
                 budget_usd = cny / trit_host::cost::usd_cny_rate();
+                budget_given = true;
             }
             "--apply" => apply = true,
             "--compact" => compact = true,
@@ -1706,6 +1716,17 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     }
     let roots = expand_roots(roots);
     let settings = trit_host::settings::load(&roots[0])?;
+    if !workers_given && settings.concurrency.workers > 0 {
+        workers = settings.concurrency.workers as usize;
+    }
+    if !budget_given {
+        if settings.budget.tokens > 0 {
+            budget_tokens = settings.budget.tokens;
+        }
+        if settings.budget.cny > 0.0 {
+            budget_usd = settings.budget.cny / trit_host::cost::usd_cny_rate();
+        }
+    }
     let cap = concurrency_cap(
         max_concurrency
             .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
@@ -1923,6 +1944,8 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut max_items = 4usize;
     let mut workers = 4usize;
     let mut max_concurrency: Option<usize> = None;
+    let mut workers_given = false;
+    let mut budget_given = false;
     let mut max_steps = 20usize;
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
@@ -1945,6 +1968,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                 workers = next(&mut args, "--workers")?
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
+                workers_given = true;
             }
             "--max-concurrency" => {
                 max_concurrency = Some(
@@ -1967,6 +1991,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                 budget_tokens = next(&mut args, "--budget-tokens")?
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+                budget_given = true;
             }
             "--budget-usd" => {
                 budget_usd = next(&mut args, "--budget-usd")?
@@ -1984,6 +2009,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                     return Err(fail("--budget-cny must be a non-negative number"));
                 }
                 budget_usd = cny / trit_host::cost::usd_cny_rate();
+                budget_given = true;
             }
             "--scope" => scope = Some(next(&mut args, "--scope")?),
             "--apply" => apply = true,
@@ -1995,6 +2021,17 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     }
     let roots = expand_roots(roots);
     let settings = trit_host::settings::load(&roots[0])?;
+    if !workers_given && settings.concurrency.workers > 0 {
+        workers = settings.concurrency.workers as usize;
+    }
+    if !budget_given {
+        if settings.budget.tokens > 0 {
+            budget_tokens = settings.budget.tokens;
+        }
+        if settings.budget.cny > 0.0 {
+            budget_usd = settings.budget.cny / trit_host::cost::usd_cny_rate();
+        }
+    }
     let cap = concurrency_cap(
         max_concurrency
             .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
