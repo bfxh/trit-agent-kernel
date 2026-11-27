@@ -15,6 +15,8 @@ use trit_orch::{EvidenceVerdict, Ternary, TokenUsage};
 use trit_reasonix::{CriterionRequest, HostUsage, TurnSpec};
 
 pub const SESSION_SCHEMA: u32 = 1;
+/// 单个会话日志读取上限；超过时 fail closed，避免巨型文件拖垮进程。
+const MAX_SESSION_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -297,6 +299,14 @@ fn gate_chain_record(event: &SessionEvent) -> Option<GateChainRecord> {
 }
 
 fn read_records(path: &Path) -> Result<Vec<SessionRecord>, AgentError> {
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > MAX_SESSION_LOG_BYTES
+    {
+        return Err(AgentError::SessionState(format!(
+            "session log too large: {} bytes",
+            metadata.len()
+        )));
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

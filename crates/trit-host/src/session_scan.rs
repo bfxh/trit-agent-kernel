@@ -20,6 +20,8 @@ pub const SESSION_SCAN_SCHEMA: u32 = 1;
 const MAX_SESSION_BYTES: u64 = 32 * 1024 * 1024;
 /// 扫描缓存上限；超过时忽略缓存并回退全量扫描。
 const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+/// 会话 meta 上限；meta 只承载 id/parent/model 等小字段。
+const MAX_META_BYTES: u64 = 1024 * 1024;
 /// 会话目录递归深度；`projects/<name>/sessions` 通常两层。
 const MAX_DEPTH: usize = 4;
 
@@ -459,6 +461,9 @@ fn reasonix_task_text(value: &serde_json::Value) -> String {
 fn read_meta(path: &Path) -> Option<SessionMeta> {
     let mut meta_path = path.as_os_str().to_os_string();
     meta_path.push(".meta");
+    if fs::metadata(&meta_path).is_ok_and(|metadata| metadata.len() > MAX_META_BYTES) {
+        return None;
+    }
     let text = fs::read_to_string(meta_path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let field = |key: &str| {
