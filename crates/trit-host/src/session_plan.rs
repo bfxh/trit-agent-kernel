@@ -127,6 +127,14 @@ fn classify(entry: &SessionEntry) -> (SessionAction, u8, String, Option<String>)
             None,
         );
     }
+    if entry.format == SessionFormat::Reasonix {
+        return (
+            SessionAction::Inspect,
+            50,
+            "external session (read-only adapter)".into(),
+            task,
+        );
+    }
     if entry.in_doubt > 0 {
         return (
             SessionAction::Inspect,
@@ -308,5 +316,25 @@ mod tests {
         };
         let plan = plan_sessions(&report);
         assert_eq!(plan.unassigned, vec!["missing-parent".to_owned()]);
+    }
+
+    #[test]
+    fn reasonix_sessions_are_inspected_not_resumed() {
+        let mut chat = entry("chat");
+        chat.format = SessionFormat::Reasonix;
+        chat.tasks = vec![task(1, false)];
+        let report = SessionScanReport {
+            schema: 1,
+            root: ".".into(),
+            scanned: 1,
+            sessions: vec![chat],
+            links: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let plan = plan_sessions(&report);
+        assert_eq!(plan.items[0].action, SessionAction::Inspect);
+        assert_eq!(plan.items[0].priority, 50);
+        assert_eq!(plan.items[0].task.as_deref(), Some("task-1"));
+        assert!(plan.items[0].reason.contains("read-only"));
     }
 }

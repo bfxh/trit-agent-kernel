@@ -94,7 +94,9 @@ pub struct SessionGate {
 pub enum SessionFormat {
     /// 至少有一条可解析的 `TurnStarted`。
     Trit,
-    /// 其他 JSONL（例如前端会话），只保留路径/meta。
+    /// Reasonix 的 `role/content` 消息格式；只读适配，不当内核 turn 续跑。
+    Reasonix,
+    /// 其他 JSONL，只保留路径/meta。
     Unknown,
 }
 
@@ -196,22 +198,71 @@ fn scan_session(path: &Path) -> Result<SessionEntry, AgentError> {
     let text = String::from_utf8_lossy(&bytes);
     let mut records = Vec::new();
     let mut corrupt_lines = 0usize;
+    let mut json_lines = 0usize;
+    let mut reasonix_lines = 0usize;
+    let mut reasonix_tasks = Vec::new();
+    let mut current: Option<SessionTask> = None;
     for line in text.lines() {
-        if line.trim().is_empty() {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        match serde_json::from_str::<SessionRecord>(line) {
-            Ok(record) => records.push(record),
-            Err(_) => corrupt_lines += 1,
+        json_lines += 1;
+        if let Ok(record) = serde_json::from_str::<SessionRecord>(line) {
+            records.push(record);
+            continue;
         }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            corrupt_lines += 1;
+            continue;
+        };
+        let Some(role) = value.get("role").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        reasonix_lines += 1;
+        match role {
+            "user" => {
+                if let Some(task) = current.take() {
+                    reasonix_tasks.push(task);
+                }
+                current = Some(SessionTask {
+                    index: reasonix_tasks.len() + 1,
+                    task: reasonix_task_text(&value),
+                    objective: String::new(),
+                    steps: 0,
+                    complete: false,
+                    finished: false,
+                });
+            }
+            "assistant" | "tool" => {
+                if let Some(task) = current.as_mut() {
+                    task.steps += 1;
+                    if role == "assistant" {
+                        task.complete = true;
+                        task.finished = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(task) = current.take() {
+        reasonix_tasks.push(task);
     }
     let format = if records
         .iter()
         .any(|record| matches!(record.event, SessionEvent::TurnStarted { .. }))
     {
         SessionFormat::Trit
+    } else if reasonix_lines > 0 {
+        SessionFormat::Reasonix
     } else {
         SessionFormat::Unknown
+    };
+    let record_count = match format {
+        SessionFormat::Trit => records.len(),
+        SessionFormat::Reasonix => reasonix_lines,
+        SessionFormat::Unknown => json_lines,
     };
     let meta = read_meta(path);
     let session_id = meta
@@ -229,46 +280,58 @@ fn scan_session(path: &Path) -> Result<SessionEntry, AgentError> {
         .unwrap_or(SessionRole::Primary);
     let project = meta.as_ref().and_then(|meta| meta.project.clone());
 
-    let mut tasks = Vec::new();
-    let mut in_doubt = 0usize;
-    let mut open_turn = false;
-    let mut last_gate = None;
-    for record in &records {
-        match &record.event {
-            SessionEvent::TurnStarted {
-                task, objective, ..
-            } => {
-                tasks.push(SessionTask {
-                    index: tasks.len() + 1,
-                    task: task.clone(),
-                    objective: objective.clone(),
-                    steps: 0,
-                    complete: false,
-                    finished: false,
-                });
-                open_turn = true;
-            }
-            SessionEvent::TurnFinished {
-                steps, complete, ..
-            } => {
-                if let Some(task) = tasks.last_mut() {
-                    task.steps = *steps;
-                    task.complete = *complete;
-                    task.finished = true;
+    let (tasks, open_turn, in_doubt, last_gate) = match format {
+        SessionFormat::Trit => {
+            let mut tasks = Vec::new();
+            let mut in_doubt = 0usize;
+            let mut open_turn = false;
+            let mut last_gate = None;
+            for record in &records {
+                match &record.event {
+                    SessionEvent::TurnStarted {
+                        task, objective, ..
+                    } => {
+                        tasks.push(SessionTask {
+                            index: tasks.len() + 1,
+                            task: task.clone(),
+                            objective: objective.clone(),
+                            steps: 0,
+                            complete: false,
+                            finished: false,
+                        });
+                        open_turn = true;
+                    }
+                    SessionEvent::TurnFinished {
+                        steps, complete, ..
+                    } => {
+                        if let Some(task) = tasks.last_mut() {
+                            task.steps = *steps;
+                            task.complete = *complete;
+                            task.finished = true;
+                        }
+                        open_turn = false;
+                    }
+                    SessionEvent::ToolCompleted { outcome, .. } if outcome.in_doubt => {
+                        in_doubt += 1
+                    }
+                    SessionEvent::GateChain { status, exit, .. } => {
+                        last_gate = Some(SessionGate {
+                            status: status.clone(),
+                            exit: *exit,
+                            passed: *exit == 0 && matches!(status.as_str(), "passed" | "aligned"),
+                        });
+                    }
+                    _ => {}
                 }
-                open_turn = false;
             }
-            SessionEvent::ToolCompleted { outcome, .. } if outcome.in_doubt => in_doubt += 1,
-            SessionEvent::GateChain { status, exit, .. } => {
-                last_gate = Some(SessionGate {
-                    status: status.clone(),
-                    exit: *exit,
-                    passed: *exit == 0 && matches!(status.as_str(), "passed" | "aligned"),
-                });
-            }
-            _ => {}
+            (tasks, open_turn, in_doubt, last_gate)
         }
-    }
+        SessionFormat::Reasonix => {
+            let open_turn = reasonix_tasks.last().is_some_and(|task| !task.finished);
+            (reasonix_tasks, open_turn, 0, None)
+        }
+        SessionFormat::Unknown => (Vec::new(), false, 0, None),
+    };
 
     Ok(SessionEntry {
         path: path.display().to_string(),
@@ -283,13 +346,24 @@ fn scan_session(path: &Path) -> Result<SessionEntry, AgentError> {
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_millis() as u64),
-        records: records.len(),
+        records: record_count,
         corrupt_lines,
         tasks,
         open_turn,
         in_doubt,
         last_gate,
     })
+}
+
+/// 从一条 `role/content` 消息提取任务摘要；只取前 200 个字符。
+fn reasonix_task_text(value: &serde_json::Value) -> String {
+    let text = value
+        .get("raw_content")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("content").and_then(serde_json::Value::as_str))
+        .unwrap_or_default();
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(200).collect()
 }
 
 /// 读取 `<session>.jsonl.meta`；字段缺失或非法时返回 None，不阻断会话扫描。
@@ -481,15 +555,35 @@ mod tests {
     #[test]
     fn unknown_jsonl_is_kept_as_unknown_format() {
         let root = temp("unknown");
-        fs::write(
-            root.join("chat.jsonl"),
-            "{\"role\":\"user\",\"content\":\"hi\"}\n",
-        )
-        .unwrap();
+        fs::write(root.join("chat.jsonl"), "{\"foo\":\"bar\"}\n").unwrap();
         let report = scan_sessions(&root).unwrap();
         assert_eq!(report.sessions.len(), 1);
         assert_eq!(report.sessions[0].format, SessionFormat::Unknown);
-        assert_eq!(report.sessions[0].corrupt_lines, 1);
+        assert_eq!(report.sessions[0].corrupt_lines, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reasonix_role_content_is_adapted_to_tasks() {
+        let root = temp("reasonix");
+        fs::write(
+            root.join("chat.jsonl"),
+            "{\"role\":\"user\",\"content\":\"do the thing\"}\n\
+             {\"role\":\"assistant\",\"content\":\"calling tool\",\"tool_calls\":[]}\n\
+             {\"role\":\"tool\",\"content\":\"ok\"}\n\
+             {\"role\":\"user\",\"content\":\"second task\"}\n",
+        )
+        .unwrap();
+        let report = scan_sessions(&root).unwrap();
+        let entry = &report.sessions[0];
+        assert_eq!(entry.format, SessionFormat::Reasonix);
+        assert_eq!(entry.records, 4);
+        assert_eq!(entry.corrupt_lines, 0);
+        assert_eq!(entry.tasks.len(), 2);
+        assert_eq!(entry.tasks[0].task, "do the thing");
+        assert!(entry.tasks[0].finished);
+        assert_eq!(entry.tasks[1].task, "second task");
+        assert!(entry.open_turn, "last user message has no assistant reply");
         let _ = fs::remove_dir_all(&root);
     }
 }
