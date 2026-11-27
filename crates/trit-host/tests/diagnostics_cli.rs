@@ -138,3 +138,58 @@ fn session_and_projection_summaries_are_optional() {
     );
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn default_report_has_no_live_section() {
+    let dir = temp_dir("no-live");
+    let (code, report) = diagnostics(&dir, &[]);
+    assert_eq!(code, Some(0));
+    assert!(
+        report.get("live").is_none(),
+        "不传 --live-mcp 时报告里不该出现 live 段"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn live_mcp_probe_collects_redacted_stderr() {
+    let dir = temp_dir("live");
+    let workspace = dir.to_str().unwrap();
+    let line = format!("leaked {workspace} token=abcdef123456 Bearer sk-live-abcdef123456");
+    #[cfg(windows)]
+    let (program, script) = (
+        "cmd",
+        format!("echo {line} 1>&2 & ping -n 3 127.0.0.1 >nul"),
+    );
+    #[cfg(not(windows))]
+    let (program, script) = ("sh", format!("echo {line} >&2; sleep 2"));
+
+    let mut extra = vec![
+        "--live-mcp",
+        program,
+        "--live-mcp-arg",
+        if cfg!(windows) { "/C" } else { "-c" },
+        "--live-mcp-arg",
+        script.as_str(),
+        "--live-wait-ms",
+        "400",
+    ];
+    let (code, report) = diagnostics(&dir, &extra);
+    assert_eq!(code, Some(0), "diagnostics 必须成功返回 JSON");
+    let live = &report["live"];
+    assert_eq!(live["launched"], true, "子进程应当被拉起");
+    assert_eq!(live["program"], program);
+    let lines = live["stderr_lines"]
+        .as_array()
+        .expect("stderr_lines 必须是数组");
+    assert!(!lines.is_empty(), "启动阶段的 stderr 应当被采集");
+    let text = lines
+        .iter()
+        .filter_map(|line| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains(workspace), "工作区路径必须脱敏: {text}");
+    assert!(!text.contains("abcdef123456"), "凭据必须脱敏: {text}");
+    assert!(!dir.join(".agent").exists(), "诊断不得创建 .agent 目录");
+    let _ = fs::remove_dir_all(&dir);
+}

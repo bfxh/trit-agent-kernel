@@ -9,9 +9,11 @@
 | Chrome 子进程 | `Browser::launch` spawn | `Browser::drop` kill + wait；启动中途失败由 `LaunchGuard` kill |
 | 临时 user-data-dir | `unique_temp_dir` | `Browser::drop` 删除；启动失败由 `LaunchGuard` 删除 |
 | WebSocket | `WebSocket::connect` | 随 `Browser` drop 关闭 |
-| CDP target | `Target.createTarget` | 每次 `open` 关闭旧 target；进程退出兜底 |
+| CDP target | `Target.createTarget`（每标签一个） | `close_tab` 关闭对应 target；`Browser::drop` 随进程退出兜底 |
 
-边界：单页面、单实例；不等待 `load` 事件；截图路径限制在 workspace 且需要 `allow-write`。
+边界：单实例浏览器、多标签（`open` 新建并切换到新标签，`tabs` 列出，`select` 切换，
+`close_tab` 关闭）；标签数不设上限，由调用方控制。导航等待 `Page.loadEventFired`，
+超时 fail closed。截图路径限制在 workspace 且需要 `allow-write`。
 
 ## 2. HTTP MCP
 
@@ -55,5 +57,5 @@
 
 - `McpToolClient::routes()` 有 5s 缓存与 `invalidate()`；临时分配只发生在缓存过期或失效时。
 - HTTP MCP 工具缓存有 TTL（默认 60s）与 `refresh()`；服务端 `list_changed` 仍不会自动推送，需要重建客户端或调用 refresh。
-- 浏览器单页面；多标签/页面池是后续能力。
+- 浏览器单实例、多标签；没有标签池/预热复用，每个标签独占一个 CDP target。
 - `background` 注册表没有条目上限，但条目随线程结束移除；长期服务应监控 `running()`。

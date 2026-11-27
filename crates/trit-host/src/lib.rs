@@ -1607,8 +1607,9 @@ pub use context_tools::{
     ContextReadRecord, ContextReadTools, LowHitPolicy,
 };
 pub use diagnostics::{
-    DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions,
-    ProjectionDiagnostics, SessionDiagnostics, TOOL_CAPABILITIES, ToolCapability, diagnose,
+    DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions, LiveMcpDiagnostics,
+    LiveMcpProbe, ProjectionDiagnostics, SessionDiagnostics, TOOL_CAPABILITIES, ToolCapability,
+    diagnose, live_mcp_diagnostics, redact_line,
 };
 pub use extensions::{
     CommandRegistry, CommandSpec, HookEvent, HookRegistry, HookSpec, ParsedCommand, SkillIndex,

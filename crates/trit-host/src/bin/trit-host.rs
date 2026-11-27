@@ -2441,23 +2441,55 @@ fn run_settings(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Er
 }
 
 /// `diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]`：
-/// 只读静态诊断。不启动 MCP / gateway / 子进程，也不创建目录或账本。
+/// 只读静态诊断。默认不启动 MCP / gateway / 子进程，也不创建目录或账本；
+/// 显式传 `--live-mcp <program>` 才拉起一个 stdio MCP server 做启动探测。
 fn run_diagnostics(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut workspace = PathBuf::from(".");
     let mut session = None;
     let mut db = None;
+    let mut live_program: Option<String> = None;
+    let mut live_args: Vec<String> = Vec::new();
+    let mut live_wait_ms = 1_500u64;
+    let mut live_max_stderr = 40usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--workspace" => workspace = PathBuf::from(next(&mut args, "--workspace")?),
             "--session" => session = Some(PathBuf::from(next(&mut args, "--session")?)),
             "--db" => db = Some(PathBuf::from(next(&mut args, "--db")?)),
+            "--live-mcp" => live_program = Some(next(&mut args, "--live-mcp")?),
+            "--live-mcp-arg" => live_args.push(next(&mut args, "--live-mcp-arg")?),
+            "--live-wait-ms" => {
+                live_wait_ms = next(&mut args, "--live-wait-ms")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --live-wait-ms: {error}")))?;
+            }
+            "--live-max-stderr" => {
+                live_max_stderr = next(&mut args, "--live-max-stderr")?
+                    .parse()
+                    .map_err(|error| fail(format!("bad --live-max-stderr: {error}")))?;
+            }
             other => return Err(fail(format!("unknown diagnostics argument: {other}"))),
         }
     }
+    if live_program.is_none() && (!live_args.is_empty() || live_wait_ms != 1_500) {
+        return Err(fail(
+            "--live-mcp-arg/--live-wait-ms require --live-mcp <program>".to_owned(),
+        ));
+    }
+    let live = live_program.map(|program| {
+        let mut probe = trit_host::LiveMcpProbe::new(program)
+            .with_wait_millis(live_wait_ms)
+            .with_max_stderr_lines(live_max_stderr);
+        for arg in live_args.drain(..) {
+            probe = probe.with_arg(arg);
+        }
+        probe
+    });
     let report = trit_host::diagnose(&trit_host::DiagnosticsOptions {
         workspace: &workspace,
         session: session.as_deref(),
         projection: db.as_deref(),
+        live: live.as_ref(),
     })?;
     println!(
         "{}",
