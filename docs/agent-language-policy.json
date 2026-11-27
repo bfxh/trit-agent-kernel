@@ -1,0 +1,52 @@
+{
+  "schema": "trit.agent-language-policy/v1",
+  "scope": "所有由智能体或编程模型产出的仓库产物",
+  "principle": "artifact-locale-follows-project-documentation",
+  "rule": "产物语言由项目文档规定；模型自己的语言偏好、厂商标识、训练语料都不是依据",
+  "default_locale": "zh-CN",
+  "allowed_locales": ["zh-CN", "en-US"],
+  "fallback_when_project_silent": "follow-the-language-of-the-current-user-request",
+  "artifacts": {
+    "docs": "zh-CN",
+    "code_comments": "zh-CN",
+    "commit_messages": "zh-CN",
+    "cli_help": "zh-CN",
+    "cli_errors": "zh-CN",
+    "test_assertion_messages": "zh-CN",
+    "ui_copy": "zh-CN",
+    "log_messages": "zh-CN",
+    "agent_notices": "zh-CN"
+  },
+  "never": [
+    "switch-language-because-of-model-preference",
+    "switch-language-because-of-model-vendor",
+    "switch-language-because-of-training-corpus",
+    "translate-identifiers-paths-commands-or-protocol-names",
+    "mix-locales-in-one-artifact-without-quoting-original"
+  ],
+  "untranslated": [
+    "identifiers",
+    "file_paths",
+    "shell_commands",
+    "protocol_names",
+    "code"
+  ],
+  "model_neutrality": {
+    "applies_to": "every current and future model and provider",
+    "model_must_not_bring": [
+      "language-preference",
+      "project-preference",
+      "vendor-specific-output-shape"
+    ],
+    "adding_a_model_requires": [
+      "provider-adapter",
+      "language-policy-acknowledgement",
+      "conformance-test"
+    ]
+  },
+  "enforcement": {
+    "contract_test": "crates/trit-host/tests/agent_policy.rs",
+    "human_doc": "docs/LANGUAGE-POLICY.md",
+    "manifest_binding": "docs/agent-model-manifest.json#language_policy"
+  }
+}
