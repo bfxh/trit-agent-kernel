@@ -83,6 +83,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     if command == "diagnostics" {
         return run_diagnostics(args);
     }
+    if command == "settings" {
+        return run_settings(args);
+    }
     if command == "journal-status" {
         return run_journal_status(args);
     }
@@ -1445,6 +1448,8 @@ fn usage() {
          [--workers N] [--max-concurrency N] [--retry N] [--budget-tokens N] [--scope S] [--health-probe]\n\
          [--cache <path>] [--apply] [--compact]\n\
          dispatches session fleet tasks to remote nodes through NodeTable; dry-run by default.\n\
+         settings: trit-host settings [--root <dir>] [--get KEY] [--set KEY=VALUE] [--compact]\n\
+         reads/writes <root>/.agent/settings.json; keys follow docs/FRONTEND-CONTRACT.md §10.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
          prints a static, read-only capability report (kernel schema versions, built-in\n\
          tool catalog, write-journal reconciliation, optional session/projection summary).\n\
@@ -1595,11 +1600,15 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
         .ok_or_else(|| fail("session-fleet-remote requires --nodes <node-table.json>"))?;
     let text = std::fs::read_to_string(&nodes_path)?;
     let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
-    let cap = concurrency_cap(max_concurrency);
+    let roots = expand_roots(roots);
+    let settings = trit_host::settings::load(&roots[0])?;
+    let cap = concurrency_cap(
+        max_concurrency
+            .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
+    );
     if cap > 0 {
         workers = workers.min(cap);
     }
-    let roots = expand_roots(roots);
     let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
@@ -1695,11 +1704,15 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
             }
         }
     }
-    let cap = concurrency_cap(max_concurrency);
+    let roots = expand_roots(roots);
+    let settings = trit_host::settings::load(&roots[0])?;
+    let cap = concurrency_cap(
+        max_concurrency
+            .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
+    );
     if cap > 0 {
         workers = workers.min(cap);
     }
-    let roots = expand_roots(roots);
     let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
@@ -1980,11 +1993,15 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             }
         }
     }
-    let cap = concurrency_cap(max_concurrency);
+    let roots = expand_roots(roots);
+    let settings = trit_host::settings::load(&roots[0])?;
+    let cap = concurrency_cap(
+        max_concurrency
+            .or((settings.concurrency.max > 0).then_some(settings.concurrency.max as usize)),
+    );
     if cap > 0 {
         workers = workers.min(cap);
     }
-    let roots = expand_roots(roots);
     let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let workspace = workspace.unwrap_or_else(|| roots[0].clone());
@@ -2275,6 +2292,43 @@ fn run_session_index(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
         }))
         .map_err(|error| fail(error.to_string()))?
     );
+    Ok(())
+}
+
+/// `settings [--root <dir>] [--get KEY] [--set KEY=VALUE] [--compact]`：
+/// 读写 `<root>/.agent/settings.json`；键与 `docs/FRONTEND-CONTRACT.md` 第 10 节一致。
+fn run_settings(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let mut root = PathBuf::from(".");
+    let mut get: Option<String> = None;
+    let mut set: Option<String> = None;
+    let mut compact = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--get" => get = Some(next(&mut args, "--get")?),
+            "--set" => set = Some(next(&mut args, "--set")?),
+            "--compact" => compact = true,
+            other => return Err(fail(format!("unknown settings argument: {other}"))),
+        }
+    }
+    let mut settings = trit_host::settings::load(&root)?;
+    if let Some(pair) = set {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| fail("--set requires KEY=VALUE"))?;
+        trit_host::settings::set(&mut settings, key, value).map_err(|error| fail(error))?;
+        trit_host::settings::save(&root, &settings)?;
+    }
+    let output = match get {
+        Some(key) => trit_host::settings::get(&settings, &key).map_err(|error| fail(error))?,
+        None => serde_json::to_value(&settings)?,
+    };
+    let text = if compact {
+        serde_json::to_string(&output)?
+    } else {
+        serde_json::to_string_pretty(&output)?
+    };
+    println!("{text}");
     Ok(())
 }
 

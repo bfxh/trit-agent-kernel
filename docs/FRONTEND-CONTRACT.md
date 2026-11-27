@@ -161,6 +161,8 @@ FeatureGroupSpec { id, members[] }
 
 设置项不是能力门禁的替代：能力决定“入口能不能显示”，设置决定“显示后默认开不开、参数是多少”。设置由前端持久化，内核只接受显式参数或环境变量；内核不读写注册表、不替用户改系统设置。
 
+设置文件：`<root>/.agent/settings.json`，用 `trit-host settings --root <dir> [--get KEY] [--set KEY=VALUE]` 读写；键与本节一致，缺文件用默认值，损坏或 schema 不符 fail closed。
+
 ### 10.1 两项自启动
 
 | id | 类型 | 默认 | 作用 | 生效时机 | 内核行为 |

@@ -1458,6 +1458,7 @@ pub mod session_plan;
 pub mod session_run;
 pub mod session_scan;
 pub mod session_verify;
+pub mod settings;
 pub mod state_layer;
 pub mod subagent_process;
 pub mod supervisor;
