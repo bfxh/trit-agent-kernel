@@ -203,6 +203,8 @@ pub fn run_cli_agent(
 ) -> Result<CliAgentRun, AgentError> {
     let (program, argv, stdin_prompt) = spec.command(prompt);
     let mut command = Command::new(&program);
+    // 外部 CLI 不继承父进程环境：避免把 provider 凭据带出去。
+    crate::child_env::sanitize_with(&mut command, std::iter::empty::<(String, String)>());
     command
         .args(&argv)
         .current_dir(workspace)
@@ -220,8 +222,10 @@ pub fn run_cli_agent(
     if let Some(prompt) = stdin_prompt
         && let Some(mut stdin) = child.stdin.take()
     {
-        let _ = stdin.write_all(prompt.as_bytes());
-        // stdin 在此 drop：子进程读到 EOF。
+        // 大 prompt 不能阻塞主线程：写 stdin 放到独立线程，写完 drop 关闭。
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(prompt.as_bytes());
+        });
     }
 
     let (sender, receiver) = mpsc::channel();
@@ -229,7 +233,7 @@ pub fn run_cli_agent(
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
-            let result = stdout.read_to_end(&mut buffer);
+            let result = stdout.take(MAX_CLI_OUTPUT_BYTES + 1).read_to_end(&mut buffer);
             let _ = sender.send(("out", result, buffer));
         });
     }
@@ -237,7 +241,7 @@ pub fn run_cli_agent(
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
-            let result = stderr.read_to_end(&mut buffer);
+            let result = stderr.take(MAX_CLI_OUTPUT_BYTES + 1).read_to_end(&mut buffer);
             let _ = sender.send(("err", result, buffer));
         });
     }
@@ -291,12 +295,17 @@ pub fn run_cli_agent(
     let (content, dissent) = parse_cli_output(&text);
     // 子智能体不得自行引入新技术栈：默认允许集合为空，越权即失败。
     if let Some(stack) = parse_stack_block(&text) {
-        trit_orch::validate_stack(&stack.added, &[])
+        trit_orch::validate_stack(&stack, &trit_orch::StackPolicy::default())
             .map_err(|error| AgentError::Provider(error.to_string()))?;
     }
     let stderr_text = String::from_utf8_lossy(&stderr);
     let stderr_tail: String = {
-        let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
+        let mut tail: Vec<String> = stderr_text
+            .lines()
+            .rev()
+            .take(20)
+            .map(|line| crate::diagnostics::redact_line(line, workspace))
+            .collect();
         tail.reverse();
         tail.join("\n")
     };

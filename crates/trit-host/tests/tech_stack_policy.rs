@@ -111,15 +111,45 @@ fn human_doc_states_the_rule_and_separates_languages() {
 }
 
 #[test]
-fn subagent_stack_validation_rejects_unauthorized_additions() {
-    // 默认允许集合为空：任何新增都算越权。
-    let error = trit_orch::validate_stack(&["python".to_owned()], &[]).unwrap_err();
+fn subagent_stack_validation_rejects_unauthorized_usage() {
+    let empty = trit_orch::StackPolicy::default();
+    // 用了项目里不存在、也未授权的技术：拒绝（防"用新语言但不报新增"）。
+    let used_unknown = trit_orch::StackReport {
+        used: vec!["python".to_owned()],
+        added: Vec::new(),
+    };
+    let error = trit_orch::validate_stack(&used_unknown, &empty).unwrap_err();
+    assert!(
+        error.to_string().contains("outside the project stack"),
+        "{error}"
+    );
+
+    // 项目现有栈内：通过。
+    let rust_project = trit_orch::StackPolicy {
+        existing: vec!["rust".to_owned()],
+        allowed_additions: Vec::new(),
+    };
+    let used_rust = trit_orch::StackReport {
+        used: vec!["rust".to_owned()],
+        added: Vec::new(),
+    };
+    trit_orch::validate_stack(&used_rust, &rust_project).unwrap();
+
+    // 新增未授权：拒绝。
+    let added_python = trit_orch::StackReport {
+        used: vec!["rust".to_owned()],
+        added: vec!["python".to_owned()],
+    };
+    let error = trit_orch::validate_stack(&added_python, &rust_project).unwrap_err();
     assert!(
         error.to_string().contains("without authorization"),
         "{error}"
     );
+
     // 显式授权后才放行。
-    trit_orch::validate_stack(&["python".to_owned()], &["python".to_owned()]).unwrap();
-    // 没有新增时永远通过。
-    trit_orch::validate_stack(&[], &[]).unwrap();
+    let authorized = trit_orch::StackPolicy {
+        existing: vec!["rust".to_owned()],
+        allowed_additions: vec!["python".to_owned()],
+    };
+    trit_orch::validate_stack(&added_python, &authorized).unwrap();
 }

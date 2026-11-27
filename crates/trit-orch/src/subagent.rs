@@ -87,11 +87,21 @@ pub struct StackReport {
 /// 校验子智能体自报的技术栈：`added` 必须是授权集合的子集。
 ///
 /// 用于帧协议子智能体与外部 CLI 子智能体；越权新增直接判协议违约。
-pub fn validate_stack(added: &[String], allowed_additions: &[String]) -> Result<(), Error> {
-    for item in added {
-        if !allowed_additions.iter().any(|allowed| allowed == item) {
+pub fn validate_stack(report: &StackReport, policy: &StackPolicy) -> Result<(), Error> {
+    // 用到的技术必须落在项目现有栈或显式授权里：否则就是"用新语言但不报新增"的绕过。
+    for used in &report.used {
+        let allowed = policy.existing.iter().any(|item| item == used)
+            || policy.allowed_additions.iter().any(|item| item == used);
+        if !allowed {
             return Err(Error::SubagentProtocol {
-                message: format!("subagent added tech {item} without authorization"),
+                message: format!("subagent used tech {used} outside the project stack"),
+            });
+        }
+    }
+    for added in &report.added {
+        if !policy.allowed_additions.iter().any(|item| item == added) {
+            return Err(Error::SubagentProtocol {
+                message: format!("subagent added tech {added} without authorization"),
             });
         }
     }
