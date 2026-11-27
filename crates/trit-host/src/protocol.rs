@@ -25,13 +25,16 @@ pub const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 4_096;
 pub enum Protocol {
     #[default]
     OpenAiChat,
+    /// DeepSeek：OpenAI Chat 兼容的传输，独立的默认端点与凭据变量。
+    DeepSeekChat,
     AnthropicMessages,
     GeminiGenerateContent,
 }
 
 impl Protocol {
-    pub const ALL: [Protocol; 3] = [
+    pub const ALL: [Protocol; 4] = [
         Protocol::OpenAiChat,
+        Protocol::DeepSeekChat,
         Protocol::AnthropicMessages,
         Protocol::GeminiGenerateContent,
     ];
@@ -41,6 +44,7 @@ impl Protocol {
         let normalized = name.trim().to_ascii_lowercase().replace('_', "-");
         match normalized.as_str() {
             "" | "openai" | "openai-chat" | "chat-completions" => Ok(Self::OpenAiChat),
+            "deepseek" | "deepseek-chat" | "deepseek-reasoner" => Ok(Self::DeepSeekChat),
             "anthropic" | "anthropic-messages" | "claude" => Ok(Self::AnthropicMessages),
             "gemini" | "google" | "gemini-generate-content" | "generate-content" => {
                 Ok(Self::GeminiGenerateContent)
@@ -54,6 +58,7 @@ impl Protocol {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenAiChat => "openai-chat",
+            Self::DeepSeekChat => "deepseek-chat",
             Self::AnthropicMessages => "anthropic-messages",
             Self::GeminiGenerateContent => "gemini-generate-content",
         }
@@ -62,7 +67,9 @@ impl Protocol {
     /// 未显式指定协议时按 base_url 推断；未知主机保留 OpenAI Chat（兼容自建网关）。
     pub fn from_base_url(base_url: &str) -> Self {
         let lower = base_url.to_ascii_lowercase();
-        if lower.contains("anthropic") {
+        if lower.contains("deepseek") {
+            Self::DeepSeekChat
+        } else if lower.contains("anthropic") {
             Self::AnthropicMessages
         } else if lower.contains("generativelanguage.googleapis.com") {
             Self::GeminiGenerateContent
@@ -75,6 +82,7 @@ impl Protocol {
     pub fn api_key_env(&self) -> &'static str {
         match self {
             Self::OpenAiChat => "OPENAI_API_KEY",
+            Self::DeepSeekChat => "DEEPSEEK_API_KEY",
             Self::AnthropicMessages => "ANTHROPIC_API_KEY",
             Self::GeminiGenerateContent => "GEMINI_API_KEY",
         }
@@ -83,7 +91,7 @@ impl Protocol {
     pub fn endpoint(&self, base_url: &str, model: &str, stream: bool) -> String {
         let base = base_url.trim_end_matches('/');
         match self {
-            Self::OpenAiChat => join(base, "chat/completions"),
+            Self::OpenAiChat | Self::DeepSeekChat => join(base, "chat/completions"),
             Self::AnthropicMessages => join_versioned(base, "v1/messages"),
             Self::GeminiGenerateContent => format!(
                 "{}/v1beta/models/{}:{}",
@@ -100,7 +108,9 @@ impl Protocol {
 
     pub fn headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
         match self {
-            Self::OpenAiChat => vec![("Authorization", format!("Bearer {api_key}"))],
+            Self::OpenAiChat | Self::DeepSeekChat => {
+                vec![("Authorization", format!("Bearer {api_key}"))]
+            }
             Self::AnthropicMessages => vec![
                 ("x-api-key", api_key.to_owned()),
                 ("anthropic-version", ANTHROPIC_VERSION.to_owned()),
@@ -113,7 +123,7 @@ impl Protocol {
     pub fn build_body(&self, config: &OpenAiConfig, request: &ProviderRequest) -> Value {
         let base = openai::build_request_body(config, request);
         match self {
-            Self::OpenAiChat => base,
+            Self::OpenAiChat | Self::DeepSeekChat => base,
             Self::AnthropicMessages => anthropic_body(&base, config, request),
             Self::GeminiGenerateContent => gemini_body(&base, config, request),
         }
@@ -125,7 +135,7 @@ impl Protocol {
         tools: &[ToolSpec],
     ) -> Result<ProviderResponse, AgentError> {
         match self {
-            Self::OpenAiChat => openai::parse_response(body, tools),
+            Self::OpenAiChat | Self::DeepSeekChat => openai::parse_response(body, tools),
             Self::AnthropicMessages => anthropic_parse(body, tools),
             Self::GeminiGenerateContent => gemini_parse(body, tools),
         }
@@ -134,7 +144,7 @@ impl Protocol {
     /// 流式解码器；三种协议的 SSE 事件形状不同，统一产出 `ProviderStreamEvent`。
     pub fn stream_decoder(&self) -> Box<dyn ProtocolStream> {
         match self {
-            Self::OpenAiChat => Box::new(OpenAiProtocolStream::default()),
+            Self::OpenAiChat | Self::DeepSeekChat => Box::new(OpenAiProtocolStream::default()),
             Self::AnthropicMessages => Box::new(AnthropicProtocolStream::default()),
             Self::GeminiGenerateContent => Box::new(GeminiProtocolStream::default()),
         }

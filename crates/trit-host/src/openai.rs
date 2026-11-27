@@ -110,6 +110,12 @@ impl OpenAiConfig {
                 "OPENAI_MODEL",
                 "https://api.openai.com/v1",
             ),
+            Protocol::DeepSeekChat => (
+                "DEEPSEEK_BASE_URL",
+                "DEEPSEEK_API_KEY",
+                "DEEPSEEK_MODEL",
+                "https://api.deepseek.com",
+            ),
             Protocol::AnthropicMessages => (
                 "ANTHROPIC_BASE_URL",
                 "ANTHROPIC_API_KEY",

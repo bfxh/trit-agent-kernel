@@ -105,6 +105,15 @@ fn endpoint_and_headers_per_protocol() {
     assert!(!headers.iter().any(|(name, _)| *name == "Authorization"));
 
     assert_eq!(
+        Protocol::DeepSeekChat.endpoint("https://api.deepseek.com", "deepseek-chat", false),
+        "https://api.deepseek.com/chat/completions"
+    );
+    let headers = Protocol::DeepSeekChat.headers("d-key");
+    assert_eq!(headers[0].0, "Authorization");
+    assert!(headers[0].1.contains("d-key"));
+    assert_eq!(Protocol::DeepSeekChat.api_key_env(), "DEEPSEEK_API_KEY");
+
+    assert_eq!(
         Protocol::GeminiGenerateContent.endpoint(
             "https://generativelanguage.googleapis.com",
             "gemini-x",
@@ -151,7 +160,12 @@ fn protocol_names_parse_and_unknown_fails_closed() {
     let message = error.to_string();
     assert!(message.contains("unknown protocol"), "{message}");
     assert!(message.contains("anthropic-messages"), "{message}");
-    assert_eq!(Protocol::ALL.len(), 3);
+    assert_eq!(Protocol::parse("deepseek").unwrap(), Protocol::DeepSeekChat);
+    assert_eq!(
+        Protocol::parse("deepseek-chat").unwrap(),
+        Protocol::DeepSeekChat
+    );
+    assert_eq!(Protocol::ALL.len(), 4);
 }
 
 #[test]

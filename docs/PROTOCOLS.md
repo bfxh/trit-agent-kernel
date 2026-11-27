@@ -8,24 +8,26 @@
 | `--protocol` | `--provider` | 端点 | 认证头 |
 | --- | --- | --- | --- |
 | `openai-chat`（默认） | `openai` | `{base}/chat/completions` | `Authorization: Bearer <key>` |
+| `deepseek-chat` | `deepseek` | `{base}/chat/completions`（默认 `https://api.deepseek.com`） | `Authorization: Bearer <key>` |
 | `anthropic-messages` | `anthropic` | `{base}/v1/messages`（base 带 `/v1` 不重复） | `x-api-key: <key>` + `anthropic-version: 2023-06-01` |
 | `gemini-generate-content` | `gemini` | `{base}/v1beta/models/{model}:generateContent`（流式 `:streamGenerateContent?alt=sse`） | `x-goog-api-key: <key>` |
 
-别名：`openai`、`chat-completions`；`anthropic`、`claude`；`gemini`、`google`、`generate-content`。
+别名：`openai`、`chat-completions`；`deepseek`、`deepseek-chat`、`deepseek-reasoner`；
+`anthropic`、`claude`；`gemini`、`google`、`generate-content`。
 
 ## 2. 环境变量
 
 通用变量优先，其次才是厂商前缀：
 
-| 用途 | 通用 | OpenAI | Anthropic | Gemini |
-| --- | --- | --- | --- | --- |
-| API key | `TRIT_API_KEY` | `OPENAI_API_KEY` | `ANTHROPIC_API_KEY` | `GEMINI_API_KEY` |
-| 模型 | `TRIT_MODEL` | `OPENAI_MODEL` | `ANTHROPIC_MODEL` | `GEMINI_MODEL` |
-| 端点 | `TRIT_BASE_URL` | `OPENAI_BASE_URL` | `ANTHROPIC_BASE_URL` | `GEMINI_BASE_URL` |
+| 用途 | 通用 | OpenAI | DeepSeek | Anthropic | Gemini |
+| --- | --- | --- | --- | --- | --- |
+| API key | `TRIT_API_KEY` | `OPENAI_API_KEY` | `DEEPSEEK_API_KEY` | `ANTHROPIC_API_KEY` | `GEMINI_API_KEY` |
+| 模型 | `TRIT_MODEL` | `OPENAI_MODEL` | `DEEPSEEK_MODEL` | `ANTHROPIC_MODEL` | `GEMINI_MODEL` |
+| 端点 | `TRIT_BASE_URL` | `OPENAI_BASE_URL` | `DEEPSEEK_BASE_URL` | `ANTHROPIC_BASE_URL` | `GEMINI_BASE_URL` |
 
 - `TRIT_PROTOCOL` 可强制协议（优先级高于 `--provider` 推断与 base_url 推断）。
-- 没显式指定协议时按 base_url 主机推断：含 `anthropic` → Anthropic Messages；含
-  `generativelanguage.googleapis.com` → Gemini；其他（含自建网关）→ OpenAI Chat。
+- 没显式指定协议时按 base_url 主机推断：含 `deepseek` → DeepSeek Chat；含 `anthropic` →
+  Anthropic Messages；含 `generativelanguage.googleapis.com` → Gemini；其他（含自建网关）→ OpenAI Chat。
 - 缺 key 或 model 一律 fail closed，报错里点明该配哪个变量，**不会**回落到别家凭据。
 
 ## 3. 用法
@@ -41,6 +43,10 @@ ANTHROPIC_API_KEY=... ANTHROPIC_MODEL=claude-sonnet-4-5 \
 # Gemini
 GEMINI_API_KEY=... GEMINI_MODEL=gemini-2.5-pro \
   trit-host run --task "fix the bug" --workspace . --provider gemini
+
+# DeepSeek（默认端点 https://api.deepseek.com，OpenAI 兼容）
+DEEPSEEK_API_KEY=... DEEPSEEK_MODEL=deepseek-chat \
+  trit-host run --task "fix the bug" --workspace . --provider deepseek
 
 # 自建 OpenAI 兼容网关；显式固定协议
 TRIT_API_KEY=... TRIT_MODEL=my-model TRIT_BASE_URL=https://gw.internal/v1 \
@@ -86,6 +92,8 @@ usage 映射口径：
 
 ## 6. 边界
 
+- DeepSeek 走 OpenAI Chat 兼容形状：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+  已按 DeepSeek 字段名识别；`deepseek-reasoner` 的 `reasoning_content` 目前不进上下文。
 - Gemini 的 function call 没有 id，适配层生成 `gemini-call-<n>`；会话与回执按该 id 对齐。
 - Gemini 的 JSON Schema 子集比 OpenAI 窄：动态工具若用到 `additionalProperties` 等关键字，
   需要在上游 schema 里先降级，否则可能被服务端拒绝。

@@ -24,6 +24,9 @@ fn run(workspace: &PathBuf, args: &[&str]) -> (bool, String, String) {
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_MODEL")
         .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("DEEPSEEK_API_KEY")
+        .env_remove("DEEPSEEK_MODEL")
+        .env_remove("DEEPSEEK_BASE_URL")
         .env_remove("GEMINI_API_KEY")
         .env_remove("GEMINI_MODEL")
         .env_remove("GEMINI_BASE_URL")
@@ -135,5 +138,29 @@ fn gemini_provider_names_the_missing_key() {
     );
     assert!(!ok, "缺 key 必须 fail closed");
     assert!(stderr.contains("GEMINI_API_KEY"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn deepseek_provider_names_the_missing_key() {
+    let workspace = temp_workspace("deepseek-key");
+    let (ok, _stdout, stderr) = run(
+        &workspace,
+        &[
+            "run",
+            "--task",
+            "t",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--provider",
+            "deepseek",
+        ],
+    );
+    assert!(!ok, "缺 key 必须 fail closed");
+    assert!(stderr.contains("DEEPSEEK_API_KEY"), "{stderr}");
+    assert!(
+        !stderr.contains("OPENAI_API_KEY"),
+        "不能悄悄回落到别家凭据: {stderr}"
+    );
     let _ = std::fs::remove_dir_all(&workspace);
 }

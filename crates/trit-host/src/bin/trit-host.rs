@@ -410,6 +410,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         None => match provider.as_str() {
             "anthropic" => Protocol::AnthropicMessages,
             "gemini" => Protocol::GeminiGenerateContent,
+            "deepseek" => Protocol::DeepSeekChat,
             _ => Protocol::OpenAiChat,
         },
     };
@@ -632,7 +633,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .map_err(|error| fail(format!("parse script: {error}")))?,
             )
         }
-        "openai" | "anthropic" | "gemini" => {
+        "openai" | "anthropic" | "gemini" | "deepseek" => {
             if script.is_some() {
                 return Err(fail(format!(
                     "--script is not used with --provider {provider}"
@@ -1346,7 +1347,7 @@ fn usage() {
          [--alignment-changed <path>] [--alignment-changed-set] \\\n    \
          [--alignment-no-git-changed] [--gate-chain-post] \\\n    \
          [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
-         [--provider scripted|openai|anthropic|gemini] [--protocol <name>] [--script <proposals.json>] \\\n    \
+         [--provider scripted|openai|anthropic|gemini|deepseek] [--protocol <name>] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
@@ -1376,6 +1377,8 @@ fn usage() {
          (optionally ANTHROPIC_BASE_URL).\n\
          gemini:   Gemini generateContent; set GEMINI_API_KEY / GEMINI_MODEL\n\
          (optionally GEMINI_BASE_URL).\n\
+         deepseek: DeepSeek OpenAI-compatible API; set DEEPSEEK_API_KEY / DEEPSEEK_MODEL\n\
+         (optionally DEEPSEEK_BASE_URL).\n\
          --protocol overrides the protocol otherwise inferred from --provider;\n\
          TRIT_PROTOCOL / TRIT_API_KEY / TRIT_MODEL / TRIT_BASE_URL work for any protocol.\n\
          Writes are disabled unless --allow-write; links are rejected unless --allow-hardlinks.\n\
@@ -3587,6 +3590,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
         && provider != "openai"
         && provider != "anthropic"
         && provider != "gemini"
+        && provider != "deepseek"
     {
         return Err(fail(format!("plan-exec: bad --provider {provider}")));
     }
@@ -3600,6 +3604,7 @@ fn run_plan_exec(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn E
         None => match provider.as_str() {
             "anthropic" => Protocol::AnthropicMessages,
             "gemini" => Protocol::GeminiGenerateContent,
+            "deepseek" => Protocol::DeepSeekChat,
             _ => Protocol::OpenAiChat,
         },
     };
