@@ -1,0 +1,54 @@
+name: bench-nightly
+
+# 基准只在这里跑数据：CI 的 bench-compile 负责"能编译"，这里负责"跑出来的数字"。
+# 基准全是 harness = false 的自研计时器，每个用例输出一行 JSON，便于跨天对比。
+on:
+  schedule:
+    # UTC 18:10 = 北京 02:10，避开整点调度高峰。
+    - cron: '10 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  run:
+    name: run all benches
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: run benches
+        run: |
+          set -euo pipefail
+          mkdir -p bench-results
+          for crate in trit-core trit-host; do
+            echo "::group::bench $crate"
+            cargo bench -p "$crate" --locked 2>&1 | tee "bench-results/$crate.log"
+            echo "::endgroup::"
+          done
+          # 只保留数据行（JSON）与结尾标记，日志体积可控。
+          for crate in trit-core trit-host; do
+            grep -E '^\{' "bench-results/$crate.log" > "bench-results/$crate.jsonl" || true
+          done
+      - name: summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## bench results"
+            for crate in trit-core trit-host; do
+              echo "### $crate"
+              echo '```json'
+              cat "bench-results/$crate.jsonl" 2>/dev/null || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results/
+          retention-days: 30

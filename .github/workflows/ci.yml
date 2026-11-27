@@ -91,3 +91,14 @@ jobs:
             cargo test --locked -p trit-host --test supervisor_cli -- --test-threads=1
             echo "::endgroup::"
           done
+
+  # 基准不进回归，但必须保证它们能编译：bench 文件腐烂（API 改名、字段增删）
+  # 不会让 test 失败，只会在有人真正跑基准时才发现。数据本身由 bench-nightly 跑。
+  bench-compile:
+    name: bench compile gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo bench --workspace --no-run --locked
