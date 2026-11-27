@@ -42,6 +42,8 @@ use windows_sys::Win32::System::Threading::{
 
 /// 本 workspace 记录过的 profile 清单（相对路径）。
 const PROFILE_LIST: &str = ".agent/appcontainer-profiles";
+/// profile 清单读取上限；清单只承载 profile 名与时间戳。
+const MAX_PROFILE_LIST_BYTES: u64 = 1024 * 1024;
 /// profile 的默认 TTL（秒）：超过后下次运行自动回收。
 const PROFILE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -134,6 +136,9 @@ fn unix_now() -> u64 {
 /// profile 清单格式：`<name>\t<unix_secs>`，一行一个；旧版无时间戳的行按“刚用过”处理。
 fn read_profiles(workspace: &Path) -> Result<Vec<(String, u64)>, String> {
     let path = workspace.join(PROFILE_LIST);
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_PROFILE_LIST_BYTES) {
+        return Err(format!("profile list too large: {}", path.display()));
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

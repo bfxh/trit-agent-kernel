@@ -26,6 +26,8 @@ use crate::{ToolOutcome, ToolRequest};
 pub const JOURNAL_SCHEMA: u32 = 1;
 /// 账本相对 root 的路径。
 pub const JOURNAL_PATH: &str = ".agent/write-journal.jsonl";
+/// journal 读取上限；超过时 fail closed，避免回滚时把巨型文件读进内存。
+const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 /// 单条记录里保留的工具输出上限（字符）；账本不复制完整日志。
 const MAX_OUTPUT: usize = 512;
 
@@ -665,6 +667,14 @@ fn read_records(path: &Path) -> Result<Vec<JournalRecord>, JournalError> {
             )));
         }
     };
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() > MAX_JOURNAL_BYTES
+    {
+        return Err(JournalError::Io(format!(
+            "read {}: file too large",
+            path.display()
+        )));
+    }
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|error| JournalError::Io(format!("read {}: {error}", path.display())))?;

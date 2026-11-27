@@ -166,6 +166,7 @@ fn execute_once(
     options: &FleetRunOptions,
     cancel: CancelToken,
 ) -> Result<FleetRunOutcome, AgentError> {
+    reject_symlink(session_dir).map_err(AgentError::SessionState)?;
     let plan = build_plan(report)?;
     let provider = OpenAiProvider::new(config);
     let fallback_workspace = workspace.to_path_buf();

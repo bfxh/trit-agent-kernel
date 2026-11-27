@@ -524,20 +524,6 @@ fn handle(
             }
         }
         "/claim" => {
-            if let Some(budget) = config.token_budget {
-                let used = match state.lock() {
-                    Ok(state) => state.tokens_used,
-                    Err(_) => return respond(&mut stream, 503, "Service Unavailable", b""),
-                };
-                if used >= budget {
-                    return respond(
-                        &mut stream,
-                        503,
-                        "Service Unavailable",
-                        b"token budget exhausted",
-                    );
-                }
-            }
             let server = LedgerServerView { state, config };
             match server.claim(&key) {
                 Ok(Claim::New { lease }) => respond_with_lease(&mut stream, 200, "OK", b"", &lease),
@@ -640,6 +626,11 @@ impl LedgerServerView<'_> {
     fn claim(&self, key: &str) -> Result<Claim, ()> {
         let now = Instant::now();
         let mut state = self.state.lock().map_err(|_| ())?;
+        if let Some(budget) = self.config.token_budget
+            && state.tokens_used >= budget
+        {
+            return Err(());
+        }
         if let Some(entry) = state.entries.get_mut(key) {
             match entry {
                 Entry::Done { frame, .. } => return Ok(Claim::Done(frame.clone())),

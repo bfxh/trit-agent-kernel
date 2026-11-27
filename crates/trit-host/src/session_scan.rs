@@ -152,7 +152,8 @@ fn scan_sessions_inner(
     cache_path: Option<&Path>,
 ) -> Result<SessionScanReport, AgentError> {
     let mut files = Vec::new();
-    collect_session_files(root, 0, &mut files)?;
+    let mut warnings = Vec::new();
+    collect_session_files(root, 0, &mut files, &mut warnings)?;
     files.sort();
 
     let cache = cache_path
@@ -164,13 +165,13 @@ fn scan_sessions_inner(
             fs::read_to_string(path).ok()
         })
         .and_then(|text| serde_json::from_str::<ScanCache>(&text).ok())
+        .filter(|cache| cache.schema == SESSION_SCAN_SCHEMA)
         .unwrap_or_default();
     let mut next = ScanCache {
         schema: SESSION_SCAN_SCHEMA,
         files: BTreeMap::new(),
     };
     let mut sessions = Vec::new();
-    let mut warnings = Vec::new();
     let mut dirty = false;
     for path in &files {
         let key = path.display().to_string();
@@ -232,12 +233,21 @@ fn collect_session_files(
     dir: &Path,
     depth: usize,
     out: &mut Vec<PathBuf>,
+    warnings: &mut Vec<String>,
 ) -> Result<(), AgentError> {
     if depth > MAX_DEPTH {
         return Ok(());
     }
-    let entries = fs::read_dir(dir)
-        .map_err(|error| AgentError::Io(format!("scan {}: {error}", dir.display())))?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if depth > 0 => {
+            warnings.push(format!("scan {}: {error}", dir.display()));
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(AgentError::Io(format!("scan {}: {error}", dir.display())));
+        }
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let metadata = match fs::symlink_metadata(&path) {
@@ -259,7 +269,9 @@ fn collect_session_files(
             {
                 continue;
             }
-            collect_session_files(&path, depth + 1, out)?;
+            if let Err(error) = collect_session_files(&path, depth + 1, out, warnings) {
+                warnings.push(format!("scan {}: {error}", path.display()));
+            }
         } else if is_session_file(&path) {
             out.push(path);
         }
