@@ -1395,13 +1395,14 @@ fn usage() {
          session-scan: trit-host session-scan --root <dir> [--cache <path>] [--compact]\n\
          scans session JSONL files under a directory and prints tasks, links and\n\
          per-session health (open turns, corrupt lines, in-doubt tools, last gate).\n\
-         session-plan: trit-host session-plan --root <dir> [--compact]\n\
+         session-plan: trit-host session-plan --root <dir> [--cache <path>] [--compact]\n\
          scans sessions and prints a deterministic resume/inspect/idle plan with\n\
          links and unassigned parent ids.\n\
          session-dispatch: trit-host session-dispatch --root <dir> [--apply] [--compact]\n\
          dispatches resume items into new trit session files; dry-run by default,\n\
          --apply writes one TurnStarted per item and never overwrites targets.\n\
-         session-auto: trit-host session-auto --root <dir> [--max-items N] [--apply] [--compact]\n\
+         session-auto: trit-host session-auto --root <dir> [--max-items N] [--cache <path>]\n\
+         [--apply] [--compact]\n\
          scans, plans and dispatches only Resume items (default 4, 0 = unlimited);\n\
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-callback: trit-host session-callback --root <dir> [--apply] [--compact]\n\
@@ -1415,11 +1416,11 @@ fn usage() {
          re-scans children and compares them with delegations.jsonl; reports ok, stale,\n\
          mismatch, missing child or missing delegation without writing anything.\n\
          session-fleet: trit-host session-fleet --root <dir> [--workers N] [--budget-tokens N]\n\
-         [--compact]\n\
+         [--cache <path>] [--compact]\n\
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
          session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
-         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N]\n\
+         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N] [--cache <path>]\n\
          [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
@@ -1523,6 +1524,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let mut max_steps = 20usize;
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
+    let mut cache: Option<PathBuf> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
@@ -1549,6 +1551,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
             }
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => {
@@ -1556,7 +1559,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
             }
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
@@ -1627,6 +1630,7 @@ fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
     let mut root = PathBuf::from(".");
     let mut workers = 4usize;
     let mut budget_tokens = 0u64;
+    let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1641,11 +1645,12 @@ fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
             }
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-fleet argument: {other}"))),
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
@@ -1752,6 +1757,7 @@ fn run_session_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
     let mut max_items = 4usize;
+    let mut cache: Option<PathBuf> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
@@ -1763,11 +1769,12 @@ fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
                     .map_err(|_| fail("--max-items must be a non-negative integer"))?;
             }
             "--apply" => apply = true,
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-auto argument: {other}"))),
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let report = trit_host::auto_dispatch(
         &scanned,
@@ -1849,17 +1856,29 @@ fn run_session_dispatch(mut args: impl Iterator<Item = String>) -> Result<(), Bo
 }
 
 /// `session-plan --root <dir> [--compact]`：扫描会话并生成确定性的任务分配。
+fn scan_for(
+    root: &Path,
+    cache: Option<&Path>,
+) -> Result<trit_host::SessionScanReport, Box<dyn Error>> {
+    match cache {
+        Some(path) => Ok(trit_host::scan_sessions_cached(root, path)?),
+        None => Ok(trit_host::scan_sessions(root)?),
+    }
+}
+
 fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
+    let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-plan argument: {other}"))),
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let scanned = scan_for(&root, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let text = if compact {
         serde_json::to_string(&plan)
