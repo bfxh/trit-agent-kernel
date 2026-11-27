@@ -50,6 +50,8 @@ fn default_timeout_secs() -> u64 {
 
 pub struct HttpMcpClient {
     spec: HttpMcpSpec,
+    /// 复用连接池；不要每次请求新建 Agent。
+    agent: ureq::Agent,
     next_id: AtomicU64,
     initialized: AtomicBool,
     tools: Mutex<Option<Vec<McpTool>>>,
@@ -57,8 +59,12 @@ pub struct HttpMcpClient {
 
 impl HttpMcpClient {
     pub fn new(spec: HttpMcpSpec) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(spec.timeout_secs.max(1)))
+            .build();
         Self {
             spec,
+            agent,
             next_id: AtomicU64::new(0),
             initialized: AtomicBool::new(false),
             tools: Mutex::new(None),
@@ -139,10 +145,8 @@ impl HttpMcpClient {
     fn rpc(&self, method: &str, params: Value) -> Result<Value, AgentError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(self.spec.timeout_secs.max(1)))
-            .build();
-        let mut request = agent
+        let mut request = self
+            .agent
             .post(self.spec.url.trim())
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream");

@@ -83,16 +83,20 @@ impl Browser {
         let child = command
             .spawn()
             .map_err(|error| AgentError::Io(format!("spawn {}: {error}", chrome.display())))?;
-
+        // 启动中途失败时 kill 子进程并删临时目录；Child 的 Drop 不会 kill。
+        let mut guard = LaunchGuard {
+            child: Some(child),
+            dir: Some(user_data_dir.clone()),
+        };
         let (port, ws_path) = read_devtools_port(&user_data_dir, config.timeout)?;
         let socket = WebSocket::connect("127.0.0.1", port, &ws_path)?;
         Ok(Self {
-            child: Some(child),
+            child: guard.child.take(),
             socket,
             session_id: None,
             target_id: None,
             next_id: 0,
-            user_data_dir: Some(user_data_dir),
+            user_data_dir: guard.dir.take(),
         })
     }
 
@@ -199,6 +203,24 @@ impl Drop for Browser {
             let _ = child.wait();
         }
         if let Some(dir) = self.user_data_dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// 启动中途失败的清理器：kill Chrome 并删除临时 user-data-dir。
+struct LaunchGuard {
+    child: Option<Child>,
+    dir: Option<PathBuf>,
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(dir) = self.dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
