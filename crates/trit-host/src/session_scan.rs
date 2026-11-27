@@ -161,6 +161,7 @@ fn scan_sessions_inner(
     };
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
+    let mut dirty = false;
     for path in &files {
         let key = path.display().to_string();
         let metadata = fs::metadata(path).ok();
@@ -180,6 +181,7 @@ fn scan_sessions_inner(
         }
         match scan_session(path) {
             Ok(entry) => {
+                dirty = true;
                 next.files.insert(
                     key,
                     CachedEntry {
@@ -190,10 +192,17 @@ fn scan_sessions_inner(
                 );
                 sessions.push(entry);
             }
-            Err(error) => warnings.push(format!("{}: {error}", path.display())),
+            Err(error) => {
+                dirty = true;
+                warnings.push(format!("{}: {error}", path.display()));
+            }
         }
     }
+    if cache.files.len() != next.files.len() {
+        dirty = true;
+    }
     if let Some(path) = cache_path
+        && dirty
         && let Ok(text) = serde_json::to_string(&next)
     {
         let _ = fs::write(path, text);

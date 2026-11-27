@@ -1601,10 +1601,12 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let scanned = trit_host::scan_sessions(&root)?;
     let callbacks =
         trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: false })?;
+    let verification = trit_host::verify_callbacks(&scanned)?;
     let failed = outcome.failed.is_some();
     let report = serde_json::json!({
         "fleet": outcome,
         "callbacks": callbacks,
+        "verification": verification,
     });
     let text = if compact {
         serde_json::to_string(&report)
