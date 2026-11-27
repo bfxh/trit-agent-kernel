@@ -21,6 +21,7 @@ use crate::cost::{self, BudgetAlert, CostEstimate, PriceTable};
 
 use crate::openai::{OpenAiConfig, OpenAiProvider};
 use crate::provider::{ProviderModel, default_tools};
+use crate::session::{SessionEvent, SessionRecord};
 use crate::session_fleet::SessionFleetReport;
 use crate::tools::WorkspaceConfig;
 use crate::{AgentError, ContextPolicy, HeadlessConfig, run_headless, turn_spec_from_task};
@@ -168,6 +169,42 @@ pub fn execute_fleet(
         }
     }
     Ok(outcome)
+}
+
+/// 续跑：跳过上次已经完成（session 文件最后一条 `TurnFinished.complete=true`）的任务。
+///
+/// 只读检查文件，不创建或追加任何 session；读不到/解析失败一律视为未完成。
+pub fn skip_completed_tasks(report: &SessionFleetReport, session_dir: &Path) -> SessionFleetReport {
+    let tasks: Vec<crate::session_fleet::FleetTask> = report
+        .tasks
+        .iter()
+        .filter(|task| !task_completed(session_dir, &task.id))
+        .cloned()
+        .collect();
+    let (layers, cyclic) = crate::session_fleet::topological_layers(&tasks);
+    SessionFleetReport {
+        schema: report.schema,
+        workers: report.workers,
+        tasks,
+        layers,
+        skipped: report.skipped.clone(),
+        cyclic,
+    }
+}
+
+fn task_completed(dir: &Path, id: &str) -> bool {
+    let path = safe_task_path(dir, id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    text.lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<SessionRecord>(line).ok())
+        .and_then(|record| match record.event {
+            SessionEvent::TurnFinished { complete, .. } => Some(complete),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// 任务 id 只允许 `[A-Za-z0-9._-]`，避免 meta 里的 `../` 把 session 写出目录。
@@ -508,5 +545,65 @@ mod tests {
         assert_eq!(merged.usage.cached, 4);
         assert_eq!(merged.usage.output, 9);
         assert_eq!(merged.attempts, 2);
+    }
+
+    #[test]
+    fn skip_completed_tasks_drops_finished_sessions() {
+        let dir = std::env::temp_dir().join(format!(
+            "trit-resume-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = crate::session::SessionLog::open(dir.join("done.run.jsonl")).unwrap();
+        log.append(SessionEvent::TurnStarted {
+            task: "done".into(),
+            objective: "o".into(),
+            max_steps: 1,
+        })
+        .unwrap();
+        log.append(SessionEvent::TurnFinished {
+            steps: 1,
+            complete: true,
+            metrics: None,
+        })
+        .unwrap();
+        let mut log = crate::session::SessionLog::open(dir.join("pending.run.jsonl")).unwrap();
+        log.append(SessionEvent::TurnStarted {
+            task: "pending".into(),
+            objective: "o".into(),
+            max_steps: 1,
+        })
+        .unwrap();
+        let report = SessionFleetReport {
+            schema: SESSION_FLEET_SCHEMA,
+            workers: 1,
+            tasks: vec![
+                FleetTask {
+                    id: "done.run".into(),
+                    task: "done".into(),
+                    deps: Vec::new(),
+                    workspace: None,
+                    parent: None,
+                    max_tokens: 0,
+                },
+                FleetTask {
+                    id: "pending.run".into(),
+                    task: "pending".into(),
+                    deps: Vec::new(),
+                    workspace: None,
+                    parent: None,
+                    max_tokens: 0,
+                },
+            ],
+            layers: vec![vec!["done.run".into(), "pending.run".into()]],
+            skipped: Vec::new(),
+            cyclic: Vec::new(),
+        };
+        let filtered = skip_completed_tasks(&report, &dir);
+        assert_eq!(filtered.tasks.len(), 1);
+        assert_eq!(filtered.tasks[0].id, "pending.run");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

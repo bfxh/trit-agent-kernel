@@ -1423,7 +1423,7 @@ fn usage() {
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
          [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
          [--workers N] [--max-concurrency N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-cny F]\n\
-         [--write-journal-rollback] [--apply] [--compact]\n\
+         [--write-journal-rollback] [--resume] [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
          With --nodes, the fleet phase dispatches through the remote node table instead.\n\
@@ -1960,6 +1960,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut budget_tokens = 0u64;
     let mut budget_usd = 0.0f64;
     let mut write_journal_rollback = false;
+    let mut resume = false;
     let mut scope: Option<String> = None;
     let mut apply = false;
     let mut compact = false;
@@ -2023,6 +2024,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             }
             "--scope" => scope = Some(next(&mut args, "--scope")?),
             "--write-journal-rollback" => write_journal_rollback = true,
+            "--resume" => resume = true,
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => {
@@ -2082,6 +2084,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             budget_tokens,
             budget_usd,
             write_journal_rollback,
+            resume,
             dry_run: !apply,
             scope,
         },

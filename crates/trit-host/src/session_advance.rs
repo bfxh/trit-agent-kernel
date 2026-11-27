@@ -18,7 +18,9 @@ use crate::session_fleet::{
     FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, apply_budget, topological_layers,
 };
 use crate::session_fleet_remote::{RemoteFleetOptions, RemoteFleetOutcome, run_remote_fleet};
-use crate::session_fleet_run::{FleetRunOptions, FleetRunOutcome, execute_fleet};
+use crate::session_fleet_run::{
+    FleetRunOptions, FleetRunOutcome, execute_fleet, skip_completed_tasks,
+};
 use crate::session_plan::{SessionPlanReport, plan_sessions};
 use crate::session_scan::{SessionScanReport, scan_sessions, scan_sessions_cached};
 use crate::session_verify::{CallbackVerifyReport, verify_callbacks};
@@ -38,6 +40,9 @@ pub struct AdvanceOptions {
     /// 发现 in_doubt 写日志时自动安全回滚；默认 false（fail closed）。
     #[serde(default)]
     pub write_journal_rollback: bool,
+    /// 续跑：跳过上次已完成（`TurnFinished.complete=true`）的任务；默认 false。
+    #[serde(default)]
+    pub resume: bool,
     pub dry_run: bool,
     /// 跨机执行时的计划作用域。
     #[serde(default)]
@@ -54,6 +59,7 @@ impl Default for AdvanceOptions {
             budget_tokens: 0,
             budget_usd: 0.0,
             write_journal_rollback: false,
+            resume: false,
             dry_run: true,
             scope: None,
         }
@@ -112,6 +118,11 @@ pub fn advance(
     )?;
     let fleet = fleet_from_dispatch(scan, &dispatch, options.workers, options.budget_tokens)
         .map_err(AgentError::SessionState)?;
+    let fleet = if options.resume {
+        skip_completed_tasks(&fleet, session_dir)
+    } else {
+        fleet
+    };
     let mut report = AdvanceReport {
         schema: SESSION_ADVANCE_SCHEMA,
         dry_run: options.dry_run,
