@@ -82,3 +82,40 @@ fn unknown_arguments_fail_closed() {
         "{stderr}"
     );
 }
+
+#[test]
+fn budget_usd_is_echoed_and_validated() {
+    let dir = temp_dir("budget-usd");
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "session-fleet-run",
+            "--root",
+            dir.to_str().unwrap(),
+            "--budget-usd",
+            "2.5",
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["budget_usd"], 2.5);
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "session-fleet-run",
+            "--root",
+            dir.to_str().unwrap(),
+            "--budget-usd",
+            "-1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("--budget-usd"));
+    let _ = fs::remove_dir_all(dir);
+}

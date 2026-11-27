@@ -1375,6 +1375,7 @@ pub mod context;
 pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
+pub mod cost;
 pub mod diagnostics;
 pub mod extensions;
 pub mod fleet_runner;
@@ -1557,6 +1558,7 @@ pub use session_run::{ResumeSpec, read_resume_spec, resume_command, resume_targe
 pub use session_scan::{
     LinkKind, SESSION_SCAN_SCHEMA, SessionEntry, SessionFormat, SessionGate, SessionLink,
     SessionMeta, SessionScanReport, SessionTask, scan_sessions, scan_sessions_cached,
+    scan_sessions_roots, scan_sessions_roots_cached,
 };
 pub use session_verify::{
     CallbackVerifyReport, CheckVerdict, DelegationCheck, SESSION_VERIFY_SCHEMA, verify_callbacks,

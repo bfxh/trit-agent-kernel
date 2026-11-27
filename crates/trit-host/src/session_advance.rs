@@ -25,13 +25,16 @@ use crate::session_verify::{CallbackVerifyReport, verify_callbacks};
 
 pub const SESSION_ADVANCE_SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdvanceOptions {
     pub max_items: usize,
     pub workers: usize,
     pub max_steps: usize,
     pub retries: usize,
     pub budget_tokens: u64,
+    /// 美元预算；0 表示不限。跨过 80% 时报告告警。
+    #[serde(default)]
+    pub budget_usd: f64,
     pub dry_run: bool,
     /// 跨机执行时的计划作用域。
     #[serde(default)]
@@ -46,13 +49,14 @@ impl Default for AdvanceOptions {
             max_steps: 20,
             retries: 0,
             budget_tokens: 0,
+            budget_usd: 0.0,
             dry_run: true,
             scope: None,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdvanceReport {
     pub schema: u32,
     pub dry_run: bool,
@@ -136,6 +140,7 @@ pub fn advance(
             workers: options.workers,
             max_steps: options.max_steps,
             retries: options.retries,
+            budget_usd: options.budget_usd,
         },
     )?;
     let rescanned = match cache {
@@ -279,6 +284,7 @@ mod tests {
         SessionScanReport {
             schema: 1,
             root: root.display().to_string(),
+            roots: vec![root.display().to_string()],
             scanned: 2,
             sessions: vec![entry(root, "parent"), entry(root, "child")],
             links: vec![SessionLink {

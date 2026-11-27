@@ -1391,6 +1391,8 @@ fn usage() {
          recovery. --mcp-sampling serves sampling/createMessage with the OpenAI-compatible\n\
          provider (optionally --mcp-sampling-model); roots_watch directories contribute\n\
          roots automatically and changes emit roots/list_changed.\n\n\
+         session commands accept repeated --root <dir>; multiple roots merge into one\n\
+         report (root = first, roots[] = all).\n\n\
          session-status: trit-host session-status --session <jsonl>\n\
          prints turn count and the latest gate-chain verdict; exits 1 when blocked.\n\
          session-index: trit-host session-index --session <jsonl> --db <path>\n\
@@ -1413,7 +1415,8 @@ fn usage() {
          dry-run by default; in_doubt/gate-blocked/Reasonix items are never auto-dispatched.\n\
          session-advance: trit-host session-advance --root <dir> [--workspace <dir>]\n\
          [--cache <path>] [--nodes <node-table.json>] [--scope S] [--max-items N]\n\
-         [--workers N] [--max-steps N] [--retry N] [--budget-tokens N] [--apply] [--compact]\n\
+         [--workers N] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-usd F]\n\
+         [--apply] [--compact]\n\
          one-shot scan → plan → auto dispatch → fleet run → callback → verify; dry-run\n\
          by default; --apply uses the OpenAI-compatible provider from the environment.\n\
          With --nodes, the fleet phase dispatches through the remote node table instead.\n\
@@ -1434,8 +1437,8 @@ fn usage() {
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
          session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
-         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N] [--cache <path>]\n\
-         [--apply] [--compact]\n\
+         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N] [--budget-usd F]\n\
+         [--cache <path>] [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          session-fleet-remote: trit-host session-fleet-remote --root <dir> --nodes <node-table.json>\n\
@@ -1538,7 +1541,7 @@ fn run_session_status(mut args: impl Iterator<Item = String>) -> Result<(), Box<
 /// `session-fleet-remote --root <dir> --nodes <node-table.json> [...]`：
 /// 把 session-fleet 任务图按节点表跨机派发；默认 dry-run。
 fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut nodes_path: Option<PathBuf> = None;
     let mut workers = 4usize;
     let mut retry_limit = 0u32;
@@ -1550,7 +1553,7 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--nodes" => nodes_path = Some(PathBuf::from(next(&mut args, "--nodes")?)),
             "--workers" => {
                 workers = next(&mut args, "--workers")?
@@ -1583,7 +1586,8 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
         .ok_or_else(|| fail("session-fleet-remote requires --nodes <node-table.json>"))?;
     let text = std::fs::read_to_string(&nodes_path)?;
     let nodes: Vec<trit_host::RemoteNode> = serde_json::from_str(&text)?;
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
@@ -1611,18 +1615,19 @@ fn run_session_fleet_remote(mut args: impl Iterator<Item = String>) -> Result<()
 }
 
 fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut workers = 4usize;
     let mut workspace: Option<PathBuf> = None;
     let mut max_steps = 20usize;
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
+    let mut budget_usd = 0.0f64;
     let mut cache: Option<PathBuf> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--workers" => {
                 workers = next(&mut args, "--workers")?
                     .parse()
@@ -1645,6 +1650,14 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
             }
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
+            "--budget-usd" => {
+                budget_usd = next(&mut args, "--budget-usd")?
+                    .parse()
+                    .map_err(|_| fail("--budget-usd must be a non-negative number"))?;
+                if !budget_usd.is_finite() || budget_usd < 0.0 {
+                    return Err(fail("--budget-usd must be a non-negative number"));
+                }
+            }
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => {
@@ -1652,13 +1665,14 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
             }
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
         trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
     }
-    let workspace = workspace.unwrap_or_else(|| root.clone());
+    let workspace = workspace.unwrap_or_else(|| roots[0].clone());
     if !apply {
         let report = serde_json::json!({
             "dry_run": true,
@@ -1667,6 +1681,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
             "max_steps": max_steps,
             "retry": retries,
             "budget_tokens": budget_tokens,
+            "budget_usd": budget_usd,
             "tasks": fleet.tasks,
             "layers": fleet.layers,
             "skipped": fleet.skipped,
@@ -1685,16 +1700,17 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let outcome = trit_host::execute_fleet(
         &fleet,
         &workspace,
-        &root,
+        &roots[0],
         config,
         trit_host::FleetRunOptions {
             workers,
             max_steps,
             retries,
+            budget_usd,
         },
     )?;
     // 执行会话已写 `<task>.jsonl.meta`（parent），扫描后自动回填结果侧车。
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let callbacks =
         trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: false })?;
     let verification = trit_host::verify_callbacks(&scanned)?;
@@ -1720,14 +1736,14 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
 /// `session-fleet --root <dir> [--workers N] [--compact]`：
 /// 生成 resume 项的分层任务图；只读，不启动模型。
 fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut workers = 4usize;
     let mut budget_tokens = 0u64;
     let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--workers" => {
                 workers = next(&mut args, "--workers")?
                     .parse()
@@ -1743,7 +1759,8 @@ fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
             other => return Err(fail(format!("unknown session-fleet argument: {other}"))),
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
     if budget_tokens > 0 {
@@ -1764,12 +1781,12 @@ fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
 fn run_session_callback_verify(
     mut args: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => {
@@ -1779,7 +1796,8 @@ fn run_session_callback_verify(
             }
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let report = trit_host::verify_callbacks(&scanned)?;
     let text = if compact {
         serde_json::to_string(&report)
@@ -1851,7 +1869,7 @@ fn run_session_run(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn
 /// 扫描 + 分配 + 只自动派发 Resume 项；默认 dry-run。
 /// `session-advance --root <dir> [...]`：一条命令推进多会话；默认 dry-run。
 fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut workspace: Option<PathBuf> = None;
     let mut cache: Option<PathBuf> = None;
     let mut nodes_path: Option<PathBuf> = None;
@@ -1860,12 +1878,13 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
     let mut max_steps = 20usize;
     let mut retries = 0usize;
     let mut budget_tokens = 0u64;
+    let mut budget_usd = 0.0f64;
     let mut scope: Option<String> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--workspace" => workspace = Some(PathBuf::from(next(&mut args, "--workspace")?)),
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--nodes" => nodes_path = Some(PathBuf::from(next(&mut args, "--nodes")?)),
@@ -1894,6 +1913,14 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
                     .parse()
                     .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
             }
+            "--budget-usd" => {
+                budget_usd = next(&mut args, "--budget-usd")?
+                    .parse()
+                    .map_err(|_| fail("--budget-usd must be a non-negative number"))?;
+                if !budget_usd.is_finite() || budget_usd < 0.0 {
+                    return Err(fail("--budget-usd must be a non-negative number"));
+                }
+            }
             "--scope" => scope = Some(next(&mut args, "--scope")?),
             "--apply" => apply = true,
             "--compact" => compact = true,
@@ -1902,9 +1929,10 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             }
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
-    let workspace = workspace.unwrap_or_else(|| root.clone());
+    let workspace = workspace.unwrap_or_else(|| roots[0].clone());
     let config = if apply && nodes_path.is_none() {
         Some(trit_host::OpenAiConfig::from_env()?)
     } else {
@@ -1921,7 +1949,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
         &scanned,
         &plan,
         &workspace,
-        &root,
+        &roots[0],
         cache.as_deref(),
         config,
         nodes,
@@ -1931,6 +1959,7 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
             max_steps,
             retries,
             budget_tokens,
+            budget_usd,
             dry_run: !apply,
             scope,
         },
@@ -1946,14 +1975,14 @@ fn run_session_advance(mut args: impl Iterator<Item = String>) -> Result<(), Box
 }
 
 fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut max_items = 4usize;
     let mut cache: Option<PathBuf> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--max-items" => {
                 max_items = next(&mut args, "--max-items")?
                     .parse()
@@ -1965,7 +1994,8 @@ fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
             other => return Err(fail(format!("unknown session-auto argument: {other}"))),
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let report = trit_host::auto_dispatch(
         &scanned,
@@ -1988,20 +2018,21 @@ fn run_session_auto(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
 /// `session-callback --root <dir> [--apply] [--compact]`：
 /// 默认 dry-run；`--apply` 才把 parent/child 结果追加到 delegations.jsonl。
 fn run_session_callback(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut cache: Option<PathBuf> = None;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-callback argument: {other}"))),
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let report =
         trit_host::callback_sessions(&scanned, &trit_host::CallbackOptions { dry_run: !apply })?;
     let text = if compact {
@@ -2017,18 +2048,19 @@ fn run_session_callback(mut args: impl Iterator<Item = String>) -> Result<(), Bo
 /// `session-dispatch --root <dir> [--apply] [--compact]`：
 /// 默认 dry-run；`--apply` 才为新会话写 TurnStarted，且拒绝覆盖已有目标。
 fn run_session_dispatch(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-dispatch argument: {other}"))),
         }
     }
-    let scanned = trit_host::scan_sessions(&root)?;
+    let roots = expand_roots(roots);
+    let scanned = trit_host::scan_sessions_roots(&roots)?;
     let plan = trit_host::plan_sessions(&scanned);
     let report = trit_host::dispatch_sessions(
         &scanned,
@@ -2050,28 +2082,37 @@ fn run_session_dispatch(mut args: impl Iterator<Item = String>) -> Result<(), Bo
 
 /// `session-plan --root <dir> [--compact]`：扫描会话并生成确定性的任务分配。
 fn scan_for(
-    root: &Path,
+    roots: &[PathBuf],
     cache: Option<&Path>,
 ) -> Result<trit_host::SessionScanReport, Box<dyn Error>> {
     match cache {
-        Some(path) => Ok(trit_host::scan_sessions_cached(root, path)?),
-        None => Ok(trit_host::scan_sessions(root)?),
+        Some(path) => Ok(trit_host::scan_sessions_roots_cached(roots, path)?),
+        None => Ok(trit_host::scan_sessions_roots(roots)?),
     }
 }
 
+/// `--root` 可重复；未提供时回退到当前目录。
+fn expand_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    if roots.is_empty() {
+        roots.push(PathBuf::from("."));
+    }
+    roots
+}
+
 fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-plan argument: {other}"))),
         }
     }
-    let scanned = scan_for(&root, cache.as_deref())?;
+    let roots = expand_roots(roots);
+    let scanned = scan_for(&roots, cache.as_deref())?;
     let plan = trit_host::plan_sessions(&scanned);
     let text = if compact {
         serde_json::to_string(&plan)
@@ -2085,20 +2126,21 @@ fn run_session_plan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
 
 /// `session-scan --root <dir> [--compact]`：只读扫描会话目录，输出清单/任务/链接。
 fn run_session_scan(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let mut root = PathBuf::from(".");
+    let mut roots: Vec<PathBuf> = Vec::new();
     let mut cache: Option<PathBuf> = None;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--root" => root = PathBuf::from(next(&mut args, "--root")?),
+            "--root" => roots.push(PathBuf::from(next(&mut args, "--root")?)),
             "--cache" => cache = Some(PathBuf::from(next(&mut args, "--cache")?)),
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-scan argument: {other}"))),
         }
     }
+    let roots = expand_roots(roots);
     let report = match cache {
-        Some(path) => trit_host::scan_sessions_cached(&root, &path)?,
-        None => trit_host::scan_sessions(&root)?,
+        Some(path) => trit_host::scan_sessions_roots_cached(&roots, &path)?,
+        None => trit_host::scan_sessions_roots(&roots)?,
     };
     let text = if compact {
         serde_json::to_string(&report)

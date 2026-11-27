@@ -29,6 +29,9 @@ const MAX_DEPTH: usize = 4;
 pub struct SessionScanReport {
     pub schema: u32,
     pub root: String,
+    /// 全部扫描根；单根时与 `root` 相同。
+    #[serde(default)]
+    pub roots: Vec<String>,
     pub scanned: usize,
     pub sessions: Vec<SessionEntry>,
     pub links: Vec<SessionLink>,
@@ -136,7 +139,7 @@ struct CachedEntry {
 
 /// 扫描 `root` 下的会话文件；错误只降级为 warnings，不中断整次扫描。
 pub fn scan_sessions(root: &Path) -> Result<SessionScanReport, AgentError> {
-    scan_sessions_inner(root, None)
+    scan_sessions_inner(&[root.to_path_buf()], None)
 }
 
 /// 带缓存扫描：未变化（size + mtime）的会话直接复用上次结果，只重扫变化文件。
@@ -144,17 +147,33 @@ pub fn scan_sessions_cached(
     root: &Path,
     cache_path: &Path,
 ) -> Result<SessionScanReport, AgentError> {
-    scan_sessions_inner(root, Some(cache_path))
+    scan_sessions_inner(&[root.to_path_buf()], Some(cache_path))
+}
+
+/// 多根扫描：合并成一份报告，`root` 取第一个根，`roots` 保留全部输入。
+pub fn scan_sessions_roots(roots: &[PathBuf]) -> Result<SessionScanReport, AgentError> {
+    scan_sessions_inner(roots, None)
+}
+
+/// 多根 + 缓存；缓存 key 是文件绝对路径，因此跨根天然去重与复用。
+pub fn scan_sessions_roots_cached(
+    roots: &[PathBuf],
+    cache_path: &Path,
+) -> Result<SessionScanReport, AgentError> {
+    scan_sessions_inner(roots, Some(cache_path))
 }
 
 fn scan_sessions_inner(
-    root: &Path,
+    roots: &[PathBuf],
     cache_path: Option<&Path>,
 ) -> Result<SessionScanReport, AgentError> {
     let mut files = Vec::new();
     let mut warnings = Vec::new();
-    collect_session_files(root, 0, &mut files, &mut warnings)?;
+    for root in roots {
+        collect_session_files(root, 0, &mut files, &mut warnings)?;
+    }
     files.sort();
+    files.dedup();
 
     let cache = cache_path
         .and_then(|path| {
@@ -221,7 +240,14 @@ fn scan_sessions_inner(
     let links = build_links(&sessions);
     Ok(SessionScanReport {
         schema: SESSION_SCAN_SCHEMA,
-        root: root.display().to_string(),
+        root: roots
+            .first()
+            .map(|root| root.display().to_string())
+            .unwrap_or_default(),
+        roots: roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect(),
         scanned: files.len(),
         sessions,
         links,
@@ -572,6 +598,61 @@ mod tests {
         for event in events {
             log.append(event.clone()).unwrap();
         }
+    }
+
+    #[test]
+    fn multiple_roots_merge_into_one_report() {
+        let first = temp("multi-a");
+        let second = temp("multi-b");
+        write_session(
+            &first.join("parent.jsonl"),
+            &[SessionEvent::TurnStarted {
+                task: "parent".into(),
+                objective: "p".into(),
+                max_steps: 2,
+            }],
+        );
+        let child = second.join("child.jsonl");
+        write_session(
+            &child,
+            &[SessionEvent::TurnStarted {
+                task: "child".into(),
+                objective: "c".into(),
+                max_steps: 2,
+            }],
+        );
+        let mut meta = child.as_os_str().to_os_string();
+        meta.push(".meta");
+        fs::write(meta, r#"{"id":"child","parent":"parent"}"#).unwrap();
+
+        let report = scan_sessions_roots(&[first.clone(), second.clone()]).unwrap();
+        assert_eq!(report.roots.len(), 2);
+        assert_eq!(report.root, first.display().to_string());
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.sessions.len(), 2);
+        // 跨根 parent/child 链接仍然成立。
+        assert!(report.links.iter().any(|link| {
+            link.kind == LinkKind::ParentChild && link.from == "parent" && link.to == "child"
+        }));
+        let _ = fs::remove_dir_all(&first);
+        let _ = fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn duplicate_roots_do_not_double_count() {
+        let root = temp("multi-dup");
+        write_session(
+            &root.join("one.jsonl"),
+            &[SessionEvent::TurnStarted {
+                task: "one".into(),
+                objective: "o".into(),
+                max_steps: 2,
+            }],
+        );
+        let report = scan_sessions_roots(&[root.clone(), root.clone()]).unwrap();
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.sessions.len(), 1);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

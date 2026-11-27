@@ -221,6 +221,7 @@ mod tests {
         let scan = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: ids.len(),
             sessions: ids.iter().map(|id| entry(id)).collect(),
             links,
@@ -291,6 +292,7 @@ mod tests {
         let scan = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: 1,
             sessions: vec![chat],
             links: Vec::new(),
@@ -323,6 +325,7 @@ mod tests {
         let scan = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: 1,
             sessions: vec![session],
             links: Vec::new(),

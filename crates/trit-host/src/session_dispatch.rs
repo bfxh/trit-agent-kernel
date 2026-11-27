@@ -247,6 +247,7 @@ mod tests {
         let scan = SessionScanReport {
             schema: 1,
             root: root.display().to_string(),
+            roots: vec![root.display().to_string()],
             scanned: 1,
             sessions: vec![SessionEntry {
                 path: path.display().to_string(),
@@ -325,6 +326,7 @@ mod tests {
         let scan = SessionScanReport {
             schema: 1,
             root: root.display().to_string(),
+            roots: vec![root.display().to_string()],
             scanned: 1,
             sessions: vec![SessionEntry {
                 path: root.join("chat.jsonl").display().to_string(),
@@ -370,6 +372,7 @@ mod tests {
         let mut scan = SessionScanReport {
             schema: 1,
             root: root.display().to_string(),
+            roots: vec![root.display().to_string()],
             scanned: 2,
             sessions: Vec::new(),
             links: Vec::new(),

@@ -8,13 +8,16 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use trit_orch::{
     CancelToken, Dependency, FleetConfig, FleetOutput, Plan, Task, TaskGuidance, TaskSpec, Ternary,
-    execute,
+    TokenUsage, execute,
 };
+
+use crate::cost::{self, BudgetAlert, CostEstimate, PriceTable};
 
 use crate::openai::{OpenAiConfig, OpenAiProvider};
 use crate::provider::{ProviderModel, default_tools};
@@ -24,16 +27,19 @@ use crate::{AgentError, ContextPolicy, HeadlessConfig, run_headless, turn_spec_f
 
 pub const SESSION_FLEET_RUN_SCHEMA: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FleetRunOptions {
     pub workers: usize,
     pub max_steps: usize,
     /// 失败后重跑未完成任务（deferred + 失败任务）的次数上限。
     #[serde(default)]
     pub retries: usize,
+    /// 美元预算；0 表示不限。达到 80% 时报告告警，不改变执行行为。
+    #[serde(default)]
+    pub budget_usd: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FleetRunOutcome {
     pub schema: u32,
     /// 实际执行轮数（首次 + 重试）。
@@ -48,6 +54,18 @@ pub struct FleetRunOutcome {
     pub cancelled: Vec<String>,
     #[serde(default)]
     pub references: BTreeMap<String, String>,
+    /// 本次执行（含重试）累计的真实 token 用量。
+    #[serde(default)]
+    pub usage: TokenUsage,
+    /// 按模型单价折算的预估费用；模型不在价目表时为 None。
+    #[serde(default)]
+    pub cost: Option<CostEstimate>,
+    /// 达到预算阈值时的结构化告警。
+    #[serde(default)]
+    pub budget_alert: Option<BudgetAlert>,
+    /// 人读告警文本（预算告警、未知模型等）。
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// 把调度报告映射成 `trit_orch::Plan`，依赖一律 `True`（必需）。
@@ -126,6 +144,29 @@ pub fn execute_fleet(
         outcome = merge_outcomes(outcome, next, attempts);
     }
     outcome.attempts = attempts;
+    if outcome.usage.total().unwrap_or(0) > 0 {
+        match PriceTable::from_env() {
+            Ok(table) => {
+                if let Some(estimate) = table.estimate(&config.model, &outcome.usage) {
+                    if let Some(alert) = cost::budget_alert(
+                        estimate.usd,
+                        options.budget_usd,
+                        cost::DEFAULT_ALERT_THRESHOLD,
+                    ) {
+                        outcome.warnings.push(alert.warning());
+                        outcome.budget_alert = Some(alert);
+                    }
+                    outcome.cost = Some(estimate);
+                } else {
+                    outcome.warnings.push(format!(
+                        "cost model: no price for model {}; cost unknown",
+                        config.model
+                    ));
+                }
+            }
+            Err(error) => return Err(AgentError::SessionState(format!("cost model: {error}"))),
+        }
+    }
     Ok(outcome)
 }
 
@@ -190,6 +231,8 @@ fn execute_once(
         .collect();
     let session_dir = session_dir.to_path_buf();
     let max_steps = options.max_steps;
+    let usage_acc = Arc::new(Mutex::new(TokenUsage::default()));
+    let usage_for_runner = Arc::clone(&usage_acc);
     let runner = move |task: &TaskSpec, cancel: &CancelToken| -> Result<FleetOutput, String> {
         if cancel.is_cancelled() {
             return Err("cancelled before start".to_owned());
@@ -221,6 +264,15 @@ fn execute_once(
         let outcome = run_headless(turn_spec_from_task(task), model, headless)
             .map_err(|error| error.to_string())?;
         let tokens = outcome.usage.total().map_err(|error| error.to_string())?;
+        {
+            let mut usage = usage_for_runner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            usage.fresh += outcome.usage.fresh;
+            usage.cached += outcome.usage.cached;
+            usage.output += outcome.usage.output;
+            usage.estimated |= outcome.usage.estimated;
+        }
         Ok(FleetOutput {
             content: outcome.render_markdown().into_bytes(),
             tokens,
@@ -233,6 +285,9 @@ fn execute_once(
         runner,
     )
     .map_err(|error| AgentError::SessionState(format!("fleet: {error}")))?;
+    let usage = *usage_acc
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let references = report
         .references()
         .into_iter()
@@ -246,6 +301,10 @@ fn execute_once(
         deferred: report.deferred,
         cancelled: report.cancelled,
         references,
+        usage,
+        cost: None,
+        budget_alert: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -289,6 +348,10 @@ fn merge_outcomes(
     target.deferred = next.deferred;
     target.cancelled = next.cancelled;
     target.references.extend(next.references);
+    target.usage.fresh += next.usage.fresh;
+    target.usage.cached += next.usage.cached;
+    target.usage.output += next.usage.output;
+    target.usage.estimated |= next.usage.estimated;
     target
 }
 
@@ -418,5 +481,32 @@ mod tests {
         assert!(!name.contains('/'), "{name}");
         assert!(!name.contains('\\'), "{name}");
         assert!(name.ends_with("evil.jsonl"), "{name}");
+    }
+
+    #[test]
+    fn merge_accumulates_usage_across_retries() {
+        let outcome = |fresh, cached, output| FleetRunOutcome {
+            schema: SESSION_FLEET_RUN_SCHEMA,
+            attempts: 1,
+            completed: Vec::new(),
+            failed: None,
+            deferred: Vec::new(),
+            cancelled: Vec::new(),
+            references: BTreeMap::new(),
+            usage: TokenUsage {
+                fresh,
+                cached,
+                output,
+                estimated: false,
+            },
+            cost: None,
+            budget_alert: None,
+            warnings: Vec::new(),
+        };
+        let merged = merge_outcomes(outcome(10, 3, 7), outcome(5, 1, 2), 2);
+        assert_eq!(merged.usage.fresh, 15);
+        assert_eq!(merged.usage.cached, 4);
+        assert_eq!(merged.usage.output, 9);
+        assert_eq!(merged.attempts, 2);
     }
 }

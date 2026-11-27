@@ -237,6 +237,7 @@ mod tests {
         let report = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: 4,
             sessions: vec![idle.clone(), open, blocked, in_doubt],
             links: Vec::new(),
@@ -274,6 +275,7 @@ mod tests {
         let report = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: 2,
             sessions: vec![child, parent],
             links: vec![SessionLink {
@@ -305,6 +307,7 @@ mod tests {
         let report = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: 1,
             sessions: vec![entry("child")],
             links: vec![SessionLink {
@@ -326,6 +329,7 @@ mod tests {
         let report = SessionScanReport {
             schema: 1,
             root: ".".into(),
+            roots: vec![".".to_owned()],
             scanned: 1,
             sessions: vec![chat],
             links: Vec::new(),

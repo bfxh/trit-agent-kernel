@@ -13,23 +13,25 @@
 
 | 命令 | 作用 | 默认 |
 | --- | --- | --- |
-| `session-scan --root <dir> [--cache <path>]` | 扫描会话、任务、链接、健康信息 | 只读 |
-| `session-plan --root <dir> [--cache <path>]` | 生成 resume/inspect/idle/skip 分配 | 只读 |
-| `session-auto --root <dir> [--max-items N] [--cache <path>]` | 只自动派发 `resume` 项 | dry-run |
-| `session-advance --root <dir> [--workspace <dir>] [--cache <path>]` | 一条命令：scan → plan → auto dispatch → fleet run → callback → verify | dry-run |
-| `session-dispatch --root <dir> [--cache <path>]` | 手动派发全部 `resume` 项 | dry-run |
+| `session-scan --root <dir>... [--cache <path>]` | 扫描会话、任务、链接、健康信息 | 只读 |
+| `session-plan --root <dir>... [--cache <path>]` | 生成 resume/inspect/idle/skip 分配 | 只读 |
+| `session-auto --root <dir>... [--max-items N] [--cache <path>]` | 只自动派发 `resume` 项 | dry-run |
+| `session-advance --root <dir>... [--workspace <dir>] [--cache <path>] [--budget-usd F]` | 一条命令：scan → plan → auto dispatch → fleet run → callback → verify | dry-run |
+| `session-dispatch --root <dir>... [--cache <path>]` | 手动派发全部 `resume` 项 | dry-run |
 | `session-run --session <resume.jsonl> [--apply]` | 读取派发单并执行单任务 | dry-run |
-| `session-callback --root <dir> [--apply]` | 写 parent 的 `delegations.jsonl` | dry-run |
-| `session-callback-verify --root <dir>` | 对账回填记录与 child 当前状态 | 只读 |
-| `session-fleet --root <dir> [--workers N] [--budget-tokens N] [--cache <path>]` | 生成依赖分层 + 预算 | 只读 |
-| `session-fleet-run --root <dir> [--workers N] [--retry N] [--budget-tokens N] [--cache <path>]` | 并发执行 + 自动回填 + 对账 | dry-run |
-| `session-fleet-remote --root <dir> --nodes <node-table.json> [--retry N] [--scope S] [--apply]` | 把 fleet 任务按节点表跨机派发 | dry-run |
+| `session-callback --root <dir>... [--apply]` | 写 parent 的 `delegations.jsonl` | dry-run |
+| `session-callback-verify --root <dir>...` | 对账回填记录与 child 当前状态 | 只读 |
+| `session-fleet --root <dir>... [--workers N] [--budget-tokens N] [--cache <path>]` | 生成依赖分层 + 预算 | 只读 |
+| `session-fleet-run --root <dir>... [--workers N] [--retry N] [--budget-tokens N] [--budget-usd F] [--cache <path>]` | 并发执行 + 自动回填 + 对账 | dry-run |
+| `session-fleet-remote --root <dir>... --nodes <node-table.json> [--retry N] [--scope S] [--apply]` | 把 fleet 任务按节点表跨机派发 | dry-run |
 | `remote-ledger --token-budget N` | 跨机 claim/complete 的 token 预算 | 预算不设则不限 |
 
 ## 2. 数据流
 
 ```text
 SessionScanReport
+  root:       第一个扫描根（兼容单根调用）
+  roots[]:    全部扫描根；多根结果合并成一份报告
   sessions[]: id/role/format/project/tasks/open_turn/in_doubt/last_gate
   links[]:    planner_executor | parent_child
 
@@ -69,11 +71,16 @@ DelegationResult（parent 目录 delegations.jsonl）
 - Ctrl-C 接 `CancelToken`（Unix SIGINT / Windows SetConsoleCtrlHandler），协作式取消。
 - 每个任务独立 provider/model，但共享 `ureq::Agent` 连接池。
 
-## 5. 预算
+## 5. 预算与成本
 
 - 本地：`--budget-tokens` 均分到 fleet 任务，预算小于任务数直接 fail closed。
 - 跨机：`remote-ledger` 累计 `/complete` 帧里 `SubagentResponse.tokens`；达到预算后新 `/claim` 返回 503。
 - 预算随状态文件回放，ledger 重启不清零。
+- 成本模型（`crates/trit-host/src/cost.rs`）：
+  - `FleetRunOutcome` 汇总本次执行（含重试）的真实 `usage`，按模型单价折算 `cost.usd`；
+  - 内置常见模型价目表（美元 / 百万 token，cache 命中单独计价）；`TRIT_MODEL_PRICES=<json>` 可覆盖或补充，文件读不到/非法时 fail closed；
+  - 未知模型返回 `null` 并写 warning，绝不按 0 计价；
+  - `--budget-usd F` 在已花达到 80% 时写 `warnings` 与结构化 `budget_alert`，不改变执行行为；超过预算时 `exceeded = true`。
 
 ## 6. 结果回填与对账
 
@@ -116,5 +123,7 @@ cargo bench -p trit-host --bench session_scan
 - `session-fleet-remote` 复用 `NodeTable` + `run_remote_plan_with_table`：节点容量、失败隔离、换节点重试与幂等键由现有层负责；跨机预算在 ledger 服务端生效。
 - `--scope S` 把幂等键变成 `[scope|]task@epoch`：不同计划必须用不同 scope，否则同名任务会在共享 ledger 中互相去重；`session-advance` 会把 scope 透传到远程 fleet 阶段。
 - 扫描缓存是 JSON 侧车，不是 SQLite 投影；`session_index` 仍只服务单个会话。
+- `--root` 可重复：多个根合并成一份报告（`root` = 第一个，`roots[]` = 全部），跨根链接照常建立；缓存仍按文件绝对路径复用，重复根不会重复计数。
+- 成本模型只折算本地 fleet 的真实 usage；跨机预算仍只在 ledger 端累计，货币折算不跨机回传。
 - 跨机预算只在 ledger 端累计，不把 usage 写回 remote-exec 的本地账本。
 - UI/设置栏只消费这些 JSON，不参与内核判定。

@@ -145,3 +145,49 @@ fn session_scan_cli_rejects_unknown_arguments() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown session-scan argument"), "{stderr}");
 }
+
+#[test]
+fn repeated_roots_merge_into_one_report() {
+    let first = temp_dir("multi-a");
+    let second = temp_dir("multi-b");
+    write_session(
+        &first.join("one.jsonl"),
+        &[SessionEvent::TurnStarted {
+            task: "one".into(),
+            objective: "o".into(),
+            max_steps: 2,
+        }],
+    );
+    write_session(
+        &second.join("two.jsonl"),
+        &[SessionEvent::TurnStarted {
+            task: "two".into(),
+            objective: "t".into(),
+            max_steps: 2,
+        }],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_trit-host"))
+        .args([
+            "session-scan",
+            "--root",
+            first.to_str().unwrap(),
+            "--root",
+            second.to_str().unwrap(),
+            "--compact",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["roots"].as_array().unwrap().len(), 2);
+    assert_eq!(report["root"], first.to_str().unwrap());
+    assert_eq!(report["scanned"], 2);
+    assert_eq!(report["sessions"].as_array().unwrap().len(), 2);
+    let _ = fs::remove_dir_all(first);
+    let _ = fs::remove_dir_all(second);
+}

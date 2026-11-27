@@ -333,6 +333,7 @@ mod tests {
         SessionScanReport {
             schema: 1,
             root: root.display().to_string(),
+            roots: vec![root.display().to_string()],
             scanned: 2,
             sessions: vec![entry(root, "parent", true), child],
             links: vec![SessionLink {
