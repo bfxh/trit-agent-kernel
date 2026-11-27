@@ -190,9 +190,12 @@ fn scan_sessions_inner(
         schema: SESSION_SCAN_SCHEMA,
         files: BTreeMap::new(),
     };
-    let mut sessions = Vec::new();
+    let mut entries: Vec<Option<SessionEntry>> = Vec::new();
+    entries.resize(files.len(), None);
+    let mut pending: Vec<(usize, PathBuf, u64, u64)> = Vec::new();
     let mut dirty = false;
-    for path in &files {
+    // 先串行处理缓存命中，未命中的会话收集起来并行解析。
+    for (index, path) in files.iter().enumerate() {
         let key = path.display().to_string();
         let metadata = fs::metadata(path).ok();
         let size = metadata.as_ref().map_or(0, |metadata| metadata.len());
@@ -206,21 +209,64 @@ fn scan_sessions_inner(
             && cached.modified_ms == modified_ms
         {
             next.files.insert(key, cached.clone());
-            sessions.push(cached.entry.clone());
+            entries[index] = Some(cached.entry.clone());
             continue;
         }
-        match scan_session(path) {
+        pending.push((index, path.clone(), size, modified_ms));
+    }
+    // 并行解析：会话文件彼此独立，结果按原文件顺序归位，报告顺序保持确定。
+    let workers = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(pending.len().max(1));
+    let scanned: Vec<(usize, PathBuf, u64, u64, Result<SessionEntry, String>)> = if workers <= 1 {
+        pending
+            .into_iter()
+            .map(|(index, path, size, modified_ms)| {
+                let result = scan_session(&path).map_err(|error| error.to_string());
+                (index, path, size, modified_ms, result)
+            })
+            .collect()
+    } else {
+        let chunk = pending.len().div_ceil(workers);
+        let batches: Vec<Vec<(usize, PathBuf, u64, u64, Result<SessionEntry, String>)>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = pending
+                    .chunks(chunk)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|(index, path, size, modified_ms)| {
+                                    let result =
+                                        scan_session(path).map_err(|error| error.to_string());
+                                    (*index, path.clone(), *size, *modified_ms, result)
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .collect()
+            });
+        batches.into_iter().flatten().collect()
+    };
+    for (index, path, size, modified_ms, result) in scanned {
+        match result {
             Ok(entry) => {
                 dirty = true;
                 next.files.insert(
-                    key,
+                    path.display().to_string(),
                     CachedEntry {
                         size,
                         modified_ms,
                         entry: entry.clone(),
                     },
                 );
-                sessions.push(entry);
+                entries[index] = Some(entry);
             }
             Err(error) => {
                 dirty = true;
@@ -228,6 +274,7 @@ fn scan_sessions_inner(
             }
         }
     }
+    let sessions: Vec<SessionEntry> = entries.into_iter().flatten().collect();
     if cache.files.len() != next.files.len() {
         dirty = true;
     }
@@ -652,6 +699,33 @@ mod tests {
         let report = scan_sessions_roots(&[root.clone(), root.clone()]).unwrap();
         assert_eq!(report.scanned, 1);
         assert_eq!(report.sessions.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parallel_scan_keeps_deterministic_order() {
+        let root = temp("parallel");
+        let mut ids = Vec::new();
+        for index in 0..24 {
+            let id = format!("s{index:02}");
+            write_session(
+                &root.join(format!("{id}.jsonl")),
+                &[SessionEvent::TurnStarted {
+                    task: id.clone(),
+                    objective: "o".into(),
+                    max_steps: 1,
+                }],
+            );
+            ids.push(id);
+        }
+        let report = scan_sessions(&root).unwrap();
+        assert_eq!(report.scanned, 24);
+        let actual: Vec<String> = report
+            .sessions
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect();
+        assert_eq!(actual, ids);
         let _ = fs::remove_dir_all(&root);
     }
 
