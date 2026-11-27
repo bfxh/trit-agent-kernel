@@ -46,7 +46,14 @@ shell 仍受 `allow_shell` / `allow_unsandboxed_shell` / 沙箱约束。
 `OPENAI_API_KEY` 等 provider 凭据不再被任何工具子进程继承。需要额外变量的调用方
 必须显式传入（`ProcessSpec.env` 或 `SubagentProcessConfig::with_env`）。
 
+## 远程执行面
+
+- 非 loopback 监听必须配置非空 bearer token，否则 `RemoteServer::bind` 直接拒绝启动。
+- 带 `Origin` 的请求一律 `403`：本协议没有浏览器客户端，避免任意网页通过
+  DNS rebinding / no-cors 触发本机 `remote-exec`。
+- `exec_workspace_root` 的任务/作用域目录名拒绝 `.git`、`.agent` 与 Windows 设备名
+  （`CON`、`NUL`、`COM1` 等），防止把子 agent 的 workspace 指到仓库 hooks 或控制目录。
+
 ## 已知待补
 
-- 远程执行面需要 token / Host / Origin 与保留路径名校验（审计第 5 项）。
 - git journal 的 `backup` 字段与控制面文件完整性校验（审计第 6 项）。

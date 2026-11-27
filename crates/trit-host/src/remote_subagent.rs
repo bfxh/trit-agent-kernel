@@ -86,9 +86,49 @@ pub const MAX_IDEMPOTENCY_SCOPE_LEN: usize = 128;
 pub(crate) fn is_safe_namespace_component(value: &str) -> bool {
     !value.is_empty()
         && !matches!(value, "." | "..")
+        && !value.ends_with('.')
+        && !is_reserved_namespace_component(value)
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+/// 拒绝会落到仓库控制目录或 Windows 设备名的单段名字。
+///
+/// `.git` 会让子 agent 的 workspace 变成仓库 hooks 目录；`.agent` 是宿主的
+/// journal / checkpoint 控制目录。Windows 会把 `CON`、`NUL`、`COM1` 等当成
+/// 设备而不是目录，带扩展名（`CON.txt`）也一样。
+pub(crate) fn is_reserved_namespace_component(value: &str) -> bool {
+    let normalized = value.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() || matches!(normalized.as_str(), ".git" | ".agent") {
+        return true;
+    }
+    let stem = normalized.split('.').next().unwrap_or("");
+    matches!(
+        stem,
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
 }
 
 /// 校验计划作用域：非空、长度有界、只含安全字符、不是 `.`/`..`。

@@ -915,6 +915,35 @@ fn request_read_deadline_aborts_slow_body_upload() {
 }
 
 #[test]
+fn echo_server_rejects_browser_origin_before_framing() {
+    // 本机端口不能被任意网页通过 no-cors/DNS rebinding 触发；带 Origin 即 403。
+    let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();
+    let address = server.addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let _ = server.serve_once();
+    });
+
+    let frame = encode_frame(&request()).unwrap();
+    let mut stream = TcpStream::connect(address).unwrap();
+    let _ = write!(
+        stream,
+        "POST /run HTTP/1.1\r\nHost: test\r\nOrigin: http://evil.example\r\nContent-Type: {FRAME_CONTENT_TYPE}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        frame.len()
+    );
+    let _ = stream.write_all(&frame);
+    let _ = stream.flush();
+
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    let _ = reader.read_line(&mut response);
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "browser origin must be rejected, got {response}"
+    );
+    handle.join().unwrap();
+}
+
+#[test]
 fn echo_server_rejects_mismatched_idempotency_key() {
     // 头里的 key 与帧里的 task@epoch 不一致：400，不解帧执行。
     let server = RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0")).unwrap();

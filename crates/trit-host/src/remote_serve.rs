@@ -58,10 +58,14 @@
 //! 13. **请求读取总时限**：请求行 + 头部 + 请求体共享 `request_read_timeout`
 //!     （默认 60s；`--request-read-timeout-ms`，0 关闭）。慢速滴流即使每次
 //!     socket 读取都没超时，也会在总截止点回 `408`，不进入派发/执行阶段。
+//! 14. **监听与浏览器边界**：非 loopback 监听必须配置非空 bearer token，否则
+//!     拒绝启动；带 `Origin` 的请求一律 `403`，避免本机端口被任意网页通过
+//!     DNS rebinding / no-cors 触发。任务与作用域目录名拒绝 `.git` / `.agent`
+//!     与 Windows 设备名。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
@@ -492,9 +496,9 @@ pub enum RemoteMode {
 /// 参考服务端配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteServerConfig {
-    /// 监听地址；`127.0.0.1:0` 表示由系统分配端口。
+    /// 监听地址；`127.0.0.1:0` 表示由系统分配端口。非 loopback 时必须配 token。
     pub bind: String,
-    /// 可选 bearer token；配置后所有请求都要带同一个值。
+    /// 可选 bearer token；配置后所有请求都要带同一个值。非 loopback 监听时不可为空。
     pub token: Option<String>,
     /// 应答模式。
     pub mode: RemoteMode,
@@ -625,6 +629,39 @@ pub struct RemoteServer {
 impl RemoteServer {
     /// 绑定监听地址；失败即返回，不重试。
     pub fn bind(config: RemoteServerConfig) -> std::io::Result<Self> {
+        if config
+            .token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bearer token must not be empty",
+            ));
+        }
+        let bind_addrs: Vec<SocketAddr> = config
+            .bind
+            .to_socket_addrs()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid bind address {:?}: {error}", config.bind),
+                )
+            })?
+            .collect();
+        if bind_addrs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("bind address {:?} resolved to nothing", config.bind),
+            ));
+        }
+        // 非 loopback 监听等于把执行面暴露到网络；没有 token 时直接拒绝启动。
+        if config.token.is_none() && bind_addrs.iter().any(|addr| !addr.ip().is_loopback()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "non-loopback bind requires a bearer token",
+            ));
+        }
         if let Some(ledger) = config.ledger.as_ref() {
             ledger.validate().map_err(|error| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
@@ -667,7 +704,7 @@ impl RemoteServer {
             ));
         }
         let auth = config.token.as_deref().map(bearer_digest);
-        let listener = TcpListener::bind(config.bind.as_str())?;
+        let listener = TcpListener::bind(bind_addrs.as_slice())?;
         let slots = ConnectionSlots::new(config.max_connections);
         Ok(Self {
             listener,
@@ -827,6 +864,7 @@ fn handle(
     let mut content_length: Option<usize> = None;
     let mut authorization: Option<String> = None;
     let mut idempotency: Option<String> = None;
+    let mut origin: Option<String> = None;
     let mut header_count = 0;
     loop {
         let line = match read_http_line(&mut reader, MAX_HEADER_LINE_BYTES) {
@@ -865,6 +903,7 @@ fn handle(
             },
             "authorization" => authorization = Some(value.to_string()),
             "x-trit-idempotency" => idempotency = Some(value.to_string()),
+            "origin" => origin = Some(value.to_string()),
             _ => {}
         }
     }
@@ -874,6 +913,12 @@ fn handle(
         if !authorization_matches(authorization.as_deref(), expected) {
             return respond(&mut stream, 401, "Unauthorized", b"");
         }
+    }
+
+    // 浏览器对跨源 POST 总会带 Origin；本协议没有浏览器客户端。拒绝所有带
+    // Origin 的请求，避免本机端口被任意网页通过 DNS rebinding / no-cors 触发。
+    if origin.is_some() {
+        return respond(&mut stream, 403, "Forbidden", b"");
     }
 
     if is_health {
@@ -1213,6 +1258,16 @@ fn safe_task_component(task: &str) -> Result<String, String> {
             "task id {task:?} is not a safe workspace directory"
         ));
     }
+    if task.ends_with('.') {
+        return Err(format!(
+            "task id {task:?} ends with a dot and is not a safe workspace directory"
+        ));
+    }
+    if crate::remote_subagent::is_reserved_namespace_component(task) {
+        return Err(format!(
+            "task id {task:?} is a reserved workspace directory"
+        ));
+    }
     if !task
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -1324,4 +1379,44 @@ fn respond(stream: &mut TcpStream, code: u16, reason: &str, body: &[u8]) -> std:
     )?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_loopback_bind_without_token_is_rejected_before_listen() {
+        let error = match RemoteServer::bind(RemoteServerConfig::new("0.0.0.0:0")) {
+            Ok(_) => panic!("0.0.0.0 without a token must not bind"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("non-loopback bind requires"));
+    }
+
+    #[test]
+    fn empty_token_is_rejected() {
+        let error =
+            match RemoteServer::bind(RemoteServerConfig::new("127.0.0.1:0").with_token("  ")) {
+                Ok(_) => panic!("empty token must not bind"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn task_and_scope_components_reject_control_dirs() {
+        for name in [".git", ".GIT", ".agent", "CON", "con.txt", "NUL", "COM1"] {
+            assert!(
+                safe_task_component(name).is_err(),
+                "{name} must not become a task workspace"
+            );
+        }
+        assert!(safe_task_component("a.b").is_ok());
+        assert!(safe_task_component("hooks").is_ok());
+        assert!(safe_scope_component(".git").is_err());
+        assert!(safe_scope_component("plan-a").is_ok());
+    }
 }
