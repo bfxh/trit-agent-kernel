@@ -1530,7 +1530,9 @@ pub use session_dispatch::{
     DispatchAction, DispatchItem, DispatchOptions, DispatchReport, SESSION_DISPATCH_SCHEMA,
     dispatch_sessions,
 };
-pub use session_fleet::{FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, plan_fleet};
+pub use session_fleet::{
+    FleetTask, SESSION_FLEET_SCHEMA, SessionFleetReport, apply_budget, plan_fleet,
+};
 pub use session_fleet_run::{
     FleetRunOptions, FleetRunOutcome, SESSION_FLEET_RUN_SCHEMA, build_plan, execute_fleet,
 };

@@ -51,7 +51,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trit_orch::{MAX_FRAME_BYTES, RemoteEndpoint, SubagentResponse, decode_frame, encode_frame};
@@ -1277,6 +1277,24 @@ struct LedgerReply {
     done: bool,
 }
 
+/// 按 endpoint timeout 复用 ureq 连接池；claim/renew/complete 共享同一 agent。
+fn ledger_agent(timeout_secs: u64) -> ureq::Agent {
+    static AGENTS: OnceLock<Mutex<BTreeMap<u64, ureq::Agent>>> = OnceLock::new();
+    let agents = AGENTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut agents = agents
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    agents
+        .entry(timeout_secs)
+        .or_insert_with(|| {
+            ureq::AgentBuilder::new()
+                .timeout(Duration::from_secs(timeout_secs))
+                .redirects(0)
+                .build()
+        })
+        .clone()
+}
+
 fn post(
     endpoint: &RemoteEndpoint,
     path: &str,
@@ -1285,10 +1303,7 @@ fn post(
     body: Option<&[u8]>,
 ) -> Result<LedgerReply, String> {
     endpoint.validate().map_err(|error| error.to_string())?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(endpoint.timeout_secs))
-        .redirects(0)
-        .build();
+    let agent = ledger_agent(endpoint.timeout_secs);
     let url = format!("{}{path}", endpoint.url.trim().trim_end_matches('/'));
     let mut request = agent
         .post(&url)

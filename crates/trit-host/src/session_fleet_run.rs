@@ -73,6 +73,7 @@ pub fn build_plan(report: &SessionFleetReport) -> Result<Plan, AgentError> {
                 objective: task.task.clone(),
                 ..TaskGuidance::default()
             },
+            max_tokens: task.max_tokens,
             ..TaskSpec::default()
         })
         .collect();
@@ -137,7 +138,7 @@ fn execute_once(
     cancel: CancelToken,
 ) -> Result<FleetRunOutcome, AgentError> {
     let plan = build_plan(report)?;
-    let config = std::sync::Arc::new(config);
+    let provider = OpenAiProvider::new(config);
     let fallback_workspace = workspace.to_path_buf();
     let workspaces: BTreeMap<String, PathBuf> = report
         .tasks
@@ -163,7 +164,7 @@ fn execute_once(
         if cancel.is_cancelled() {
             return Err("cancelled before start".to_owned());
         }
-        let provider = OpenAiProvider::new((*config).clone());
+        let provider = provider.clone();
         let model = ProviderModel::with_tools(provider, default_tools());
         let workspace = workspaces
             .get(&task.task.id)
@@ -276,6 +277,7 @@ mod tests {
                     deps: Vec::new(),
                     workspace: None,
                     parent: None,
+                    max_tokens: 0,
                 },
                 FleetTask {
                     id: "child".into(),
@@ -283,6 +285,7 @@ mod tests {
                     deps: vec!["parent".into()],
                     workspace: None,
                     parent: Some("parent".into()),
+                    max_tokens: 0,
                 },
             ],
             layers: vec![vec!["parent".into()], vec!["child".into()]],
@@ -310,6 +313,7 @@ mod tests {
                     deps: vec!["b".into()],
                     workspace: None,
                     parent: Some("b".into()),
+                    max_tokens: 0,
                 },
                 FleetTask {
                     id: "b".into(),
@@ -317,6 +321,7 @@ mod tests {
                     deps: vec!["a".into()],
                     workspace: None,
                     parent: Some("a".into()),
+                    max_tokens: 0,
                 },
             ],
             layers: Vec::new(),
@@ -338,6 +343,7 @@ mod tests {
                     deps: Vec::new(),
                     workspace: None,
                     parent: None,
+                    max_tokens: 0,
                 },
                 FleetTask {
                     id: "b".into(),
@@ -345,6 +351,7 @@ mod tests {
                     deps: vec!["a".into()],
                     workspace: None,
                     parent: Some("a".into()),
+                    max_tokens: 0,
                 },
                 FleetTask {
                     id: "c".into(),
@@ -352,6 +359,7 @@ mod tests {
                     deps: vec!["b".into()],
                     workspace: None,
                     parent: Some("b".into()),
+                    max_tokens: 0,
                 },
             ],
             layers: vec![vec!["a".into()], vec!["b".into()], vec!["c".into()]],

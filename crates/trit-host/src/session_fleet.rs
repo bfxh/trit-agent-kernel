@@ -29,6 +29,9 @@ pub struct FleetTask {
     /// 第一个父会话 id；执行完成后用于把结果回填到 parent 的 delegations.jsonl。
     #[serde(default)]
     pub parent: Option<String>,
+    /// 单任务 token 预算；0 表示不限制。
+    #[serde(default)]
+    pub max_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +85,7 @@ pub fn plan_fleet(
             deps: Vec::new(),
             workspace: entry.project.clone(),
             parent: None,
+            max_tokens: 0,
         });
     }
 
@@ -119,6 +123,24 @@ pub fn plan_fleet(
         skipped,
         cyclic,
     }
+}
+
+/// 把总 token 预算均分到任务；0 表示不限制。预算小于任务数时 fail closed。
+pub fn apply_budget(report: &mut SessionFleetReport, budget_tokens: u64) -> Result<(), String> {
+    if budget_tokens == 0 || report.tasks.is_empty() {
+        return Ok(());
+    }
+    let per_task = budget_tokens / report.tasks.len() as u64;
+    if per_task == 0 {
+        return Err(format!(
+            "budget {budget_tokens} is smaller than {} tasks",
+            report.tasks.len()
+        ));
+    }
+    for task in &mut report.tasks {
+        task.max_tokens = per_task;
+    }
+    Ok(())
 }
 
 pub(crate) fn topological_layers(tasks: &[FleetTask]) -> (Vec<Vec<String>>, Vec<String>) {
@@ -314,5 +336,21 @@ mod tests {
         };
         let fleet = plan_fleet(&scan, &plan, 1);
         assert_eq!(fleet.tasks[0].workspace.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn budget_is_split_across_tasks() {
+        let (scan, plan) = report(&["a", "b"], Vec::new());
+        let mut fleet = plan_fleet(&scan, &plan, 1);
+        apply_budget(&mut fleet, 100).unwrap();
+        assert_eq!(fleet.tasks[0].max_tokens, 50);
+        assert_eq!(fleet.tasks[1].max_tokens, 50);
+    }
+
+    #[test]
+    fn budget_smaller_than_tasks_fails_closed() {
+        let (scan, plan) = report(&["a", "b"], Vec::new());
+        let mut fleet = plan_fleet(&scan, &plan, 1);
+        assert!(apply_budget(&mut fleet, 1).is_err());
     }
 }

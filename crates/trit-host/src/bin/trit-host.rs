@@ -1408,11 +1408,13 @@ fn usage() {
          session-callback-verify: trit-host session-callback-verify --root <dir> [--compact]\n\
          re-scans children and compares them with delegations.jsonl; reports ok, stale,\n\
          mismatch, missing child or missing delegation without writing anything.\n\
-         session-fleet: trit-host session-fleet --root <dir> [--workers N] [--compact]\n\
+         session-fleet: trit-host session-fleet --root <dir> [--workers N] [--budget-tokens N]\n\
+         [--compact]\n\
          turns resume items into a dependency-ordered task graph; prints workers and\n\
          topological layers (cycles are reported separately, never scheduled).\n\
          session-fleet-run: trit-host session-fleet-run --root <dir> [--workers N]\n\
-         [--workspace <dir>] [--max-steps N] [--retry N] [--apply] [--compact]\n\
+         [--workspace <dir>] [--max-steps N] [--retry N] [--budget-tokens N]\n\
+         [--apply] [--compact]\n\
          dry-run prints the plan; --apply runs tasks through trit-orch fleet with the\n\
          OpenAI-compatible provider from the environment and stops starting after a failure.\n\
          diagnostics: trit-host diagnostics --workspace <dir> [--session <jsonl>] [--db <path>]\n\
@@ -1514,6 +1516,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     let mut workspace: Option<PathBuf> = None;
     let mut max_steps = 20usize;
     let mut retries = 0usize;
+    let mut budget_tokens = 0u64;
     let mut apply = false;
     let mut compact = false;
     while let Some(arg) = args.next() {
@@ -1535,6 +1538,11 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
                     .parse()
                     .map_err(|_| fail("--retry must be a non-negative integer"))?;
             }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+            }
             "--apply" => apply = true,
             "--compact" => compact = true,
             other => {
@@ -1544,7 +1552,10 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
     }
     let scanned = trit_host::scan_sessions(&root)?;
     let plan = trit_host::plan_sessions(&scanned);
-    let fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    if budget_tokens > 0 {
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+    }
     let workspace = workspace.unwrap_or_else(|| root.clone());
     if !apply {
         let report = serde_json::json!({
@@ -1553,6 +1564,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
             "workspace": workspace.display().to_string(),
             "max_steps": max_steps,
             "retry": retries,
+            "budget_tokens": budget_tokens,
             "tasks": fleet.tasks,
             "layers": fleet.layers,
             "skipped": fleet.skipped,
@@ -1606,6 +1618,7 @@ fn run_session_fleet_run(mut args: impl Iterator<Item = String>) -> Result<(), B
 fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let mut root = PathBuf::from(".");
     let mut workers = 4usize;
+    let mut budget_tokens = 0u64;
     let mut compact = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1615,13 +1628,21 @@ fn run_session_fleet(mut args: impl Iterator<Item = String>) -> Result<(), Box<d
                     .parse()
                     .map_err(|_| fail("--workers must be a positive integer"))?;
             }
+            "--budget-tokens" => {
+                budget_tokens = next(&mut args, "--budget-tokens")?
+                    .parse()
+                    .map_err(|_| fail("--budget-tokens must be a non-negative integer"))?;
+            }
             "--compact" => compact = true,
             other => return Err(fail(format!("unknown session-fleet argument: {other}"))),
         }
     }
     let scanned = trit_host::scan_sessions(&root)?;
     let plan = trit_host::plan_sessions(&scanned);
-    let fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    let mut fleet = trit_host::plan_fleet(&scanned, &plan, workers);
+    if budget_tokens > 0 {
+        trit_host::apply_budget(&mut fleet, budget_tokens).map_err(|error| fail(error))?;
+    }
     let text = if compact {
         serde_json::to_string(&fleet)
     } else {

@@ -74,6 +74,7 @@ impl OpenAiConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct OpenAiProvider {
     config: OpenAiConfig,
     agent: ureq::Agent,
