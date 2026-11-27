@@ -1593,6 +1593,7 @@ pub mod context_layers;
 pub mod context_projection;
 pub mod context_tools;
 pub mod cost;
+pub mod design_score;
 pub mod diagnostics;
 pub mod extensions;
 pub mod fleet_runner;
@@ -1668,6 +1669,9 @@ pub use context_projection::{
 pub use context_tools::{
     AgentContextPlanner, AgentContextTools, CachePressurePolicy, ContextAddRecord,
     ContextReadRecord, ContextReadTools, LowHitPolicy,
+};
+pub use design_score::{
+    Artifact, DesignAxis, DesignAxisScore, DesignFinding, DesignReport, score_artifacts,
 };
 pub use diagnostics::{
     DiagnosticsOptions, DiagnosticsReport, JournalDiagnostics, KernelVersions, LiveMcpDiagnostics,

@@ -229,19 +229,23 @@ pub fn run_cli_agent(
     }
 
     let (sender, receiver) = mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
+    if let Some(stdout) = child.stdout.take() {
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
-            let result = stdout.take(MAX_CLI_OUTPUT_BYTES + 1).read_to_end(&mut buffer);
+            let result = stdout
+                .take(MAX_CLI_OUTPUT_BYTES + 1)
+                .read_to_end(&mut buffer);
             let _ = sender.send(("out", result, buffer));
         });
     }
-    if let Some(mut stderr) = child.stderr.take() {
+    if let Some(stderr) = child.stderr.take() {
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
-            let result = stderr.take(MAX_CLI_OUTPUT_BYTES + 1).read_to_end(&mut buffer);
+            let result = stderr
+                .take(MAX_CLI_OUTPUT_BYTES + 1)
+                .read_to_end(&mut buffer);
             let _ = sender.send(("err", result, buffer));
         });
     }
