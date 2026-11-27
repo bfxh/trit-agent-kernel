@@ -1428,6 +1428,7 @@ mod http_read;
 pub mod journal;
 pub mod jsonl_layout;
 pub mod lease;
+pub mod mcp_http;
 pub mod mcp_tools;
 pub mod memory;
 pub mod openai;

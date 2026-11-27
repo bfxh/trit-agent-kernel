@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::context_layers::CacheLedger;
+use crate::mcp_http::{HttpMcpClient, HttpMcpSpec};
 use crate::port_bridge::{PortBridge, PortBridgeSpec};
 use crate::session_migration::HookDescriptor;
 use crate::state_layer::StateLayer;
@@ -117,6 +118,9 @@ pub struct SupervisorConfig {
     pub gateway: Vec<ProcessSpec>,
     #[serde(default)]
     pub mcp: Vec<ProcessSpec>,
+    /// HTTP MCP server（Streamable HTTP，例如 FluxDown 的 `/mcp`）。
+    #[serde(default)]
+    pub mcp_http: Vec<HttpMcpSpec>,
     #[serde(default)]
     pub bridges: Vec<PortBridgeSpec>,
     #[serde(default)]
@@ -144,6 +148,7 @@ impl Default for SupervisorConfig {
         Self {
             gateway: Vec::new(),
             mcp: Vec::new(),
+            mcp_http: Vec::new(),
             bridges: Vec::new(),
             roots: Vec::new(),
             roots_watch: Vec::new(),
@@ -2054,6 +2059,7 @@ pub struct SupervisorRuntime {
     bridges: Vec<PortBridge>,
     gateways: Vec<Arc<Mutex<ProcessSupervisor>>>,
     mcps: Vec<Arc<Mutex<McpSupervisor>>>,
+    mcp_http: Vec<Arc<HttpMcpClient>>,
     recovery: Arc<Mutex<RecoveryContext>>,
     loops: Vec<SupervisorLoop>,
     roots_watch: Option<RootsWatchHandle>,
@@ -2079,6 +2085,7 @@ impl SupervisorRuntime {
             bridges: Vec::new(),
             gateways: Vec::new(),
             mcps: Vec::new(),
+            mcp_http: Vec::new(),
             recovery: Arc::new(Mutex::new(recovery)),
             loops: Vec::new(),
             roots_watch: None,
@@ -2149,6 +2156,11 @@ impl SupervisorRuntime {
             ));
             runtime.mcps.push(supervisor);
         }
+        for spec in &config.mcp_http {
+            runtime
+                .mcp_http
+                .push(Arc::new(HttpMcpClient::new(spec.clone())));
+        }
         if !config.roots_watch.is_empty() && !runtime.mcps.is_empty() {
             runtime.roots_watch = Some(RootsWatchHandle::start(
                 config.roots_watch.clone(),
@@ -2178,7 +2190,12 @@ impl SupervisorRuntime {
     }
 
     pub fn tool_client_with_timeout(&self, timeout: Duration) -> crate::mcp_tools::McpToolClient {
-        crate::mcp_tools::McpToolClient::new(self.mcps.clone(), Arc::clone(&self.recovery), timeout)
+        crate::mcp_tools::McpToolClient::new(
+            self.mcps.clone(),
+            self.mcp_http.clone(),
+            Arc::clone(&self.recovery),
+            timeout,
+        )
     }
 
     /// 更新下一次重连使用的恢复包；状态层校验失败时拒绝。
@@ -3625,6 +3642,7 @@ done
             interval_ms: 10,
             mcp_timeout_ms: 30_000,
             resource_read_concurrency: 8,
+            mcp_http: Vec::new(),
         };
         let mut runtime = SupervisorRuntime::start(
             &config,

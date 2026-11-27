@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::mcp_http::HttpMcpClient;
 use crate::provider::{ToolCatalog, ToolSpec};
 use crate::supervisor::{McpSupervisor, RecoveryContext};
 use crate::{AgentError, ToolExecutor, ToolOutcome, ToolRequest};
@@ -20,12 +21,16 @@ pub struct McpToolRoute {
     pub description: String,
     pub input_schema: Value,
     pub declared_read_only: bool,
+    /// stdio supervisor 下标；HTTP 客户端为 0 且 `http` 为 Some。
     supervisor: usize,
+    /// HTTP MCP 客户端下标；stdio 路由为 None。
+    http: Option<usize>,
 }
 
 #[derive(Clone)]
 pub struct McpToolClient {
     supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
+    http: Vec<Arc<HttpMcpClient>>,
     recovery: Arc<Mutex<RecoveryContext>>,
     timeout: Duration,
 }
@@ -33,11 +38,13 @@ pub struct McpToolClient {
 impl McpToolClient {
     pub(crate) fn new(
         supervisors: Vec<Arc<Mutex<McpSupervisor>>>,
+        http: Vec<Arc<HttpMcpClient>>,
         recovery: Arc<Mutex<RecoveryContext>>,
         timeout: Duration,
     ) -> Self {
         Self {
             supervisors,
+            http,
             recovery,
             timeout,
         }
@@ -78,6 +85,39 @@ impl McpToolClient {
                         .as_ref()
                         .is_some_and(|annotations| annotations.read_only_hint),
                     supervisor: index,
+                    http: None,
+                });
+            }
+        }
+        for (index, client) in self.http.iter().enumerate() {
+            let server = client.name().to_owned();
+            let Ok(mut tools) = client.tools() else {
+                continue;
+            };
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            for tool in tools {
+                let exposed_name = unique_exposed_name(&server, &tool.name, &mut used);
+                let description = tool
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("MCP tool {}.{}", server, tool.name));
+                let input_schema = if tool.input_schema.is_null() {
+                    serde_json::json!({"type": "object"})
+                } else {
+                    tool.input_schema.clone()
+                };
+                routes.push(McpToolRoute {
+                    exposed_name,
+                    server: server.clone(),
+                    tool: tool.name.clone(),
+                    description,
+                    input_schema,
+                    declared_read_only: tool
+                        .annotations
+                        .as_ref()
+                        .is_some_and(|annotations| annotations.read_only_hint),
+                    supervisor: 0,
+                    http: Some(index),
                 });
             }
         }
@@ -98,6 +138,15 @@ impl McpToolClient {
         let route = self
             .route(exposed_name)
             .ok_or_else(|| AgentError::Tool(format!("unknown MCP tool: {exposed_name}")))?;
+        if let Some(index) = route.http {
+            let client = self
+                .http
+                .get(index)
+                .ok_or_else(|| AgentError::Tool("HTTP MCP client is missing".into()))?;
+            return client.call(&route.tool, arguments).map_err(|error| {
+                AgentError::Tool(format!("MCP {}/{}: {error}", route.server, route.tool))
+            });
+        }
         let recovery = self
             .recovery
             .lock()

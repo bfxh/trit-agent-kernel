@@ -284,6 +284,7 @@ fn cli_starts_supervised_gateway_and_reports_it() {
         interval_ms: 10,
         mcp_timeout_ms: 1_000,
         resource_read_concurrency: 8,
+        mcp_http: Vec::new(),
     };
     std::fs::write(&config_path, serde_json::to_string(&config).unwrap()).unwrap();
 
