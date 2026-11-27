@@ -7,7 +7,7 @@
 //! 失败语义沿用 fleet：第一个失败后不再启动新任务，未启动的进 `cancelled`/`deferred`。
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -83,7 +83,16 @@ pub fn execute_fleet(
 ) -> Result<FleetRunOutcome, AgentError> {
     let plan = build_plan(report)?;
     let config = std::sync::Arc::new(config);
-    let workspace = workspace.to_path_buf();
+    let fallback_workspace = workspace.to_path_buf();
+    let workspaces: BTreeMap<String, PathBuf> = report
+        .tasks
+        .iter()
+        .filter_map(|task| {
+            task.workspace
+                .as_ref()
+                .map(|workspace| (task.id.clone(), PathBuf::from(workspace)))
+        })
+        .collect();
     let session_dir = session_dir.to_path_buf();
     let max_steps = options.max_steps;
     let runner = move |task: &TaskSpec, cancel: &CancelToken| -> Result<FleetOutput, String> {
@@ -92,6 +101,10 @@ pub fn execute_fleet(
         }
         let provider = OpenAiProvider::new((*config).clone());
         let model = ProviderModel::with_tools(provider, default_tools());
+        let workspace = workspaces
+            .get(&task.task.id)
+            .cloned()
+            .unwrap_or_else(|| fallback_workspace.clone());
         let headless = HeadlessConfig {
             workspace: WorkspaceConfig::new(&workspace),
             max_steps,
@@ -107,10 +120,13 @@ pub fn execute_fleet(
             tokens,
         })
     };
+    let cancel = CancelToken::new();
+    // Ctrl-C 只做协作式取消；安装失败（例如已安装）不阻止执行。
+    let _ = crate::cancel_guard::install(cancel.clone());
     let report = execute(
         &plan,
         FleetConfig::new(options.workers.max(1)),
-        CancelToken::new(),
+        cancel,
         runner,
     )
     .map_err(|error| AgentError::SessionState(format!("fleet: {error}")))?;
@@ -144,11 +160,13 @@ mod tests {
                     id: "parent".into(),
                     task: "do parent".into(),
                     deps: Vec::new(),
+                    workspace: None,
                 },
                 FleetTask {
                     id: "child".into(),
                     task: "do child".into(),
                     deps: vec!["parent".into()],
+                    workspace: None,
                 },
             ],
             layers: vec![vec!["parent".into()], vec!["child".into()]],
@@ -174,11 +192,13 @@ mod tests {
                     id: "a".into(),
                     task: "a".into(),
                     deps: vec!["b".into()],
+                    workspace: None,
                 },
                 FleetTask {
                     id: "b".into(),
                     task: "b".into(),
                     deps: vec!["a".into()],
+                    workspace: None,
                 },
             ],
             layers: Vec::new(),

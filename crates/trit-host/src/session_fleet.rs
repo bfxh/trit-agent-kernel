@@ -23,6 +23,9 @@ pub struct FleetTask {
     pub task: String,
     #[serde(default)]
     pub deps: Vec<String>,
+    /// 该任务的写根；来自会话 meta 的 project/project_path，缺省时由执行层回退。
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +77,7 @@ pub fn plan_fleet(
             id: entry.session_id.clone(),
             task,
             deps: Vec::new(),
+            workspace: entry.project.clone(),
         });
     }
 
@@ -280,5 +284,27 @@ mod tests {
         assert!(fleet.tasks.is_empty());
         assert_eq!(fleet.skipped.len(), 1);
         assert!(fleet.skipped[0].contains("non-trit"));
+    }
+
+    #[test]
+    fn project_meta_becomes_task_workspace() {
+        let mut session = entry("s");
+        session.project = Some("/repo".into());
+        let scan = SessionScanReport {
+            schema: 1,
+            root: ".".into(),
+            scanned: 1,
+            sessions: vec![session],
+            links: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let plan = SessionPlanReport {
+            schema: 1,
+            root: ".".into(),
+            items: vec![plan_item("s")],
+            unassigned: Vec::new(),
+        };
+        let fleet = plan_fleet(&scan, &plan, 1);
+        assert_eq!(fleet.tasks[0].workspace.as_deref(), Some("/repo"));
     }
 }
