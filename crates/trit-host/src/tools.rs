@@ -860,6 +860,7 @@ impl ToolExecutor for LocalTools {
             "bash" => self.bash(request),
             "browser" => self.browser(request),
             "download" => self.download(request),
+            "tools_batch" => self.tools_batch(request),
             other => Err(AgentError::Tool(format!("unknown tool: {other}"))),
         }
     }
@@ -1043,6 +1044,99 @@ impl LocalTools {
         }
     }
 
+    /// 一次调用执行多个只读工具，返回紧凑结果，减少模型往返与上下文开销。
+    fn tools_batch(&mut self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
+        let args = request
+            .arguments
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let calls = args
+            .get("calls")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| AgentError::Tool("tools_batch requires calls[]".into()))?;
+        if calls.is_empty() || calls.len() > 64 {
+            return Err(AgentError::Tool(
+                "tools_batch calls must contain 1..=64 entries".into(),
+            ));
+        }
+        let mut requests = Vec::with_capacity(calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            let tool = call
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    AgentError::Tool(format!("tools_batch calls[{index}] requires tool"))
+                })?;
+            if !BATCH_ALLOWED.contains(&tool) {
+                return Err(AgentError::Tool(format!(
+                    "tools_batch does not allow {tool}; allowed: {}",
+                    BATCH_ALLOWED.join(", ")
+                )));
+            }
+            requests.push(ToolRequest {
+                call_id: format!("{}#{index}", request.call_id),
+                tool: tool.into(),
+                read_only: tool != "download",
+                command: call
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                paths: call
+                    .get("paths")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(|path| path.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                operation: None,
+                content: None,
+                span: None,
+                arguments: call.get("arguments").cloned(),
+            });
+        }
+        let outcomes = self.execute_batch(&requests);
+        let budget = (self.max_output_bytes / calls.len()).max(1024);
+        let mut passed = true;
+        let mut results = Vec::with_capacity(outcomes.len());
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let (ok, output) = match outcome {
+                Ok(outcome) => {
+                    let ok = outcome.passed && !outcome.in_doubt;
+                    passed &= ok;
+                    (ok, truncate(outcome.output, budget))
+                }
+                Err(error) => {
+                    passed = false;
+                    (false, error.to_string())
+                }
+            };
+            results.push(serde_json::json!({
+                "index": index,
+                "tool": requests[index].tool,
+                "passed": ok,
+                "output": output,
+            }));
+        }
+        let output = serde_json::to_string(&serde_json::json!({
+            "passed": passed,
+            "calls": results,
+        }))
+        .unwrap_or_else(|_| "{}".into());
+        Ok(ToolOutcome {
+            call_id: request.call_id.clone(),
+            tool: request.tool.clone(),
+            command: None,
+            passed,
+            assertions: 0,
+            written_paths: Vec::new(),
+            in_doubt: false,
+            output: truncate(output, self.max_output_bytes),
+        })
+    }
+
     /// 调用外部下载器（默认 FluxDown）创建下载任务；未安装时 fail closed。
     fn download(&self, request: &ToolRequest) -> Result<ToolOutcome, AgentError> {
         let args = request
@@ -1094,6 +1188,9 @@ pub fn is_parallel_tool(tool: &str) -> bool {
         "read_file" | "search_code" | "glob" | "write_file" | "move_path"
     )
 }
+
+/// 允许进入 `tools_batch` 的工具：只读检索 + 外部下载；写工具与 bash 不走批量，避免绕过 claim。
+const BATCH_ALLOWED: &[&str] = &["read_file", "search_code", "glob", "download"];
 
 fn find(parent: &mut [usize], mut index: usize) -> usize {
     while parent[index] != index {
@@ -1390,6 +1487,46 @@ mod tests {
             arguments: None,
         };
         assert!(tools.download(&request).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tools_batch_runs_readonly_calls() {
+        let root = temp("batch-readonly");
+        std::fs::write(root.join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.join("b.txt"), "beta").unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut tools = LocalTools::new(config).unwrap();
+        let request = ToolRequest {
+            call_id: "batch".into(),
+            tool: "tools_batch".into(),
+            read_only: true,
+            command: None,
+            paths: Vec::new(),
+            operation: None,
+            content: None,
+            span: None,
+            arguments: Some(serde_json::json!({"calls": [
+                {"tool": "read_file", "paths": ["a.txt"]},
+                {"tool": "read_file", "paths": ["b.txt"]}
+            ]})),
+        };
+        let outcome = tools.tools_batch(&request).unwrap();
+        assert!(outcome.passed);
+        let value: serde_json::Value = serde_json::from_str(&outcome.output).unwrap();
+        assert_eq!(value["calls"].as_array().unwrap().len(), 2);
+        assert!(
+            value["calls"][0]["output"]
+                .as_str()
+                .unwrap()
+                .contains("alpha")
+        );
+        assert!(
+            value["calls"][1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("beta")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

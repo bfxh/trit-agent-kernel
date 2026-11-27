@@ -238,6 +238,20 @@ fn build_default_tools() -> Vec<ToolSpec> {
             })),
         },
         ToolSpec {
+            name: "tools_batch".into(),
+            description:
+                "Run up to 64 read-only tools (read_file/search_code/glob/download) in one call; returns compact per-call results."
+                    .into(),
+            read_only: true,
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "calls": {"type": "array", "items": {"type": "object"}}
+                },
+                "required": ["calls"]
+            })),
+        },
+        ToolSpec {
             name: "context_search".into(),
             description: "Search the context catalog and return candidate ids/labels.".into(),
             read_only: true,

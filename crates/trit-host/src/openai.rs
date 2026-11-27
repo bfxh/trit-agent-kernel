@@ -783,6 +783,7 @@ mod tests {
                 "glob",
                 "browser",
                 "download",
+                "tools_batch",
                 "context_search",
                 "context_add",
                 "context_read",

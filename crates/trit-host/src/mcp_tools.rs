@@ -4,7 +4,7 @@
 //! 执行仍走 `ToolExecutor`，因此会话、检查点与会话回放无需特殊分支。
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -33,6 +33,8 @@ pub struct McpToolClient {
     http: Vec<Arc<HttpMcpClient>>,
     recovery: Arc<Mutex<RecoveryContext>>,
     timeout: Duration,
+    /// 路由缓存；高频 `route()`/`tools()` 调用不重复重建。
+    routes_cache: Arc<Mutex<Option<(Instant, Vec<McpToolRoute>)>>>,
 }
 
 impl McpToolClient {
@@ -47,11 +49,34 @@ impl McpToolClient {
             http,
             recovery,
             timeout,
+            routes_cache: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 每次都从 supervisor 当前 tools 重建，list_changed 后无需重启。
+    /// 路由缓存：5 秒内复用；`invalidate` 可强制重建。
     pub fn routes(&self) -> Vec<McpToolRoute> {
+        let now = Instant::now();
+        if let Ok(cache) = self.routes_cache.lock()
+            && let Some((cached_at, routes)) = cache.as_ref()
+            && now.duration_since(*cached_at) < Duration::from_secs(5)
+        {
+            return routes.clone();
+        }
+        let routes = self.build_routes();
+        if let Ok(mut cache) = self.routes_cache.lock() {
+            *cache = Some((now, routes.clone()));
+        }
+        routes
+    }
+
+    /// 强制下次 `routes()` 重建；MCP `list_changed` 或 HTTP `refresh` 后调用。
+    pub fn invalidate(&self) {
+        if let Ok(mut cache) = self.routes_cache.lock() {
+            *cache = None;
+        }
+    }
+
+    fn build_routes(&self) -> Vec<McpToolRoute> {
         let mut used = std::collections::BTreeSet::new();
         let mut routes = Vec::new();
         for (index, supervisor) in self.supervisors.iter().enumerate() {
