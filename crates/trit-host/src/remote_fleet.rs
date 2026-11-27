@@ -780,6 +780,13 @@ pub fn spawn_remote_health_flusher(
 }
 
 fn load_remote_health_file(path: &Path) -> Result<Vec<NodeSnapshot>, AgentError> {
+    const MAX_HEALTH_FILE_BYTES: u64 = 8 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_HEALTH_FILE_BYTES) {
+        return Err(AgentError::Io(format!(
+            "health file too large: {}",
+            path.display()
+        )));
+    }
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text).map_err(|error| {
             AgentError::Io(format!("parse health file {}: {error}", path.display()))

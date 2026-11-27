@@ -26,6 +26,8 @@ where
     R: BufRead,
     F: FnMut(SseEvent) -> Result<(), AgentError>,
 {
+    const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+    const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
     let mut data = String::new();
     let mut event = None;
     let mut id = None;
@@ -39,6 +41,11 @@ where
             dispatch_sse(&mut data, &mut event, &mut id, &mut on_event)?;
             return Ok(());
         }
+        if line.len() > MAX_SSE_LINE_BYTES {
+            return Err(AgentError::Provider(format!(
+                "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes"
+            )));
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             dispatch_sse(&mut data, &mut event, &mut id, &mut on_event)?;
@@ -51,6 +58,11 @@ where
         let value = raw.strip_prefix(' ').unwrap_or(raw);
         match field {
             "data" => {
+                if data.len().saturating_add(value.len()) > MAX_SSE_EVENT_BYTES {
+                    return Err(AgentError::Provider(format!(
+                        "SSE event exceeds {MAX_SSE_EVENT_BYTES} bytes"
+                    )));
+                }
                 if !data.is_empty() {
                     data.push('\n');
                 }
