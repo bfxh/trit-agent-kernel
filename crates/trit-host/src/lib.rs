@@ -1603,6 +1603,7 @@ mod http_read;
 pub mod journal;
 pub mod jsonl_layout;
 pub mod lease;
+pub mod lint_score;
 pub mod mcp_http;
 pub mod mcp_tools;
 pub mod memory;

@@ -196,6 +196,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut output_format = String::from("md");
     let mut design_score_enabled = true;
     let mut design_block_below: Option<u8> = None;
+    let mut lint_score_enabled: bool = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -244,6 +245,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             "--allow-unsandboxed-shell" => allow_unsandboxed_shell = true,
             "--allow-hardlinks" => allow_hardlinks = true,
             "--no-design-score" => design_score_enabled = false,
+            "--lint-score" => lint_score_enabled = true,
             "--design-block-below" => {
                 design_block_below = Some(
                     next(&mut args, "--design-block-below")?
@@ -933,14 +935,26 @@ fn run() -> Result<(), Box<dyn Error>> {
             .participate_in_decision
             .then_some(host_settings.scoring.design_block_below)
     });
-    let design = design_score_enabled
+    let mut design = design_score_enabled
         .then(|| trit_host::score_written_paths(&workspace_root, &outcome.receipts));
+    // 显式开启才跑外部 lint；工具不存在/失败/超时都只是跳过，不影响主流程。
+    let lint = if lint_score_enabled {
+        trit_host::lint_score::run(&workspace_root, std::time::Duration::from_secs(120)).ok()
+    } else {
+        None
+    };
+    if let (Some(design), Some(lint)) = (design.as_mut(), lint.as_ref()) {
+        trit_host::lint_score::apply(design, lint);
+    }
     let mut stdout = std::io::stdout().lock();
     let rendered = if output_format == "json" {
         let mut value = serde_json::to_value(&outcome).map_err(|error| fail(error.to_string()))?;
         if let Some(design) = &design {
             value["design"] =
                 serde_json::to_value(design).map_err(|error| fail(error.to_string()))?;
+        }
+        if let Some(lint) = &lint {
+            value["lint"] = serde_json::to_value(lint).map_err(|error| fail(error.to_string()))?;
         }
         serde_json::to_string_pretty(&value).map_err(|error| fail(error.to_string()))?
     } else {
@@ -1404,7 +1418,7 @@ fn usage() {
          [--gate-chain-report <path>] [--gate-chain-post-report <path>]] \\\n    \
          [--provider scripted|openai|anthropic|gemini|deepseek] [--protocol <name>] [--script <proposals.json>] \\\n    \
          [--max-steps N] [--allow-write] [--session <jsonl>] [--resume] \\\n    \
-         [--no-design-score] [--design-block-below N] \\\n    \
+         [--no-design-score] [--design-block-below N] [--lint-score] \\\n    \
          [--checkpoint-dir <dir> [--checkpoint-backend files|git] [--checkpoint-retain N]] \\\n    \
          [--allow-shell (--sandbox <program> [--sandbox-arg <arg>...] | --allow-unsandboxed-shell)] \\\n    \
          [--allow-hardlinks] [--write-claim <path>]... [--write-lease <owner>] \\\n    \

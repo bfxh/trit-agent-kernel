@@ -78,6 +78,20 @@
 `crate::design_score::score_artifacts` 是"设计质量分"（本文件描述的四个维度）。
 两者不互相替代：证据裁决照样 fail closed，设计分只描述产出质量。
 
+## 3.5 真实 lint（可选，默认关闭）
+
+显式 `--lint-score` 才会跑外部 lint。工具按项目清单检测：
+
+| 清单 | 工具 | 命令 |
+| --- | --- | --- |
+| `go.mod` | golangci-lint | `golangci-lint run --out-format json ./...` |
+| `package.json` | eslint | `eslint -f json .` |
+| `pyproject.toml` / `setup.cfg` / `requirements.txt` | ruff | `ruff check --output-format json .` |
+
+- 子进程清空继承环境、120s 超时、4 MiB 输出上限；
+- 结果折进代码轴：每 10 个 error 扣 5（上限 25），写出 `lint-errors` 规则；
+- 工具不存在 / 失败 / 超时都只是跳过，不影响主流程；JSON 输出里的 `lint` 字段记录工具与计数。
+
 ## 4. 检查
 
 ```bash
