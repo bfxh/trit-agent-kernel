@@ -207,6 +207,27 @@ fn task_completed(dir: &Path, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 续跑前归档未完成的旧 session，避免新 turn 追加进同一文件。
+///
+/// 只做同目录 rename；失败直接返回错误，由调用方 fail closed。
+fn archive_incomplete_session(dir: &Path, id: &str) -> Result<(), String> {
+    let path = safe_task_path(dir, id);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session".to_owned());
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let archived = dir.join(format!("{stem}.prev-{nanos}.jsonl"));
+    std::fs::rename(&path, &archived)
+        .map_err(|error| format!("archive {}: {error}", path.display()))
+}
+
 /// 任务 id 只允许 `[A-Za-z0-9._-]`，避免 meta 里的 `../` 把 session 写出目录。
 fn safe_task_path(dir: &Path, id: &str) -> PathBuf {
     let safe: String = id
@@ -282,6 +303,9 @@ fn execute_once(
             .unwrap_or_else(|| fallback_workspace.clone());
         let session = safe_task_path(&session_dir, &task.task.id);
         reject_symlink(&session)?;
+        if let Err(error) = archive_incomplete_session(&session_dir, &task.task.id) {
+            return Err(error);
+        }
         if let Some(parent) = parents.get(&task.task.id) {
             let mut meta_path = session.as_os_str().to_os_string();
             meta_path.push(".meta");
@@ -604,6 +628,26 @@ mod tests {
         let filtered = skip_completed_tasks(&report, &dir);
         assert_eq!(filtered.tasks.len(), 1);
         assert_eq!(filtered.tasks[0].id, "pending.run");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn archive_incomplete_session_moves_old_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "trit-archive-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("task.run.jsonl"), "{}\n").unwrap();
+        archive_incomplete_session(&dir, "task.run").unwrap();
+        assert!(!dir.join("task.run.jsonl").exists());
+        let archived = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".prev-"));
+        assert!(archived);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

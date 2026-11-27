@@ -43,7 +43,15 @@
 - `--write-journal-rollback` 先做安全回滚；仍被活租约保护的操作进 `blocked`，拒绝自动回滚。
 - journal 是 append-only JSONL，回滚后闭合记录，不随运行时间累积内存。
 
-## 6. 已知边界与后续
+## 6. 跨设备落盘
+
+- `move_path` / `copy_then_remove`：同目录 `rename` 失败且 `is_cross_device` 时回退为 `copy + remove`，源文件不会因为跨挂载点而丢。
+- `checkpoint.save`：临时文件与目标在同一目录，`rename` 不跨设备；Windows 目标被占用时先删再重试。
+- `restore_rewind_backups` / `journal.backup_paths`：备份与恢复都是读写复制，不依赖 `rename` 的跨设备语义。
+- `git_checkpoint`：由 git 自己处理索引/对象写入。
+- 续跑归档：`--resume` 执行前把未完成的 `<task>.jsonl` 改名为 `<task>.prev-<ms>.jsonl`，避免新 turn 追加进旧文件；归档失败则 fail closed。
+
+## 7. 已知边界与后续
 
 - `McpToolClient::routes()` 有 5s 缓存与 `invalidate()`；临时分配只发生在缓存过期或失效时。
 - HTTP MCP 工具缓存有 TTL（默认 60s）与 `refresh()`；服务端 `list_changed` 仍不会自动推送，需要重建客户端或调用 refresh。
